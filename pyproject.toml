@@ -1,0 +1,25 @@
+[project]
+name = "trellis-mlx"
+version = "0.1.0"
+description = "MLX-native TRELLIS.2 inference for Apple Silicon"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.30",
+    "numpy",
+    "torch",
+    "torchvision",
+    "transformers",
+    "huggingface-hub",
+    "safetensors",
+    "pillow",
+    "trimesh",
+    "scipy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
