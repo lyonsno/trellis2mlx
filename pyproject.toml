@@ -1,5 +1,5 @@
 [project]
-name = "trellis-mlx"
+name = "trellis2mlx"
 version = "0.1.0"
 description = "MLX-native TRELLIS.2 inference for Apple Silicon"
 requires-python = ">=3.11"

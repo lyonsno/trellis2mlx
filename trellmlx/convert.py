@@ -1,7 +1,7 @@
 """Convert TRELLIS.2 safetensors weights to MLX format.
 
 Usage:
-    python -m trellis_mlx.convert [--model microsoft/TRELLIS.2-4B] [--output weights/]
+    python -m trellmlx.convert [--model microsoft/TRELLIS.2-4B] [--output weights/]
 
 Downloads from HuggingFace (or reads cached weights) and writes MLX-compatible
 .safetensors files with transposed linear weights (MLX convention: [out, in] -> [in, out]).
