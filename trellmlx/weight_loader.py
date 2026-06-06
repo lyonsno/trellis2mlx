@@ -21,6 +21,9 @@ _REMAP_PATTERNS = [
     (r"\.mlp\.mlp\.(\d+)\.", r".mlp.mlp_\1."),
     # TimestepEmbedder same pattern
     (r"^t_embedder\.mlp\.(\d+)\.", r"t_embedder.mlp_\1."),
+    # Decoder out_layer Sequential: out_layer.0 → out_layer_0, out_layer.2 → out_layer_2
+    (r"^out_layer\.(\d+)\.", r"out_layer_\1."),
+    # Middle block Sequential: middle_block.N → middle_block.N (list indexing, should work as-is)
 ]
 
 
@@ -32,12 +35,17 @@ def _remap_key(key: str) -> str:
 
 
 def _should_transpose(key: str, shape: tuple) -> bool:
-    """Determine if a weight should be transposed.
-
-    MLX nn.Linear uses the same [out_features, in_features] convention as PyTorch.
-    No transposition is needed for weights loaded from PyTorch safetensors.
-    """
+    """No 2D transposition needed — MLX Linear matches PyTorch convention."""
     return False
+
+
+def _should_permute_conv(key: str, shape: tuple) -> bool:
+    """Check if a 5D weight needs permutation for MLX conv_general.
+
+    PyTorch Conv3d: [out_C, in_C, kD, kH, kW]
+    MLX conv_general: [out_C, kD, kH, kW, in_C]
+    """
+    return len(shape) == 5 and key.endswith(".weight")
 
 
 def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
@@ -83,6 +91,10 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
             if _should_transpose(mlx_key, tuple(tensor.shape)):
                 tensor = tensor.T
 
+            # Permute Conv3d weights: PyTorch [out, in, D, H, W] → MLX [out, D, H, W, in]
+            if _should_permute_conv(mlx_key, tuple(tensor.shape)):
+                tensor = tensor.transpose(0, 2, 3, 4, 1)
+
             # Convert bf16 to f16 (MLX supports f16 natively)
             if tensor.dtype == mx.bfloat16:
                 tensor = tensor.astype(mx.float16)
@@ -102,6 +114,10 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
 
                 if _should_transpose(mlx_key, tensor.shape):
                     tensor = tensor.T
+
+                # Permute Conv3d: PyTorch [out, in, D, H, W] → MLX [out, D, H, W, in]
+                if _should_permute_conv(mlx_key, tensor.shape):
+                    tensor = tensor.transpose(0, 2, 3, 4, 1)
 
                 if tensor.dtype == np.float32:
                     tensor = tensor.astype(np.float16)

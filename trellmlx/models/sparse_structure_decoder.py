@@ -3,34 +3,56 @@ flow model's latent into a single-channel occupancy logit volume.
 
 Small model (~50M params). Operates entirely on dense 3D grids.
 Thresholding the output at 0 gives the binary occupancy mask.
+
+Architecture (from TRELLIS config, channels=[512, 128, 32]):
+    input_layer: Conv3d(8 → 512)
+    middle_block: ResBlock3d(512) × 2
+    blocks: ResBlock3d(512) × 2, Upsample(512→128), ResBlock3d(128) × 2, Upsample(128→32), ResBlock3d(32) × 2
+    out_layer: GroupNorm → SiLU → Conv3d(32 → 1)
+
+Upsample uses pixel shuffle: Conv3d(in_ch → out_ch*8) then reshape
+channels into 2×2×2 spatial expansion.
 """
 
 import mlx.core as mx
 import mlx.nn as nn
 
 
+def pixel_shuffle_3d(x: mx.array, factor: int = 2) -> mx.array:
+    """3D pixel shuffle: rearrange channels into spatial dimensions.
+
+    Input: [B, D, H, W, C * factor³]
+    Output: [B, D*factor, H*factor, W*factor, C]
+    """
+    B, D, H, W, C_total = x.shape
+    C = C_total // (factor ** 3)
+
+    x = x.reshape(B, D, H, W, C, factor, factor, factor)
+    # Interleave: move factor dims next to their spatial dims
+    x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)  # [B, D, f, H, f, W, f, C]
+    x = x.reshape(B, D * factor, H * factor, W * factor, C)
+    return x
+
+
 class Conv3d(nn.Module):
-    """3D convolution via mx.conv_general. MLX uses channels-last layout."""
+    """3D convolution via mx.conv_general. Channels-last layout."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
         self.padding = padding
-        # MLX conv weight: [out_C, kD, kH, kW, in_C]
         k = kernel_size
         scale = (2.0 / (in_channels * k * k * k)) ** 0.5
         self.weight = mx.random.normal((out_channels, k, k, k, in_channels)) * scale
         self.bias = mx.zeros((out_channels,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: [B, D, H, W, C] (channels-last)
-        out = mx.conv_general(x, self.weight, padding=self.padding)
-        return out + self.bias
+        return mx.conv_general(x, self.weight, padding=self.padding) + self.bias
 
 
-class GroupNorm3d(nn.Module):
-    """Group normalization for 3D volumes. Operates on channels-last layout."""
+class GroupNorm32(nn.Module):
+    """Group normalization with fp32 accumulation."""
 
-    def __init__(self, channels: int, num_groups: int = 32, eps: float = 1e-6):
+    def __init__(self, num_groups: int, channels: int, eps: float = 1e-6):
         super().__init__()
         self.num_groups = min(num_groups, channels)
         self.eps = eps
@@ -38,73 +60,59 @@ class GroupNorm3d(nn.Module):
         self.bias = mx.zeros((channels,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: [B, D, H, W, C]
         B = x.shape[0]
-        spatial = x.shape[1:-1]  # (D, H, W)
+        spatial = x.shape[1:-1]
         C = x.shape[-1]
         G = self.num_groups
 
+        orig_dtype = x.dtype
+        x = x.astype(mx.float32)
         x = x.reshape(B, *spatial, G, C // G)
-        mean = mx.mean(x, axis=tuple(range(1, len(spatial) + 1)) + (-1,), keepdims=True)
-        var = mx.var(x, axis=tuple(range(1, len(spatial) + 1)) + (-1,), keepdims=True)
+        reduce_axes = tuple(range(1, len(spatial) + 1)) + (-1,)
+        mean = mx.mean(x, axis=reduce_axes, keepdims=True)
+        var = mx.var(x, axis=reduce_axes, keepdims=True)
         x = (x - mean) * mx.rsqrt(var + self.eps)
         x = x.reshape(B, *spatial, C)
+        x = x.astype(orig_dtype)
         return x * self.weight + self.bias
 
 
 class ResBlock3d(nn.Module):
-    """3D residual block: GroupNorm → SiLU → Conv3d → GroupNorm → SiLU → Conv3d."""
+    """3D residual block: Norm → SiLU → Conv → Norm → SiLU → Conv + skip."""
 
     def __init__(self, channels: int):
         super().__init__()
-        self.norm1 = GroupNorm3d(channels)
+        self.norm1 = GroupNorm32(32, channels)
         self.conv1 = Conv3d(channels, channels)
-        self.norm2 = GroupNorm3d(channels)
+        self.norm2 = GroupNorm32(32, channels)
         self.conv2 = Conv3d(channels, channels)
 
     def __call__(self, x: mx.array) -> mx.array:
-        h = nn.silu(self.norm1(x))
-        h = self.conv1(h)
-        h = nn.silu(self.norm2(h))
-        h = self.conv2(h)
+        h = self.conv1(nn.silu(self.norm1(x)))
+        h = self.conv2(nn.silu(self.norm2(h)))
         return x + h
 
 
-class Upsample3d(nn.Module):
-    """3D spatial upsample (2x) + channel projection via Conv3d."""
+class UpsampleBlock3d(nn.Module):
+    """Upsample via Conv3d → pixel_shuffle_3d (2x spatial expansion)."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = Conv3d(in_channels, out_channels)
+        self.conv = Conv3d(in_channels, out_channels * 8)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: [B, D, H, W, C] — nearest-neighbor 2x upsample on spatial dims
-        B, D, H, W, C = x.shape
-        x = mx.repeat(x, 2, axis=1)  # D → 2D
-        x = mx.repeat(x, 2, axis=2)  # H → 2H
-        x = mx.repeat(x, 2, axis=3)  # W → 2W
-        return self.conv(x)
+        return pixel_shuffle_3d(self.conv(x), 2)
 
 
 class SparseStructureDecoder(nn.Module):
     """Decode the flow model's 8-channel latent into a 1-channel occupancy logit.
 
-    Architecture (from TRELLIS config):
-        input_layer: Conv3d(8 → 512)
-        blocks[0-1]: ResBlock3d(512) × 2
-        blocks[2]: Upsample3d(512 → 1024) (spatial 2x, but weight is [1024, 512])
-        # After upsample, channels split: the "1024" is actually the next level
-        # Actually looking at weights: blocks.2 is Conv3d(512→1024), then it
-        # reshapes 1024→128 by pixel shuffle or similar
-
-    Actually, let me re-read the weight structure more carefully...
-    The channels config is [512, 128, 32], meaning:
-        Level 0: 512 channels, 2 ResBlocks
-        Level 1: 128 channels, 2 ResBlocks
-        Level 2: 32 channels, 2 ResBlocks
-    With Upsample between levels that does spatial 2x + channel reduction.
-    blocks.2.conv is [1024, 512, 3,3,3] — this is the pixel-shuffle upsample
-    (512 → 1024 = 128 × 8, then reshape 1024 → 128 with 2×2×2 spatial expansion)
+    Config (from TRELLIS):
+        out_channels: 1
+        latent_channels: 8
+        num_res_blocks: 2
+        num_res_blocks_middle: 2
+        channels: [512, 128, 32]
     """
 
     def __init__(
@@ -121,57 +129,39 @@ class SparseStructureDecoder(nn.Module):
 
         self.input_layer = Conv3d(latent_channels, channels[0])
 
-        # Middle blocks (operate at lowest resolution)
         self.middle_block = [ResBlock3d(channels[0]) for _ in range(num_res_blocks_middle)]
 
-        # Decoder blocks: for each level, ResBlocks + Upsample to next level
         self.blocks = []
         for i, ch in enumerate(channels):
-            # ResBlocks at this level
             for _ in range(num_res_blocks):
                 self.blocks.append(ResBlock3d(ch))
-            # Upsample to next level (except last)
             if i < len(channels) - 1:
-                next_ch = channels[i + 1]
-                # Pixel shuffle: conv to ch * 8, then reshape
-                self.blocks.append(Upsample3d(ch, next_ch * 8))
+                self.blocks.append(UpsampleBlock3d(ch, channels[i + 1]))
 
-        # Output layer: GroupNorm → SiLU → Conv3d
-        self.out_layer_0 = GroupNorm3d(channels[-1])
+        self.out_layer_0 = GroupNorm32(32, channels[-1])
         self.out_layer_2 = Conv3d(channels[-1], out_channels)
 
     def __call__(self, x: mx.array) -> mx.array:
         """
         Args:
-            x: [B, latent_C, D, H, W] in channels-first (PyTorch convention)
+            x: [B, latent_C, D, H, W] channels-first (matching PyTorch convention)
 
         Returns:
-            [B, out_C, D', H', W'] occupancy logits (channels-first for compatibility)
+            [B, out_C, D', H', W'] occupancy logits, channels-first
         """
-        # Convert to channels-last for MLX convolutions
+        # Convert to channels-last for MLX
         x = x.transpose(0, 2, 3, 4, 1)  # [B, D, H, W, C]
 
         x = self.input_layer(x)
 
-        # Middle blocks
         for block in self.middle_block:
             x = block(x)
 
-        # Decoder blocks with pixel shuffle upsampling
         for block in self.blocks:
-            if isinstance(block, Upsample3d):
-                x = block(x)
-                # Pixel shuffle: [B, 2D, 2H, 2W, next_ch * 8] → need to extract
-                # Actually the Upsample3d already does nearest + conv
-                # The real architecture uses pixel shuffle (depth_to_space)
-                # Let me just use the simple upsample + conv for now
-            else:
-                x = block(x)
+            x = block(x)
 
-        # Output
         x = nn.silu(self.out_layer_0(x))
         x = self.out_layer_2(x)
 
-        # Convert back to channels-first
-        x = x.transpose(0, 4, 1, 2, 3)  # [B, out_C, D', H', W']
-        return x
+        # Back to channels-first
+        return x.transpose(0, 4, 1, 2, 3)
