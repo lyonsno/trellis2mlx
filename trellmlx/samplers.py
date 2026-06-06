@@ -74,8 +74,9 @@ def flow_euler_sample(
                 x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
-                std_pos = mx.sqrt(mx.mean(x_0_pos * x_0_pos, axis=list(range(1, x_0_pos.ndim)), keepdims=True))
-                std_cfg = mx.sqrt(mx.mean(x_0_cfg * x_0_cfg, axis=list(range(1, x_0_cfg.ndim)), keepdims=True))
+                reduce_dims = list(range(1, x_0_pos.ndim))
+                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) + 1e-8)
+                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) + 1e-8)
 
                 x_0_rescaled = x_0_cfg * (std_pos / (std_cfg + 1e-8))
                 x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
