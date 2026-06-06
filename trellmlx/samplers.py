@@ -1,0 +1,105 @@
+"""Flow-matching Euler sampler for TRELLIS.2.
+
+Implements the FlowEulerGuidanceIntervalSampler from the reference:
+- Euler integration of the flow ODE
+- Classifier-free guidance with interval masking
+- Rescaled timestep scheduling
+"""
+
+import mlx.core as mx
+import numpy as np
+
+
+def flow_euler_sample(
+    model,
+    noise: mx.array,
+    cond: mx.array,
+    neg_cond: mx.array,
+    steps: int = 12,
+    guidance_strength: float = 7.5,
+    guidance_rescale: float = 0.7,
+    guidance_interval: tuple = (0.6, 1.0),
+    rescale_t: float = 5.0,
+    sigma_min: float = 1e-5,
+    verbose: bool = True,
+):
+    """Generate samples using flow-matching Euler sampling with CFG.
+
+    Args:
+        model: The flow model (SparseStructureFlowModel or similar).
+        noise: Initial noise tensor [B, C, ...].
+        cond: Positive conditioning [B, L, C_ctx].
+        neg_cond: Negative conditioning (usually zeros) [B, L, C_ctx].
+        steps: Number of Euler steps.
+        guidance_strength: CFG strength (1.0 = no guidance).
+        guidance_rescale: CFG rescale factor (0.0 = no rescale).
+        guidance_interval: (low, high) — only apply guidance when t is in this range.
+        rescale_t: Rescale factor for timestep schedule.
+        sigma_min: Minimum noise scale.
+        verbose: Print progress.
+
+    Returns:
+        Final denoised sample, same shape as noise.
+    """
+    sample = noise
+
+    # Build timestep schedule
+    t_seq = np.linspace(1, 0, steps + 1)
+    t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+    t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
+
+    for step_idx, (t, t_prev) in enumerate(t_pairs):
+        if verbose:
+            print(f"  Step {step_idx + 1}/{steps} (t={t:.4f}→{t_prev:.4f})", end="", flush=True)
+
+        t_tensor = mx.array([1000 * t], dtype=mx.float32)
+
+        # Determine if we apply guidance at this timestep
+        apply_guidance = (
+            guidance_strength != 1.0
+            and guidance_interval[0] <= t <= guidance_interval[1]
+        )
+
+        if apply_guidance:
+            # Two forward passes: conditioned and unconditioned
+            pred_pos = model(sample, t_tensor, cond)
+            pred_neg = model(sample, t_tensor, neg_cond)
+            mx.eval(pred_pos, pred_neg)
+
+            # CFG combination
+            pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+
+            # CFG rescale (reduces overexposure)
+            if guidance_rescale > 0:
+                x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
+                x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
+
+                std_pos = mx.sqrt(mx.mean(x_0_pos * x_0_pos, axis=list(range(1, x_0_pos.ndim)), keepdims=True))
+                std_cfg = mx.sqrt(mx.mean(x_0_cfg * x_0_cfg, axis=list(range(1, x_0_cfg.ndim)), keepdims=True))
+
+                x_0_rescaled = x_0_cfg * (std_pos / (std_cfg + 1e-8))
+                x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
+                pred = _xstart_to_pred(sample, t, x_0, sigma_min)
+        else:
+            # Single forward pass with positive conditioning
+            pred = model(sample, t_tensor, cond)
+            mx.eval(pred)
+
+        # Euler step
+        sample = sample - (t - t_prev) * pred
+        mx.eval(sample)
+
+        if verbose:
+            print(f" done", flush=True)
+
+    return sample
+
+
+def _pred_to_xstart(x_t, t, pred, sigma_min):
+    """Convert velocity prediction to x_0 estimate."""
+    return (1 - sigma_min) * x_t - (sigma_min + (1 - sigma_min) * t) * pred
+
+
+def _xstart_to_pred(x_t, t, x_0, sigma_min):
+    """Convert x_0 estimate back to velocity prediction."""
+    return ((1 - sigma_min) * x_t - x_0) / (sigma_min + (1 - sigma_min) * t)
