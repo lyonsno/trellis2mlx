@@ -80,14 +80,23 @@ def varlen_attention_padded(
     return mx.concatenate(results, axis=0)
 
 
-class RMSNorm(nn.Module):
-    """Per-head RMS normalization for QK norm."""
+class MultiHeadRMSNorm(nn.Module):
+    """Per-head L2-normalize + learned scale for QK norm.
 
-    def __init__(self, dims: int, eps: float = 1e-6):
+    Matches TRELLIS.2's MultiHeadRMSNorm:
+        F.normalize(x, dim=-1) * gamma * sqrt(dim)
+    gamma shape is [num_heads, head_dim].
+    """
+
+    def __init__(self, head_dim: int, num_heads: int):
         super().__init__()
-        self.eps = eps
-        self.gamma = mx.ones((dims,))
+        self.scale = head_dim ** 0.5
+        self.gamma = mx.ones((num_heads, head_dim))
 
     def __call__(self, x: mx.array) -> mx.array:
-        rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return self.gamma * (x / rms)
+        # x: [..., H, D] — L2 normalize along last dim, then scale
+        orig_dtype = x.dtype
+        x = x.astype(mx.float32)
+        norm = mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True) + 1e-12)
+        x = (x / norm) * self.gamma * self.scale
+        return x.astype(orig_dtype)

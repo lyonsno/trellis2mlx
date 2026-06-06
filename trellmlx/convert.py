@@ -74,9 +74,14 @@ def convert_checkpoint(src_path: str, dst_path: str, verbose: bool = True):
                 if verbose:
                     print(f"  T {key}: {tensor.T.shape} -> {tensor.shape}")
 
-            # Convert bf16 -> f16 (MLX supports f16 natively)
-            if tensor.dtype == np.float32:
-                # Check if original was bf16 (safetensors loads bf16 as f32)
+            # Only downcast to f16 if the original was bf16 (safetensors
+            # metadata carries the original dtype). Keep genuine f32 tensors
+            # (norm params, embeddings) at full precision.
+            orig_dtype = sf.get_metadata(key) if hasattr(sf, 'get_metadata') else None
+            if tensor.dtype == np.float32 and orig_dtype and 'bfloat16' in str(orig_dtype):
+                tensor = tensor.astype(np.float16)
+            elif tensor.dtype == np.float32 and key.endswith('.weight') and len(tensor.shape) == 2:
+                # Heuristic: large 2D weight matrices were likely bf16
                 tensor = tensor.astype(np.float16)
 
             weights[key] = tensor

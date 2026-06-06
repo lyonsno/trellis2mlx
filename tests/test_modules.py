@@ -44,24 +44,32 @@ class TestLayerNorm32:
         assert out.shape == (2, 32)
 
 
-class TestRMSNorm:
+class TestMultiHeadRMSNorm:
     def test_output_shape(self):
-        from trellmlx.modules.attention import RMSNorm
-        rn = RMSNorm(128)
+        from trellmlx.modules.attention import MultiHeadRMSNorm
+        rn = MultiHeadRMSNorm(head_dim=128, num_heads=12)
         x = mx.random.normal((4, 12, 128))  # [T, H, D]
         out = rn(x)
         assert out.shape == (4, 12, 128)
 
-    def test_unit_rms(self):
-        from trellmlx.modules.attention import RMSNorm
-        rn = RMSNorm(64)
-        x = mx.random.normal((8, 64)) * 10
+    def test_gamma_shape(self):
+        from trellmlx.modules.attention import MultiHeadRMSNorm
+        rn = MultiHeadRMSNorm(head_dim=128, num_heads=12)
+        assert rn.gamma.shape == (12, 128), f"Expected [12, 128], got {rn.gamma.shape}"
+
+    def test_unit_l2_norm(self):
+        """After normalization with gamma=1, each vector should have L2 norm = sqrt(dim)."""
+        from trellmlx.modules.attention import MultiHeadRMSNorm
+        rn = MultiHeadRMSNorm(head_dim=64, num_heads=4)
+        x = mx.random.normal((8, 4, 64)) * 10
         out = rn(x)
         mx.eval(out)
-        rms = mx.sqrt(mx.mean(out * out, axis=-1))
-        mx.eval(rms)
-        # After RMSNorm with gamma=1, RMS should be ~1
-        assert mx.all(mx.abs(rms - 1.0) < 0.1).item(), f"RMS not ~1: {rms}"
+        # normalize to unit L2, then multiply by gamma(=1) * scale(=sqrt(64))
+        # Output L2 norm = sqrt(64) ≈ 8.0
+        l2 = mx.sqrt(mx.sum(out * out, axis=-1))
+        mx.eval(l2)
+        expected = 64 ** 0.5  # sqrt(dim) = 8.0
+        assert mx.all(mx.abs(l2 - expected) < 0.5).item(), f"L2 not ~{expected}: {l2}"
 
 
 class TestScaledDotProductAttention:
@@ -192,12 +200,14 @@ class TestSparseStructureFlowModel:
         assert params < 1000000
 
     def test_full_size_parameter_count(self):
-        """Full model should have ~1.29B parameters."""
+        """Full model should have ~1.29B parameters (excluding position embeddings)."""
         import mlx.utils
         from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
         model = SparseStructureFlowModel()  # default = full size
         params = sum(p.size for _, p in mlx.utils.tree_flatten(model.parameters()))
-        assert abs(params - 1_292_011_016) < 100000, f"Expected ~1.29B params, got {params:,}"
+        # RMSNorm gamma is now [H, D] instead of [D], adding (12*128 - 128) * 2 * 2 * 30
+        # = 118,080 extra params. Updated target accordingly.
+        assert params > 1_290_000_000 and params < 1_300_000_000, f"Expected ~1.29B params, got {params:,}"
 
     def test_deterministic_with_seed(self):
         """Same seed should produce same output."""

@@ -16,7 +16,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..modules.norm import LayerNorm32
-from ..modules.attention import scaled_dot_product_attention, RMSNorm
+from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
 
 
 class TimestepEmbedder(nn.Module):
@@ -60,8 +60,8 @@ class MultiHeadAttention(nn.Module):
             self.to_kv = nn.Linear(context_channels, 2 * channels)
 
         self.to_out = nn.Linear(channels, channels)
-        self.q_rms_norm = RMSNorm(self.head_dim)
-        self.k_rms_norm = RMSNorm(self.head_dim)
+        self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
+        self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
 
     def __call__(self, x: mx.array, context: mx.array = None) -> mx.array:
         B_T = x.shape[0]  # could be B*T for flattened, or T for single batch
@@ -115,7 +115,7 @@ class FeedForward(nn.Module):
         self.mlp_2 = nn.Linear(hidden_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.mlp_2(nn.gelu(self.mlp_0(x)))
+        return self.mlp_2(nn.gelu_approx(self.mlp_0(x)))
 
 
 class ModulatedBlock(nn.Module):
@@ -223,7 +223,7 @@ class SparseStructureFlowModel(nn.Module):
         num_blocks: 30
         mlp_hidden: 8192
         context_channels: 1024 (DINOv3 image features)
-        resolution: 64
+        resolution: 16 (sparse structure operates on 16³ grid)
     """
 
     def __init__(
@@ -235,7 +235,7 @@ class SparseStructureFlowModel(nn.Module):
         num_blocks: int = 30,
         mlp_hidden: int = 8192,
         context_channels: int = 1024,
-        resolution: int = 64,
+        resolution: int = 16,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -287,8 +287,9 @@ class SparseStructureFlowModel(nn.Module):
         # TODO: add position embedding (APE or RoPE from 3D coords)
 
         # Run through DiT blocks
+        # NOTE: B=1 only for inference (TRELLIS.2 generates one mesh at a time)
+        assert B == 1, f"Only B=1 supported for inference, got B={B}"
         for block in self.blocks:
-            # For B=1, mod is [1, 6*C] → squeeze to [6*C]
             x = block(x, mod[0], cond)
 
         # Output projection
