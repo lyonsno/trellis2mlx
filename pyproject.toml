@@ -6,9 +6,6 @@ requires-python = ">=3.11"
 dependencies = [
     "mlx>=0.30",
     "numpy",
-    "torch",
-    "torchvision",
-    "transformers",
     "huggingface-hub",
     "safetensors",
     "pillow",
@@ -19,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+convert = ["torch", "torchvision", "transformers"]
 
 [build-system]
 requires = ["setuptools>=64"]

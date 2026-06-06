@@ -20,7 +20,8 @@ Generate textured 3D meshes from single images, running entirely on Mac via [MLX
 
 ### What's next
 
-- [ ] `SparseStructureFlowModel` (dense 3D grid DiT)
+- [x] `SparseStructureFlowModel` (dense 3D grid DiT) — 1.29B params, 19 tests passing
+- [ ] Weight loading from TRELLIS.2-4B checkpoint
 - [ ] `SparseTensor` representation
 - [ ] `SLatFlowModel` (sparse token DiT)
 - [ ] Sparse 3D convolution (gather-scatter)

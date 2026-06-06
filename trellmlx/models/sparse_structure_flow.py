@@ -148,8 +148,8 @@ class ModulatedBlock(nn.Module):
         # Self-attention (no separate norm — adaLN handles it)
         self.self_attn = MultiHeadAttention(channels, num_heads)
 
-        # Cross-attention with its own affine LayerNorm
-        self.norm2 = nn.LayerNorm(channels)
+        # Cross-attention with its own affine LayerNorm (fp32 accumulation)
+        self.norm2 = LayerNorm32(channels, affine=True)
         self.cross_attn = MultiHeadAttention(channels, num_heads, context_channels)
 
         # FFN
