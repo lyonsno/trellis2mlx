@@ -17,6 +17,7 @@ import mlx.nn as nn
 
 from ..modules.norm import LayerNorm32
 from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
+from ..modules.rope import apply_rope, build_rope_phases
 
 
 class TimestepEmbedder(nn.Module):
@@ -63,8 +64,8 @@ class MultiHeadAttention(nn.Module):
         self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
 
-    def __call__(self, x: mx.array, context: mx.array = None) -> mx.array:
-        B_T = x.shape[0]  # could be B*T for flattened, or T for single batch
+    def __call__(self, x: mx.array, context: mx.array = None, rope_phases: mx.array = None) -> mx.array:
+        B_T = x.shape[0]
 
         if context is None:
             qkv = self.to_qkv(x)
@@ -74,10 +75,9 @@ class MultiHeadAttention(nn.Module):
             q = self.to_q(x).reshape(B_T, self.num_heads, self.head_dim)
             kv = self.to_kv(context)
             if kv.ndim == 3:
-                # context is [B, L, C_ctx] — need to broadcast for flattened x
                 S = kv.shape[1]
                 kv = kv.reshape(-1, S, 2, self.num_heads, self.head_dim)
-                k = kv[:, :, 0]  # [B, S, H, D]
+                k = kv[:, :, 0]
                 v = kv[:, :, 1]
             else:
                 kv = kv.reshape(B_T, 2, self.num_heads, self.head_dim)
@@ -87,12 +87,15 @@ class MultiHeadAttention(nn.Module):
         q = self.q_rms_norm(q)
         k = self.k_rms_norm(k)
 
+        # Apply RoPE to self-attention Q and K (not cross-attention)
+        if rope_phases is not None and context is None:
+            q = apply_rope(q, rope_phases)
+            k = apply_rope(k, rope_phases)
+
         # Attention
         if q.ndim == 3 and k.ndim == 4:
-            # Cross-attention: q is [B*T, H, D], k/v are [B, S, H, D]
-            # Need to handle batching — for now assume B=1
-            q = q[None].transpose(0, 2, 1, 3)  # [1, H, T, D]
-            k = k.transpose(0, 2, 1, 3)  # [B, H, S, D]
+            q = q[None].transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
             v = v.transpose(0, 2, 1, 3)
             out = scaled_dot_product_attention(q, k, v)
             out = out.transpose(0, 2, 1, 3).reshape(B_T, self.channels)
@@ -163,6 +166,7 @@ class ModulatedBlock(nn.Module):
         x: mx.array,        # [T, C]
         mod: mx.array,       # [6*C] shared modulation from timestep
         context: mx.array,   # [B, L, C_ctx]
+        rope_phases: mx.array = None,  # [T, D//2, 2]
     ) -> mx.array:
         # Add per-block learned bias
         mod = mod + self.modulation
@@ -176,14 +180,14 @@ class ModulatedBlock(nn.Module):
         scale_mlp = mod[4*C:5*C]
         gate_mlp  = mod[5*C:6*C]
 
-        # Self-attention with adaLN-Zero
+        # Self-attention with adaLN-Zero + RoPE
         h = _layernorm_noaffine(x)
         h = h * (1 + scale_msa) + shift_msa
-        h = self.self_attn(h)
+        h = self.self_attn(h, rope_phases=rope_phases)
         h = h * gate_msa
         x = x + h
 
-        # Cross-attention (uses its own affine LayerNorm, no adaLN)
+        # Cross-attention (uses its own affine LayerNorm, no adaLN, no RoPE)
         h = self.norm2(x)
         h = self.cross_attn(h, context)
         x = x + h
@@ -262,6 +266,10 @@ class SparseStructureFlowModel(nn.Module):
             for _ in range(num_blocks)
         ]
 
+        # Precompute 3D RoPE phases
+        head_dim = model_channels // num_heads
+        self._rope_phases = build_rope_phases(resolution, head_dim)
+
     def __call__(
         self,
         x: mx.array,           # [B, in_channels, R, R, R]
@@ -290,7 +298,7 @@ class SparseStructureFlowModel(nn.Module):
         # NOTE: B=1 only for inference (TRELLIS.2 generates one mesh at a time)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
         for block in self.blocks:
-            x = block(x, mod[0], cond)
+            x = block(x, mod[0], cond, rope_phases=self._rope_phases)
 
         # Output projection
         x = _layernorm_noaffine(x)
