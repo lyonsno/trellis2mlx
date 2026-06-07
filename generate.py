@@ -276,12 +276,11 @@ def main():
     dec_coords_np = np.array(dec_coords)
     dec_feats_np = np.array(dec_out)
 
-    # The decoder output coords are used directly for mesh extraction.
-    # grid_size controls world-space scaling: voxel_size = 1/grid_size.
-    # The decoder upsamples 4x (2^4=16) from the input resolution, so
-    # coords span [0, hr_resolution*16). Use that as grid_size for correct
-    # [-0.5, 0.5] world-space scaling.
-    mesh_grid_size = hr_resolution * 16
+    # The decoder output coords span [0, hr_resolution). The decoder input
+    # coords are at hr_resolution//16 (from requantization), and 4 upsamples
+    # (2^4=16x) bring them back to hr_resolution scale.
+    # grid_size = hr_resolution gives correct [-0.5, 0.5] world-space scaling.
+    mesh_grid_size = hr_resolution
     print(f"  {dec_coords_np.shape[0]:,} voxels, coord range "
           f"[{dec_coords_np[:,1:].min()}, {dec_coords_np[:,1:].max()}], "
           f"grid_size={mesh_grid_size}", flush=True)

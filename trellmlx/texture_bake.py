@@ -131,7 +131,11 @@ def rasterize_uv(uvs, faces, texture_size=1024):
 
 
 def sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size):
-    """Trilinear sample PBR attributes from the voxel grid.
+    """Sample PBR attributes from the voxel grid (nearest-neighbor).
+
+    QUALITY GAP: Uses nearest-neighbor (KDTree k=1) instead of trilinear
+    interpolation. Produces blockier textures at voxel boundaries. The
+    reference uses flex_gemm.grid_sample_3d with mode='trilinear'.
 
     Args:
         positions: [N, 3] float32 world-space positions to sample
