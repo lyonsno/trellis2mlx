@@ -166,16 +166,20 @@ def inpaint_texture(image, mask, radius=3):
     try:
         import cv2
         inpaint_mask = (~mask).astype(np.uint8)
-        if image.shape[2] == 3:
+        if image.ndim == 2 or image.shape[2] == 1:
+            # Single channel: cv2.inpaint needs 1 or 3 channel input
+            img_2d = image.squeeze() if image.ndim == 3 else image
+            result = cv2.inpaint(img_2d, inpaint_mask, radius, cv2.INPAINT_TELEA)
+            return result[:, :, None] if image.ndim == 3 else result
+        elif image.shape[2] == 3:
             return cv2.inpaint(image, inpaint_mask, radius, cv2.INPAINT_TELEA)
         else:
-            # Inpaint each channel group
+            # Inpaint RGB together, then each extra channel separately
             rgb = cv2.inpaint(image[:, :, :3], inpaint_mask, radius, cv2.INPAINT_TELEA)
             rest = []
             for c in range(3, image.shape[2]):
-                ch = cv2.inpaint(image[:, :, c:c+1].repeat(3, axis=2),
-                                 inpaint_mask, radius, cv2.INPAINT_TELEA)[:, :, 0:1]
-                rest.append(ch)
+                ch = cv2.inpaint(image[:, :, c], inpaint_mask, radius, cv2.INPAINT_TELEA)
+                rest.append(ch[:, :, None])
             return np.concatenate([rgb] + rest, axis=2)
     except ImportError:
         # QUALITY GAP: scipy nearest-neighbor fill produces blocky seam
