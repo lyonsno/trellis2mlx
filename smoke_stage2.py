@@ -72,9 +72,25 @@ def main():
     # Decode to occupancy
     logits = ss_dec(z_s.astype(mx.float32))
     mx.eval(logits)
-    occupancy = np.array(logits[0, 0] > 0)
-    coords = np.argwhere(occupancy)  # [N, 3] as (z, y, x)
-    print(f"  {len(coords)} occupied voxels", flush=True)
+    decoded = np.array(logits[0, 0] > 0)  # [64, 64, 64]
+    print(f"  Decoded: {decoded.shape}, {decoded.sum()} occupied at 64³", flush=True)
+
+    # Downsample to target resolution (matches PyTorch pipeline's max_pool3d)
+    # The SLat model operates on coords at the flow model's resolution (16³),
+    # not the decoder's full 64³ output.
+    target_res = 16
+    if decoded.shape[0] != target_res:
+        ratio = decoded.shape[0] // target_res
+        # Max-pool: if any voxel in the ratio³ block is occupied, the downsampled voxel is occupied
+        decoded_ds = decoded.reshape(
+            target_res, ratio, target_res, ratio, target_res, ratio
+        ).any(axis=(1, 3, 5))
+        print(f"  Downsampled: {decoded_ds.shape}, {decoded_ds.sum()} occupied at {target_res}³", flush=True)
+    else:
+        decoded_ds = decoded
+
+    coords = np.argwhere(decoded_ds)  # [N, 3]
+    print(f"  {len(coords)} sparse tokens for SLat", flush=True)
 
     # Free stage 1 models
     del ss_flow, ss_dec, z_s, logits
