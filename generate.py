@@ -227,17 +227,20 @@ def main():
     dec_feats_np = np.array(dec_out)
 
     # The decoder output coords are used directly for mesh extraction.
-    # grid_size controls world-space scaling only (voxel_size = 1/grid_size).
-    # Use hr_resolution as grid_size to match the PyTorch pipeline's
-    # set_resolution(hr_resolution) call.
+    # grid_size controls world-space scaling: voxel_size = 1/grid_size.
+    # The decoder upsamples 4x (2^4=16) from the input resolution, so
+    # coords span [0, hr_resolution*16). Use that as grid_size for correct
+    # [-0.5, 0.5] world-space scaling.
+    mesh_grid_size = hr_resolution * 16
     print(f"  {dec_coords_np.shape[0]:,} voxels, coord range "
-          f"[{dec_coords_np[:,1:].min()}, {dec_coords_np[:,1:].max()}]", flush=True)
+          f"[{dec_coords_np[:,1:].min()}, {dec_coords_np[:,1:].max()}], "
+          f"grid_size={mesh_grid_size}", flush=True)
 
     t0 = time.perf_counter()
     vertices, faces = decoder_output_to_mesh(
         dec_feats_np,
         dec_coords_np,
-        resolution=hr_resolution,
+        resolution=mesh_grid_size,
     )
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
