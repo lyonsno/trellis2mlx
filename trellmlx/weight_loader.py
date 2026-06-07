@@ -19,6 +19,8 @@ _REMAP_PATTERNS = [
     (r"^adaLN_modulation\.(\d+)\.", r"adaLN_modulation.layers.\1."),
     # FeedForward uses mlp_0/mlp_2 attrs instead of Sequential .0/.2
     (r"\.mlp\.mlp\.(\d+)\.", r".mlp.mlp_\1."),
+    # Decoder ConvNeXt blocks: blocks.X.Y.mlp.0 → blocks.X.Y.mlp_0
+    (r"(blocks\.\d+\.\d+)\.mlp\.(\d+)\.", r"\1.mlp_\2."),
     # TimestepEmbedder same pattern
     (r"^t_embedder\.mlp\.(\d+)\.", r"t_embedder.mlp_\1."),
     # Decoder out_layer Sequential: out_layer.0 → out_layer_0, out_layer.2 → out_layer_2
@@ -42,10 +44,22 @@ def _should_transpose(key: str, shape: tuple) -> bool:
 def _should_permute_conv(key: str, shape: tuple) -> bool:
     """Check if a 5D weight needs permutation for MLX conv_general.
 
-    PyTorch Conv3d: [out_C, in_C, kD, kH, kW]
-    MLX conv_general: [out_C, kD, kH, kW, in_C]
+    PyTorch dense Conv3d: [out_C, in_C, kD, kH, kW] → permute to [out_C, kD, kH, kW, in_C]
+    Sparse conv (flex_gemm): [out_C, kD, kH, kW, in_C] → already correct, don't permute
+
+    Heuristic: if shape is [C, 3, 3, 3, C'] with dims 1-3 all equal (kernel),
+    it's already in flex_gemm layout. If shape is [C, C', 3, 3, 3] with dims 2-4
+    all equal, it's PyTorch layout and needs permutation.
     """
-    return len(shape) == 5 and key.endswith(".weight")
+    if len(shape) != 5 or not key.endswith(".weight"):
+        return False
+    # Check if dims 2,3,4 are all equal (PyTorch layout: [out, in, K, K, K])
+    if shape[2] == shape[3] == shape[4] and shape[2] <= 7:
+        return True
+    # Check if dims 1,2,3 are all equal (flex_gemm layout: [out, K, K, K, in])
+    if shape[1] == shape[2] == shape[3] and shape[1] <= 7:
+        return False  # already correct
+    return False
 
 
 def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
