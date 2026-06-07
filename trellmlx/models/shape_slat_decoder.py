@@ -145,26 +145,20 @@ class SparseResBlockC2S3d(nn.Module):
         if new_h.shape[0] == 0:
             return new_h, new_coords, subdiv_logits
 
-        # Skip connection: upsample input features via repeat-interleave
-        # Each parent voxel's features repeat for each child, filtered by subdiv mask
-        feats_np = np.array(feats)
-        subdiv_np = np.array(subdiv_mask)
-        skip_list = []
-        for i in range(len(feats_np)):
-            for child in range(8):
-                if subdiv_np[i, child]:
-                    skip_list.append(feats_np[i])
-        skip_feats = mx.array(np.stack(skip_list)) if skip_list else mx.zeros((0, self.channels))
-        # Repeat-interleave channels to match out_channels
-        repeat_factor = self.out_channels // (self.channels // 8)
-        if repeat_factor > 1 and skip_feats.shape[1] != self.out_channels:
-            skip_feats = mx.repeat(skip_feats, repeat_factor, axis=1)
-        # Truncate or pad to match out_channels
-        if skip_feats.shape[1] > self.out_channels:
+        # Skip connection: upsample original features through Channel2Spatial
+        # Each child k gets channel slice [k*C//8 : (k+1)*C//8] from the parent,
+        # then repeat-interleaved to match out_channels.
+        skip_h, _ = SparseChannel2Spatial.upsample(feats, coords, subdiv_mask)
+        # skip_h: [N', channels//8] — each child has its own 1/8th slice
+        channels_per_child = self.channels // 8
+        repeat_factor = self.out_channels // channels_per_child
+        if repeat_factor > 1:
+            skip_feats = mx.repeat(skip_h, repeat_factor, axis=1)
+        else:
+            skip_feats = skip_h
+        # Ensure exact match
+        if skip_feats.shape[1] != self.out_channels:
             skip_feats = skip_feats[:, :self.out_channels]
-        elif skip_feats.shape[1] < self.out_channels:
-            pad = mx.zeros((skip_feats.shape[0], self.out_channels - skip_feats.shape[1]))
-            skip_feats = mx.concatenate([skip_feats, pad], axis=1)
 
         # Post-upsample: norm → silu → conv
         new_nmap = build_neighbor_map(new_coords)
