@@ -297,8 +297,13 @@ class SparseStructureFlowModel(nn.Module):
         # Run through DiT blocks
         # NOTE: B=1 only for inference (TRELLIS.2 generates one mesh at a time)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, mod[0], cond, rope_phases=self._rope_phases)
+            # Evaluate every 6 blocks to avoid starving the CPU/display
+            # with a single massive GPU burst. Slight throughput cost but
+            # prevents beachballing on shared unified memory.
+            if (i + 1) % 6 == 0:
+                mx.eval(x)
 
         # Output projection
         x = _layernorm_noaffine(x)

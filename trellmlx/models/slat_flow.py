@@ -104,8 +104,13 @@ class SLatFlowModel(nn.Module):
             rope_phases = self._coords_to_rope_phases(coords)
 
         # Run through blocks (B=1 assumed)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, mod[0], cond, rope_phases=rope_phases)
+            # Periodic eval to yield memory bus back to CPU/display.
+            # Without this, 30 blocks on 171K tokens queues a single
+            # GPU burst that beachballs the entire machine.
+            if (i + 1) % 6 == 0:
+                mx.eval(x)
 
         # Output projection
         x = _layernorm_noaffine(x)
