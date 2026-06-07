@@ -113,27 +113,41 @@ class SparseChannel2Spatial:
 class SparseResBlockC2S3d(nn.Module):
     """Upsample block: Norm→SiLU→Conv→Channel2Spatial→Norm→SiLU→Conv + skip."""
 
-    def __init__(self, channels: int, out_channels: int):
+    def __init__(self, channels: int, out_channels: int, pred_subdiv: bool = True):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels
+        self.pred_subdiv = pred_subdiv
 
         self.norm1 = LayerNorm32(channels, affine=True)
         self.norm2 = LayerNorm32(out_channels)  # no affine, like reference
         self.conv1 = SparseConv3d(channels, out_channels * 8, kernel_size=3)
         self.conv2 = SparseConv3d(out_channels, out_channels, kernel_size=3)
-        self.to_subdiv = nn.Linear(channels, 8)
+        if pred_subdiv:
+            self.to_subdiv = nn.Linear(channels, 8)
 
-    def __call__(self, feats: mx.array, coords: mx.array, neighbor_map: tuple) -> tuple:
+    def __call__(self, feats: mx.array, coords: mx.array, neighbor_map: tuple,
+                 subdiv: mx.array = None) -> tuple:
         """
+        Args:
+            subdiv: [N, 8] external subdivision mask (used when pred_subdiv=False).
+                    If None and pred_subdiv=False, all children are kept.
+
         Returns:
             new_feats: [N', out_channels]
             new_coords: [N', 4]
-            subdiv_logits: [N, 8]
+            subdiv_logits: [N, 8] (or None if pred_subdiv=False)
         """
-        # Predict subdivision
-        subdiv_logits = self.to_subdiv(feats)  # [N, 8]
-        subdiv_mask = subdiv_logits > 0  # binary mask
+        # Get subdivision mask
+        if self.pred_subdiv:
+            subdiv_logits = self.to_subdiv(feats)  # [N, 8]
+            subdiv_mask = subdiv_logits > 0
+        else:
+            subdiv_logits = subdiv
+            if subdiv is not None:
+                subdiv_mask = subdiv > 0 if subdiv.dtype != mx.bool_ else subdiv
+            else:
+                subdiv_mask = mx.ones((feats.shape[0], 8), dtype=mx.bool_)
 
         # Pre-upsample: norm → silu → conv
         h = nn.silu(self.norm1(feats))
@@ -171,14 +185,16 @@ class SparseResBlockC2S3d(nn.Module):
         return new_feats, new_coords, subdiv_logits
 
 
-class ShapeSLatDecoder(nn.Module):
-    """Decode shape latents into mesh geometry via sparse UNet.
+class SLatDecoder(nn.Module):
+    """Decode structured latents via sparse UNet.
 
-    Config (TRELLIS.2-4B):
-        model_channels: [1024, 512, 256, 128, 64]
-        latent_channels: 32
-        num_blocks: [4, 16, 8, 4, 0]
-        out_channels: 7
+    Used for both shape (out_channels=7, pred_subdiv=True) and
+    texture (out_channels=6, pred_subdiv=False) decoding.
+
+    Config (TRELLIS.2-4B shape): model_channels=[1024,512,256,128,64],
+        latent_channels=32, num_blocks=[4,16,8,4,0], out_channels=7
+    Config (TRELLIS.2-4B texture): same architecture, out_channels=6,
+        pred_subdiv=False
     """
 
     def __init__(
@@ -187,6 +203,7 @@ class ShapeSLatDecoder(nn.Module):
         latent_channels: int = 32,
         model_channels: list = None,
         num_blocks: list = None,
+        pred_subdiv: bool = True,
     ):
         super().__init__()
         if model_channels is None:
@@ -196,39 +213,43 @@ class ShapeSLatDecoder(nn.Module):
 
         self.model_channels = model_channels
         self.num_blocks = num_blocks
+        self.pred_subdiv = pred_subdiv
 
         self.from_latent = nn.Linear(latent_channels, model_channels[0])
         self.output_layer = nn.Linear(model_channels[-1], out_channels)
 
-        # Build blocks per level
-        # Build nested block structure matching checkpoint naming:
-        # blocks.0.0 ... blocks.0.{n-1} = ConvNeXt blocks at level 0
-        # blocks.0.{n} = upsample block (to_subdiv lives here)
-        # blocks.1.0 ... etc.
         self.blocks = []
         for i, (ch, n_blocks) in enumerate(zip(model_channels, num_blocks)):
             level = []
             for _ in range(n_blocks):
                 level.append(SparseConvNeXtBlock3d(ch))
             if i < len(model_channels) - 1:
-                level.append(SparseResBlockC2S3d(ch, model_channels[i + 1]))
+                level.append(SparseResBlockC2S3d(ch, model_channels[i + 1],
+                                                 pred_subdiv=pred_subdiv))
             self.blocks.append(level)
 
     def _forward_levels(self, feats: mx.array, coords: mx.array,
-                         stop_after: int = None) -> tuple:
+                         stop_after: int = None,
+                         guide_subs: list = None,
+                         return_subs: bool = False) -> tuple:
         """Run the decoder through levels, optionally stopping early.
 
         Args:
             feats: [N, C] features (already projected from latent)
             coords: [N, 4] as (batch, z, y, x)
             stop_after: if set, return coords after this many upsample levels
+            guide_subs: list of subdivision masks from shape decode (for texture decoder)
+            return_subs: if True, collect and return subdivision logits
 
         Returns:
-            (feats, coords) at the final or stopped level
+            (feats, coords) or (feats, coords, subs) if return_subs
         """
         upsample_count = 0
+        subs = [] if return_subs else None
         for level_idx, level_blocks in enumerate(self.blocks):
             if stop_after is not None and upsample_count >= stop_after:
+                if return_subs:
+                    return feats, coords, subs
                 return feats, coords
             if not level_blocks:
                 continue
@@ -240,12 +261,18 @@ class ShapeSLatDecoder(nn.Module):
                     feats = block(feats, nmap)
                     mx.eval(feats)
                 elif isinstance(block, SparseResBlockC2S3d):
-                    feats, coords, _ = block(feats, coords, nmap)
+                    # Pass guide subdivision if available (texture decoder)
+                    guide = guide_subs[upsample_count] if guide_subs is not None else None
+                    feats, coords, sub_logits = block(feats, coords, nmap, subdiv=guide)
+                    if return_subs and sub_logits is not None:
+                        subs.append(sub_logits)
                     upsample_count += 1
                     print(f"  Level {level_idx} → {level_idx+1}: "
                           f"{feats.shape[0]} voxels",
                           flush=True)
 
+        if return_subs:
+            return feats, coords, subs
         return feats, coords
 
     def upsample(self, feats: mx.array, coords: mx.array,
@@ -269,20 +296,33 @@ class ShapeSLatDecoder(nn.Module):
                                             stop_after=upsample_times)
         return hr_coords
 
-    def __call__(self, feats: mx.array, coords: mx.array) -> tuple:
+    def __call__(self, feats: mx.array, coords: mx.array,
+                 guide_subs: list = None, return_subs: bool = False) -> tuple:
         """
         Args:
             feats: [N, latent_channels] shape latent features
             coords: [N, 4] as (batch, z, y, x)
+            guide_subs: subdivision masks from shape decoder (for texture decoder)
+            return_subs: if True, return subdivision logits for use as guide_subs
 
         Returns:
-            out_feats: [N', 7] per-voxel outputs at final resolution
-            out_coords: [N', 4] coordinates at final resolution
+            (out_feats, out_coords) or (out_feats, out_coords, subs) if return_subs
         """
         feats = self.from_latent(feats)
-        feats, coords = self._forward_levels(feats, coords)
+        result = self._forward_levels(feats, coords, guide_subs=guide_subs,
+                                       return_subs=return_subs)
+        if return_subs:
+            feats, coords, subs = result
+        else:
+            feats, coords = result
 
         feats = _layernorm_noaffine(feats)
         out = self.output_layer(feats)
 
+        if return_subs:
+            return out, coords, subs
         return out, coords
+
+
+# Backwards-compatible alias
+ShapeSLatDecoder = SLatDecoder

@@ -22,6 +22,7 @@ def flow_euler_sample(
     rescale_t: float = 5.0,
     sigma_min: float = 1e-5,
     verbose: bool = True,
+    concat_cond: mx.array = None,
     **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
@@ -43,6 +44,9 @@ def flow_euler_sample(
         Final denoised sample, same shape as noise.
     """
     sample = noise
+
+    if concat_cond is not None:
+        model_kwargs['concat_cond'] = concat_cond
 
     # Build timestep schedule
     t_seq = np.linspace(1, 0, steps + 1)

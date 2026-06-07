@@ -88,8 +88,12 @@ class SLatFlowModel(nn.Module):
         t: mx.array,           # [B] timestep
         cond: mx.array,        # [B, L, context_channels]
         coords: mx.array = None,  # [N, 3] voxel coordinates for RoPE
+        concat_cond: mx.array = None,  # [N, C'] features to concatenate with x
     ) -> mx.array:
         N = x.shape[0]
+
+        if concat_cond is not None:
+            x = mx.concatenate([x, concat_cond], axis=-1)
 
         # Timestep → shared modulation
         t_emb = self.t_embedder(t)
