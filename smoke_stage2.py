@@ -124,6 +124,11 @@ def main():
     _export_colored_voxels(coords, np.array(shape_slat), args.output)
     print(f"  Saved: {args.output}", flush=True)
 
+    # Release Metal resources
+    from trellmlx.cleanup import cleanup_model, cleanup
+    cleanup_model(slat_flow)
+    cleanup()
+
 
 def _extract_image_features(image_path, resolution=512):
     try:

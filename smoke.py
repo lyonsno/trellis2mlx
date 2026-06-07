@@ -108,6 +108,10 @@ def main():
     _export_voxel_mesh(np.array(occupancy), args.output)
     print(f"  Saved: {args.output}", flush=True)
 
+    # Release Metal resources
+    from trellmlx.cleanup import cleanup
+    cleanup()
+
 
 def _extract_image_features(image_path: str, resolution: int = 512) -> mx.array:
     """Extract DINOv3 image features using TRELLIS.2's own feature extractor."""
