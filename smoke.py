@@ -109,32 +109,30 @@ def main():
     print(f"  Saved: {args.output}", flush=True)
 
 
-def _extract_image_features(image_path: str) -> mx.array:
-    """Extract DINOv3 image features using PyTorch (temporary)."""
+def _extract_image_features(image_path: str, resolution: int = 512) -> mx.array:
+    """Extract DINOv3 image features using TRELLIS.2's own feature extractor."""
     try:
         import torch
         import sys
         sys.path.insert(0, os.path.expanduser("~/dev/trellis-mac/TRELLIS.2"))
-        from trellis2.modules.image_feature_extractor import DINOv3ViTModel
-        from transformers import AutoImageProcessor
+        from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor
         from PIL import Image
 
-        processor = AutoImageProcessor.from_pretrained(
-            "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        extractor = DinoV3FeatureExtractor(
+            "facebook/dinov3-vitl16-pretrain-lvd1689m",
+            image_size=resolution,
         )
-        dino = DINOv3ViTModel.from_pretrained(
-            "facebook/dinov3-vitl16-pretrain-lvd1689m"
-        )
-        dino.eval()
+        extractor.to("cpu")
 
         img = Image.open(image_path).convert("RGB")
-        inputs = processor(images=img, return_tensors="pt")
         with torch.no_grad():
-            features = dino(**inputs).last_hidden_state  # [1, L, 1024]
+            features = extractor([img])  # [1, N, 1024]
 
+        print(f"  Features: shape={features.shape}", flush=True)
         return mx.array(features.numpy())
-    except ImportError:
-        print("  PyTorch/transformers not available — using random features", flush=True)
+    except Exception as e:
+        print(f"  Feature extraction failed: {e}", flush=True)
+        print("  Using random features", flush=True)
         return mx.random.normal((1, 10, 1024))
 
 
