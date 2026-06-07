@@ -49,30 +49,26 @@ class Conv3d(nn.Module):
         return mx.conv_general(x, self.weight, padding=self.padding) + self.bias
 
 
-class GroupNorm32(nn.Module):
-    """Group normalization with fp32 accumulation."""
+class ChannelLayerNorm32(nn.Module):
+    """Channel-wise LayerNorm with fp32 accumulation.
 
-    def __init__(self, num_groups: int, channels: int, eps: float = 1e-6):
+    Matches TRELLIS.2's ChannelLayerNorm32 — normalizes over the channel
+    dimension (last dim in channels-last layout). The checkpoint's default
+    norm_type is "layer", NOT "group".
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
-        self.num_groups = min(num_groups, channels)
         self.eps = eps
         self.weight = mx.ones((channels,))
         self.bias = mx.zeros((channels,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        B = x.shape[0]
-        spatial = x.shape[1:-1]
-        C = x.shape[-1]
-        G = self.num_groups
-
         orig_dtype = x.dtype
         x = x.astype(mx.float32)
-        x = x.reshape(B, *spatial, G, C // G)
-        reduce_axes = tuple(range(1, len(spatial) + 1)) + (-1,)
-        mean = mx.mean(x, axis=reduce_axes, keepdims=True)
-        var = mx.var(x, axis=reduce_axes, keepdims=True)
+        mean = mx.mean(x, axis=-1, keepdims=True)
+        var = mx.var(x, axis=-1, keepdims=True)
         x = (x - mean) * mx.rsqrt(var + self.eps)
-        x = x.reshape(B, *spatial, C)
         x = x.astype(orig_dtype)
         return x * self.weight + self.bias
 
@@ -82,9 +78,9 @@ class ResBlock3d(nn.Module):
 
     def __init__(self, channels: int):
         super().__init__()
-        self.norm1 = GroupNorm32(32, channels)
+        self.norm1 = ChannelLayerNorm32(channels)
         self.conv1 = Conv3d(channels, channels)
-        self.norm2 = GroupNorm32(32, channels)
+        self.norm2 = ChannelLayerNorm32(channels)
         self.conv2 = Conv3d(channels, channels)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -138,7 +134,7 @@ class SparseStructureDecoder(nn.Module):
             if i < len(channels) - 1:
                 self.blocks.append(UpsampleBlock3d(ch, channels[i + 1]))
 
-        self.out_layer_0 = GroupNorm32(32, channels[-1])
+        self.out_layer_0 = ChannelLayerNorm32(channels[-1])
         self.out_layer_2 = Conv3d(channels[-1], out_channels)
 
     def __call__(self, x: mx.array) -> mx.array:

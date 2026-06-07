@@ -22,6 +22,7 @@ def flow_euler_sample(
     rescale_t: float = 5.0,
     sigma_min: float = 1e-5,
     verbose: bool = True,
+    **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
 
@@ -62,8 +63,8 @@ def flow_euler_sample(
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
-            pred_pos = model(sample, t_tensor, cond)
-            pred_neg = model(sample, t_tensor, neg_cond)
+            pred_pos = model(sample, t_tensor, cond, **model_kwargs)
+            pred_neg = model(sample, t_tensor, neg_cond, **model_kwargs)
             mx.eval(pred_pos, pred_neg)
 
             # CFG combination
@@ -83,7 +84,7 @@ def flow_euler_sample(
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
         else:
             # Single forward pass with positive conditioning
-            pred = model(sample, t_tensor, cond)
+            pred = model(sample, t_tensor, cond, **model_kwargs)
             mx.eval(pred)
 
         # Euler step

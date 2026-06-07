@@ -78,7 +78,7 @@ def main():
     # Downsample to target resolution (matches PyTorch pipeline's max_pool3d)
     # The SLat model operates on coords at the flow model's resolution (16³),
     # not the decoder's full 64³ output.
-    target_res = 16
+    target_res = 32  # SLat 512 checkpoint operates at resolution 32
     if decoded.shape[0] != target_res:
         ratio = decoded.shape[0] // target_res
         # Max-pool: if any voxel in the ratio³ block is occupied, the downsampled voxel is occupied
@@ -112,6 +112,7 @@ def main():
     shape_slat = flow_euler_sample(
         slat_flow, slat_noise, cond, neg_cond,
         steps=12, verbose=False,
+        coords=coords_mx,  # pass coords for 3D RoPE
     )
     mx.eval(shape_slat)
     elapsed = time.perf_counter() - t0
