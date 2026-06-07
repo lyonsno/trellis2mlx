@@ -2,11 +2,11 @@
 
 MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for Apple Silicon.
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image → 3D mesh in ~20 minutes on M4 Max.
+Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image → textured 3D mesh in ~9 minutes on M4 Max.
 
 ## What works now
 
-Full shape pipeline: image → sparse structure → shape latent → mesh.
+Full pipeline: image → textured GLB with PBR materials.
 
 ```bash
 # Full pipeline (two-pass, high quality):
@@ -27,17 +27,20 @@ The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
 
 | Stage | Time | Notes |
 |-------|------|-------|
-| Sparse structure (12 steps) | ~45s | 1.29B param DiT on 16³ grid |
-| LR SLat (1.7K tokens, 12 steps) | ~15s | |
-| Upsample → HR coords | ~6s | 462K voxels |
-| HR SLat (29K tokens, 12 steps) | ~17 min | Dominates total time |
-| Decode (7.3M voxels) | ~2 min | 474M param sparse UNet |
-| Mesh extraction | ~6s | 14.5M faces |
-| **Total** | **~20 min** | |
+| Sparse structure (12 steps) | ~34s | 1.29B param DiT on 16³ grid |
+| LR SLat (1.7K tokens, 12 steps) | ~14s | |
+| Upsample → HR coords | ~6s | 463K voxels |
+| HR SLat (7.2K tokens, 12 steps) | ~2 min | 1024 cascade model |
+| Shape decode (1.9M voxels) | ~73s | 474M param sparse UNet |
+| Mesh extraction + simplify | ~3s | 3.7M → 200K faces |
+| Texture SLat (7.2K tokens, 12 steps) | ~1.3 min | No CFG (single pass) |
+| Texture decode (1.9M voxels) | ~29s | 6-channel PBR |
+| UV unwrap + texture bake | ~2.2 min | xatlas + trilinear sample |
+| **Total** | **~8.6 min** | |
 
 Peak memory: ~3 GB for SLat flow, ~5 GB during decode. Runs on any Apple Silicon Mac.
 
-For comparison, the PyTorch MPS path (trellis-mac) takes 20-30 min for stages 1-2 alone at 40-55 GB memory, with no mesh decode support on Mac.
+For comparison, the PyTorch MPS path (trellis-mac) takes 20-30 min for stages 1-2 alone at 40-55 GB memory, with no mesh decode or texture support on Mac.
 
 ### Numerical parity (12-step sampling, same weights + noise)
 
@@ -77,9 +80,11 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 - [x] Periodic eval to prevent memory bus starvation
 - [x] INT4 quantization utility
 - [x] 12-step numerical parity verified against PyTorch
-- [ ] Mesh simplification (14.5M → ~1M faces)
-- [ ] Texture SLat flow + decoder → PBR textures
-- [ ] Full pipeline: image → textured GLB
+- [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
+- [x] Texture SLat flow + decoder → per-voxel PBR attributes
+- [x] UV unwrap (xatlas) + texture baking (trilinear sample + cv2 inpaint)
+- [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
+- [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
 - [ ] INT4 speed benchmarks
 - [ ] `mx.compile` optimization
 - [ ] Native macOS/iOS app via mlx-swift
