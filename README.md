@@ -2,7 +2,7 @@
 
 MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for Apple Silicon.
 
-Generate 3D meshes from single images using [MLX](https://github.com/ml-explore/mlx) on Mac. No NVIDIA GPU required.
+Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Work in progress — sparse structure + shape latent stages working, mesh decoder coming next.
 
 ## What works now
 
@@ -82,15 +82,22 @@ TRELLIS.2 runs on Mac via [trellis-mac](https://github.com/shivampkumar/trellis-
 ```bash
 git clone https://github.com/lyonsno/trellis2mlx.git
 cd trellis2mlx
-uv venv .venv --python python3.14
+uv venv .venv --python python3.11
 source .venv/bin/activate
 uv pip install mlx numpy safetensors trimesh scikit-image scipy pillow tqdm huggingface-hub
 
-# For image conditioning (uses PyTorch for DINOv3, temporary):
+# For image conditioning (temporary — uses PyTorch for DINOv3):
 uv pip install torch torchvision transformers
+# Also need trellis-mac checkout for the DINOv3 feature extractor:
+git clone --depth 1 https://github.com/shivampkumar/trellis-mac.git ~/dev/trellis-mac
 
 # HuggingFace auth (needed for gated DINOv3 weights):
-hf auth login
+huggingface-cli login
+# Request access: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
+
+# Download model weights:
+huggingface-cli download microsoft/TRELLIS.2-4B
+huggingface-cli download microsoft/TRELLIS-image-large
 
 # Stage 1 only (sparse structure → occupancy mesh):
 PYTHONPATH=. python smoke.py --image your_image.png
@@ -101,7 +108,7 @@ PYTHONPATH=. python smoke_stage2.py --image your_image.png
 open /tmp/trellis-mlx-stage2.glb
 ```
 
-Weights download automatically on first run (~15 GB for each flow model, ~900 MB for the decoder).
+Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works).
 
 ## Tests
 
@@ -110,7 +117,7 @@ uv pip install pytest
 PYTHONPATH=. pytest tests/ -v
 ```
 
-19 tests covering LayerNorm32, MultiHeadRMSNorm, SDPA, variable-length attention, TimestepEmbedder, and SparseStructureFlowModel (shapes, parameter counts, determinism). Three independent review passes completed.
+40 tests covering LayerNorm32, MultiHeadRMSNorm, SDPA, variable-length attention, RoPE, TimestepEmbedder, SparseStructureFlowModel, SLatFlowModel, SparseStructureDecoder, sampler, weight loader, and quantization.
 
 ## Architecture
 
