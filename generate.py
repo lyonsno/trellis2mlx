@@ -337,25 +337,61 @@ def main():
     del tex_decoder
     gc.collect()
 
+    # === Stage 6: Texture Baking ===
+    print("\n=== Stage 6: Texture Baking ===", flush=True)
+    from trellmlx.texture_bake import uv_unwrap, bake_texture
+
+    tex_coords_spatial = np.array(tex_coords)[:, 1:4]  # drop batch dim
+
+    # UV unwrap
+    t0 = time.perf_counter()
+    uv_verts, uv_faces, uvs, vmapping = uv_unwrap(vertices, faces)
+    print(f"  UV unwrap: {len(uv_verts):,}V {len(uv_faces):,}F "
+          f"({time.perf_counter()-t0:.1f}s)", flush=True)
+
+    # Bake PBR textures
+    base_color, metallic_roughness = bake_texture(
+        uv_verts, uv_faces, uvs, vmapping,
+        tex_coords_spatial, tex_np, mesh_grid_size,
+        texture_size=1024,
+    )
+
     # === Export ===
-    # TODO: texture baking (UV unwrap + rasterize + sample) not yet implemented.
-    # For now, export shape mesh with per-vertex colors from nearest texture voxel.
     import trimesh
     from trimesh.visual.material import PBRMaterial
-    if len(vertices) > 0 and len(faces) > 0:
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    from PIL import Image
 
-        # Map mesh vertices to nearest texture voxel for vertex coloring
-        tex_coords_np = np.array(tex_coords)[:, 1:4].astype(np.float32)
-        tex_world = (tex_coords_np + 0.5) / mesh_grid_size - 0.5  # world space
-        from scipy.spatial import cKDTree
-        tree = cKDTree(tex_world)
-        _, idx = tree.query(vertices)
-        vert_rgb = np.clip(tex_np[idx, :3] * 255, 0, 255).astype(np.uint8)
-        vert_alpha = np.full((len(vertices), 1), 255, dtype=np.uint8)
-        mesh.visual.vertex_colors = np.concatenate([vert_rgb, vert_alpha], axis=1)
+    if len(uv_verts) > 0 and len(uv_faces) > 0:
+        # Swap Y and Z axes, invert Y for GLB compatibility (matches reference)
+        export_verts = uv_verts.copy()
+        export_verts[:, 1], export_verts[:, 2] = uv_verts[:, 2].copy(), -uv_verts[:, 1].copy()
 
-        mesh.export(args.output)
+        # Flip UV V-coordinate for GLB
+        export_uvs = uvs.copy()
+        export_uvs[:, 1] = 1 - export_uvs[:, 1]
+
+        # Build vertex normals
+        mesh = trimesh.Trimesh(vertices=export_verts, faces=uv_faces, process=False)
+        normals = mesh.vertex_normals
+
+        material = PBRMaterial(
+            baseColorTexture=Image.fromarray(base_color),
+            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+            metallicRoughnessTexture=Image.fromarray(metallic_roughness),
+            metallicFactor=1.0,
+            roughnessFactor=1.0,
+            alphaMode='OPAQUE',
+            doubleSided=True,
+        )
+
+        textured_mesh = trimesh.Trimesh(
+            vertices=export_verts,
+            faces=uv_faces,
+            vertex_normals=normals,
+            process=False,
+            visual=trimesh.visual.TextureVisuals(uv=export_uvs, material=material),
+        )
+        textured_mesh.export(args.output)
         print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
     else:
         print("  WARNING: Empty mesh!", flush=True)
