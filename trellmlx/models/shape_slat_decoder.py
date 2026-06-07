@@ -214,6 +214,61 @@ class ShapeSLatDecoder(nn.Module):
                 level.append(SparseResBlockC2S3d(ch, model_channels[i + 1]))
             self.blocks.append(level)
 
+    def _forward_levels(self, feats: mx.array, coords: mx.array,
+                         stop_after: int = None) -> tuple:
+        """Run the decoder through levels, optionally stopping early.
+
+        Args:
+            feats: [N, C] features (already projected from latent)
+            coords: [N, 4] as (batch, z, y, x)
+            stop_after: if set, return coords after this many upsample levels
+
+        Returns:
+            (feats, coords) at the final or stopped level
+        """
+        upsample_count = 0
+        for level_idx, level_blocks in enumerate(self.blocks):
+            if stop_after is not None and upsample_count >= stop_after:
+                return feats, coords
+            if not level_blocks:
+                continue
+
+            nmap = build_neighbor_map(coords)
+
+            for block in level_blocks:
+                if isinstance(block, SparseConvNeXtBlock3d):
+                    feats = block(feats, nmap)
+                    mx.eval(feats)
+                elif isinstance(block, SparseResBlockC2S3d):
+                    feats, coords, _ = block(feats, coords, nmap)
+                    upsample_count += 1
+                    print(f"  Level {level_idx} → {level_idx+1}: "
+                          f"{feats.shape[0]} voxels",
+                          flush=True)
+
+        return feats, coords
+
+    def upsample(self, feats: mx.array, coords: mx.array,
+                 upsample_times: int = 4) -> mx.array:
+        """Run the decoder to get upsampled coordinates (structure only).
+
+        This is the first pass of the two-pass architecture: run the full
+        decoder with subdivision predictions to get the high-resolution
+        coordinate structure, then discard the features.
+
+        Args:
+            feats: [N, latent_channels] shape latent features
+            coords: [N, 4] as (batch, z, y, x)
+            upsample_times: number of upsample levels to run through
+
+        Returns:
+            hr_coords: [N', 4] upsampled coordinates
+        """
+        feats = self.from_latent(feats)
+        _, hr_coords = self._forward_levels(feats, coords,
+                                            stop_after=upsample_times)
+        return hr_coords
+
     def __call__(self, feats: mx.array, coords: mx.array) -> tuple:
         """
         Args:
@@ -224,31 +279,10 @@ class ShapeSLatDecoder(nn.Module):
             out_feats: [N', 7] per-voxel outputs at final resolution
             out_coords: [N', 4] coordinates at final resolution
         """
-        # Project latent to decoder channels
         feats = self.from_latent(feats)
+        feats, coords = self._forward_levels(feats, coords)
 
-        for level_idx, level_blocks in enumerate(self.blocks):
-            if not level_blocks:
-                continue
-
-            # Build neighbor map for this level
-            nmap = build_neighbor_map(coords)
-
-            # Run blocks at this level
-            for block in level_blocks:
-                if isinstance(block, SparseConvNeXtBlock3d):
-                    feats = block(feats, nmap)
-                    mx.eval(feats)  # periodic eval for bus-friendliness
-                elif isinstance(block, SparseResBlockC2S3d):
-                    feats, coords, _ = block(feats, coords, nmap)
-                    print(f"  Level {level_idx} → {level_idx+1}: "
-                          f"{feats.shape[0]} voxels",
-                          flush=True)
-
-        # LayerNorm before output (matches reference: F.layer_norm(h.feats, h.feats.shape[-1:]))
         feats = _layernorm_noaffine(feats)
-
-        # Output projection
         out = self.output_layer(feats)
 
         return out, coords
