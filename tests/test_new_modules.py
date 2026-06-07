@@ -220,6 +220,78 @@ class TestWeightLoader:
         assert _should_permute_conv("blocks.0.self_attn.to_qkv.weight", (4608, 1536)) is False
 
 
+class TestMeshExtract:
+    def test_dense_cube_connected(self):
+        """A dense 2x2x2 cube must produce a single connected mesh."""
+        from trellmlx.mesh_extract import flexible_dual_grid_to_mesh
+        from collections import defaultdict
+
+        coords = np.array([[z, y, x] for z in range(2) for y in range(2) for x in range(2)], dtype=np.int64)
+        dual_vertices = np.full((8, 3), 0.5, dtype=np.float32)
+        intersected_flag = np.ones((8, 3), dtype=bool)
+
+        vertices, faces = flexible_dual_grid_to_mesh(
+            coords, dual_vertices, intersected_flag, None,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], grid_size=2,
+        )
+        assert len(vertices) == 8
+        assert len(faces) == 12  # 6 quads = 12 triangles
+
+        # Check single connected component via vertex sharing
+        parent = list(range(len(faces)))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b: parent[a] = b
+        v2f = defaultdict(list)
+        for fi, f in enumerate(faces):
+            for v in f:
+                v2f[v].append(fi)
+        for flist in v2f.values():
+            for i in range(1, len(flist)):
+                union(flist[0], flist[i])
+        n_comps = len(set(find(i) for i in range(len(faces))))
+        assert n_comps == 1, f"Expected 1 component, got {n_comps}"
+
+    def test_dense_cube_bounds(self):
+        """Mesh vertices must be within the specified AABB."""
+        from trellmlx.mesh_extract import flexible_dual_grid_to_mesh
+        coords = np.array([[z, y, x] for z in range(4) for y in range(4) for x in range(4)], dtype=np.int64)
+        N = len(coords)
+        dual_vertices = np.full((N, 3), 0.5, dtype=np.float32)
+        intersected_flag = np.ones((N, 3), dtype=bool)
+
+        vertices, faces = flexible_dual_grid_to_mesh(
+            coords, dual_vertices, intersected_flag, None,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], grid_size=4,
+        )
+        # All vertices should be within [-0.5, 0.5] (with dual_vertices=0.5,
+        # vertices are at grid centers, max = (3+0.5)/4 - 0.5 = 0.375)
+        assert vertices.min() >= -0.5
+        assert vertices.max() <= 0.5
+
+    def test_decoder_output_format(self):
+        """Test decoder_output_to_mesh with synthetic 7-channel data."""
+        from trellmlx.mesh_extract import decoder_output_to_mesh
+        coords_3d = np.array([[z, y, x] for z in range(4) for y in range(4) for x in range(4)], dtype=np.int64)
+        N = len(coords_3d)
+        coords_4d = np.column_stack([np.zeros(N, dtype=np.int64), coords_3d])
+        feats = np.zeros((N, 7), dtype=np.float32)
+        feats[:, 0:3] = 0.0   # sigmoid(0)=0.5
+        feats[:, 3:6] = 1.0   # edges intersected
+        feats[:, 6] = 0.0
+
+        vertices, faces = decoder_output_to_mesh(feats, coords_4d, resolution=4)
+        assert len(vertices) > 0
+        assert len(faces) > 0
+        assert vertices.min() >= -0.6  # within AABB with margin
+        assert vertices.max() <= 0.6
+
+
 class TestQuantize:
     def test_small_layer_skipped(self):
         from trellmlx.quantize import quantize_model

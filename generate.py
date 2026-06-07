@@ -99,6 +99,28 @@ def main():
     mx.eval(shape_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N} tokens)", flush=True)
 
+    # Denormalize SLat output (flow model outputs normalized latents;
+    # decoder expects denormalized). Values from pipeline.json.
+    SHAPE_SLAT_MEAN = mx.array([
+        0.781296, 0.018091, -0.495192, -0.558457, 1.06053, 0.093252,
+        1.518149, -0.933218, -0.732996, 2.604095, -0.118341, -2.143904,
+        0.495076, -2.179512, -2.130751, -0.996944, 0.261421, -2.217463,
+        1.260067, -0.150213, 3.790713, 1.481266, -1.046058, -1.523667,
+        -0.059621, 2.22078, 1.621212, 0.87723, 0.567247, -3.175944,
+        -3.186688, 1.578665,
+    ])
+    SHAPE_SLAT_STD = mx.array([
+        5.972266, 4.706852, 5.44501, 5.209927, 5.32022, 4.547237,
+        5.020802, 5.444004, 5.226681, 5.683095, 4.831436, 5.286469,
+        5.652043, 5.367606, 5.525084, 4.730578, 4.805265, 5.124013,
+        5.530808, 5.619001, 5.10393, 5.41767, 5.269677, 5.547194,
+        5.634698, 5.235274, 6.110351, 5.511298, 6.237273, 4.879207,
+        5.347008, 5.405691,
+    ])
+    shape_slat = shape_slat * SHAPE_SLAT_STD + SHAPE_SLAT_MEAN
+    mx.eval(shape_slat)
+    print(f"  Denormalized: mean={shape_slat.mean().item():.3f}", flush=True)
+
     cleanup_model(slat_flow)
 
     # === Stage 3: Decode to Mesh ===
@@ -119,11 +141,41 @@ def main():
     print("=== Mesh Extraction ===", flush=True)
     from trellmlx.mesh_extract import decoder_output_to_mesh
 
+    # The decoder upsamples 4 times (2x each) from initial resolution.
+    # Output coords are at initial_res * 2^4 = initial_res * 16.
+    # Requantize to the decoder's configured resolution (256) for correct
+    # mesh scaling and better connectivity (deduplication).
+    dec_coords_np = np.array(dec_coords)
+    dec_feats_np = np.array(dec_out)
+    decoder_resolution = 256  # from checkpoint config
+
+    # Requantize spatial coords: map from decoder output space to decoder_resolution
+    # The decoder output coords are at 2^4 = 16x the input resolution.
+    # Input resolution = decoder_resolution / 16 = 16 for the standard config.
+    input_res = target_res  # coords fed to decoder were at this resolution
+    output_res_actual = input_res * 16  # after 4 upsamples
+    if output_res_actual != decoder_resolution:
+        spatial = dec_coords_np[:, 1:4].astype(np.float64)
+        spatial = ((spatial + 0.5) / output_res_actual * decoder_resolution).astype(np.int32)
+        dec_coords_np[:, 1:4] = spatial
+
+        # Deduplicate coords, averaging features at colliding positions
+        _, inv, counts = np.unique(
+            dec_coords_np, axis=0, return_inverse=True, return_counts=True
+        )
+        n_unique = len(counts)
+        avg_feats = np.zeros((n_unique, dec_feats_np.shape[1]), dtype=np.float64)
+        np.add.at(avg_feats, inv, dec_feats_np)
+        avg_feats /= counts[:, None]
+        dec_feats_np = avg_feats.astype(np.float32)
+        dec_coords_np = np.unique(dec_coords_np, axis=0)
+        print(f"  Requantized: {n_unique:,} unique voxels at res {decoder_resolution}", flush=True)
+
     t0 = time.perf_counter()
     vertices, faces = decoder_output_to_mesh(
-        np.array(dec_out),
-        np.array(dec_coords),
-        resolution=256,  # decoder config resolution
+        dec_feats_np,
+        dec_coords_np,
+        resolution=decoder_resolution,
     )
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
