@@ -245,6 +245,7 @@ class SparseStructureFlowModel(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.model_channels = model_channels
+        self.num_heads = num_heads
         self.resolution = resolution
 
         # Timestep embedder
@@ -266,10 +267,6 @@ class SparseStructureFlowModel(nn.Module):
             for _ in range(num_blocks)
         ]
 
-        # Precompute 3D RoPE phases
-        head_dim = model_channels // num_heads
-        self._rope_phases = build_rope_phases(resolution, head_dim)
-
     def __call__(
         self,
         x: mx.array,           # [B, in_channels, R, R, R]
@@ -277,7 +274,7 @@ class SparseStructureFlowModel(nn.Module):
         cond: mx.array,        # [B, L, context_channels] image conditioning
     ) -> mx.array:
         B = x.shape[0]
-        R = self.resolution
+        R = x.shape[2]  # derive resolution from actual input, not stored config
 
         # Timestep embedding → shared modulation
         t_emb = self.t_embedder(t)                    # [B, C]
@@ -292,13 +289,15 @@ class SparseStructureFlowModel(nn.Module):
         # Project to model channels
         x = self.input_layer(x)                        # [B*R³, C]
 
-        # TODO: add position embedding (APE or RoPE from 3D coords)
+        # Compute 3D RoPE phases from actual input resolution
+        head_dim = self.model_channels // self.num_heads
+        rope_phases = build_rope_phases(R, head_dim)
 
         # Run through DiT blocks
         # NOTE: B=1 only for inference (TRELLIS.2 generates one mesh at a time)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
         for i, block in enumerate(self.blocks):
-            x = block(x, mod[0], cond, rope_phases=self._rope_phases)
+            x = block(x, mod[0], cond, rope_phases=rope_phases)
             # Evaluate every 6 blocks to avoid starving the CPU/display
             # with a single massive GPU burst. Slight throughput cost but
             # prevents beachballing on shared unified memory.
