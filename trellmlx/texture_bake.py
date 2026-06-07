@@ -131,11 +131,11 @@ def rasterize_uv(uvs, faces, texture_size=1024):
 
 
 def sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size):
-    """Sample PBR attributes from the voxel grid (nearest-neighbor).
+    """Trilinear sample PBR attributes from a sparse voxel grid.
 
-    QUALITY GAP: Uses nearest-neighbor (KDTree k=1) instead of trilinear
-    interpolation. Produces blockier textures at voxel boundaries. The
-    reference uses flex_gemm.grid_sample_3d with mode='trilinear'.
+    For each sample position, finds the 8 enclosing voxel corners in the
+    sparse grid, computes trilinear weights, and interpolates. Falls back
+    to nearest-neighbor for positions where not all 8 corners exist.
 
     Args:
         positions: [N, 3] float32 world-space positions to sample
@@ -146,15 +146,78 @@ def sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size):
     Returns:
         sampled: [N, C] float32 interpolated attributes
     """
-    from scipy.spatial import cKDTree
+    N = len(positions)
+    C = voxel_attrs.shape[1]
 
-    # Convert voxel coords to world space for lookup
-    voxel_world = (voxel_coords.astype(np.float32) + 0.5) / grid_size - 0.5
+    # Convert positions from world space to voxel coordinate space
+    # world = (coord + 0.5) / grid_size - 0.5  →  coord = (world + 0.5) * grid_size - 0.5
+    voxel_pos = (positions + 0.5) * grid_size - 0.5  # [N, 3] continuous voxel coords
 
-    tree = cKDTree(voxel_world)
-    _, idx = tree.query(positions, k=1)
+    # Floor to get the base corner of the enclosing cube
+    base = np.floor(voxel_pos).astype(np.int32)  # [N, 3]
+    frac = voxel_pos - base.astype(np.float32)    # [N, 3] fractional part in [0, 1)
 
-    return voxel_attrs[idx]
+    # Build sparse coord → index lookup
+    packed = (voxel_coords[:, 0].astype(np.int64) << 42 |
+              voxel_coords[:, 1].astype(np.int64) << 21 |
+              voxel_coords[:, 2].astype(np.int64))
+    coord_to_idx = {}
+    for i in range(len(voxel_coords)):
+        coord_to_idx[packed[i]] = i
+
+    # 8 corner offsets for trilinear interpolation
+    offsets = np.array([[dz, dy, dx]
+                        for dz in range(2) for dy in range(2) for dx in range(2)],
+                       dtype=np.int32)  # [8, 3]
+
+    # Look up all 8 corners for each sample point
+    corner_coords = base[:, None, :] + offsets[None, :, :]  # [N, 8, 3]
+    corner_packed = (corner_coords[:, :, 0].astype(np.int64) << 42 |
+                     corner_coords[:, :, 1].astype(np.int64) << 21 |
+                     corner_coords[:, :, 2].astype(np.int64))  # [N, 8]
+
+    # Vectorized lookup: flatten, batch lookup, reshape
+    MISSING = -1
+    flat_packed = corner_packed.ravel()  # [N*8]
+    flat_indices = np.array([coord_to_idx.get(k, MISSING) for k in flat_packed],
+                            dtype=np.int64)
+    corner_indices = flat_indices.reshape(N, 8)
+
+    # Compute trilinear weights: w = product of (1-frac) or frac per axis
+    # For corner (dz, dy, dx): weight = wz * wy * wx
+    # where wz = frac[:,0] if dz else (1-frac[:,0]), etc.
+    weights = np.ones((N, 8), dtype=np.float32)
+    for c, (dz, dy, dx) in enumerate(offsets):
+        weights[:, c] *= frac[:, 0] if dz else (1.0 - frac[:, 0])
+        weights[:, c] *= frac[:, 1] if dy else (1.0 - frac[:, 1])
+        weights[:, c] *= frac[:, 2] if dx else (1.0 - frac[:, 2])
+
+    # Interpolate: for each sample, sum weight * attr for existing corners,
+    # renormalize by total weight of existing corners
+    result = np.zeros((N, C), dtype=np.float32)
+    weight_sum = np.zeros(N, dtype=np.float32)
+
+    for c in range(8):
+        valid = corner_indices[:, c] != MISSING
+        if valid.any():
+            idx = corner_indices[valid, c]
+            result[valid] += weights[valid, c:c+1] * voxel_attrs[idx]
+            weight_sum[valid] += weights[valid, c]
+
+    # Normalize by total weight (handles sparse corners gracefully)
+    nonzero = weight_sum > 0
+    result[nonzero] /= weight_sum[nonzero, None]
+
+    # Fallback: positions with no corners at all get nearest-neighbor
+    if not nonzero.all():
+        from scipy.spatial import cKDTree
+        missing = ~nonzero
+        voxel_world = (voxel_coords.astype(np.float32) + 0.5) / grid_size - 0.5
+        tree = cKDTree(voxel_world)
+        _, nn_idx = tree.query(positions[missing], k=1)
+        result[missing] = voxel_attrs[nn_idx]
+
+    return result
 
 
 def inpaint_texture(image, mask, radius=3):
