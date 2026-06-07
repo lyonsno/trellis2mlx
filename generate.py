@@ -37,9 +37,31 @@ SHAPE_SLAT_STD = np.array([
     5.347008, 5.405691,
 ], dtype=np.float32)
 
+TEX_SLAT_MEAN = np.array([
+    3.501659, 2.212398, 2.226094, 0.251093, -0.026248, -0.687364,
+    0.439898, -0.928075, 0.029398, -0.339596, -0.869527, 1.038479,
+    -0.972385, 0.126042, -1.129303, 0.455149, -1.209521, 2.069067,
+    0.544735, 2.569128, -0.323407, 2.293, -1.925608, -1.217717,
+    1.213905, 0.971588, -0.023631, 0.10675, 2.021786, 0.250524,
+    -0.662387, -0.768862,
+], dtype=np.float32)
 
-def _denormalize_slat(slat: mx.array) -> mx.array:
-    return slat * mx.array(SHAPE_SLAT_STD) + mx.array(SHAPE_SLAT_MEAN)
+TEX_SLAT_STD = np.array([
+    2.665652, 2.743913, 2.765121, 2.595319, 3.037293, 2.291316,
+    2.144656, 2.911822, 2.969419, 2.501689, 2.154811, 3.163343,
+    2.621215, 2.381943, 3.186697, 3.021588, 2.295916, 3.234985,
+    3.233086, 2.26014, 2.874801, 2.810596, 3.29272, 2.674999,
+    2.680878, 2.372054, 2.451546, 2.353556, 2.995195, 2.379849,
+    2.786195, 2.77519,
+], dtype=np.float32)
+
+
+def _denormalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) -> mx.array:
+    return slat * mx.array(std) + mx.array(mean)
+
+
+def _normalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) -> mx.array:
+    return (slat - mx.array(mean)) / mx.array(std)
 
 
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
@@ -156,9 +178,9 @@ def main():
 
     # === Stage 2b: Upsample to get HR coordinates ===
     print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
-    from trellmlx.models.shape_slat_decoder import ShapeSLatDecoder
+    from trellmlx.models.shape_slat_decoder import SLatDecoder
 
-    decoder = ShapeSLatDecoder()
+    decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
     load_weights(decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
 
     t0 = time.perf_counter()
@@ -202,23 +224,25 @@ def main():
     hr_slat = _denormalize_slat(hr_slat)
     mx.eval(hr_slat)
 
-    cleanup_model(slat_flow)
-    del slat_flow
-    gc.collect()
+    # Keep slat_flow alive — reused for texture pass
+    # Keep hr_slat — needed for texture conditioning
 
-    # === Stage 3: Full Decode ===
-    print("\n=== Stage 3: Decode to Mesh ===", flush=True)
+    # === Stage 3: Shape Decode ===
+    print("\n=== Stage 3: Decode Shape ===", flush=True)
 
-    decoder = ShapeSLatDecoder()
-    load_weights(decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
+    shape_decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
+    load_weights(shape_decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
 
     t0 = time.perf_counter()
-    dec_out, dec_coords = decoder(hr_slat, mx.array(quant_coords))
+    dec_out, dec_coords, shape_subs = shape_decoder(
+        hr_slat, mx.array(quant_coords), return_subs=True,
+    )
     mx.eval(dec_out)
     print(f"  Decoded: {time.perf_counter()-t0:.1f}s ({dec_out.shape[0]:,} voxels)", flush=True)
+    print(f"  Subdivision masks: {len(shape_subs)} levels", flush=True)
 
-    cleanup_model(decoder)
-    del decoder
+    cleanup_model(shape_decoder)
+    del shape_decoder
     gc.collect()
 
     # === Mesh Extraction ===
@@ -258,16 +282,81 @@ def main():
         print(f"  Simplified: {len(vertices):,} vertices, {len(faces):,} faces "
               f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
+    # === Stage 4: Texture SLat ===
+    print("\n=== Stage 4: Texture SLat ===", flush=True)
+
+    # Load texture flow model (same architecture, in_channels=64)
+    tex_flow = SLatFlowModel(in_channels=64, out_channels=32)
+    load_weights(tex_flow, HF_4B + "slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", verbose=False)
+
+    # Re-normalize shape SLat for texture conditioning
+    shape_cond = _normalize_slat(hr_slat)
+    mx.eval(shape_cond)
+
+    # Sample texture latent: noise (32ch) conditioned on shape SLat (32ch)
+    tex_noise = mx.random.normal((num_tokens, 32))
+    t0 = time.perf_counter()
+    tex_slat = flow_euler_sample(
+        tex_flow, tex_noise, cond, neg_cond,
+        steps=12, verbose=False,
+        coords=mx.array(hr_coords_3d),
+        concat_cond=shape_cond,
+    )
+    mx.eval(tex_slat)
+    print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
+
+    tex_slat = _denormalize_slat(tex_slat, mean=TEX_SLAT_MEAN, std=TEX_SLAT_STD)
+    mx.eval(tex_slat)
+
+    cleanup_model(tex_flow, slat_flow)
+    del tex_flow, slat_flow
+    gc.collect()
+
+    # === Stage 5: Texture Decode ===
+    print("\n=== Stage 5: Texture Decode ===", flush=True)
+
+    tex_decoder = SLatDecoder(out_channels=6, pred_subdiv=False)
+    load_weights(tex_decoder, HF_4B + "tex_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
+
+    t0 = time.perf_counter()
+    tex_out, tex_coords = tex_decoder(
+        tex_slat, mx.array(quant_coords), guide_subs=shape_subs,
+    )
+    mx.eval(tex_out)
+    # Output transform: * 0.5 + 0.5 to map to [0, 1]
+    tex_out = tex_out * 0.5 + 0.5
+    mx.eval(tex_out)
+    print(f"  Decoded: {time.perf_counter()-t0:.1f}s ({tex_out.shape[0]:,} voxels, {tex_out.shape[1]} channels)", flush=True)
+
+    tex_np = np.array(tex_out)
+    print(f"  PBR attrs: RGB [{tex_np[:,:3].min():.2f}, {tex_np[:,:3].max():.2f}] "
+          f"metallic [{tex_np[:,3].min():.2f}, {tex_np[:,3].max():.2f}] "
+          f"roughness [{tex_np[:,4].min():.2f}, {tex_np[:,4].max():.2f}]", flush=True)
+
+    cleanup_model(tex_decoder)
+    del tex_decoder
+    gc.collect()
+
     # === Export ===
+    # TODO: texture baking (UV unwrap + rasterize + sample) not yet implemented.
+    # For now, export shape mesh with per-vertex colors from nearest texture voxel.
     import trimesh
     from trimesh.visual.material import PBRMaterial
     if len(vertices) > 0 and len(faces) > 0:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        mesh.visual = trimesh.visual.TextureVisuals(
-            material=PBRMaterial(doubleSided=True, baseColorFactor=[200, 200, 200, 255])
-        )
+
+        # Map mesh vertices to nearest texture voxel for vertex coloring
+        tex_coords_np = np.array(tex_coords)[:, 1:4].astype(np.float32)
+        tex_world = (tex_coords_np + 0.5) / mesh_grid_size - 0.5  # world space
+        from scipy.spatial import cKDTree
+        tree = cKDTree(tex_world)
+        _, idx = tree.query(vertices)
+        vert_rgb = np.clip(tex_np[idx, :3] * 255, 0, 255).astype(np.uint8)
+        vert_alpha = np.full((len(vertices), 1), 255, dtype=np.uint8)
+        mesh.visual.vertex_colors = np.concatenate([vert_rgb, vert_alpha], axis=1)
+
         mesh.export(args.output)
-        print(f"  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
+        print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
     else:
         print("  WARNING: Empty mesh!", flush=True)
 
