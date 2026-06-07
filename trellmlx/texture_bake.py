@@ -178,7 +178,10 @@ def inpaint_texture(image, mask, radius=3):
                 rest.append(ch)
             return np.concatenate([rgb] + rest, axis=2)
     except ImportError:
-        # Fallback: simple nearest-neighbor fill
+        # QUALITY GAP: scipy nearest-neighbor fill produces blocky seam
+        # artifacts. The cv2.inpaint Telea algorithm smoothly extends color
+        # across seam boundaries. Install opencv-python to fix:
+        #   uv pip install opencv-python
         from scipy.ndimage import distance_transform_edt
         result = image.copy()
         for c in range(image.shape[2]):
