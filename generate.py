@@ -245,6 +245,12 @@ def main():
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
 
+    # Unify face winding for consistent normals
+    from trellmlx.mesh_extract import unify_face_orientations
+    t0 = time.perf_counter()
+    faces = unify_face_orientations(faces)
+    print(f"  Unified winding: {time.perf_counter()-t0:.1f}s", flush=True)
+
     # === Export ===
     import trimesh
     if len(vertices) > 0 and len(faces) > 0:
