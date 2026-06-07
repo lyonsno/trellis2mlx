@@ -73,6 +73,8 @@ def main():
                         help="Mesh resolution (default: 256 from checkpoint config)")
     parser.add_argument("--max-tokens", type=int, default=49152,
                         help="Max tokens for HR SLat pass (reduces resolution if exceeded)")
+    parser.add_argument("--target-faces", type=int, default=1_000_000,
+                        help="Simplify mesh to this face count (0 to disable, default: 1M)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -244,6 +246,17 @@ def main():
     )
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
+
+    # Simplify to target face count
+    if args.target_faces and len(faces) > args.target_faces:
+        import fast_simplification
+        t0 = time.perf_counter()
+        ratio = args.target_faces / len(faces)
+        vertices, faces = fast_simplification.simplify(
+            vertices, faces, target_reduction=1.0 - ratio,
+        )
+        print(f"  Simplified: {len(vertices):,} vertices, {len(faces):,} faces "
+              f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # === Export ===
     import trimesh
