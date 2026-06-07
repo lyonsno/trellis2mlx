@@ -91,8 +91,8 @@ def main():
     parser.add_argument("--image", help="Input image (requires PyTorch for DINOv3)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="/tmp/trellis-mlx-mesh.glb")
-    parser.add_argument("--resolution", type=int, default=256,
-                        help="Mesh resolution (default: 256 from checkpoint config)")
+    parser.add_argument("--resolution", type=int, default=1024,
+                        help="Mesh resolution (default: 1024, matching reference cascade)")
     parser.add_argument("--max-tokens", type=int, default=49152,
                         help="Max tokens for HR SLat pass (reduces resolution if exceeded)")
     parser.add_argument("--target-faces", type=int, default=1_000_000,
@@ -157,8 +157,14 @@ def main():
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
     from trellmlx.models.slat_flow import SLatFlowModel
 
-    slat_flow = SLatFlowModel()
-    load_weights(slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
+    # Sampler params from pipeline.json
+    SHAPE_SAMPLER = dict(steps=12, guidance_strength=7.5, guidance_rescale=0.5,
+                         guidance_interval=(0.6, 1.0), rescale_t=3.0)
+    TEX_SAMPLER = dict(steps=12, guidance_strength=1.0, guidance_rescale=0.0,
+                       guidance_interval=(0.6, 0.9), rescale_t=3.0)
+
+    lr_slat_flow = SLatFlowModel()
+    load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
 
     N_lr = len(lr_coords)
     lr_noise = mx.random.normal((N_lr, 32))
@@ -166,15 +172,20 @@ def main():
 
     t0 = time.perf_counter()
     lr_slat = flow_euler_sample(
-        slat_flow, lr_noise, cond, neg_cond,
-        steps=12, verbose=False,
+        lr_slat_flow, lr_noise, cond, neg_cond,
+        verbose=False,
         coords=mx.array(lr_coords),
+        **SHAPE_SAMPLER,
     )
     mx.eval(lr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N_lr} tokens)", flush=True)
 
     lr_slat = _denormalize_slat(lr_slat)
     mx.eval(lr_slat)
+
+    cleanup_model(lr_slat_flow)
+    del lr_slat_flow
+    gc.collect()
 
     # === Stage 2b: Upsample to get HR coordinates ===
     print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
@@ -188,11 +199,15 @@ def main():
     mx.eval(hr_coords_raw)
     print(f"  Upsampled: {time.perf_counter()-t0:.1f}s ({hr_coords_raw.shape[0]:,} voxels)", flush=True)
 
-    # Requantize to target resolution, dedup
+    # Requantize: decoder output coords are at lr_resolution * 16 (= 512).
+    # The HR model (1024 variant, resolution=64) expects coords in [0, 63].
+    # Formula: ((coord + 0.5) / decoder_output_res * (hr_resolution // 16)).int()
+    # With decoder_output_res=512, hr_resolution=1024: coords → [0, 63] ✓
+    decoder_output_res = lr_resolution * 16  # 32 * 16 = 512
     hr_resolution = args.resolution
     hr_coords_np = np.array(hr_coords_raw)
     while True:
-        quant_coords = _requantize_coords(hr_coords_np, lr_resolution, hr_resolution)
+        quant_coords = _requantize_coords(hr_coords_np, decoder_output_res, hr_resolution)
         num_tokens = len(quant_coords)
         if num_tokens < args.max_tokens or hr_resolution == 1024:
             if hr_resolution != args.resolution:
@@ -200,7 +215,9 @@ def main():
             break
         hr_resolution -= 128
 
-    print(f"  HR coords: {num_tokens:,} tokens at res {hr_resolution}", flush=True)
+    hr_coords_3d = quant_coords[:, 1:4]
+    print(f"  HR coords: {num_tokens:,} tokens at res {hr_resolution}, "
+          f"coord range [{hr_coords_3d.min()}, {hr_coords_3d.max()}]", flush=True)
 
     cleanup_model(decoder)
     del decoder
@@ -209,14 +226,18 @@ def main():
     # === Stage 2c: HR Shape Latent (second SLat pass) ===
     print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
 
-    hr_coords_3d = quant_coords[:, 1:4]  # drop batch dim for RoPE
+    # Load 1024 model for HR pass (resolution=64, trained for larger coord range)
+    hr_slat_flow = SLatFlowModel()
+    load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
+
     hr_noise = mx.random.normal((num_tokens, 32))
 
     t0 = time.perf_counter()
     hr_slat = flow_euler_sample(
-        slat_flow, hr_noise, cond, neg_cond,
-        steps=12, verbose=False,
+        hr_slat_flow, hr_noise, cond, neg_cond,
+        verbose=False,
         coords=mx.array(hr_coords_3d),
+        **SHAPE_SAMPLER,
     )
     mx.eval(hr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
@@ -224,7 +245,10 @@ def main():
     hr_slat = _denormalize_slat(hr_slat)
     mx.eval(hr_slat)
 
-    # Keep slat_flow alive — reused for texture pass
+    cleanup_model(hr_slat_flow)
+    del hr_slat_flow
+    gc.collect()
+
     # Keep hr_slat — needed for texture conditioning
 
     # === Stage 3: Shape Decode ===
@@ -294,13 +318,15 @@ def main():
     mx.eval(shape_cond)
 
     # Sample texture latent: noise (32ch) conditioned on shape SLat (32ch)
+    # Texture uses guidance_strength=1.0 (no CFG — single forward pass per step)
     tex_noise = mx.random.normal((num_tokens, 32))
     t0 = time.perf_counter()
     tex_slat = flow_euler_sample(
         tex_flow, tex_noise, cond, neg_cond,
-        steps=12, verbose=False,
+        verbose=False,
         coords=mx.array(hr_coords_3d),
         concat_cond=shape_cond,
+        **TEX_SAMPLER,
     )
     mx.eval(tex_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
@@ -308,8 +334,8 @@ def main():
     tex_slat = _denormalize_slat(tex_slat, mean=TEX_SLAT_MEAN, std=TEX_SLAT_STD)
     mx.eval(tex_slat)
 
-    cleanup_model(tex_flow, slat_flow)
-    del tex_flow, slat_flow
+    cleanup_model(tex_flow)
+    del tex_flow
     gc.collect()
 
     # === Stage 5: Texture Decode ===
