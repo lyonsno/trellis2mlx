@@ -2,29 +2,42 @@
 
 MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for Apple Silicon.
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Work in progress — sparse structure + shape latent stages working, mesh decoder coming next.
+Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image → 3D mesh in ~20 minutes on M4 Max.
 
 ## What works now
 
-Stages 1 and 2 of the TRELLIS.2 pipeline run entirely in MLX:
+Full shape pipeline: image → sparse structure → shape latent → mesh.
 
 ```bash
-python smoke_stage2.py --image photo.png
+# Full pipeline (two-pass, high quality):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb
+
+# Stage 1+2 only (fast preview, colored voxels):
+PYTHONPATH=. python smoke_stage2.py --image photo.png
 ```
 
-**Stage 1 — Sparse Structure:** SparseStructureFlowModel (1.29B params) + decoder (73.7M params) → 64³ occupancy grid → downsampled sparse coordinates.
-
-**Stage 2 — Shape Latent:** SLatFlowModel (1.29B params) → shape latents at each occupied voxel, ready for mesh decoding.
+The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
+1. **Sparse Structure** — SparseStructureFlowModel (1.29B params) + decoder → 64³ occupancy grid
+2. **LR Shape Latent** — SLatFlowModel (1.29B params) at ~1.7K sparse tokens
+3. **Upsample** — Decoder subdivision predictions → high-res coordinate structure
+4. **HR Shape Latent** — SLatFlowModel again at ~29K dense tokens
+5. **Decode + Extract** — Sparse UNet decoder → `flexible_dual_grid_to_mesh` → GLB
 
 ### Performance (M4 Max, 128GB)
 
-| Metric | trellis2mlx (MLX) | trellis-mac (PyTorch MPS) |
-|--------|-------------------|---------------------------|
-| Stage 1 (sparse structure, 12 steps) | **48s** | ~10-15 min (chunked SDPA) |
-| Stage 2 (shape latent, 3.3K tokens, 12 steps) | **~60s** | ~10-15 min (chunked SDPA) |
-| Two-stage total | **~2 min** | ~20-30 min |
-| Peak memory (stage 2) | **~3 GB** | 40-55 GB (chunked), 128 GB+ (unchunked) |
-| Minimum hardware | **8 GB** (any Apple Silicon) | 24 GB+ |
+| Stage | Time | Notes |
+|-------|------|-------|
+| Sparse structure (12 steps) | ~45s | 1.29B param DiT on 16³ grid |
+| LR SLat (1.7K tokens, 12 steps) | ~15s | |
+| Upsample → HR coords | ~6s | 462K voxels |
+| HR SLat (29K tokens, 12 steps) | ~17 min | Dominates total time |
+| Decode (7.3M voxels) | ~2 min | 474M param sparse UNet |
+| Mesh extraction | ~6s | 14.5M faces |
+| **Total** | **~20 min** | |
+
+Peak memory: ~3 GB for SLat flow, ~5 GB during decode. Runs on any Apple Silicon Mac.
+
+For comparison, the PyTorch MPS path (trellis-mac) takes 20-30 min for stages 1-2 alone at 40-55 GB memory, with no mesh decode support on Mac.
 
 ### Numerical parity (12-step sampling, same weights + noise)
 
@@ -47,21 +60,24 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 | Weight memory | 5.17 GB | 0.81 GB |
 | Forward pass | works | works |
 
-### What's next
+### Roadmap
 
 - [x] SparseStructureFlowModel (1.29B param DiT) — numerically verified
 - [x] SparseStructureDecoder (73.7M param Conv U-Net)
 - [x] SLatFlowModel (1.29B param sparse token DiT)
-- [x] Weight loading (640/640 + 74/74 + 640/640 params)
+- [x] ShapeSLatDecoder (474M param sparse UNet)
+- [x] Two-pass architecture (LR SLat → upsample → HR SLat → decode)
+- [x] `flexible_dual_grid_to_mesh` mesh extraction
+- [x] SLat denormalization (pipeline.json mean/std)
+- [x] Weight loading (640/640 + 74/74 + 640/640 + 292/292 params)
 - [x] Flow Euler sampler with CFG + guidance interval + rescale
 - [x] 3D RoPE position embedding (dynamic, computed from input shape)
 - [x] Image conditioning via DINOv3
 - [x] MLX Flash Attention (`mx.fast.scaled_dot_product_attention`)
 - [x] Periodic eval to prevent memory bus starvation
 - [x] INT4 quantization utility
-- [x] Two-stage smoke: image → sparse structure → shape latent → colored voxel mesh
 - [x] 12-step numerical parity verified against PyTorch
-- [ ] Shape SLat decoder → full mesh extraction (`flexible_dual_grid_to_mesh`)
+- [ ] Mesh simplification (14.5M → ~1M faces)
 - [ ] Texture SLat flow + decoder → PBR textures
 - [ ] Full pipeline: image → textured GLB
 - [ ] INT4 speed benchmarks
@@ -99,13 +115,13 @@ huggingface-cli login
 huggingface-cli download microsoft/TRELLIS.2-4B
 huggingface-cli download microsoft/TRELLIS-image-large
 
-# Stage 1 only (sparse structure → occupancy mesh):
-PYTHONPATH=. python smoke.py --image your_image.png
+# Full pipeline (image → mesh):
+PYTHONPATH=. python generate.py --image your_image.png
 
-# Stages 1+2 (sparse structure + shape latent → colored voxel mesh):
+# Quick preview (stages 1+2 only, colored voxels):
 PYTHONPATH=. python smoke_stage2.py --image your_image.png
 
-open /tmp/trellis-mlx-stage2.glb
+open /tmp/trellis-mlx-mesh.glb
 ```
 
 Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works).
@@ -117,7 +133,7 @@ uv pip install pytest
 PYTHONPATH=. pytest tests/ -v
 ```
 
-40 tests covering LayerNorm32, MultiHeadRMSNorm, SDPA, variable-length attention, RoPE, TimestepEmbedder, SparseStructureFlowModel, SLatFlowModel, SparseStructureDecoder, sampler, weight loader, and quantization.
+43 tests covering all modules.
 
 ## Architecture
 
@@ -128,11 +144,14 @@ trellmlx/
 ├── models/
 │   ├── sparse_structure_flow.py   # 1.29B param DiT (30 blocks, 3D RoPE, adaLN-Zero)
 │   ├── sparse_structure_decoder.py # 73.7M param Conv3d U-Net (pixel shuffle upsample)
-│   └── slat_flow.py               # 1.29B param sparse token DiT (shape detail)
+│   ├── slat_flow.py               # 1.29B param sparse token DiT (shape detail)
+│   └── shape_slat_decoder.py      # 474M param sparse UNet (Channel2Spatial upsample)
 ├── modules/
 │   ├── attention.py               # mx.fast.scaled_dot_product_attention + MultiHeadRMSNorm
 │   ├── rope.py                    # 3D Rotary Position Embedding
-│   └── norm.py                    # LayerNorm32 (fp32 accumulation)
+│   ├── norm.py                    # LayerNorm32 (fp32 accumulation)
+│   └── sparse_conv.py             # Submanifold sparse 3D convolution (gather-scatter)
+├── mesh_extract.py                # flexible_dual_grid_to_mesh (numpy)
 ├── samplers.py                    # Flow Euler sampler with CFG + guidance interval
 ├── weight_loader.py               # Checkpoint loading (key remap, Conv3d permute, bf16/fp16)
 └── quantize.py                    # INT4/INT8 quantization utility

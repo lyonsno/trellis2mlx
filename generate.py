@@ -245,16 +245,14 @@ def main():
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
 
-    # Unify face winding for consistent normals
-    from trellmlx.mesh_extract import unify_face_orientations
-    t0 = time.perf_counter()
-    faces = unify_face_orientations(faces)
-    print(f"  Unified winding: {time.perf_counter()-t0:.1f}s", flush=True)
-
     # === Export ===
     import trimesh
+    from trimesh.visual.material import PBRMaterial
     if len(vertices) > 0 and len(faces) > 0:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        mesh.visual = trimesh.visual.TextureVisuals(
+            material=PBRMaterial(doubleSided=True, baseColorFactor=[200, 200, 200, 255])
+        )
         mesh.export(args.output)
         print(f"  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
     else:
