@@ -95,8 +95,8 @@ def main():
                         help="Mesh resolution (default: 1024, matching reference cascade)")
     parser.add_argument("--max-tokens", type=int, default=49152,
                         help="Max tokens for HR SLat pass (reduces resolution if exceeded)")
-    parser.add_argument("--target-faces", type=int, default=1_000_000,
-                        help="Simplify mesh to this face count (0 to disable, default: 1M)")
+    parser.add_argument("--target-faces", type=int, default=200_000,
+                        help="Simplify mesh to this face count (0 to disable, default: 200K)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
