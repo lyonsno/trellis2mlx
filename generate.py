@@ -171,6 +171,8 @@ def main():
                         help="Skip background removal (rembg) preprocessing")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Skip mesh cleanup (keep all components, no hole fill)")
+    parser.add_argument("--texture-size", type=int, default=1024,
+                        help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -490,7 +492,7 @@ def main():
     base_color, metallic_roughness = bake_texture(
         uv_verts, uv_faces, uvs, vmapping,
         tex_coords_spatial, tex_np, mesh_grid_size,
-        texture_size=1024,
+        texture_size=args.texture_size,
     )
 
     # === Export ===
