@@ -100,15 +100,22 @@ def rasterize_uv_mlx(uvs, faces, texture_size=1024):
 
     start = 0
     while start < num_faces:
-        # Find chunk end that fits in memory budget
+        # Find chunk end that fits in memory budget, tracking true max dims
         end = start + 1
+        first_idx = face_order[start]
+        run_max_w = bb_max[first_idx, 0] - bb_min[first_idx, 0] + 1
+        run_max_h = bb_max[first_idx, 1] - bb_min[first_idx, 1] + 1
         while end < num_faces:
             idx = face_order[end]
             w = bb_max[idx, 0] - bb_min[idx, 0] + 1
             h = bb_max[idx, 1] - bb_min[idx, 1] + 1
-            chunk_elements = (end - start + 1) * int(w) * int(h) * 2
+            cand_max_w = max(run_max_w, w)
+            cand_max_h = max(run_max_h, h)
+            chunk_elements = (end - start + 1) * int(cand_max_w) * int(cand_max_h) * 2
             if chunk_elements > MAX_ELEMENTS:
                 break
+            run_max_w = cand_max_w
+            run_max_h = cand_max_h
             end += 1
         end = max(end, start + 1)  # always process at least one face
 

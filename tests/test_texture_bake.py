@@ -99,6 +99,31 @@ class TestRasterizeUV:
         assert face_idx.shape == (sz, sz)
         assert bary.shape == (sz, sz, 3)
 
+    def test_mlx_orthogonal_aspect_faces(self):
+        """Faces with orthogonal aspect ratios should not OOM or produce wrong results.
+
+        Regression test for budget estimate bug: tall-narrow + wide-short faces
+        would underestimate the GPU tensor size when using per-face area instead
+        of running max_w * max_h.
+        """
+        from trellmlx.texture_bake import rasterize_uv_mlx
+
+        # Create faces with deliberately orthogonal UV bboxes
+        # Face 0: tall narrow strip (UV x in [0, 0.02], y in [0, 0.8])
+        # Face 1: wide short strip (UV x in [0.1, 0.9], y in [0.1, 0.12])
+        uvs = np.array([
+            [0.0, 0.0], [0.02, 0.0], [0.01, 0.8],   # face 0: tall
+            [0.1, 0.1], [0.9, 0.1], [0.5, 0.12],     # face 1: wide
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.uint32)
+
+        # Should not OOM or crash
+        mask, face_idx, bary = rasterize_uv_mlx(uvs, faces, texture_size=64)
+        assert mask.shape == (64, 64)
+        # Both faces should produce some covered pixels
+        assert (face_idx == 0).any(), "Tall face produced no coverage"
+        assert (face_idx == 1).any(), "Wide face produced no coverage"
+
     def test_mlx_matches_numpy(self):
         """MLX GPU rasterizer should match numpy reference within tolerance.
 
