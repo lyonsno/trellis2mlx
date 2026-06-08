@@ -4,6 +4,8 @@ MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for App
 
 Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image -> textured GLB, including native MLX DINOv3 conditioning, sparse/shape/texture stages, mesh extraction, simplification, UV unwrap, and texture baking.
 
+Claim boundary: this is the first fully working MLX-native end-to-end TRELLIS.2 pipeline we know of, validated locally on Apple Silicon with native DINO conditioning and coherent textured GLB output.
+
 This is a technical preview: the full route works, the output is real, and the public contract is proof-first rather than polished-app-first. Output quality is still seed/input-sensitive, and native-DINO generation parity remains an active quality investigation.
 
 ## Validation snapshot
