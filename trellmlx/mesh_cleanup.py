@@ -55,19 +55,70 @@ def remove_small_components(
     min_ratio: float = 0.01,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove connected components smaller than min_ratio of the largest."""
+    """Remove connected components smaller than min_ratio of the largest,
+    plus flat 'floor' components regardless of size."""
     if len(faces) == 0:
         return vertices, faces
 
-    # Build face adjacency via shared edges
     n_faces = len(faces)
-    edges = {}  # (v_min, v_max) → list of face indices
+    n_components, labels = _face_connected_components(faces, n_faces)
+
+    if n_components <= 1:
+        return vertices, faces
+
+    # Count faces per component
+    component_sizes = np.bincount(labels)
+    largest_idx = component_sizes.argmax()
+    largest = component_sizes[largest_idx]
+    threshold = int(largest * min_ratio)
+
+    # Identify flat "floor" components: thin bounding box in at least one axis
+    floor_components = set()
+    for comp_id in range(n_components):
+        if comp_id == largest_idx:
+            continue  # never remove the largest component
+        if component_sizes[comp_id] < threshold:
+            continue  # already removed by size threshold
+        # Check if this component is flat
+        comp_face_mask = labels == comp_id
+        comp_verts = vertices[np.unique(faces[comp_face_mask])]
+        bbox = comp_verts.max(axis=0) - comp_verts.min(axis=0)
+        bbox_sorted = np.sort(bbox)
+        # Flat = thinnest dimension is < 10% of the thickest
+        if bbox_sorted[0] < bbox_sorted[2] * 0.10:
+            floor_components.add(comp_id)
+
+    # Keep: largest component + non-floor components above threshold
+    keep_mask = np.zeros(n_faces, dtype=bool)
+    for comp_id in range(n_components):
+        if component_sizes[comp_id] >= threshold and comp_id not in floor_components:
+            keep_mask[labels == comp_id] = True
+
+    kept_faces = faces[keep_mask]
+    removed = n_faces - len(kept_faces)
+    removed_small = sum(1 for s in component_sizes if s < threshold)
+    removed_floors = len(floor_components)
+
+    if verbose and removed > 0:
+        parts = []
+        if removed_small:
+            parts.append(f"{removed_small} small")
+        if removed_floors:
+            parts.append(f"{removed_floors} flat/floor")
+        print(f"  Removed {' + '.join(parts)} components "
+              f"({removed:,} faces, {removed/n_faces*100:.1f}%)", flush=True)
+
+    return _reindex_mesh(vertices, kept_faces)
+
+
+def _face_connected_components(faces, n_faces):
+    """Compute connected components via face adjacency (shared edges)."""
+    edges = {}
     for fi, face in enumerate(faces):
         for i in range(3):
             e = tuple(sorted((face[i], face[(i + 1) % 3])))
             edges.setdefault(e, []).append(fi)
 
-    # Build sparse adjacency matrix
     rows, cols = [], []
     for face_list in edges.values():
         for i in range(len(face_list)):
@@ -76,35 +127,13 @@ def remove_small_components(
                 cols.extend([face_list[j], face_list[i]])
 
     if not rows:
-        return vertices, faces
+        return 1, np.zeros(n_faces, dtype=np.int32)
 
     adj = sparse.csr_matrix(
         (np.ones(len(rows), dtype=np.int8), (rows, cols)),
         shape=(n_faces, n_faces),
     )
-    n_components, labels = connected_components(adj, directed=False)
-
-    if n_components <= 1:
-        return vertices, faces
-
-    # Count faces per component
-    component_sizes = np.bincount(labels)
-    largest = component_sizes.max()
-    threshold = int(largest * min_ratio)
-
-    # Keep components above threshold
-    keep_mask = component_sizes[labels] >= threshold
-    kept_faces = faces[keep_mask]
-
-    removed = n_faces - len(kept_faces)
-    removed_components = sum(1 for s in component_sizes if s < threshold)
-
-    if verbose and removed > 0:
-        print(f"  Removed {removed_components} small components "
-              f"({removed:,} faces, {removed/n_faces*100:.1f}%)", flush=True)
-
-    # Reindex vertices
-    return _reindex_mesh(vertices, kept_faces)
+    return connected_components(adj, directed=False)
 
 
 def fill_small_holes(
