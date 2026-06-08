@@ -86,6 +86,72 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     return unique_coords
 
 
+def _cleanup_and_simplify_mesh(
+    vertices,
+    faces,
+    *,
+    target_faces,
+    no_cleanup,
+    cleanup_mesh=None,
+    simplify=None,
+    log=print,
+):
+    """Run mesh cleanup and multi-pass simplification."""
+    if not no_cleanup:
+        if cleanup_mesh is None:
+            from trellmlx.mesh_cleanup import cleanup_mesh
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(vertices, faces)
+        log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if not target_faces or len(faces) <= target_faces:
+        return vertices, faces
+
+    if simplify is None:
+        import fast_simplification
+        simplify = fast_simplification.simplify
+
+    # Pass 1: Aggressive simplify to 3x target, then cleanup
+    t0 = time.perf_counter()
+    coarse_target = target_faces * 3
+    if len(faces) > coarse_target:
+        ratio = coarse_target / len(faces)
+        vertices, faces = simplify(
+            vertices, faces, target_reduction=1.0 - ratio,
+        )
+        log(f"  Coarse simplify: {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
+        if not no_cleanup:
+            vertices, faces = cleanup_mesh(vertices, faces, verbose=False)
+
+    if len(faces) <= target_faces:
+        return vertices, faces
+
+    # Pass 2: Final simplify to target, then cleanup
+    t0 = time.perf_counter()
+    did_final_simplify = False
+    for attempt in range(3):
+        if len(faces) <= target_faces:
+            break
+        ratio = target_faces / len(faces)
+        target_reduction = 1.0 - ratio
+        if target_reduction <= 0:
+            break
+        vertices, faces = simplify(
+            vertices, faces, target_reduction=target_reduction,
+        )
+        did_final_simplify = True
+        if len(faces) <= target_faces * 1.1:
+            break
+    log(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
+        f"({time.perf_counter()-t0:.1f}s)", flush=True)
+    if did_final_simplify and not no_cleanup:
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(vertices, faces)
+        log(f"  Cleanup pass 2: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    return vertices, faces
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -340,43 +406,12 @@ def main():
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
 
-    # Clean up and simplify (multi-pass, matching reference pipeline)
-    if not args.no_cleanup:
-        from trellmlx.mesh_cleanup import cleanup_mesh
-        t0 = time.perf_counter()
-        vertices, faces = cleanup_mesh(vertices, faces)
-        print(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
-
-    if args.target_faces and len(faces) > args.target_faces:
-        import fast_simplification
-
-        # Pass 1: Aggressive simplify to 3x target, then cleanup
-        t0 = time.perf_counter()
-        coarse_target = args.target_faces * 3
-        if len(faces) > coarse_target:
-            ratio = coarse_target / len(faces)
-            vertices, faces = fast_simplification.simplify(
-                vertices, faces, target_reduction=1.0 - ratio,
-            )
-            print(f"  Coarse simplify: {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
-            if not args.no_cleanup:
-                vertices, faces = cleanup_mesh(vertices, faces, verbose=False)
-
-        # Pass 2: Final simplify to target, then cleanup
-        t0 = time.perf_counter()
-        for attempt in range(3):
-            ratio = args.target_faces / len(faces)
-            vertices, faces = fast_simplification.simplify(
-                vertices, faces, target_reduction=1.0 - ratio,
-            )
-            if len(faces) <= args.target_faces * 1.1:
-                break
-        print(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
-              f"({time.perf_counter()-t0:.1f}s)", flush=True)
-        if not args.no_cleanup:
-            t0 = time.perf_counter()
-            vertices, faces = cleanup_mesh(vertices, faces)
-            print(f"  Cleanup pass 2: {time.perf_counter()-t0:.1f}s", flush=True)
+    vertices, faces = _cleanup_and_simplify_mesh(
+        vertices,
+        faces,
+        target_faces=args.target_faces,
+        no_cleanup=args.no_cleanup,
+    )
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
