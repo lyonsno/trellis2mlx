@@ -348,10 +348,14 @@ def main():
     if args.target_faces and len(faces) > args.target_faces:
         import fast_simplification
         t0 = time.perf_counter()
-        ratio = args.target_faces / len(faces)
-        vertices, faces = fast_simplification.simplify(
-            vertices, faces, target_reduction=1.0 - ratio,
-        )
+        # Iterate: fast_simplification may not reach target in one pass on dense meshes
+        for attempt in range(3):
+            ratio = args.target_faces / len(faces)
+            vertices, faces = fast_simplification.simplify(
+                vertices, faces, target_reduction=1.0 - ratio,
+            )
+            if len(faces) <= args.target_faces * 1.1:
+                break
         print(f"  Simplified: {len(vertices):,} vertices, {len(faces):,} faces "
               f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
