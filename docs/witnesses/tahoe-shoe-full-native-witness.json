@@ -1,0 +1,81 @@
+{
+  "input_glb": "/tmp/trellis2mlx-tahoe-shoe-full-native.glb",
+  "mesh": {
+    "bounds_max": [
+      0.4637143611907959,
+      0.33628326654434204,
+      0.4999920725822449
+    ],
+    "bounds_min": [
+      -0.46231603622436523,
+      -0.3249830901622772,
+      -0.4990299940109253
+    ],
+    "extents": [
+      0.9260303974151611,
+      0.6612663567066193,
+      0.9990220665931702
+    ],
+    "faces": 199999,
+    "is_watertight": false,
+    "vertices": 264350
+  },
+  "output_png": "docs/witnesses/tahoe-shoe-full-native-witness.png",
+  "phase": "complete",
+  "report_json": "docs/witnesses/tahoe-shoe-full-native-witness.json",
+  "route": "software_projected_mesh_witness",
+  "status": "ok",
+  "witness": {
+    "color_route": "texture_uv_centroid",
+    "faces_drawn": 547321,
+    "nonblank": true,
+    "panel_reports": [
+      {
+        "axes": [
+          0,
+          2
+        ],
+        "depth_axis": 1,
+        "faces_drawn": 182204,
+        "faces_rendered": 199999,
+        "faces_skipped": 17795,
+        "panel": "front_xz",
+        "scale": 590.9779370673575
+      },
+      {
+        "axes": [
+          1,
+          2
+        ],
+        "depth_axis": 0,
+        "faces_drawn": 183116,
+        "faces_rendered": 199999,
+        "faces_skipped": 16883,
+        "panel": "side_yz",
+        "scale": 590.9779370673575
+      },
+      {
+        "axes": [
+          0,
+          1
+        ],
+        "depth_axis": 2,
+        "faces_drawn": 182001,
+        "faces_rendered": 199999,
+        "faces_skipped": 17998,
+        "panel": "top_xy",
+        "scale": 637.56006460262
+      }
+    ],
+    "panels": [
+      "front_xz",
+      "side_yz",
+      "top_xy"
+    ],
+    "pixel_std": 91.37551549887866,
+    "size": [
+      2160,
+      720
+    ]
+  }
+}
