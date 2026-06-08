@@ -313,6 +313,12 @@ def main():
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
 
+    # Clean up: remove floaters, fill holes
+    from trellmlx.mesh_cleanup import cleanup_mesh
+    t0 = time.perf_counter()
+    vertices, faces = cleanup_mesh(vertices, faces)
+    print(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+
     # Simplify to target face count
     if args.target_faces and len(faces) > args.target_faces:
         import fast_simplification
