@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 
 def test_readme_uses_current_huggingface_cli():
     text = Path("README.md").read_text()
@@ -57,3 +59,20 @@ def test_cleanup_falls_back_to_metal_clear_cache(monkeypatch):
     cleanup.cleanup()
 
     assert calls == ["metal.clear_cache", "synchronize"]
+
+
+def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch):
+    import builtins
+    import generate
+
+    real_import = builtins.__import__
+
+    def fail_torch_import(name, *args, **kwargs):
+        if name == "torch":
+            raise ImportError("torch missing for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_torch_import)
+
+    with pytest.raises(RuntimeError, match="Image feature extraction failed"):
+        generate._extract_image_features("/tmp/does-not-matter.png")

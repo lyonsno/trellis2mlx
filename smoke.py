@@ -135,9 +135,11 @@ def _extract_image_features(image_path: str, resolution: int = 512) -> mx.array:
         print(f"  Features: shape={features.shape}", flush=True)
         return mx.array(features.numpy())
     except Exception as e:
-        print(f"  Feature extraction failed: {e}", flush=True)
-        print("  Using random features", flush=True)
-        return mx.random.normal((1, 10, 1024))
+        raise RuntimeError(
+            f"Image feature extraction failed for {image_path!r}. "
+            "Install the image extra, clone trellis-mac at ~/dev/trellis-mac, "
+            "and ensure DINOv3 weights are accessible; omit --image for random conditioning."
+        ) from e
 
 
 def _export_voxel_mesh(occupancy: np.ndarray, output_path: str):
