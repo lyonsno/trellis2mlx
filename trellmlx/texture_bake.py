@@ -557,6 +557,9 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     H = W = texture_size
 
+    if backend not in ("cpu", "gpu"):
+        raise ValueError(f"backend must be 'cpu' or 'gpu', got {backend!r}")
+
     rasterize_fn = rasterize_uv_mlx if backend == "gpu" else rasterize_uv
     sample_fn = sample_voxel_attrs_fast if backend == "gpu" else sample_voxel_attrs
 

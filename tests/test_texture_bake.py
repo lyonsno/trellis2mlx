@@ -369,6 +369,18 @@ class TestBakeTextureBackend:
         )
         assert bc.shape == (8, 8, 4)
 
+    def test_bake_texture_rejects_invalid_backend(self):
+        """Invalid backend values should raise ValueError, not silently fallback."""
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        with pytest.raises(ValueError, match="backend must be"):
+            bake_texture(
+                vertices, faces, uvs, vmapping, vc, va, gs,
+                texture_size=8, backend="metal",
+            )
+
     def test_sample_voxel_attrs_fast_used_in_gpu_backend(self):
         """GPU backend should use sample_voxel_attrs_fast, not the dict version."""
         from unittest.mock import patch
