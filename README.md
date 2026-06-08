@@ -40,7 +40,7 @@ The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
 
 Peak memory: ~3 GB for SLat flow, ~5 GB during decode. Runs on any Apple Silicon Mac.
 
-For comparison, the PyTorch MPS path (trellis-mac) takes 20-30 min for stages 1-2 alone at 40-55 GB memory, with no mesh decode or texture support on Mac.
+[trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 viability on Mac via PyTorch MPS. This MLX rewrite targets lower memory (~3-5 GB vs 40-55 GB) and faster inference by using MLX's native Flash Attention and Apple Silicon memory architecture.
 
 ### Numerical parity (12-step sampling, same weights + noise)
 
@@ -91,12 +91,12 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 
 ## Why MLX
 
-TRELLIS.2 runs on Mac via [trellis-mac](https://github.com/shivampkumar/trellis-mac) (PyTorch MPS), but:
+[trellis-mac](https://github.com/shivampkumar/trellis-mac) demonstrated that TRELLIS.2 can run on Mac via PyTorch MPS, and [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) contributed Metal modules for the ecosystem. This project rewrites the inference stack in MLX to take full advantage of Apple Silicon:
 
-- **Memory:** MPS SDPA materializes full N×N attention matrices (275 GB for 262K tokens). MLX's SDPA is real Flash Attention — O(N) memory, handles any sequence length at ~3 GB.
-- **Quantization:** INT4 drops weights from 5.17 GB to 0.81 GB. Proportional bandwidth reduction on Apple Silicon's unified memory.
-- **Accessibility:** Runs on any Apple Silicon device (8 GB+), not just high-end Macs.
+- **Memory:** MLX's SDPA is real Flash Attention — O(N) memory vs O(N²) for MPS SDPA. Handles 262K tokens at ~3 GB instead of 275 GB.
+- **Accessibility:** Runs on any Apple Silicon Mac (8 GB+), not just high-end configurations.
 - **Bus-friendly:** Periodic eval yields memory bus between GPU bursts, preventing beachballs during generation.
+- **No PyTorch:** Fully native MLX pipeline including DINOv3 image conditioning. No torch/torchvision/transformers dependency.
 
 ## Quick start
 
