@@ -75,7 +75,7 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 - [x] Weight loading (640/640 + 74/74 + 640/640 + 292/292 params)
 - [x] Flow Euler sampler with CFG + guidance interval + rescale
 - [x] 3D RoPE position embedding (dynamic, computed from input shape)
-- [x] Image conditioning via DINOv3
+- [x] Image conditioning via DINOv3 (native MLX — no PyTorch required)
 - [x] MLX Flash Attention (`mx.fast.scaled_dot_product_attention`)
 - [x] Periodic eval to prevent memory bus starvation
 - [x] INT4 quantization utility
@@ -107,11 +107,6 @@ uv venv .venv --python python3.11
 source .venv/bin/activate
 uv pip install -e .
 
-# For image conditioning (temporary — uses PyTorch for DINOv3):
-uv pip install -e ".[image]"
-# Also need trellis-mac checkout for the DINOv3 feature extractor:
-git clone --depth 1 https://github.com/shivampkumar/trellis-mac.git ~/dev/trellis-mac
-
 # HuggingFace auth (needed for gated DINOv3 weights):
 huggingface-cli login
 # Request access: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
@@ -119,17 +114,18 @@ huggingface-cli login
 # Download model weights (~5 GB total):
 huggingface-cli download microsoft/TRELLIS.2-4B
 huggingface-cli download microsoft/TRELLIS-image-large
+huggingface-cli download facebook/dinov3-vitl16-pretrain-lvd1689m
 
 # Full pipeline (image → textured mesh):
 PYTHONPATH=. python generate.py --image your_image.png
 
-# Quick preview (stages 1+2 only, no texture, no PyTorch needed):
+# Quick preview (stages 1+2 only, no texture):
 PYTHONPATH=. python smoke_stage2.py
 
 open /tmp/trellis-mlx-mesh.glb
 ```
 
-Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works without DINOv3/PyTorch).
+Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works without downloading DINOv3 weights).
 
 ## Tests
 

@@ -98,7 +98,9 @@ def main():
     parser.add_argument("--target-faces", type=int, default=200_000,
                         help="Simplify mesh to this face count (0 to disable, default: 200K)")
     parser.add_argument("--compile", action="store_true",
-                        help="Use mx.compile for flow model forward passes (faster, same output)")
+                        help="Use mx.compile for flow model forward passes (experimental, not faster)")
+    parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8],
+                        help="Quantize flow models to INT4 or INT8 (0=disabled, default: 0)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -117,6 +119,9 @@ def main():
     from trellmlx.samplers import flow_euler_sample
     from trellmlx.cleanup import cleanup_model, cleanup
 
+    if args.quantize:
+        from trellmlx.quantize import quantize_model
+
     # === Image conditioning ===
     if args.image:
         cond = _extract_image_features(args.image)
@@ -132,6 +137,8 @@ def main():
 
     ss_flow = SparseStructureFlowModel()
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
+    if args.quantize:
+        quantize_model(ss_flow, bits=args.quantize)
     if args.compile:
         ss_flow.compile()
     ss_dec = SparseStructureDecoder()
@@ -169,6 +176,8 @@ def main():
 
     lr_slat_flow = SLatFlowModel()
     load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
+    if args.quantize:
+        quantize_model(lr_slat_flow, bits=args.quantize)
     if args.compile:
         lr_slat_flow.compile()
 
@@ -235,6 +244,8 @@ def main():
     # Load 1024 model for HR pass (resolution=64, trained for larger coord range)
     hr_slat_flow = SLatFlowModel()
     load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
+    if args.quantize:
+        quantize_model(hr_slat_flow, bits=args.quantize)
     if args.compile:
         hr_slat_flow.compile()
 
@@ -319,6 +330,8 @@ def main():
     # Load texture flow model (same architecture, in_channels=64)
     tex_flow = SLatFlowModel(in_channels=64, out_channels=32)
     load_weights(tex_flow, HF_4B + "slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", verbose=False)
+    if args.quantize:
+        quantize_model(tex_flow, bits=args.quantize)
     if args.compile:
         tex_flow.compile()
 
@@ -437,6 +450,15 @@ def main():
 
 
 def _extract_image_features(image_path, resolution=512):
+    """Extract DINOv3 image features, preferring native MLX path."""
+    try:
+        from trellmlx.models.dinov3 import extract_features
+        features = extract_features(image_path, image_size=resolution)
+        print(f"  Features: {features.shape} (MLX)", flush=True)
+        return features
+    except Exception as e:
+        print(f"  MLX DINOv3 failed ({e}), trying PyTorch...", flush=True)
+
     try:
         import torch, sys
         sys.path.insert(0, os.path.expanduser("~/dev/trellis-mac/TRELLIS.2"))
@@ -447,7 +469,7 @@ def _extract_image_features(image_path, resolution=512):
         img = Image.open(image_path).convert("RGB")
         with torch.no_grad():
             features = extractor([img])
-        print(f"  Features: {features.shape}", flush=True)
+        print(f"  Features: {features.shape} (PyTorch)", flush=True)
         return mx.array(features.numpy())
     except Exception as e:
         print(f"  Feature extraction failed: {e}", flush=True)
