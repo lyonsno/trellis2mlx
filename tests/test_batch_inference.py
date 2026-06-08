@@ -1,6 +1,7 @@
 """Batch inference scheduling contracts."""
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -64,9 +65,9 @@ def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path):
         return subprocess.CompletedProcess(cmd, 0, stdout="saved\n", stderr="")
 
     jobs = [
-        BatchJob(images=("a.png",), seed=1, output_path=tmp_path / "one.glb"),
-        BatchJob(images=("a.png",), seed=2, output_path=tmp_path / "two.glb"),
-        BatchJob(images=("a.png",), seed=3, output_path=tmp_path / "three.glb"),
+        BatchJob(images=("a.png",), seed=1, output_path=tmp_path / "nested" / "one.glb"),
+        BatchJob(images=("a.png",), seed=2, output_path=tmp_path / "nested" / "two.glb"),
+        BatchJob(images=("a.png",), seed=3, output_path=tmp_path / "nested" / "three.glb"),
     ]
     report_path = tmp_path / "report.json"
 
@@ -90,8 +91,8 @@ def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path):
     assert report.results[0].output_size_bytes == 3
     assert report.results[1].output_exists is False
     assert report.results[1].failure_phase == "subprocess"
-    assert calls[0][0][:2] == ["python-test", "generate.py"]
-    assert calls[0][2]["PYTHONPATH"] == str(tmp_path)
+    assert all(call[0][:2] == ["python-test", "generate.py"] for call in calls)
+    assert all(call[2]["PYTHONPATH"] == str(tmp_path) for call in calls)
 
     persisted = json.loads(report_path.read_text())
     assert persisted["schema"] == "trellis2mlx.batch_report.v1"
@@ -99,3 +100,29 @@ def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path):
     assert persisted["effective_concurrency"] == 3
     assert persisted["diagnostics"] == ["known_metal_deadlock_risk:max_concurrent>2"]
     assert persisted["results"][1]["stderr"] == "model exploded\n"
+
+
+def test_run_batch_prepends_repo_root_to_existing_pythonpath(tmp_path, monkeypatch):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
+
+    monkeypatch.setenv("PYTHONPATH", "/opt/extra")
+    seen_pythonpaths = []
+
+    def runner(cmd, cwd, env, capture_output, text):
+        seen_pythonpaths.append(env["PYTHONPATH"])
+        output_path = cmd[cmd.index("--output") + 1]
+        with open(output_path, "wb") as handle:
+            handle.write(b"glb")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    run_batch(
+        [BatchJob(images=("a.png",), seed=1, output_path=tmp_path / "out" / "one.glb")],
+        BatchRunOptions(
+            max_concurrent=1,
+            repo_root=tmp_path,
+            python_executable="python-test",
+        ),
+        runner=runner,
+    )
+
+    assert seen_pythonpaths == [f"{tmp_path}{os.pathsep}/opt/extra"]

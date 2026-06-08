@@ -199,6 +199,8 @@ def run_batch(
 
     results_by_index: dict[int, BatchJobResult] = {}
     if jobs:
+        for output_dir in sorted({job.output_path.parent for job in jobs}):
+            output_dir.mkdir(parents=True, exist_ok=True)
         with ThreadPoolExecutor(max_workers=options.max_concurrent) as executor:
             futures = {
                 executor.submit(_run_one_job, index, job, options, repo_root, runner): index
@@ -233,8 +235,7 @@ def _run_one_job(
     runner: Runner,
 ) -> tuple[int, BatchJobResult]:
     cmd = build_generate_command(job, options.python_executable)
-    env = {**os.environ, "PYTHONPATH": str(repo_root)}
-    job.output_path.parent.mkdir(parents=True, exist_ok=True)
+    env = _subprocess_env(repo_root)
 
     start = time.perf_counter()
     stdout = ""
@@ -275,6 +276,14 @@ def _run_one_job(
         stderr=stderr,
         failure_phase=failure_phase,
     )
+
+
+def _subprocess_env(repo_root: Path) -> dict[str, str]:
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(repo_root)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    return {**os.environ, "PYTHONPATH": pythonpath}
 
 
 def _parse_ints(raw: str) -> tuple[int, ...]:
