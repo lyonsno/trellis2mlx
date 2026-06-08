@@ -255,8 +255,133 @@ class TestBakeTexture:
             np.array([[0.2, 0.4, 0.6, 0.8, 0.5, 1.0]], dtype=np.float32),
             grid_size=4,
             texture_size=4,
+            backend="gpu",
         )
 
         assert calls == [("raster", 4), ("sample", 1)]
         assert base_color.shape == (4, 4, 4)
         assert metallic_roughness.shape == (4, 4, 3)
+
+
+class TestBakeTextureBackend:
+    """Tests for bake_texture backend selection (gpu vs cpu)."""
+
+    @staticmethod
+    def _make_textured_mesh():
+        """Create a minimal mesh + voxel grid for bake_texture testing.
+
+        Returns vertices, faces, uvs, vmapping, voxel_coords, voxel_attrs,
+        grid_size suitable for bake_texture.
+        """
+        # Simple quad in world space
+        vertices = np.array([
+            [-0.25, -0.25, 0.0],
+            [ 0.25, -0.25, 0.0],
+            [ 0.25,  0.25, 0.0],
+            [-0.25,  0.25, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+        uvs = np.array([
+            [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0],
+        ], dtype=np.float32)
+        vmapping = np.arange(4, dtype=np.int32)
+
+        # Fill a small voxel grid around the mesh
+        grid_size = 4
+        coords = []
+        attrs = []
+        for z in range(grid_size):
+            for y in range(grid_size):
+                for x in range(grid_size):
+                    coords.append([z, y, x])
+                    # Predictable PBR: RGB = normalized coords, metallic=0.1,
+                    # roughness=0.5, alpha=1.0
+                    attrs.append([x / grid_size, y / grid_size, z / grid_size,
+                                  0.1, 0.5, 1.0])
+        voxel_coords = np.array(coords, dtype=np.int32)
+        voxel_attrs = np.array(attrs, dtype=np.float32)
+        return vertices, faces, uvs, vmapping, voxel_coords, voxel_attrs, grid_size
+
+    def test_bake_texture_accepts_backend_parameter(self):
+        """bake_texture should accept a backend='gpu' parameter."""
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        # Should not raise — backend parameter must be accepted
+        bc, mr = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=8, backend="gpu",
+        )
+        assert bc.shape == (8, 8, 4)
+        assert mr.shape == (8, 8, 3)
+
+    def test_bake_texture_gpu_produces_nonzero_output(self):
+        """GPU backend should produce actual texture content, not zeros."""
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        bc, mr = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=16, backend="gpu",
+        )
+        # Base color should have nonzero content in covered region
+        assert bc[:, :, :3].sum() > 0, "GPU backend produced empty base color"
+
+    def test_bake_texture_gpu_matches_cpu(self):
+        """GPU and CPU backends should produce similar textures.
+
+        Allows small per-pixel differences from edge rasterization,
+        but the overall texture must be very close.
+        """
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+        sz = 16
+
+        bc_cpu, mr_cpu = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=sz, backend="cpu",
+        )
+        bc_gpu, mr_gpu = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=sz, backend="gpu",
+        )
+
+        # Overall texture similarity: mean absolute difference < 5 uint8 levels
+        # (allows for edge pixel rasterization differences)
+        bc_diff = np.abs(bc_cpu.astype(np.float32) - bc_gpu.astype(np.float32))
+        assert bc_diff.mean() < 5.0, (
+            f"GPU/CPU base color mean diff {bc_diff.mean():.1f} too large"
+        )
+
+    def test_bake_texture_default_backend_is_cpu(self):
+        """Default backend (no parameter) should still work = backwards compat."""
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        # No backend param — should work as before (cpu)
+        bc, mr = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=8,
+        )
+        assert bc.shape == (8, 8, 4)
+
+    def test_sample_voxel_attrs_fast_used_in_gpu_backend(self):
+        """GPU backend should use sample_voxel_attrs_fast, not the dict version."""
+        from unittest.mock import patch
+        from trellmlx.texture_bake import bake_texture
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        with patch("trellmlx.texture_bake.sample_voxel_attrs_fast",
+                    wraps=__import__("trellmlx.texture_bake",
+                                     fromlist=["sample_voxel_attrs_fast"]).sample_voxel_attrs_fast
+                    ) as mock_fast:
+            bake_texture(
+                vertices, faces, uvs, vmapping, vc, va, gs,
+                texture_size=8, backend="gpu",
+            )
+            assert mock_fast.called, "GPU backend did not call sample_voxel_attrs_fast"

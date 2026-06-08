@@ -515,7 +515,7 @@ def inpaint_texture(image, mask, radius=3):
 
 def bake_texture(vertices, faces, uvs, vmapping,
                  voxel_coords, voxel_attrs, grid_size,
-                 texture_size=1024):
+                 texture_size=1024, backend="cpu"):
     """Full texture baking pipeline.
 
     Args:
@@ -527,6 +527,8 @@ def bake_texture(vertices, faces, uvs, vmapping,
         voxel_attrs: [M, 6] float32 PBR attrs (RGB, metallic, roughness, alpha)
         grid_size: int — decoder output coord space extent
         texture_size: output texture resolution
+        backend: "cpu" for numpy reference, "gpu" for MLX Metal rasterizer +
+                 vectorized sampler
 
     Returns:
         base_color: [H, W, 4] uint8 RGBA
@@ -536,10 +538,14 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     H = W = texture_size
 
+    rasterize_fn = rasterize_uv_mlx if backend == "gpu" else rasterize_uv
+    sample_fn = sample_voxel_attrs_fast if backend == "gpu" else sample_voxel_attrs
+
     # Step 1: Rasterize in UV space
-    print(f"    Rasterizing UV space ({len(faces):,} tris, {H}x{W})...", flush=True)
+    label = "MLX" if backend == "gpu" else "numpy"
+    print(f"    Rasterizing UV space ({len(faces):,} tris, {H}x{W}, {label})...", flush=True)
     t0 = time.perf_counter()
-    mask, face_idx, bary = rasterize_uv_mlx(uvs, faces, texture_size)
+    mask, face_idx, bary = rasterize_fn(uvs, faces, texture_size)
     print(f"    {mask.sum():,} pixels covered ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 2: Interpolate 3D positions from barycentric coords
@@ -556,7 +562,7 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     # Step 3: Sample PBR attrs from voxel grid
     t0 = time.perf_counter()
-    sampled = sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size)
+    sampled = sample_fn(positions, voxel_coords, voxel_attrs, grid_size)
     print(f"    Sampled voxel attrs ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 4: Build texture images
