@@ -45,9 +45,10 @@ def test_build_batch_jobs_requires_output_count_to_match_seed_count(tmp_path):
         build_batch_jobs(request)
 
 
-def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path):
+def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path, monkeypatch):
     from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
 
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     calls = []
 
     def runner(cmd, cwd, env, capture_output, text):
