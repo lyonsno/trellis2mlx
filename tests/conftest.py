@@ -2,13 +2,10 @@
 
 import gc
 
-import mlx.core as mx
+from trellmlx.cleanup import _clear_mlx_cache
 
 
 def pytest_runtest_teardown(item, nextitem):
     """Clear MLX memory pool after each test to reduce Metal event accumulation."""
     gc.collect()
-    try:
-        mx.metal.clear_cache()
-    except AttributeError:
-        pass
+    _clear_mlx_cache()

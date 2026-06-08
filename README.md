@@ -107,14 +107,14 @@ uv venv .venv --python python3.11
 source .venv/bin/activate
 uv pip install -e .
 
-# HuggingFace auth (needed for gated DINOv3 weights):
-huggingface-cli login
+# Hugging Face auth (needed for gated DINOv3 weights):
+hf auth login
 # Request access: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
 
 # Download model weights (~5 GB total):
-huggingface-cli download microsoft/TRELLIS.2-4B
-huggingface-cli download microsoft/TRELLIS-image-large
-huggingface-cli download facebook/dinov3-vitl16-pretrain-lvd1689m
+hf download microsoft/TRELLIS.2-4B
+hf download microsoft/TRELLIS-image-large
+hf download facebook/dinov3-vitl16-pretrain-lvd1689m
 
 # Full pipeline (image → textured mesh):
 PYTHONPATH=. python generate.py --image your_image.png
