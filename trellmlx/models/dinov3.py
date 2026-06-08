@@ -96,7 +96,10 @@ class DINOv3ViT(nn.Module):
         for layer in self.layers:
             x = layer(x, cos, sin, self.num_prefix_tokens)
 
-        # Final LayerNorm
+        # Final LayerNorm — no-affine, matching TRELLIS.2 training distribution.
+        # The checkpoint has learned norm.weight/bias from DINOv3 pretraining,
+        # but TRELLIS.2 was trained on features WITHOUT those applied.
+        # Applying them produces 0 sparse voxels (out of distribution).
         x = mx.fast.layer_norm(x, None, None, 1e-6)
 
         return x
@@ -249,6 +252,10 @@ def load_dinov3_weights(model: DINOv3ViT, weights_path: str):
     w = np.transpose(w, (0, 2, 3, 1))  # [1024, 16, 16, 3]
     new_weights["patch_embed.weight"] = mx.array(w)
     new_weights["patch_embed.bias"] = mx.array(tensors["embeddings.patch_embeddings.bias"])
+
+    # NOTE: checkpoint has learned norm.weight/bias but TRELLIS.2 was trained
+    # without them. Applying them produces empty occupancy (0 voxels).
+    # See: metadosis/upstream-directives/trellis2mlx-dinov3-learned-final-norm-quality-experiment_2026-06-08T160000Z.md
 
     # Transformer layers
     for i in range(len(model.layers)):
