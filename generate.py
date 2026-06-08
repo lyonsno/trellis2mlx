@@ -88,7 +88,7 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
-    parser.add_argument("--image", help="Input image (uses native MLX DINOv3)")
+    parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="/tmp/trellis-mlx-mesh.glb")
     parser.add_argument("--resolution", type=int, default=1024,
@@ -124,7 +124,16 @@ def main():
 
     # === Image conditioning ===
     if args.image:
-        cond = _extract_image_features(args.image)
+        if len(args.image) == 1:
+            cond = _extract_image_features(args.image[0])
+        else:
+            # Multi-view: extract features per view, concatenate along sequence dim
+            view_features = []
+            for img_path in args.image:
+                feat = _extract_image_features(img_path)
+                view_features.append(feat)
+            cond = mx.concatenate(view_features, axis=1)
+            print(f"  Multi-view: {len(args.image)} views → {cond.shape[1]} context tokens", flush=True)
     else:
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
