@@ -20,7 +20,7 @@ import numpy as np
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", help="Input image (requires PyTorch for DINOv3)")
+    parser.add_argument("--image", help="Input image (uses native MLX DINOv3)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--output", default="/tmp/trellis-mlx-smoke.glb")
@@ -114,7 +114,15 @@ def main():
 
 
 def _extract_image_features(image_path: str, resolution: int = 512) -> mx.array:
-    """Extract DINOv3 image features using TRELLIS.2's own feature extractor."""
+    """Extract DINOv3 image features, preferring native MLX path."""
+    try:
+        from trellmlx.models.dinov3 import extract_features
+        features = extract_features(image_path, image_size=resolution)
+        print(f"  Features: {features.shape} (MLX)", flush=True)
+        return features
+    except Exception as e:
+        print(f"  MLX DINOv3 failed ({e}), trying PyTorch...", flush=True)
+
     try:
         import torch
         import sys
@@ -137,8 +145,9 @@ def _extract_image_features(image_path: str, resolution: int = 512) -> mx.array:
     except Exception as e:
         raise RuntimeError(
             f"Image feature extraction failed for {image_path!r}. "
-            "Install the image extra, clone trellis-mac at ~/dev/trellis-mac, "
-            "and ensure DINOv3 weights are accessible; omit --image for random conditioning."
+            "Download the native DINOv3 weights with "
+            "`hf download facebook/dinov3-vitl16-pretrain-lvd1689m`, "
+            "or omit --image for random conditioning."
         ) from e
 
 

@@ -12,6 +12,7 @@ def test_readme_uses_current_huggingface_cli():
     assert "hf auth login" in text
     assert "hf download microsoft/TRELLIS.2-4B" in text
     assert "hf download microsoft/TRELLIS-image-large" in text
+    assert "hf download facebook/dinov3-vitl16-pretrain-lvd1689m" in text
 
 
 def test_cleanup_prefers_modern_mlx_clear_cache(monkeypatch):
@@ -67,12 +68,18 @@ def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch)
 
     real_import = builtins.__import__
 
-    def fail_torch_import(name, *args, **kwargs):
+    def fail_dino_imports(name, *args, **kwargs):
+        if name == "trellmlx.models.dinov3":
+            raise RuntimeError("native missing for test")
         if name == "torch":
             raise ImportError("torch missing for test")
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", fail_torch_import)
+    monkeypatch.setattr(builtins, "__import__", fail_dino_imports)
 
-    with pytest.raises(RuntimeError, match="Image feature extraction failed"):
+    with pytest.raises(RuntimeError, match="Image feature extraction failed") as exc_info:
         generate._extract_image_features("/tmp/does-not-matter.png")
+
+    message = str(exc_info.value)
+    assert "native DINOv3 weights" in message
+    assert "trellis-mac" not in message

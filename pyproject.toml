@@ -22,6 +22,9 @@ dependencies = [
 dev = ["pytest"]
 image = ["torch", "torchvision", "transformers"]
 
+[tool.setuptools.packages.find]
+include = ["trellmlx*"]
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"

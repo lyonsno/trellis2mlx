@@ -132,6 +132,14 @@ def main():
 
 def _extract_image_features(image_path, resolution=512):
     try:
+        from trellmlx.models.dinov3 import extract_features
+        features = extract_features(image_path, image_size=resolution)
+        print(f"  Features: {features.shape} (MLX)", flush=True)
+        return features
+    except Exception as e:
+        print(f"  MLX DINOv3 failed ({e}), trying PyTorch...", flush=True)
+
+    try:
         import torch, sys
         sys.path.insert(0, os.path.expanduser("~/dev/trellis-mac/TRELLIS.2"))
         from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor
@@ -146,8 +154,9 @@ def _extract_image_features(image_path, resolution=512):
     except Exception as e:
         raise RuntimeError(
             f"Image feature extraction failed for {image_path!r}. "
-            "Install the image extra, clone trellis-mac at ~/dev/trellis-mac, "
-            "and ensure DINOv3 weights are accessible; omit --image for random conditioning."
+            "Download the native DINOv3 weights with "
+            "`hf download facebook/dinov3-vitl16-pretrain-lvd1689m`, "
+            "or omit --image for random conditioning."
         ) from e
 
 

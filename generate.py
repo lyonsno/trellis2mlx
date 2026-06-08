@@ -88,7 +88,7 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
-    parser.add_argument("--image", help="Input image (requires PyTorch for DINOv3)")
+    parser.add_argument("--image", help="Input image (uses native MLX DINOv3)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="/tmp/trellis-mlx-mesh.glb")
     parser.add_argument("--resolution", type=int, default=1024,
@@ -474,8 +474,9 @@ def _extract_image_features(image_path, resolution=512):
     except Exception as e:
         raise RuntimeError(
             f"Image feature extraction failed for {image_path!r}. "
-            "Install the image extra, clone trellis-mac at ~/dev/trellis-mac, "
-            "and ensure DINOv3 weights are accessible; omit --image for random conditioning."
+            "Download the native DINOv3 weights with "
+            "`hf download facebook/dinov3-vitl16-pretrain-lvd1689m`, "
+            "or omit --image for random conditioning."
         ) from e
 
 
