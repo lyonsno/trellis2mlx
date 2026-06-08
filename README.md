@@ -6,6 +6,25 @@ Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac usi
 
 This is a technical preview: the full route works, the output is real, and the public contract is proof-first rather than polished-app-first. Output quality is still seed/input-sensitive, and native-DINO generation parity remains an active quality investigation.
 
+### Input → Output
+
+<table>
+<tr>
+<td><img src="assets/blender_mlx_preview_paint_more_stone.png" width="240" alt="Input image"></td>
+<td><img src="assets/outputs/blender-ball-angle1.png" width="240" alt="Output angle 1"></td>
+<td><img src="assets/outputs/blender-ball-angle2.png" width="240" alt="Output angle 2"></td>
+<td><img src="assets/outputs/blender-ball-angle3.png" width="240" alt="Output angle 3"></td>
+</tr>
+<tr>
+<td align="center"><em>Input</em></td>
+<td align="center"><em>Generated — front</em></td>
+<td align="center"><em>Generated — side</em></td>
+<td align="center"><em>Generated — back</em></td>
+</tr>
+</table>
+
+*Single image → textured 3D mesh with PBR materials. ~12 min on M4 Max, ~21 min on M2 Pro. No NVIDIA GPU, no PyTorch — pure MLX on Apple Silicon.*
+
 ## Validation snapshot
 
 Validated end-to-end on Apple Silicon:
