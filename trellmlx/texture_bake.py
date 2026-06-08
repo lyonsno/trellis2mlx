@@ -38,6 +38,162 @@ def uv_unwrap(vertices, faces):
     return new_vertices, new_faces, uvs, vmapping
 
 
+def rasterize_uv_mlx(uvs, faces, texture_size=1024):
+    """GPU-accelerated UV-space rasterization via MLX on Metal.
+
+    Vectorized face-centric approach: processes faces in chunks, builds
+    per-face local grids, computes barycentric coords in parallel on GPU,
+    then scatters results to the texture buffer.
+
+    Same interface as rasterize_uv but runs on Metal GPU.
+
+    Args:
+        uvs: [V, 2] float32 UV coordinates in [0, 1]
+        faces: [F, 3] uint32
+        texture_size: output texture resolution
+
+    Returns:
+        pixel_mask: [H, W] bool — which pixels are covered
+        pixel_face_idx: [H, W] int — which face covers each pixel (-1 if none)
+        pixel_bary: [H, W, 3] float32 — barycentric weights
+    """
+    import mlx.core as mx
+
+    H = W = texture_size
+    num_faces = len(faces)
+
+    uvs = np.asarray(uvs, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+
+    # Gather per-face UV data: [F, 3, 2]
+    face_uvs = uvs[faces]
+    # Scale to pixel coords
+    face_uvs_px = face_uvs * texture_size
+
+    # Bounding boxes per face
+    bb_min = np.floor(face_uvs_px.min(axis=1)).astype(np.int32)
+    bb_max = np.ceil(face_uvs_px.max(axis=1)).astype(np.int32)
+    bb_min = np.clip(bb_min, 0, texture_size - 1)
+    bb_max = np.clip(bb_max, 0, texture_size - 1)
+
+    # Precompute barycentric constants per face
+    uv0 = face_uvs_px[:, 0]  # [F, 2]
+    e1 = face_uvs_px[:, 1] - uv0  # [F, 2]
+    e2 = face_uvs_px[:, 2] - uv0  # [F, 2]
+    d00 = (e1 * e1).sum(axis=1)  # [F]
+    d01 = (e1 * e2).sum(axis=1)  # [F]
+    d11 = (e2 * e2).sum(axis=1)  # [F]
+    denom = d00 * d11 - d01 * d01
+    non_degen = np.abs(denom) > 1e-10
+    inv_denom = np.where(non_degen, 1.0 / np.where(non_degen, denom, 1.0), 0.0)
+
+    # Output buffers (numpy — scatter writes are CPU-side)
+    pixel_face_idx = np.full((H, W), -1, dtype=np.int32)
+    pixel_bary = np.zeros((H, W, 3), dtype=np.float32)
+
+    # Process faces in chunks on GPU
+    CHUNK = 50000
+    for start in range(0, num_faces, CHUNK):
+        end = min(start + CHUNK, num_faces)
+        C = end - start
+
+        c_bb_min = bb_min[start:end]
+        c_bb_max = bb_max[start:end]
+        c_uv0 = uv0[start:end]
+        c_e1 = e1[start:end]
+        c_e2 = e2[start:end]
+        c_d00 = d00[start:end]
+        c_d01 = d01[start:end]
+        c_d11 = d11[start:end]
+        c_inv_denom = inv_denom[start:end]
+        c_non_degen = non_degen[start:end]
+
+        # Max bbox size in this chunk
+        widths = c_bb_max[:, 0] - c_bb_min[:, 0] + 1
+        heights = c_bb_max[:, 1] - c_bb_min[:, 1] + 1
+        max_w = int(widths.max())
+        max_h = int(heights.max())
+
+        if max_w <= 0 or max_h <= 0:
+            continue
+
+        # Build local pixel grids on GPU: [C, max_h, max_w, 2]
+        # +0.5 for pixel centers, matching the numpy rasterizer
+        local_x = mx.arange(max_w).astype(mx.float32) + 0.5
+        local_y = mx.arange(max_h).astype(mx.float32) + 0.5
+        # MLX meshgrid
+        gx = mx.broadcast_to(local_x[None, :], (max_h, max_w))
+        gy = mx.broadcast_to(local_y[:, None], (max_h, max_w))
+        grid = mx.stack([gx, gy], axis=-1)  # [max_h, max_w, 2]
+        grid = mx.broadcast_to(grid[None], (C, max_h, max_w, 2))
+
+        # Offset to absolute pixel coords
+        offsets = mx.array(c_bb_min.astype(np.float32))  # [C, 2]
+        grid = grid + offsets[:, None, None, :]  # [C, max_h, max_w, 2]
+
+        # Validity mask
+        bb_max_f = mx.array(c_bb_max.astype(np.float32))
+        valid = (
+            (grid[..., 0] <= bb_max_f[:, None, None, 0]) &
+            (grid[..., 1] <= bb_max_f[:, None, None, 1]) &
+            (grid[..., 0] >= 0) & (grid[..., 0] < W) &
+            (grid[..., 1] >= 0) & (grid[..., 1] < H)
+        )
+
+        # Barycentric computation on GPU
+        uv0_mx = mx.array(c_uv0)  # [C, 2]
+        v2 = grid - uv0_mx[:, None, None, :]  # [C, max_h, max_w, 2]
+
+        e1_mx = mx.array(c_e1)
+        e2_mx = mx.array(c_e2)
+        dot02 = (v2 * e1_mx[:, None, None, :]).sum(axis=-1)  # [C, max_h, max_w]
+        dot12 = (v2 * e2_mx[:, None, None, :]).sum(axis=-1)
+
+        d11_mx = mx.array(c_d11)[:, None, None]
+        d01_mx = mx.array(c_d01)[:, None, None]
+        d00_mx = mx.array(c_d00)[:, None, None]
+        inv_d_mx = mx.array(c_inv_denom)[:, None, None]
+        nd_mx = mx.array(c_non_degen.astype(np.float32))[:, None, None]
+
+        u = (d11_mx * dot02 - d01_mx * dot12) * inv_d_mx
+        v = (d00_mx * dot12 - d01_mx * dot02) * inv_d_mx
+        w = 1.0 - u - v
+
+        eps = -1e-4
+        inside = (u >= eps) & (v >= eps) & ((u + v) <= 1.0 - eps) & valid & (nd_mx > 0.5)
+
+        mx.eval(inside, grid, u, v, w)
+
+        # Scatter to CPU output buffers
+        inside_np = np.array(inside)
+        grid_np = np.array(grid)
+        u_np = np.array(u)
+        v_np = np.array(v)
+        w_np = np.array(w)
+
+        hit_indices = np.where(inside_np)
+        if len(hit_indices[0]) == 0:
+            continue
+
+        fi_batch = hit_indices[0]  # face index within chunk
+        abs_x = (grid_np[hit_indices[0], hit_indices[1], hit_indices[2], 0] - 0.5).astype(np.int32)
+        abs_y = (grid_np[hit_indices[0], hit_indices[1], hit_indices[2], 1] - 0.5).astype(np.int32)
+
+        # Bounds check
+        valid_px = (abs_x >= 0) & (abs_x < W) & (abs_y >= 0) & (abs_y < H)
+        abs_x = abs_x[valid_px]
+        abs_y = abs_y[valid_px]
+        fi_batch = fi_batch[valid_px]
+
+        pixel_face_idx[abs_y, abs_x] = fi_batch + start
+        pixel_bary[abs_y, abs_x, 0] = w_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
+        pixel_bary[abs_y, abs_x, 1] = u_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
+        pixel_bary[abs_y, abs_x, 2] = v_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
+
+    pixel_mask = pixel_face_idx >= 0
+    return pixel_mask, pixel_face_idx, pixel_bary
+
+
 def rasterize_uv(uvs, faces, texture_size=1024):
     """Rasterize triangles in UV space to get per-pixel barycentric coords.
 
@@ -213,6 +369,97 @@ def sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size):
         from scipy.spatial import cKDTree
         missing = ~nonzero
         voxel_world = (voxel_coords.astype(np.float32) + 0.5) / grid_size - 0.5
+        tree = cKDTree(voxel_world)
+        _, nn_idx = tree.query(positions[missing], k=1)
+        result[missing] = voxel_attrs[nn_idx]
+
+    return result
+
+
+def sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size):
+    """Trilinear sample PBR attributes using vectorized numpy with sorted hash.
+
+    Drop-in replacement for sample_voxel_attrs. Replaces the Python dict
+    loop with numpy searchsorted for ~1.5x speedup. Works at any grid_size
+    without allocating a dense volume.
+
+    Args:
+        positions: [N, 3] float32 world-space positions to sample
+        voxel_coords: [M, 3] int voxel coordinates (spatial, no batch dim)
+        voxel_attrs: [M, C] float32 per-voxel attributes
+        grid_size: int — coordinate space extent
+
+    Returns:
+        sampled: [N, C] float32 interpolated attributes (numpy)
+    """
+    positions = np.asarray(positions, dtype=np.float32)
+    voxel_coords = np.asarray(voxel_coords, dtype=np.int32)
+    voxel_attrs = np.asarray(voxel_attrs, dtype=np.float32)
+
+    N = len(positions)
+    M, C = voxel_attrs.shape
+    G = int(grid_size)
+
+    assert voxel_coords.min() >= 0, "negative voxel coordinates in hash packing"
+    assert voxel_coords.max() < (1 << 21), "coordinate overflow in hash packing"
+
+    # Build sorted hash table for vectorized lookup
+    packed = (voxel_coords[:, 0].astype(np.int64) << 42 |
+              voxel_coords[:, 1].astype(np.int64) << 21 |
+              voxel_coords[:, 2].astype(np.int64))
+    sort_idx = np.argsort(packed)
+    sorted_keys = packed[sort_idx]
+
+    # Convert world positions to continuous voxel coordinates
+    voxel_pos = (positions + 0.5) * G - 0.5  # [N, 3]
+    base = np.floor(voxel_pos).astype(np.int32)
+    frac = voxel_pos - base.astype(np.float32)
+
+    # 8 corner offsets
+    offsets = np.array([[dz, dy, dx]
+                        for dz in range(2) for dy in range(2) for dx in range(2)],
+                       dtype=np.int32)
+
+    # All 8 corners for each position: [N, 8, 3]
+    corner_coords = base[:, None, :] + offsets[None, :, :]
+    corner_packed = (corner_coords[:, :, 0].astype(np.int64) << 42 |
+                     corner_coords[:, :, 1].astype(np.int64) << 21 |
+                     corner_coords[:, :, 2].astype(np.int64))
+
+    # Vectorized lookup via searchsorted
+    flat_packed = corner_packed.ravel()  # [N*8]
+    insert_pos = np.searchsorted(sorted_keys, flat_packed)
+    insert_pos = np.clip(insert_pos, 0, M - 1)
+    found = sorted_keys[insert_pos] == flat_packed
+    flat_indices = np.where(found, sort_idx[insert_pos], -1)
+    corner_indices = flat_indices.reshape(N, 8)
+
+    # Trilinear weights
+    weights = np.ones((N, 8), dtype=np.float32)
+    for c, (dz, dy, dx) in enumerate(offsets):
+        weights[:, c] *= frac[:, 0] if dz else (1.0 - frac[:, 0])
+        weights[:, c] *= frac[:, 1] if dy else (1.0 - frac[:, 1])
+        weights[:, c] *= frac[:, 2] if dx else (1.0 - frac[:, 2])
+
+    # Interpolate
+    result = np.zeros((N, C), dtype=np.float32)
+    weight_sum = np.zeros(N, dtype=np.float32)
+
+    for c in range(8):
+        valid = corner_indices[:, c] != -1
+        if valid.any():
+            idx = corner_indices[valid, c]
+            result[valid] += weights[valid, c:c+1] * voxel_attrs[idx]
+            weight_sum[valid] += weights[valid, c]
+
+    nonzero = weight_sum > 0
+    result[nonzero] /= weight_sum[nonzero, None]
+
+    # Fallback: nearest-neighbor for positions with no corners
+    if not nonzero.all():
+        from scipy.spatial import cKDTree
+        missing = ~nonzero
+        voxel_world = (voxel_coords.astype(np.float32) + 0.5) / G - 0.5
         tree = cKDTree(voxel_world)
         _, nn_idx = tree.query(positions[missing], k=1)
         result[missing] = voxel_attrs[nn_idx]

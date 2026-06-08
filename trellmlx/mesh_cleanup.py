@@ -16,17 +16,27 @@ from scipy.sparse.csgraph import connected_components
 def cleanup_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
-    min_component_ratio: float = 0.01,
-    fill_max_hole_edges: int = 100,
+    max_hole_perimeter: float = 3e-2,
+    do_fix_normals: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean up a raw decoder mesh.
 
+    Matches the reference TRELLIS.2 postprocessing pipeline:
+    1. Remove duplicate faces
+    2. Repair non-manifold edges
+    3. Keep only the largest connected component
+    4. Fill small holes
+    5. Fix normals/winding consistency (optional, skip for intermediate passes)
+
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
-        min_component_ratio: Remove components smaller than this fraction of the largest.
-        fill_max_hole_edges: Fill boundary loops with fewer edges than this.
+        max_hole_perimeter: Fill holes with perimeter smaller than this (world-space
+            units). Matches reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
+        do_fix_normals: Run winding unification. The reference only does this once
+            at the end, so callers can skip it for intermediate cleanup passes
+            before simplification.
         verbose: Print progress.
 
     Returns:
@@ -36,11 +46,21 @@ def cleanup_mesh(
     original_faces = len(faces)
     original_verts = len(vertices)
 
-    # Step 1: Keep only the largest connected component
+    # Step 1: Remove duplicate faces
+    vertices, faces = remove_duplicate_faces(vertices, faces, verbose)
+
+    # Step 2: Repair non-manifold edges
+    vertices, faces = repair_non_manifold_edges(vertices, faces, verbose)
+
+    # Step 3: Keep only the largest connected component
     vertices, faces = keep_largest_component(vertices, faces, verbose)
 
-    # Step 2: Fill small holes on the remaining mesh
-    vertices, faces = fill_small_holes(vertices, faces, fill_max_hole_edges, verbose)
+    # Step 4: Fill small holes on the remaining mesh
+    vertices, faces = fill_small_holes(vertices, faces, max_hole_perimeter, verbose)
+
+    # Step 5: Fix normals/winding consistency (skip for intermediate passes)
+    if do_fix_normals:
+        vertices, faces = fix_normals(vertices, faces, verbose)
 
     if verbose:
         print(f"  Cleanup: {original_verts:,}V {original_faces:,}F → "
@@ -168,10 +188,14 @@ def _face_connected_components(faces, n_faces):
 def fill_small_holes(
     vertices: np.ndarray,
     faces: np.ndarray,
-    max_edges: int = 100,
+    max_hole_perimeter: float = 3e-2,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fill boundary loops (holes) with fan triangulation."""
+    """Fill boundary loops (holes) with fan triangulation.
+
+    Uses a perimeter-based threshold in world-space units, matching the
+    reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
+    """
     if len(faces) == 0:
         return vertices, faces
 
@@ -223,14 +247,22 @@ def fill_small_holes(
     if not loops:
         return vertices, faces
 
-    # Fill loops that are small enough
+    # Fill loops whose perimeter is below the threshold
     new_faces = list(faces)
     filled = 0
+    skipped = 0
     for loop in loops:
-        if len(loop) > max_edges:
+        # Compute perimeter in world-space units
+        loop_verts = vertices[loop]  # [L, 3]
+        edge_vecs = np.roll(loop_verts, -1, axis=0) - loop_verts  # [L, 3]
+        perimeter = np.sqrt((edge_vecs ** 2).sum(axis=1)).sum()
+
+        if perimeter > max_hole_perimeter:
+            skipped += 1
             continue
+
         # Fan triangulation from the centroid
-        centroid = vertices[loop].mean(axis=0)
+        centroid = loop_verts.mean(axis=0)
         centroid_idx = len(vertices)
         vertices = np.vstack([vertices, centroid[None]])
         for i in range(len(loop)):
@@ -240,10 +272,104 @@ def fill_small_holes(
         filled += 1
 
     if verbose and filled > 0:
-        print(f"  Filled {filled} holes ({len(loops) - filled} too large, "
-              f"max_edges={max_edges})", flush=True)
+        print(f"  Filled {filled} holes ({skipped} too large, "
+              f"max_perimeter={max_hole_perimeter})", flush=True)
 
     return vertices, np.array(new_faces, dtype=faces.dtype)
+
+
+def remove_duplicate_faces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove duplicate faces (including permutations of the same triangle)."""
+    if len(faces) == 0:
+        return vertices, faces
+
+    # Canonical form: sort vertex indices within each face
+    canonical = np.sort(faces, axis=1)
+    _, unique_idx = np.unique(canonical, axis=0, return_index=True)
+
+    if len(unique_idx) == len(faces):
+        return vertices, faces
+
+    removed = len(faces) - len(unique_idx)
+    if verbose:
+        print(f"  Removed {removed} duplicate faces", flush=True)
+
+    unique_idx.sort()  # preserve original order
+    return vertices, faces[unique_idx]
+
+
+def repair_non_manifold_edges(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove faces that create non-manifold edges (edges shared by 3+ faces).
+
+    For each non-manifold edge, keeps the two largest adjacent faces and
+    removes the rest.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    # Build edge → face list mapping
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            e = tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+            edge_faces.setdefault(e, []).append(fi)
+
+    # Find faces to remove: for non-manifold edges (3+ faces), keep the two
+    # faces with the most total area (heuristic: largest faces are most likely
+    # the intended geometry)
+    faces_to_remove = set()
+    for edge, face_list in edge_faces.items():
+        if len(face_list) <= 2:
+            continue
+        # Compute face areas for the candidates
+        areas = []
+        for fi in face_list:
+            v0, v1, v2 = vertices[faces[fi]]
+            area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+            areas.append(area)
+        # Keep the two largest, remove the rest
+        sorted_idx = np.argsort(areas)[::-1]
+        for i in range(2, len(sorted_idx)):
+            faces_to_remove.add(face_list[sorted_idx[i]])
+
+    if not faces_to_remove:
+        return vertices, faces
+
+    if verbose:
+        print(f"  Removed {len(faces_to_remove)} non-manifold faces", flush=True)
+
+    keep_mask = np.ones(len(faces), dtype=bool)
+    for fi in faces_to_remove:
+        keep_mask[fi] = False
+    return _reindex_mesh(vertices, faces[keep_mask])
+
+
+def fix_normals(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unify face winding so normals are consistent.
+
+    Uses trimesh's fix_normals which handles both winding consistency
+    and outward orientation.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    import trimesh
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    trimesh.repair.fix_normals(mesh)
+    # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)
+    return np.array(mesh.vertices, dtype=vertices.dtype), np.array(mesh.faces, dtype=faces.dtype)
 
 
 def _reindex_mesh(vertices, faces):
