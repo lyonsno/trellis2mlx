@@ -48,8 +48,9 @@ def cleanup():
     # Force synchronization to flush any pending Metal work
     try:
         mx.synchronize()
-    except Exception:
-        pass
+    except RuntimeError as exc:
+        if not _is_no_metal_device_error(exc):
+            raise
 
 
 def cleanup_model(*models):

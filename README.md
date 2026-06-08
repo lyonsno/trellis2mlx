@@ -189,11 +189,10 @@ Without `--image`, runs with random conditioning (abstract shapes, useful for ve
 ## Tests
 
 ```bash
-uv pip install pytest
-PYTHONPATH=. pytest tests/ -v
+uv run --with pytest python -m pytest tests/ -v
 ```
 
-47 tests covering all modules and onboarding contracts.
+Test suite covers core modules, onboarding contracts, and witness renderer behavior.
 
 ## Architecture
 

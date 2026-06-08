@@ -82,6 +82,35 @@ def test_cleanup_tolerates_headless_no_metal(monkeypatch):
     assert calls == ["mx.clear_cache", "synchronize"]
 
 
+def test_cleanup_propagates_unrelated_synchronize_failure(monkeypatch):
+    import trellmlx.cleanup as cleanup
+
+    calls = []
+
+    class FakeMX:
+        def clear_cache(self):
+            calls.append("mx.clear_cache")
+
+        def synchronize(self):
+            calls.append("synchronize")
+            raise RuntimeError("synchronize failed for unrelated reason")
+
+    monkeypatch.setattr(cleanup, "mx", FakeMX())
+
+    with pytest.raises(RuntimeError, match="synchronize failed for unrelated reason"):
+        cleanup.cleanup()
+
+    assert calls == ["mx.clear_cache", "synchronize"]
+
+
+def test_readme_tests_section_avoids_stale_exact_count():
+    text = Path("README.md").read_text()
+    tests_section = text.split("## Tests", 1)[1].split("## Architecture", 1)[0]
+
+    assert "47 tests" not in tests_section
+    assert "Test suite covers core modules" in tests_section
+
+
 def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch):
     import builtins
     import generate
