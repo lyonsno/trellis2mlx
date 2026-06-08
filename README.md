@@ -2,7 +2,26 @@
 
 MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for Apple Silicon.
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image → textured 3D mesh in ~9 minutes on M4 Max.
+Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image -> textured GLB, including native MLX DINOv3 conditioning, sparse/shape/texture stages, mesh extraction, simplification, UV unwrap, and texture baking.
+
+This is a technical preview: the full route works, the output is real, and the public contract is proof-first rather than polished-app-first. Output quality is still seed/input-sensitive, and native-DINO generation parity remains an active quality investigation.
+
+## Validation snapshot
+
+Validated end-to-end on Apple Silicon:
+
+| Machine | OS | Result | Wall time | Peak RSS |
+|---|---|---|---:|---:|
+| M2 Pro, 16 GB | macOS 26.5.1 / Tahoe | Coherent textured GLB from `assets/shoe_input.png` | 21m05s | 6.75 GB |
+| M4 Max, 128 GB | macOS | Full textured shoe pipeline | ~8.6 min | ~5 GB during decode |
+
+The M2 Pro run is the hardware proof: native MLX DINOv3 features, full TRELLIS.2 cascade, textured GLB export, structural GLB inspection, and visually inspected coherent output. Hero images and demos may use the best Apple Silicon output available, but hardware provenance should be labeled honestly.
+
+Claim boundary:
+
+> The first fully working MLX-native end-to-end TRELLIS.2 pipeline we know of: native DINO conditioning, sparse/shape/texture stages, mesh extraction, texture bake, and coherent textured GLB output locally on Apple Silicon, validated on a 16 GB M2 Pro.
+
+This is not a claim to be the first TRELLIS.2 project on Mac. [trellis-mac](https://github.com/shivampkumar/trellis-mac) proved the important prior Mac viability path via PyTorch MPS and should be credited.
 
 ## What works now
 
@@ -17,13 +36,45 @@ PYTHONPATH=. python smoke_stage2.py --image photo.png
 ```
 
 The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
-1. **Sparse Structure** — SparseStructureFlowModel (1.29B params) + decoder → 64³ occupancy grid
-2. **LR Shape Latent** — SLatFlowModel (1.29B params) at ~1.7K sparse tokens
-3. **Upsample** — Decoder subdivision predictions → high-res coordinate structure
-4. **HR Shape Latent** — SLatFlowModel again at ~29K dense tokens
-5. **Decode + Extract** — Sparse UNet decoder → `flexible_dual_grid_to_mesh` → GLB
+1. **Image conditioning** — native MLX DINOv3 ViT-L/16 features
+2. **Sparse Structure** — SparseStructureFlowModel (1.29B params) + decoder -> 64³ occupancy grid
+3. **LR Shape Latent** — SLatFlowModel (1.29B params) on sparse tokens
+4. **Upsample** — decoder subdivision predictions -> high-res coordinate structure
+5. **HR Shape Latent** — SLatFlowModel again at 1024 cascade resolution
+6. **Shape decode + mesh extraction** — sparse UNet decoder -> `flexible_dual_grid_to_mesh`
+7. **Texture SLat + decode** — per-voxel PBR attributes
+8. **UV unwrap + bake** — xatlas unwrap, trilinear voxel sampling, seam inpaint, GLB export
 
-### Performance (M4 Max, 128GB)
+### Performance: M2 Pro validation run
+
+Full native-DINO shoe run on M2 Pro / 16 GB / macOS 26.5.1:
+
+```bash
+PYTHONPATH=. python generate.py --image assets/shoe_input.png --output /tmp/trellis2mlx-tahoe-shoe-full-native.glb
+```
+
+| Stage | Time | Notes |
+|-------|------|-------|
+| Native DINOv3 | loaded 412 arrays | features `(1, 1029, 1024)` |
+| Sparse structure | 116.9s | 2,977 sparse voxels |
+| LR SLat | 80.0s | 2,977 tokens |
+| Upsample -> HR coords | 15.6s | 761,916 voxels, 12,043 HR tokens |
+| HR SLat | 518.0s | 12,043 tokens |
+| Shape decode | 63.2s | 3,040,506 voxels |
+| Mesh extraction + simplify | 6.0s | 6,016,550 raw faces -> 199,999 faces |
+| Texture SLat | 290.6s | 12,043 tokens |
+| Texture decode | 60.1s | 6-channel PBR |
+| UV unwrap + texture bake | 97.9s | unwrap, raster, voxel sample, seam inpaint |
+| **Total** | **1264.4s** | 1265.04s wall-clock |
+
+Output artifact from that run:
+
+- GLB: `/tmp/trellis2mlx-tahoe-shoe-full-native.glb`
+- SHA256: `608f1c3487a02b3545c8d54b4f02fedaa7deb5dd736c0020129e1a86a1033882`
+- Structure: 264,350 vertices, 199,999 faces, `TextureVisuals`, `PBRMaterial`, base color texture present
+- Visual result: recognizable red shoe with white swoosh/upper structure, plus expected single-image reconstruction debris and red background fragments
+
+### Performance: M4 Max reference run
 
 | Stage | Time | Notes |
 |-------|------|-------|
@@ -38,11 +89,15 @@ The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
 | UV unwrap + texture bake | ~2.2 min | xatlas + trilinear sample |
 | **Total** | **~8.6 min** | |
 
-Peak memory: ~3 GB for SLat flow, ~5 GB during decode. Runs on any Apple Silicon Mac.
+Peak memory: ~3 GB for SLat flow, ~5 GB during decode on the M4 Max reference path.
 
 [trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 viability on Mac via PyTorch MPS. This MLX rewrite targets lower memory (~3-5 GB vs 40-55 GB) and faster inference by using MLX's native Flash Attention and Apple Silicon memory architecture.
 
-### Numerical parity (12-step sampling, same weights + noise)
+### Parity and quality status
+
+Native MLX model components track the PyTorch reference closely in direct checks, but small DINO/precision differences can amplify through flow sampling and produce different generations. Treat the current release as a working end-to-end MLX pipeline, not a promise that every seed/input matches the PyTorch route visually.
+
+12-step sampling parity, same weights + noise:
 
 | Step | Correlation | Max diff |
 |------|-------------|----------|
@@ -52,7 +107,7 @@ Peak memory: ~3 GB for SLat flow, ~5 GB during decode. Runs on any Apple Silicon
 | 9 | 0.998852 | 0.434 |
 | 12 | 0.968466 | 2.128 |
 
-Divergence is monotonic precision accumulation (bf16 → fp16), not architectural — single forward pass correlation is 0.999999.
+Divergence is monotonic precision accumulation (bf16 -> fp16), not architectural; single forward pass correlation is 0.999999. Native DINOv3 feature parity and downstream generation quality remain tracked separately from route validity.
 
 ### Quantization (experimental)
 
@@ -85,16 +140,18 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 - [x] UV unwrap (xatlas) + texture baking (trilinear sample + cv2 inpaint)
 - [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
+- [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
+- [ ] Public demo polish and seed/input curation
 - [ ] INT4 speed benchmarks
 - [x] `mx.compile` investigation (no speedup — eager dispatch is already optimal for 30-block DiT)
-- [ ] Native macOS/iOS app via mlx-swift
+- [ ] Native macOS/iOS app (PyObjC/SwiftUI shell first, MLX Swift route later)
 
 ## Why MLX
 
 [trellis-mac](https://github.com/shivampkumar/trellis-mac) demonstrated that TRELLIS.2 can run on Mac via PyTorch MPS, and [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) contributed Metal modules for the ecosystem. This project rewrites the inference stack in MLX to take full advantage of Apple Silicon:
 
 - **Memory:** MLX's SDPA is real Flash Attention — O(N) memory vs O(N²) for MPS SDPA. Handles 262K tokens at ~3 GB instead of 275 GB.
-- **Accessibility:** Runs on any Apple Silicon Mac (8 GB+), not just high-end configurations.
+- **Accessibility:** Validated on a 16 GB M2 Pro as well as an M4 Max; designed for Apple Silicon rather than CUDA-only workstations.
 - **Bus-friendly:** Periodic eval yields memory bus between GPU bursts, preventing beachballs during generation.
 - **No PyTorch:** Fully native MLX pipeline including DINOv3 image conditioning. No torch/torchvision/transformers dependency.
 
@@ -134,7 +191,7 @@ uv pip install pytest
 PYTHONPATH=. pytest tests/ -v
 ```
 
-43 tests covering all modules.
+47 tests covering all modules and onboarding contracts.
 
 ## Architecture
 
