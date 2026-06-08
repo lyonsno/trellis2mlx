@@ -62,6 +62,26 @@ def test_cleanup_falls_back_to_metal_clear_cache(monkeypatch):
     assert calls == ["metal.clear_cache", "synchronize"]
 
 
+def test_cleanup_tolerates_headless_no_metal(monkeypatch):
+    import trellmlx.cleanup as cleanup
+
+    calls = []
+
+    class FakeMX:
+        def clear_cache(self):
+            calls.append("mx.clear_cache")
+            raise RuntimeError("[metal::load_device] No Metal device available")
+
+        def synchronize(self):
+            calls.append("synchronize")
+
+    monkeypatch.setattr(cleanup, "mx", FakeMX())
+
+    cleanup.cleanup()
+
+    assert calls == ["mx.clear_cache", "synchronize"]
+
+
 def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch):
     import builtins
     import generate

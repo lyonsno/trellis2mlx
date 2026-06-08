@@ -73,6 +73,30 @@ def _failure_report(
     return payload
 
 
+def _write_failure_report_and_cleanup(
+    *,
+    phase: str,
+    error: str,
+    input_path: Path,
+    output_path: Path,
+    report_path: Path,
+    status_code: int,
+) -> int:
+    report = _failure_report(
+        phase=phase,
+        error=error,
+        input_path=input_path,
+        output_path=output_path,
+        report_path=report_path,
+    )
+    if output_path.exists():
+        output_path.unlink()
+    _write_json(report_path, report)
+    if phase != "parse_args":
+        print(f"{phase}: {error}", file=sys.stderr)
+    return status_code
+
+
 def _load_mesh(path: Path) -> trimesh.Trimesh:
     if not path.exists():
         raise WitnessError("load_mesh", f"input GLB does not exist: {path}")
@@ -344,18 +368,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.size < 128:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        _write_json(
-            args.report,
-            _failure_report(
-                phase="parse_args",
-                error="--size must be at least 128",
-                input_path=args.input,
-                output_path=args.output,
-                report_path=args.report,
-            ),
+        return _write_failure_report_and_cleanup(
+            phase="parse_args",
+            error="--size must be at least 128",
+            input_path=args.input,
+            output_path=args.output,
+            report_path=args.report,
+            status_code=2,
         )
-        return 2
 
     try:
         mesh = _load_mesh(args.input)
@@ -372,36 +392,24 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
     except WitnessError as exc:
-        if args.output.exists():
-            args.output.unlink()
-        _write_json(
-            args.report,
-            _failure_report(
-                phase=exc.phase,
-                error=str(exc),
-                input_path=args.input,
-                output_path=args.output,
-                report_path=args.report,
-            ),
+        return _write_failure_report_and_cleanup(
+            phase=exc.phase,
+            error=str(exc),
+            input_path=args.input,
+            output_path=args.output,
+            report_path=args.report,
+            status_code=1,
         )
-        print(f"{exc.phase}: {exc}", file=sys.stderr)
-        return 1
     except Exception as exc:  # pragma: no cover - defensive durable failure report
-        if args.output.exists():
-            args.output.unlink()
         phase = "unexpected"
-        _write_json(
-            args.report,
-            _failure_report(
-                phase=phase,
-                error=f"{type(exc).__name__}: {exc}",
-                input_path=args.input,
-                output_path=args.output,
-                report_path=args.report,
-            ),
+        return _write_failure_report_and_cleanup(
+            phase=phase,
+            error=f"{type(exc).__name__}: {exc}",
+            input_path=args.input,
+            output_path=args.output,
+            report_path=args.report,
+            status_code=1,
         )
-        print(f"{phase}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
 
     print(f"wrote witness: {args.output}")
     print(f"wrote report: {args.report}")

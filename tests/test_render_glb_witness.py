@@ -110,6 +110,27 @@ def test_witness_renderer_failure_writes_report(tmp_path, input_name, expected_p
     assert data["last_trustworthy_evidence"]["input_exists"] == glb.exists()
 
 
+def test_witness_renderer_removes_stale_output_on_argument_failure(tmp_path):
+    glb = tmp_path / "missing.glb"
+    output = tmp_path / "stale.png"
+    report = tmp_path / "witness.json"
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(output)
+
+    result = _run_witness(glb, output, report, "--size", "1")
+
+    assert result.returncode == 2
+    assert not output.exists()
+    assert report.exists()
+
+    data = json.loads(report.read_text())
+    assert data["status"] == "error"
+    assert data["phase"] == "parse_args"
+    assert data["output_png"] == str(output)
+    assert data["last_trustworthy_evidence"]["input_exists"] is False
+    assert data["last_trustworthy_evidence"]["output_exists"] is True
+    assert data["last_trustworthy_evidence"]["output_size_bytes"] > 0
+
+
 def test_witness_renderer_rejects_blank_geometry_render(tmp_path):
     glb = tmp_path / "degenerate.glb"
     output = tmp_path / "witness.png"

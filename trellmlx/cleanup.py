@@ -9,17 +9,30 @@ import gc
 import mlx.core as mx
 
 
+def _is_no_metal_device_error(exc):
+    message = str(exc)
+    return "No Metal device available" in message or "[metal::load_device]" in message
+
+
 def _clear_mlx_cache():
     """Clear MLX's memory pool across old and current MLX releases."""
     clear_cache = getattr(mx, "clear_cache", None)
     if clear_cache is not None:
-        clear_cache()
+        try:
+            clear_cache()
+        except RuntimeError as exc:
+            if not _is_no_metal_device_error(exc):
+                raise
         return
 
     metal = getattr(mx, "metal", None)
     metal_clear_cache = getattr(metal, "clear_cache", None)
     if metal_clear_cache is not None:
-        metal_clear_cache()
+        try:
+            metal_clear_cache()
+        except RuntimeError as exc:
+            if not _is_no_metal_device_error(exc):
+                raise
 
 
 def cleanup():

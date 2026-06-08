@@ -110,11 +110,11 @@ Failure behavior is part of the contract. Missing inputs, empty meshes, invalid 
 Witness renderer contracts:
 
 ```bash
-uv run python -m pytest tests/test_render_glb_witness.py -v
+uv run --with pytest python -m pytest tests/test_render_glb_witness.py -v
 ```
 
 Full local test suite:
 
 ```bash
-uv run python -m pytest tests/ -v
+uv run --with pytest python -m pytest tests/ -v
 ```
