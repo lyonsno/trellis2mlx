@@ -16,6 +16,7 @@ dependencies = [
     "fast-simplification",
     "xatlas",
     "opencv-python",
+    "rembg[cpu]",
 ]
 
 [project.optional-dependencies]

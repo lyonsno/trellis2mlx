@@ -101,6 +101,8 @@ def main():
                         help="Use mx.compile for flow model forward passes (experimental, not faster)")
     parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8],
                         help="Quantize flow models to INT4 or INT8 (0=disabled, default: 0)")
+    parser.add_argument("--no-rembg", action="store_true",
+                        help="Skip background removal (rembg) preprocessing")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -124,16 +126,30 @@ def main():
 
     # === Image conditioning ===
     if args.image:
-        if len(args.image) == 1:
-            cond = _extract_image_features(args.image[0])
+        # Preprocess: background removal + center crop
+        image_paths = args.image
+        if not args.no_rembg:
+            from trellmlx.preprocess import preprocess_image
+            import tempfile
+            processed_paths = []
+            for img_path in image_paths:
+                print(f"  Preprocessing {img_path}...", flush=True)
+                processed = preprocess_image(img_path)
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                processed.save(tmp.name)
+                processed_paths.append(tmp.name)
+            image_paths = processed_paths
+
+        if len(image_paths) == 1:
+            cond = _extract_image_features(image_paths[0])
         else:
             # Multi-view: extract features per view, concatenate along sequence dim
             view_features = []
-            for img_path in args.image:
+            for img_path in image_paths:
                 feat = _extract_image_features(img_path)
                 view_features.append(feat)
             cond = mx.concatenate(view_features, axis=1)
-            print(f"  Multi-view: {len(args.image)} views → {cond.shape[1]} context tokens", flush=True)
+            print(f"  Multi-view: {len(image_paths)} views → {cond.shape[1]} context tokens", flush=True)
     else:
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
