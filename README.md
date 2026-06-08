@@ -86,7 +86,7 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 - [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
 - [ ] INT4 speed benchmarks
-- [ ] `mx.compile` optimization
+- [x] `mx.compile` investigation (no speedup — eager dispatch is already optimal for 30-block DiT)
 - [ ] Native macOS/iOS app via mlx-swift
 
 ## Why MLX
