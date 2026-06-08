@@ -91,22 +91,41 @@ def rasterize_uv_mlx(uvs, faces, texture_size=1024):
     pixel_face_idx = np.full((H, W), -1, dtype=np.int32)
     pixel_bary = np.zeros((H, W, 3), dtype=np.float32)
 
-    # Process faces in chunks on GPU
-    CHUNK = 50000
-    for start in range(0, num_faces, CHUNK):
-        end = min(start + CHUNK, num_faces)
-        C = end - start
+    # Sort faces by bbox area so chunks have uniform grid sizes
+    bbox_areas = (bb_max[:, 0] - bb_min[:, 0] + 1) * (bb_max[:, 1] - bb_min[:, 1] + 1)
+    face_order = np.argsort(bbox_areas)
 
-        c_bb_min = bb_min[start:end]
-        c_bb_max = bb_max[start:end]
-        c_uv0 = uv0[start:end]
-        c_e1 = e1[start:end]
-        c_e2 = e2[start:end]
-        c_d00 = d00[start:end]
-        c_d01 = d01[start:end]
-        c_d11 = d11[start:end]
-        c_inv_denom = inv_denom[start:end]
-        c_non_degen = non_degen[start:end]
+    # Adaptive chunking: target ~200M elements per chunk GPU tensor
+    MAX_ELEMENTS = 200_000_000  # ~800MB at float32
+
+    start = 0
+    while start < num_faces:
+        # Find chunk end that fits in memory budget
+        end = start + 1
+        while end < num_faces:
+            idx = face_order[end]
+            w = bb_max[idx, 0] - bb_min[idx, 0] + 1
+            h = bb_max[idx, 1] - bb_min[idx, 1] + 1
+            chunk_elements = (end - start + 1) * int(w) * int(h) * 2
+            if chunk_elements > MAX_ELEMENTS:
+                break
+            end += 1
+        end = max(end, start + 1)  # always process at least one face
+
+        chunk_indices = face_order[start:end]
+        C = len(chunk_indices)
+        start = end
+
+        c_bb_min = bb_min[chunk_indices]
+        c_bb_max = bb_max[chunk_indices]
+        c_uv0 = uv0[chunk_indices]
+        c_e1 = e1[chunk_indices]
+        c_e2 = e2[chunk_indices]
+        c_d00 = d00[chunk_indices]
+        c_d01 = d01[chunk_indices]
+        c_d11 = d11[chunk_indices]
+        c_inv_denom = inv_denom[chunk_indices]
+        c_non_degen = non_degen[chunk_indices]
 
         # Max bbox size in this chunk
         widths = c_bb_max[:, 0] - c_bb_min[:, 0] + 1
@@ -185,7 +204,7 @@ def rasterize_uv_mlx(uvs, faces, texture_size=1024):
         abs_y = abs_y[valid_px]
         fi_batch = fi_batch[valid_px]
 
-        pixel_face_idx[abs_y, abs_x] = fi_batch + start
+        pixel_face_idx[abs_y, abs_x] = chunk_indices[fi_batch]
         pixel_bary[abs_y, abs_x, 0] = w_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
         pixel_bary[abs_y, abs_x, 1] = u_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
         pixel_bary[abs_y, abs_x, 2] = v_np[hit_indices[0], hit_indices[1], hit_indices[2]][valid_px]
