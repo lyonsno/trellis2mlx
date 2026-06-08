@@ -82,6 +82,10 @@ class SLatFlowModel(nn.Module):
             for _ in range(num_blocks)
         ]
 
+        # Compilation state (call .compile() to enable)
+        self._compiled = False
+        self._run_blocks = self._run_blocks_impl
+
     def __call__(
         self,
         x: mx.array,           # [N, in_channels] sparse token features
@@ -108,19 +112,40 @@ class SLatFlowModel(nn.Module):
             rope_phases = self._coords_to_rope_phases(coords)
 
         # Run through blocks (B=1 assumed)
-        for i, block in enumerate(self.blocks):
-            x = block(x, mod[0], cond, rope_phases=rope_phases)
-            # Periodic eval to yield memory bus back to CPU/display.
+        if self._compiled:
+            # Compiled path: single fused graph, no internal evals.
+            # mx.compile handles buffer reuse; the sampler evals between steps.
+            x = self._run_blocks(x, mod[0], cond, rope_phases)
+        else:
+            # Eager path: periodic eval to yield memory bus back to CPU/display.
             # Without this, 30 blocks on 171K tokens queues a single
             # GPU burst that beachballs the entire machine.
-            if (i + 1) % 6 == 0:
-                mx.eval(x)
+            for i, block in enumerate(self.blocks):
+                x = block(x, mod[0], cond, rope_phases=rope_phases)
+                if (i + 1) % 6 == 0:
+                    mx.eval(x)
 
         # Output projection
         x = _layernorm_noaffine(x)
         x = self.out_layer(x)  # [N, out_channels]
 
         return x
+
+    def _run_blocks_impl(self, x, mod, cond, rope_phases):
+        """Pure forward pass through all blocks (no mx.eval)."""
+        for block in self.blocks:
+            x = block(x, mod, cond, rope_phases=rope_phases)
+        return x
+
+    def compile(self):
+        """Enable mx.compile for the transformer block loop."""
+        self._compiled = True
+        self._run_blocks = mx.compile(self._run_blocks_impl)
+
+    def uncompile(self):
+        """Disable mx.compile, fall back to eager with periodic eval."""
+        self._compiled = False
+        self._run_blocks = self._run_blocks_impl
 
     def _coords_to_rope_phases(self, coords: mx.array) -> mx.array:
         """Compute RoPE phases from sparse voxel coordinates.

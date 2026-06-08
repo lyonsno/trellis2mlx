@@ -97,6 +97,8 @@ def main():
                         help="Max tokens for HR SLat pass (reduces resolution if exceeded)")
     parser.add_argument("--target-faces", type=int, default=200_000,
                         help="Simplify mesh to this face count (0 to disable, default: 200K)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use mx.compile for flow model forward passes (faster, same output)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -130,6 +132,8 @@ def main():
 
     ss_flow = SparseStructureFlowModel()
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
+    if args.compile:
+        ss_flow.compile()
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
@@ -165,6 +169,8 @@ def main():
 
     lr_slat_flow = SLatFlowModel()
     load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
+    if args.compile:
+        lr_slat_flow.compile()
 
     N_lr = len(lr_coords)
     lr_noise = mx.random.normal((N_lr, 32))
@@ -229,6 +235,8 @@ def main():
     # Load 1024 model for HR pass (resolution=64, trained for larger coord range)
     hr_slat_flow = SLatFlowModel()
     load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
+    if args.compile:
+        hr_slat_flow.compile()
 
     hr_noise = mx.random.normal((num_tokens, 32))
 
@@ -311,6 +319,8 @@ def main():
     # Load texture flow model (same architecture, in_channels=64)
     tex_flow = SLatFlowModel(in_channels=64, out_channels=32)
     load_weights(tex_flow, HF_4B + "slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", verbose=False)
+    if args.compile:
+        tex_flow.compile()
 
     # Re-normalize shape SLat for texture conditioning
     shape_cond = _normalize_slat(hr_slat)

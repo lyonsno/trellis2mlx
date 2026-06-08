@@ -11,13 +11,17 @@ dependencies = [
     "pillow",
     "trimesh",
     "scipy",
+    "scikit-image",
     "tqdm",
+    "fast-simplification",
+    "xatlas",
+    "opencv-python",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
-convert = ["torch", "torchvision", "transformers"]
+image = ["torch", "torchvision", "transformers"]
 
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"

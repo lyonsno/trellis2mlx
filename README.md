@@ -105,10 +105,10 @@ git clone https://github.com/lyonsno/trellis2mlx.git
 cd trellis2mlx
 uv venv .venv --python python3.11
 source .venv/bin/activate
-uv pip install mlx numpy safetensors trimesh scikit-image scipy pillow tqdm huggingface-hub
+uv pip install -e .
 
 # For image conditioning (temporary — uses PyTorch for DINOv3):
-uv pip install torch torchvision transformers
+uv pip install -e ".[image]"
 # Also need trellis-mac checkout for the DINOv3 feature extractor:
 git clone --depth 1 https://github.com/shivampkumar/trellis-mac.git ~/dev/trellis-mac
 
@@ -116,20 +116,20 @@ git clone --depth 1 https://github.com/shivampkumar/trellis-mac.git ~/dev/trelli
 huggingface-cli login
 # Request access: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
 
-# Download model weights:
+# Download model weights (~5 GB total):
 huggingface-cli download microsoft/TRELLIS.2-4B
 huggingface-cli download microsoft/TRELLIS-image-large
 
-# Full pipeline (image → mesh):
+# Full pipeline (image → textured mesh):
 PYTHONPATH=. python generate.py --image your_image.png
 
-# Quick preview (stages 1+2 only, colored voxels):
-PYTHONPATH=. python smoke_stage2.py --image your_image.png
+# Quick preview (stages 1+2 only, no texture, no PyTorch needed):
+PYTHONPATH=. python smoke_stage2.py
 
 open /tmp/trellis-mlx-mesh.glb
 ```
 
-Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works).
+Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works without DINOv3/PyTorch).
 
 ## Tests
 
