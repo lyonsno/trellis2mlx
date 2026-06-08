@@ -36,10 +36,10 @@ def cleanup_mesh(
     original_faces = len(faces)
     original_verts = len(vertices)
 
-    # Step 1: Remove small connected components
-    vertices, faces = remove_small_components(vertices, faces, min_component_ratio, verbose)
+    # Step 1: Keep only the largest connected component
+    vertices, faces = keep_largest_component(vertices, faces, verbose)
 
-    # Step 2: Fill small holes
+    # Step 2: Fill small holes on the remaining mesh
     vertices, faces = fill_small_holes(vertices, faces, fill_max_hole_edges, verbose)
 
     if verbose:
@@ -47,6 +47,35 @@ def cleanup_mesh(
               f"{len(vertices):,}V {len(faces):,}F", flush=True)
 
     return vertices, faces
+
+
+def keep_largest_component(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only the largest connected component, remove everything else."""
+    if len(faces) == 0:
+        return vertices, faces
+
+    n_faces = len(faces)
+    n_components, labels = _face_connected_components(faces, n_faces)
+
+    if n_components <= 1:
+        return vertices, faces
+
+    component_sizes = np.bincount(labels)
+    largest_idx = component_sizes.argmax()
+    keep_mask = labels == largest_idx
+
+    kept = keep_mask.sum()
+    removed = n_faces - kept
+    if verbose:
+        print(f"  Kept largest component ({kept:,} faces), "
+              f"removed {n_components - 1} others ({removed:,} faces, "
+              f"{removed/n_faces*100:.1f}%)", flush=True)
+
+    return _reindex_mesh(vertices, faces[keep_mask])
 
 
 def remove_small_components(
