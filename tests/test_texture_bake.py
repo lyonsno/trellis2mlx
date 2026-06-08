@@ -186,3 +186,77 @@ class TestSampleVoxelAttrs:
         result_mlx = sample_voxel_attrs_fast(positions, coords, attrs, grid_size)
 
         np.testing.assert_allclose(result_np, result_mlx, atol=1e-4)
+
+    def test_fast_sampler_handles_empty_inputs_without_min_assert(self):
+        """Empty voxel arrays should return an empty-shaped result, not call min()."""
+        from trellmlx.texture_bake import sample_voxel_attrs_fast
+
+        positions = np.zeros((0, 3), dtype=np.float32)
+        coords = np.zeros((0, 3), dtype=np.int32)
+        attrs = np.zeros((0, 6), dtype=np.float32)
+
+        result = sample_voxel_attrs_fast(positions, coords, attrs, grid_size=4)
+
+        assert result.shape == (0, 6)
+        assert result.dtype == np.float32
+
+    def test_fast_sampler_matches_numpy_with_negative_query_corners(self):
+        """Out-of-grid query corners should behave like sparse misses, not assert."""
+        from trellmlx.texture_bake import sample_voxel_attrs_fast
+
+        grid_size = 4
+        coords = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.int32)
+        attrs = np.array([
+            [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
+            [1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
+        ], dtype=np.float32)
+        positions = np.array([[-0.5, -0.5, -0.5]], dtype=np.float32)
+
+        result_np = sample_voxel_attrs(positions, coords, attrs, grid_size)
+        result_fast = sample_voxel_attrs_fast(positions, coords, attrs, grid_size)
+
+        np.testing.assert_allclose(result_fast, result_np, atol=1e-5)
+
+
+class TestBakeTexture:
+    def test_bake_texture_uses_fast_raster_and_sampler(self, monkeypatch):
+        """The main bake route should exercise the optimized helpers."""
+        import trellmlx.texture_bake as texture_bake
+
+        vertices, faces, uvs = _make_uv_quad()
+        calls = []
+
+        def fake_rasterize_uv_mlx(got_uvs, got_faces, texture_size):
+            calls.append(("raster", texture_size))
+            mask = np.zeros((texture_size, texture_size), dtype=bool)
+            mask[0, 0] = True
+            face_idx = np.zeros((texture_size, texture_size), dtype=np.int64)
+            bary = np.zeros((texture_size, texture_size, 3), dtype=np.float32)
+            bary[0, 0] = [1.0, 0.0, 0.0]
+            return mask, face_idx, bary
+
+        def fake_sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size):
+            calls.append(("sample", len(positions)))
+            return np.array([[0.2, 0.4, 0.6, 0.8, 0.5, 1.0]], dtype=np.float32)
+
+        def fake_inpaint_texture(image, mask, radius=3):
+            return image
+
+        monkeypatch.setattr(texture_bake, "rasterize_uv_mlx", fake_rasterize_uv_mlx)
+        monkeypatch.setattr(texture_bake, "sample_voxel_attrs_fast", fake_sample_voxel_attrs_fast)
+        monkeypatch.setattr(texture_bake, "inpaint_texture", fake_inpaint_texture)
+
+        base_color, metallic_roughness = texture_bake.bake_texture(
+            vertices,
+            faces,
+            uvs,
+            np.arange(len(vertices)),
+            np.array([[0, 0, 0]], dtype=np.int32),
+            np.array([[0.2, 0.4, 0.6, 0.8, 0.5, 1.0]], dtype=np.float32),
+            grid_size=4,
+            texture_size=4,
+        )
+
+        assert calls == [("raster", 4), ("sample", 1)]
+        assert base_color.shape == (4, 4, 4)
+        assert metallic_roughness.shape == (4, 4, 3)

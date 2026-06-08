@@ -16,6 +16,7 @@ from scipy.sparse.csgraph import connected_components
 def cleanup_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
+    *,
     max_hole_perimeter: float = 3e-2,
     do_fix_normals: bool = True,
     verbose: bool = True,
@@ -56,7 +57,12 @@ def cleanup_mesh(
     vertices, faces = keep_largest_component(vertices, faces, verbose)
 
     # Step 4: Fill small holes on the remaining mesh
-    vertices, faces = fill_small_holes(vertices, faces, max_hole_perimeter, verbose)
+    vertices, faces = fill_small_holes(
+        vertices,
+        faces,
+        max_hole_perimeter=max_hole_perimeter,
+        verbose=verbose,
+    )
 
     # Step 5: Fix normals/winding consistency (skip for intermediate passes)
     if do_fix_normals:
@@ -188,6 +194,7 @@ def _face_connected_components(faces, n_faces):
 def fill_small_holes(
     vertices: np.ndarray,
     faces: np.ndarray,
+    *,
     max_hole_perimeter: float = 3e-2,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:

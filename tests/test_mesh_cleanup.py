@@ -159,6 +159,12 @@ class TestFixNormals:
 
 
 class TestFillSmallHolesPerimeter:
+    def test_max_hole_perimeter_is_keyword_only(self):
+        """Old positional max_edges callers must not silently become perimeter callers."""
+        verts, faces = _make_open_box()
+        with pytest.raises(TypeError):
+            fill_small_holes(verts, faces, 100)
+
     def test_small_hole_filled_large_hole_skipped(self):
         """Perimeter threshold should fill small holes and skip large ones."""
         # Two open boxes at different scales — same topology, different perimeters.
@@ -209,6 +215,12 @@ class TestFillSmallHolesPerimeter:
 
 
 class TestCleanupMeshIntegration:
+    def test_cleanup_tuning_arguments_are_keyword_only(self):
+        """Old positional cleanup thresholds must fail loud instead of remapping."""
+        verts, faces = _make_tetrahedron()
+        with pytest.raises(TypeError):
+            cleanup_mesh(verts, faces, 0.01, 100)
+
     def test_full_cleanup_with_floater_and_duplicate(self):
         """Mesh with a floater, a duplicate face, and a hole."""
         verts, faces = _make_open_box()

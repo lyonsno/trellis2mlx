@@ -400,8 +400,12 @@ def sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size):
     M, C = voxel_attrs.shape
     G = int(grid_size)
 
-    assert voxel_coords.min() >= 0, "negative voxel coordinates in hash packing"
-    assert voxel_coords.max() < (1 << 21), "coordinate overflow in hash packing"
+    if N == 0:
+        return np.zeros((0, C), dtype=np.float32)
+    if M == 0:
+        return np.zeros((N, C), dtype=np.float32)
+    if voxel_coords.min() < 0 or voxel_coords.max() >= (1 << 21):
+        return sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size)
 
     # Build sorted hash table for vectorized lookup
     packed = (voxel_coords[:, 0].astype(np.int64) << 42 |
@@ -535,7 +539,7 @@ def bake_texture(vertices, faces, uvs, vmapping,
     # Step 1: Rasterize in UV space
     print(f"    Rasterizing UV space ({len(faces):,} tris, {H}x{W})...", flush=True)
     t0 = time.perf_counter()
-    mask, face_idx, bary = rasterize_uv(uvs, faces, texture_size)
+    mask, face_idx, bary = rasterize_uv_mlx(uvs, faces, texture_size)
     print(f"    {mask.sum():,} pixels covered ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 2: Interpolate 3D positions from barycentric coords
@@ -552,7 +556,7 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     # Step 3: Sample PBR attrs from voxel grid
     t0 = time.perf_counter()
-    sampled = sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size)
+    sampled = sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size)
     print(f"    Sampled voxel attrs ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 4: Build texture images
