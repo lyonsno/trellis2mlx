@@ -245,6 +245,8 @@ class StageExecutionContext:
     run_id: str
     handles: Mapping[str, object] = field(default_factory=dict)
     handle_metadata: Mapping[str, Mapping[str, StageArtifactValue]] = field(default_factory=dict)
+    load_reports: tuple["StageHandleLoadReport", ...] = ()
+    close_reports: tuple["StageHandleCloseReport", ...] = ()
 
     def __post_init__(self) -> None:
         if not self.run_id:
@@ -256,6 +258,8 @@ class StageExecutionContext:
             raise ValueError(f"metadata for unknown handle_id: {', '.join(unknown_metadata)}")
         object.__setattr__(self, "handles", handles)
         object.__setattr__(self, "handle_metadata", metadata)
+        object.__setattr__(self, "load_reports", tuple(self.load_reports))
+        object.__setattr__(self, "close_reports", tuple(self.close_reports))
 
     @property
     def handle_ids(self) -> tuple[str, ...]:
@@ -266,6 +270,217 @@ class StageExecutionContext:
             return self.handles[handle_id]
         except KeyError as exc:
             raise KeyError(f"missing stage execution handle: {handle_id}") from exc
+
+
+@dataclass(frozen=True)
+class StageHandleRuntime:
+    """Inputs passed to one handle factory or closer."""
+
+    run_id: str
+    plan: InterleavedBatchPlan | None
+    spec: "StageHandleSpec"
+
+
+StageHandleFactory = Callable[[StageHandleRuntime], object]
+StageHandleCloser = Callable[[StageHandleRuntime, object], None]
+
+
+@dataclass(frozen=True)
+class StageHandleSpec:
+    """Declarative fixture-loadable handle required by a stage execution run."""
+
+    handle_id: str
+    kind: str
+    factory: StageHandleFactory
+    close: StageHandleCloser | None = None
+    metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.handle_id:
+            raise ValueError("StageHandleSpec requires a handle_id")
+        if not self.kind:
+            raise ValueError("StageHandleSpec requires a kind")
+        object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
+
+
+@dataclass(frozen=True)
+class StageHandleLoadReport:
+    """Portable report for one handle load attempt."""
+
+    handle_id: str
+    kind: str
+    load_phase: str
+    metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
+
+
+@dataclass(frozen=True)
+class StageHandleCloseReport:
+    """Portable report for one handle close attempt."""
+
+    handle_id: str
+    kind: str
+    close_phase: str
+    metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
+
+
+class StageHandleLoadError(RuntimeError):
+    """Raised when the context factory cannot load a required handle."""
+
+    def __init__(self, report: StageHandleLoadReport):
+        super().__init__(f"failed to load stage handle {report.handle_id}: {report.error}")
+        self.report = report
+
+
+class StageHandleCloseError(RuntimeError):
+    """Raised when a loaded handle cannot be closed cleanly."""
+
+    def __init__(self, report: StageHandleCloseReport):
+        super().__init__(f"failed to close stage handle {report.handle_id}: {report.error}")
+        self.report = report
+
+
+class StageContextFactoryFromSpecs:
+    """Callable context factory built from named handle specs."""
+
+    def __init__(self, specs: Sequence[StageHandleSpec], *, run_id: str = "stage-runner") -> None:
+        if not specs:
+            raise ValueError("build_stage_context_factory requires at least one handle spec")
+        if not run_id:
+            raise ValueError("build_stage_context_factory requires a run_id")
+        seen: set[str] = set()
+        specs_tuple: list[StageHandleSpec] = []
+        for spec in specs:
+            if spec.handle_id in seen:
+                raise ValueError(f"duplicate handle_id: {spec.handle_id}")
+            seen.add(spec.handle_id)
+            specs_tuple.append(spec)
+        self.specs = tuple(specs_tuple)
+        self.run_id = run_id
+        self.last_load_reports: tuple[StageHandleLoadReport, ...] = ()
+        self.last_close_reports: tuple[StageHandleCloseReport, ...] = ()
+
+    def __call__(self, plan: InterleavedBatchPlan) -> StageExecutionContext:
+        handles: dict[str, object] = {}
+        metadata: dict[str, dict[str, StageArtifactValue]] = {}
+        reports: list[StageHandleLoadReport] = []
+        self.last_close_reports = ()
+        for spec in self.specs:
+            runtime = StageHandleRuntime(run_id=self.run_id, plan=plan, spec=spec)
+            try:
+                handle = spec.factory(runtime)
+            except Exception as exc:
+                report_metadata = {"kind": spec.kind, "load_phase": "load_error", **spec.metadata}
+                report = StageHandleLoadReport(
+                    handle_id=spec.handle_id,
+                    kind=spec.kind,
+                    load_phase="load_error",
+                    metadata=report_metadata,
+                    error=str(exc),
+                )
+                reports.append(report)
+                self.last_load_reports = tuple(reports)
+                self.last_close_reports = self._close_loaded_handles(handles)
+                raise StageHandleLoadError(report) from exc
+
+            report_metadata = {"kind": spec.kind, "load_phase": "loaded", **spec.metadata}
+            report = StageHandleLoadReport(
+                handle_id=spec.handle_id,
+                kind=spec.kind,
+                load_phase="loaded",
+                metadata=report_metadata,
+            )
+            handles[spec.handle_id] = handle
+            metadata[spec.handle_id] = dict(report_metadata)
+            reports.append(report)
+
+        self.last_load_reports = tuple(reports)
+        return StageExecutionContext(
+            run_id=self.run_id,
+            handles=handles,
+            handle_metadata=metadata,
+            load_reports=tuple(reports),
+        )
+
+    def _close_loaded_handles(self, handles: Mapping[str, object]) -> tuple[StageHandleCloseReport, ...]:
+        close_reports: list[StageHandleCloseReport] = []
+        for spec in reversed(self.specs):
+            if spec.handle_id not in handles:
+                continue
+            try:
+                report = _close_stage_handle(self.run_id, spec, handles[spec.handle_id])
+            except StageHandleCloseError as exc:
+                report = exc.report
+            close_reports.append(report)
+        return tuple(close_reports)
+
+
+class StageContextCloserFromSpecs:
+    """Callable context closer built from named handle specs."""
+
+    def __init__(self, specs: Sequence[StageHandleSpec], *, run_id: str = "stage-runner") -> None:
+        self.specs = tuple(specs)
+        self.run_id = run_id
+        self.last_close_reports: tuple[StageHandleCloseReport, ...] = ()
+
+    def __call__(self, context: StageExecutionContext) -> None:
+        reports: list[StageHandleCloseReport] = []
+        first_error: StageHandleCloseError | None = None
+        for spec in reversed(self.specs):
+            if spec.handle_id not in context.handles:
+                continue
+            try:
+                report = _close_stage_handle(context.run_id, spec, context.handles[spec.handle_id])
+            except StageHandleCloseError as exc:
+                report = exc.report
+                if first_error is None:
+                    first_error = exc
+            reports.append(report)
+            self.last_close_reports = tuple(reports)
+        object.__setattr__(context, "close_reports", tuple(reports))
+        self.last_close_reports = tuple(reports)
+        if first_error is not None:
+            raise first_error
+
+
+def _close_stage_handle(run_id: str, spec: StageHandleSpec, handle: object) -> StageHandleCloseReport:
+    runtime = StageHandleRuntime(run_id=run_id, plan=None, spec=spec)
+    try:
+        if spec.close is not None:
+            spec.close(runtime, handle)
+    except Exception as exc:
+        report = StageHandleCloseReport(
+            handle_id=spec.handle_id,
+            kind=spec.kind,
+            close_phase="close_error",
+            metadata={"kind": spec.kind, "close_phase": "close_error", **spec.metadata},
+            error=str(exc),
+        )
+        raise StageHandleCloseError(report) from exc
+
+    return StageHandleCloseReport(
+        handle_id=spec.handle_id,
+        kind=spec.kind,
+        close_phase="closed",
+        metadata={"kind": spec.kind, "close_phase": "closed", **spec.metadata},
+    )
+
+
+def build_stage_context_factory(
+    specs: Sequence[StageHandleSpec],
+    *,
+    run_id: str = "stage-runner",
+) -> tuple[StageContextFactoryFromSpecs, StageContextCloserFromSpecs]:
+    factory = StageContextFactoryFromSpecs(specs, run_id=run_id)
+    closer = StageContextCloserFromSpecs(factory.specs, run_id=run_id)
+    return factory, closer
 
 
 @dataclass(frozen=True)

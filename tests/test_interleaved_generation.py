@@ -503,3 +503,252 @@ def test_stage_runner_validates_initial_states_before_opening_context(tmp_path):
         runner.run(initial_states={})
 
     assert events == []
+
+
+def test_stage_handle_specs_validate_identity_and_scalar_metadata():
+    from trellmlx.interleaved_generation import StageHandleSpec, build_stage_context_factory
+
+    spec = StageHandleSpec(
+        handle_id="dinov3",
+        kind="fixture",
+        factory=lambda runtime: object(),
+        metadata={"weights": "fixture", "quantized": False},
+    )
+
+    assert spec.handle_id == "dinov3"
+    assert spec.kind == "fixture"
+    assert spec.metadata == {"weights": "fixture", "quantized": False}
+
+    with pytest.raises(ValueError, match="StageHandleSpec requires a handle_id"):
+        StageHandleSpec(handle_id="", kind="fixture", factory=lambda runtime: object())
+
+    with pytest.raises(ValueError, match="artifact values must be bool, int, float, or str"):
+        StageHandleSpec(
+            handle_id="bad",
+            kind="fixture",
+            factory=lambda runtime: object(),
+            metadata={"tensor_like": [1, 2, 3]},
+        )
+
+    with pytest.raises(ValueError, match="duplicate handle_id: dinov3"):
+        build_stage_context_factory(
+            [
+                spec,
+                StageHandleSpec("dinov3", "fixture", lambda runtime: object()),
+            ]
+        )
+
+
+def test_stage_context_factory_loads_named_handles_once_and_reports_close_order(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        InterleavedBatchPlan,
+        StageHandleSpec,
+        build_stage_context_factory,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    events = []
+    handles = {"dinov3": object(), "sparse_structure": object()}
+
+    def load_dinov3(runtime):
+        events.append(("load", runtime.run_id, runtime.spec.handle_id, len(runtime.plan.jobs)))
+        return handles["dinov3"]
+
+    def load_sparse(runtime):
+        events.append(("load", runtime.run_id, runtime.spec.handle_id, len(runtime.plan.jobs)))
+        return handles["sparse_structure"]
+
+    def close_handle(runtime, handle):
+        events.append(("close", runtime.run_id, runtime.spec.handle_id, handle is handles[runtime.spec.handle_id]))
+
+    context_factory, context_closer = build_stage_context_factory(
+        [
+            StageHandleSpec(
+                "dinov3",
+                "fixture",
+                load_dinov3,
+                close=close_handle,
+                metadata={"weights": "fixture-dino"},
+            ),
+            StageHandleSpec(
+                "sparse_structure",
+                "fixture",
+                load_sparse,
+                close=close_handle,
+                metadata={"weights": "fixture-ss"},
+            ),
+        ],
+        run_id="fixture-run",
+    )
+
+    context = context_factory(plan)
+
+    assert context.require_handle("dinov3") is handles["dinov3"]
+    assert context.require_handle("sparse_structure") is handles["sparse_structure"]
+    assert context.handle_ids == ("dinov3", "sparse_structure")
+    assert context.handle_metadata == {
+        "dinov3": {
+            "kind": "fixture",
+            "load_phase": "loaded",
+            "weights": "fixture-dino",
+        },
+        "sparse_structure": {
+            "kind": "fixture",
+            "load_phase": "loaded",
+            "weights": "fixture-ss",
+        },
+    }
+    assert [report.handle_id for report in context.load_reports] == ["dinov3", "sparse_structure"]
+    assert [report.load_phase for report in context.load_reports] == ["loaded", "loaded"]
+    assert context.load_reports[0].metadata == {
+        "kind": "fixture",
+        "load_phase": "loaded",
+        "weights": "fixture-dino",
+    }
+
+    context_closer(context)
+
+    assert events == [
+        ("load", "fixture-run", "dinov3", 1),
+        ("load", "fixture-run", "sparse_structure", 1),
+        ("close", "fixture-run", "sparse_structure", True),
+        ("close", "fixture-run", "dinov3", True),
+    ]
+    assert [report.close_phase for report in context.close_reports] == ["closed", "closed"]
+    assert [report.handle_id for report in context.close_reports] == ["sparse_structure", "dinov3"]
+
+
+def test_stage_runner_context_factory_failure_reports_without_stage_calls(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageHandleSpec,
+        StageHandleLoadError,
+        StageRunner,
+        build_stage_context_factory,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    calls = []
+
+    def fail_load(runtime):
+        raise RuntimeError("fixture loader exploded")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [StageHandleSpec("dinov3", "fixture", fail_load)],
+        run_id="failure-run",
+    )
+    runner = StageRunner(
+        plan,
+        handlers={
+            "stage": lambda invocation, state, context: calls.append(invocation.job_id)
+            or GenerationStageResult(invocation.stage, elapsed_seconds=0.0)
+        },
+        context_factory=context_factory,
+        context_closer=context_closer,
+    )
+
+    with pytest.raises(StageHandleLoadError, match="failed to load stage handle dinov3"):
+        runner.run()
+
+    assert calls == []
+    assert context_factory.last_load_reports[0].handle_id == "dinov3"
+    assert context_factory.last_load_reports[0].load_phase == "load_error"
+    assert "fixture loader exploded" in context_factory.last_load_reports[0].error
+
+
+def test_stage_context_factory_closes_loaded_handles_after_later_load_failure(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        InterleavedBatchPlan,
+        StageHandleLoadError,
+        StageHandleSpec,
+        build_stage_context_factory,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    first_handle = object()
+    events = []
+
+    def load_first(runtime):
+        events.append(("load", runtime.spec.handle_id))
+        return first_handle
+
+    def close_first(runtime, handle):
+        events.append(("close", runtime.spec.handle_id, handle is first_handle))
+
+    def load_second(runtime):
+        events.append(("load", runtime.spec.handle_id))
+        raise RuntimeError("second handle failed")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [
+            StageHandleSpec("first", "fixture", load_first, close=close_first),
+            StageHandleSpec("second", "fixture", load_second),
+        ],
+        run_id="partial-failure",
+    )
+
+    with pytest.raises(StageHandleLoadError, match="failed to load stage handle second"):
+        context_factory(plan)
+
+    assert events == [
+        ("load", "first"),
+        ("load", "second"),
+        ("close", "first", True),
+    ]
+    assert [report.load_phase for report in context_factory.last_load_reports] == [
+        "loaded",
+        "load_error",
+    ]
+    assert [report.handle_id for report in context_factory.last_close_reports] == ["first"]
+    assert [report.close_phase for report in context_factory.last_close_reports] == ["closed"]
+    assert context_closer.last_close_reports == ()
+
+
+def test_stage_context_closer_reports_close_errors_and_continues(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        InterleavedBatchPlan,
+        StageHandleCloseError,
+        StageHandleSpec,
+        build_stage_context_factory,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    events = []
+    handles = {"first": object(), "second": object()}
+
+    def close_first(runtime, handle):
+        events.append(("close", runtime.spec.handle_id, handle is handles["first"]))
+
+    def close_second(runtime, handle):
+        events.append(("close", runtime.spec.handle_id, handle is handles["second"]))
+        raise RuntimeError("second close failed")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [
+            StageHandleSpec("first", "fixture", lambda runtime: handles["first"], close=close_first),
+            StageHandleSpec("second", "fixture", lambda runtime: handles["second"], close=close_second),
+        ],
+        run_id="close-failure",
+    )
+    context = context_factory(plan)
+
+    with pytest.raises(StageHandleCloseError, match="failed to close stage handle second"):
+        context_closer(context)
+
+    assert events == [
+        ("close", "second", True),
+        ("close", "first", True),
+    ]
+    assert [report.handle_id for report in context.close_reports] == ["second", "first"]
+    assert [report.close_phase for report in context.close_reports] == ["close_error", "closed"]
+    assert "second close failed" in context.close_reports[0].error
+    assert context_closer.last_close_reports == context.close_reports
