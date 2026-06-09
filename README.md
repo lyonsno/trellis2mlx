@@ -155,6 +155,19 @@ FP16 in this benchmark. Further speedups likely need fewer sampler steps,
 stage/model reuse, batching, or fused kernels rather than weight-only
 quantization.
 
+To rerun the flow-stage benchmark:
+
+```bash
+PYTHONPATH=. python scripts/bench_quantization.py \
+  --image assets/shoe_input.png \
+  --variants fp16,int8,int4 \
+  --stages ss-flow,slat-flow
+```
+
+The script writes an incremental JSON report and records the effective repo
+head, checkpoint files, host/MLX identity, asset route, variants, stages, and
+failure phase if the run stops early.
+
 ### Roadmap
 
 - [x] SparseStructureFlowModel (1.29B param DiT) — numerically verified
