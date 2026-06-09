@@ -170,6 +170,13 @@ print("stdout-done", flush=True)
             time.sleep(0.02)
 
         assert sentinel.exists()
+        while time.monotonic() < deadline:
+            stdout_seen = stdout_log.exists() and "stdout-live" in stdout_log.read_text()
+            stderr_seen = stderr_log.exists() and "stderr-live" in stderr_log.read_text()
+            if stdout_seen and stderr_seen:
+                break
+            time.sleep(0.02)
+
         assert stdout_log.exists()
         assert stderr_log.exists()
         assert "stdout-live" in stdout_log.read_text()

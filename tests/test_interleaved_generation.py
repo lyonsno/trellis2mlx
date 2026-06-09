@@ -155,3 +155,121 @@ def test_stage_seed_is_deterministic_per_job_and_stage():
         stage_index=4,
     )
     assert 0 <= derive_stage_seed(job_seed=101, stage_index=3) < 2**32
+
+
+def test_stage_runner_executes_stage_major_and_preserves_job_state(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageRunner,
+        StageRunnerOutput,
+        derive_stage_seed,
+    )
+
+    jobs = (
+        GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb"),
+        GenerationJob("seed-202", ("subject.png",), 202, tmp_path / "seed-202.glb"),
+    )
+    plan = InterleavedBatchPlan(jobs=jobs, stages=("image_conditioning", "sparse_structure"))
+    calls = []
+
+    def image_conditioning(invocation, state):
+        calls.append((invocation.stage, invocation.job_id, state.next_stage_index))
+        return StageRunnerOutput(
+            result=GenerationStageResult(invocation.stage, elapsed_seconds=0.01),
+            artifacts={"conditioning_seed": invocation.stage_seed},
+        )
+
+    def sparse_structure(invocation, state):
+        calls.append((invocation.stage, invocation.job_id, state.next_stage_index))
+        assert state.artifacts["conditioning_seed"] == derive_stage_seed(
+            job_seed=invocation.seed,
+            stage_index=0,
+        )
+        return StageRunnerOutput(
+            result=GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.02,
+                output_counts={"tokens": 17},
+            ),
+            artifacts={"sparse_tokens": 17},
+        )
+
+    result = StageRunner(
+        plan,
+        handlers={
+            "image_conditioning": image_conditioning,
+            "sparse_structure": sparse_structure,
+        },
+    ).run()
+
+    assert calls == [
+        ("image_conditioning", "seed-101", 0),
+        ("image_conditioning", "seed-202", 0),
+        ("sparse_structure", "seed-101", 1),
+        ("sparse_structure", "seed-202", 1),
+    ]
+    assert result.ok is True
+    assert result.job_states["seed-101"].next_stage_index == 2
+    assert result.job_states["seed-101"].artifacts["sparse_tokens"] == 17
+    assert [stage.stage for stage in result.job_states["seed-202"].stage_results] == [
+        "image_conditioning",
+        "sparse_structure",
+    ]
+
+
+def test_stage_runner_captures_failure_phase_and_skips_failed_job(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageRunner,
+    )
+
+    jobs = (
+        GenerationJob("ok", ("subject.png",), 101, tmp_path / "ok.glb"),
+        GenerationJob("bad", ("subject.png",), 202, tmp_path / "bad.glb"),
+    )
+    plan = InterleavedBatchPlan(jobs=jobs, stages=("sparse_structure", "export"))
+    calls = []
+
+    def sparse_structure(invocation, state):
+        calls.append((invocation.stage, invocation.job_id))
+        if invocation.job_id == "bad":
+            return GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.01,
+                failure_phase="sparse_structure:model_error",
+            )
+        return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
+
+    def export(invocation, state):
+        calls.append((invocation.stage, invocation.job_id))
+        return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
+
+    result = StageRunner(
+        plan,
+        handlers={"sparse_structure": sparse_structure, "export": export},
+    ).run()
+
+    assert calls == [
+        ("sparse_structure", "ok"),
+        ("sparse_structure", "bad"),
+        ("export", "ok"),
+    ]
+    assert result.ok is False
+    assert result.job_states["bad"].failure_phase == "sparse_structure:model_error"
+    assert [stage.stage for stage in result.job_states["bad"].stage_results] == [
+        "sparse_structure",
+    ]
+
+
+def test_stage_runner_requires_handlers_for_all_stages(tmp_path):
+    from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan, StageRunner
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("image_conditioning", "export"))
+
+    with pytest.raises(ValueError, match="missing stage handlers: export"):
+        StageRunner(plan, handlers={"image_conditioning": lambda invocation, state: None})

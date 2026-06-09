@@ -11,7 +11,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
+
+
+StageArtifactValue = bool | int | float | str
 
 
 DEFAULT_STAGE_SEQUENCE: tuple[str, ...] = (
@@ -216,3 +219,133 @@ def new_job_traces(jobs: Iterable[GenerationJob]) -> dict[str, GenerationJobTrac
             raise ValueError(f"duplicate job_id: {job.job_id}")
         traces[job.job_id] = GenerationJobTrace.from_job(job)
     return traces
+
+
+@dataclass(frozen=True)
+class StageRunnerOutput:
+    """State update returned by a stage handler.
+
+    `artifacts` is intentionally a small scalar map so the contract stays easy
+    to port to MLX Swift and easy to serialize in future reports.
+    """
+
+    result: GenerationStageResult
+    artifacts: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifacts", dict(self.artifacts))
+
+
+@dataclass(frozen=True)
+class JobState:
+    """Portable per-job state snapshot consumed by stage handlers."""
+
+    job_id: str
+    seed: int
+    images: tuple[str, ...]
+    output_path: str
+    config: Mapping[str, int | bool | str]
+    next_stage_index: int = 0
+    stage_results: tuple[GenerationStageResult, ...] = ()
+    artifacts: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+    failure_phase: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "images", tuple(self.images))
+        object.__setattr__(self, "config", dict(self.config))
+        object.__setattr__(self, "artifacts", dict(self.artifacts))
+
+    @classmethod
+    def from_job(cls, job: GenerationJob) -> "JobState":
+        return cls(
+            job_id=job.job_id,
+            seed=job.seed,
+            images=job.images,
+            output_path=str(job.output_path),
+            config=job.config_dict(),
+        )
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_phase is None
+
+    def record_stage(
+        self,
+        invocation: GenerationStageInvocation,
+        output: StageRunnerOutput,
+    ) -> "JobState":
+        if not self.ok:
+            raise ValueError(f"cannot record stage for failed job: {self.job_id}")
+        if invocation.job_id != self.job_id:
+            raise ValueError(f"invocation job_id {invocation.job_id} does not match state {self.job_id}")
+        if invocation.stage_index != self.next_stage_index:
+            raise ValueError(
+                f"stage index mismatch for {self.job_id}: expected {self.next_stage_index}, "
+                f"got {invocation.stage_index}"
+            )
+        if output.result.stage != invocation.stage:
+            raise ValueError(
+                f"result stage {output.result.stage} does not match invocation stage {invocation.stage}"
+            )
+
+        return replace(
+            self,
+            next_stage_index=self.next_stage_index + 1,
+            stage_results=(*self.stage_results, output.result),
+            artifacts={**self.artifacts, **output.artifacts},
+            failure_phase=output.result.failure_phase,
+        )
+
+
+StageHandler = Callable[[GenerationStageInvocation, JobState], StageRunnerOutput | GenerationStageResult]
+
+
+@dataclass(frozen=True)
+class StageRunResult:
+    """Final state for a stage-major runner invocation."""
+
+    job_states: Mapping[str, JobState]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_states", dict(self.job_states))
+
+    @property
+    def ok(self) -> bool:
+        return all(state.ok for state in self.job_states.values())
+
+
+class StageRunner:
+    """Execute a stage-major plan against explicit per-stage handlers."""
+
+    def __init__(
+        self,
+        plan: InterleavedBatchPlan,
+        *,
+        handlers: Mapping[str, StageHandler],
+    ) -> None:
+        missing = [stage for stage in plan.stages if stage not in handlers]
+        if missing:
+            raise ValueError(f"missing stage handlers: {', '.join(missing)}")
+        self.plan = plan
+        self.handlers = dict(handlers)
+
+    def run(self, initial_states: Mapping[str, JobState] | None = None) -> StageRunResult:
+        states = (
+            dict(initial_states)
+            if initial_states is not None
+            else {job.job_id: JobState.from_job(job) for job in self.plan.jobs}
+        )
+        for job in self.plan.jobs:
+            if job.job_id not in states:
+                raise ValueError(f"missing initial state for job_id: {job.job_id}")
+
+        for invocation in self.plan.iter_invocations():
+            state = states[invocation.job_id]
+            if not state.ok:
+                continue
+            output = self.handlers[invocation.stage](invocation, state)
+            if isinstance(output, GenerationStageResult):
+                output = StageRunnerOutput(result=output)
+            states[invocation.job_id] = state.record_stage(invocation, output)
+
+        return StageRunResult(job_states=states)
