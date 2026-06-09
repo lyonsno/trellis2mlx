@@ -8,6 +8,7 @@ sparse tensor batching exists.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -26,6 +27,13 @@ DEFAULT_STAGE_SEQUENCE: tuple[str, ...] = (
     "texture_bake",
     "export",
 )
+
+
+def derive_stage_seed(*, job_seed: int, stage_index: int) -> int:
+    """Derive a deterministic per-job/per-stage uint32 seed."""
+
+    digest = hashlib.blake2s(f"{int(job_seed)}:{int(stage_index)}".encode("ascii"), digest_size=4).digest()
+    return int.from_bytes(digest, "little")
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,7 @@ class GenerationStageInvocation:
     stage_index: int
     job_id: str
     seed: int
+    stage_seed: int
     images: tuple[str, ...]
     output_path: str
     conditioning_route: str
@@ -151,6 +160,7 @@ class InterleavedBatchPlan:
                     stage_index=stage_index,
                     job_id=job.job_id,
                     seed=job.seed,
+                    stage_seed=derive_stage_seed(job_seed=job.seed, stage_index=stage_index),
                     images=job.images,
                     output_path=str(job.output_path),
                     conditioning_route=job.conditioning_route,

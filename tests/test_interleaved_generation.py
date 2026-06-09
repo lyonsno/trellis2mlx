@@ -137,3 +137,21 @@ def test_generation_job_can_be_built_from_process_batch_job(tmp_path):
     assert generation_job.resolution == 512
     assert generation_job.target_faces == 50_000
     assert generation_job.no_cleanup is True
+
+
+def test_stage_seed_is_deterministic_per_job_and_stage():
+    from trellmlx.interleaved_generation import derive_stage_seed
+
+    assert derive_stage_seed(job_seed=101, stage_index=3) == derive_stage_seed(
+        job_seed=101,
+        stage_index=3,
+    )
+    assert derive_stage_seed(job_seed=101, stage_index=3) != derive_stage_seed(
+        job_seed=202,
+        stage_index=3,
+    )
+    assert derive_stage_seed(job_seed=101, stage_index=3) != derive_stage_seed(
+        job_seed=101,
+        stage_index=4,
+    )
+    assert 0 <= derive_stage_seed(job_seed=101, stage_index=3) < 2**32

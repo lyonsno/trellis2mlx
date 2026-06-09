@@ -95,6 +95,12 @@ class SLatFlowModel(nn.Module):
         concat_cond: mx.array = None,  # [N, C'] features to concatenate with x
     ) -> mx.array:
         N = x.shape[0]
+        B = t.shape[0] if len(t.shape) else 1
+        cond_B = cond.shape[0] if cond is not None and len(cond.shape) else B
+        if B != 1 or cond_B != 1:
+            raise ValueError(
+                f"Only B=1 supported for SLatFlowModel inference, got t B={B}, cond B={cond_B}"
+            )
 
         if concat_cond is not None:
             x = mx.concatenate([x, concat_cond], axis=-1)

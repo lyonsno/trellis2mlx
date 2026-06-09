@@ -111,6 +111,20 @@ class TestSLatFlowModel:
         diff = mx.max(mx.abs(out_no_coords - out_with_coords)).item()
         assert diff > 0.01, "Coords should change the output via RoPE"
 
+    def test_rejects_batch_greater_than_one(self):
+        from trellmlx.models.slat_flow import SLatFlowModel
+        model = SLatFlowModel(
+            in_channels=32, out_channels=32, model_channels=64,
+            num_heads=4, num_blocks=1, mlp_hidden=128,
+            context_channels=32,
+        )
+        x = mx.random.normal((16, 32))
+        t = mx.array([500.0, 500.0])
+        cond = mx.random.normal((2, 5, 32))
+
+        with pytest.raises(ValueError, match="Only B=1 supported"):
+            model(x, t, cond)
+
 
 class TestSparseStructureDecoder:
     def test_pixel_shuffle_3d(self):

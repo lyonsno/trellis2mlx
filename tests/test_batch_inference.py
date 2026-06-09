@@ -1,11 +1,13 @@
 """Batch inference scheduling contracts."""
 
 import concurrent.futures
+from datetime import datetime
 import json
 import os
 import subprocess
 import sys
 import time
+from uuid import UUID
 
 import pytest
 
@@ -207,6 +209,10 @@ def test_run_batch_persists_route_identity_for_measurement(tmp_path):
     )
 
     persisted = json.loads(report_path.read_text())
+    assert UUID(persisted["batch_run_id"])
+    started_at = datetime.fromisoformat(persisted["started_at"].replace("Z", "+00:00"))
+    finished_at = datetime.fromisoformat(persisted["finished_at"].replace("Z", "+00:00"))
+    assert finished_at >= started_at
     assert persisted["identity"]["command_line"] == [
         "python",
         "-m",

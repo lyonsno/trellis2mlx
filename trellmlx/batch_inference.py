@@ -9,6 +9,7 @@ while avoiding the known Metal scheduler risk of hidden process fanout.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import importlib.metadata
 import json
 import os
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -141,6 +143,9 @@ class BatchRunReport:
     """Durable report for one batch invocation."""
 
     schema: str
+    batch_run_id: str
+    started_at: str
+    finished_at: str
     requested_concurrency: int
     effective_concurrency: int
     diagnostics: list[str]
@@ -244,6 +249,8 @@ def run_batch(
         raise ValueError("max_concurrent must be >= 1")
 
     repo_root = Path(options.repo_root)
+    batch_run_id = str(uuid.uuid4())
+    started_at = _utc_now_iso()
     effective_concurrency = min(options.max_concurrent, len(jobs)) if jobs else 0
     diagnostics: list[str] = []
     if options.max_concurrent > 2:
@@ -264,6 +271,9 @@ def run_batch(
 
     report = BatchRunReport(
         schema=SCHEMA,
+        batch_run_id=batch_run_id,
+        started_at=started_at,
+        finished_at=_utc_now_iso(),
         requested_concurrency=options.max_concurrent,
         effective_concurrency=effective_concurrency,
         diagnostics=diagnostics,
@@ -282,6 +292,10 @@ def run_batch(
         report_path.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
 
     return report
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _run_one_job(
