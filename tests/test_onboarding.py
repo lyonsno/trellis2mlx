@@ -15,6 +15,12 @@ def test_readme_uses_current_huggingface_cli():
     assert "hf download facebook/dinov3-vitl16-pretrain-lvd1689m" in text
 
 
+def test_uv_lock_is_ignored_for_agent_review_runs():
+    gitignore_lines = Path(".gitignore").read_text().splitlines()
+
+    assert "/uv.lock" in gitignore_lines
+
+
 def test_cleanup_prefers_modern_mlx_clear_cache(monkeypatch):
     import trellmlx.cleanup as cleanup
 
