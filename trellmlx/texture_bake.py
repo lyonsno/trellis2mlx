@@ -38,6 +38,240 @@ def uv_unwrap(vertices, faces):
     return new_vertices, new_faces, uvs, vmapping
 
 
+def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
+    """UV unwrap via normal-cone chart segmentation + LSCM parameterization.
+
+    Segments the mesh into charts by grouping faces with similar normals
+    (connected components where adjacent face normals are within cone_angle),
+    then parameterizes each chart independently using Least Squares Conformal
+    Maps (libigl). Charts are packed into [0,1]² UV space.
+
+    Handles both smooth and voxel geometry without pathological behavior.
+
+    Args:
+        vertices: [V, 3] float32
+        faces: [F, 3] int
+        cone_angle: max angle (radians) between adjacent face normals within
+                    a chart. Default 70° (matches cumesh's 90° half-angle cone).
+
+    Returns:
+        new_vertices: [V', 3] float32 (duplicated at chart seams)
+        new_faces: [F, 3] uint32
+        uvs: [V', 2] float32 in [0, 1]
+        vmapping: [V'] int — maps new vertex indices to original vertex indices
+    """
+    import igl
+    from scipy import sparse
+    from scipy.sparse.csgraph import connected_components
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    F_count = len(faces)
+
+    if F_count == 0:
+        return (vertices.astype(np.float32), faces.astype(np.uint32),
+                np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int64))
+
+    # Step 1: Compute face normals
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    norms = np.linalg.norm(face_normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-10, 1.0, norms)
+    face_normals = face_normals / norms
+
+    # Step 2: Build face adjacency and segment by normal similarity
+    # Edge → face mapping
+    edge_faces = {}
+    for fi in range(F_count):
+        for i in range(3):
+            e = tuple(sorted((faces[fi, i], faces[fi, (i + 1) % 3])))
+            edge_faces.setdefault(e, []).append(fi)
+
+    # Build adjacency: connect faces sharing an edge if normals are similar
+    cos_threshold = np.cos(cone_angle)
+    rows, cols = [], []
+    for face_list in edge_faces.values():
+        for i in range(len(face_list)):
+            for j in range(i + 1, len(face_list)):
+                fi, fj = face_list[i], face_list[j]
+                dot = (face_normals[fi] * face_normals[fj]).sum()
+                if dot >= cos_threshold:
+                    rows.extend([fi, fj])
+                    cols.extend([fj, fi])
+
+    if rows:
+        adj = sparse.csr_matrix(
+            (np.ones(len(rows), dtype=np.int8), (rows, cols)),
+            shape=(F_count, F_count),
+        )
+        n_charts, chart_labels = connected_components(adj, directed=False)
+    else:
+        n_charts = F_count
+        chart_labels = np.arange(F_count)
+
+    # Step 3: LSCM parameterization per chart
+    # Build output arrays: each chart may duplicate vertices at seams
+    all_new_verts = []
+    all_new_faces = []
+    all_uvs = []
+    all_vmapping = []
+    vert_offset = 0
+
+    # Collect chart UV bounding boxes for packing
+    chart_uv_data = []  # list of (uvs, faces, verts, vmapping, width, height)
+
+    for chart_id in range(n_charts):
+        chart_face_mask = chart_labels == chart_id
+        chart_faces_orig = faces[chart_face_mask]
+
+        if len(chart_faces_orig) == 0:
+            continue
+
+        # Reindex chart to local vertex indices
+        unique_verts, local_faces = np.unique(chart_faces_orig, return_inverse=True)
+        local_faces = local_faces.reshape(-1, 3)
+        local_verts = vertices[unique_verts]
+
+        # LSCM needs at least 2 boundary vertices pinned
+        bnd = igl.boundary_loop(local_faces)
+        if len(bnd) < 2:
+            # Closed chart (no boundary) — pin two arbitrary vertices
+            b = np.array([0, len(local_verts) // 2], dtype=np.int64)
+        else:
+            # Pin two boundary vertices far apart
+            b = np.array([bnd[0], bnd[len(bnd) // 2]], dtype=np.int64)
+        bc = np.array([[0.0, 0.0], [1.0, 0.0]])
+
+        try:
+            lscm_result = igl.lscm(local_verts, local_faces, b, bc)
+            chart_uvs = lscm_result[0] if isinstance(lscm_result, tuple) else lscm_result
+            chart_uvs = np.asarray(chart_uvs, dtype=np.float64)
+            if np.any(np.isnan(chart_uvs)):
+                raise RuntimeError("NaN in LSCM result")
+        except (RuntimeError, ValueError):
+            chart_uvs = None
+
+        if chart_uvs is None or len(chart_uvs) == 0:
+            # Fallback: simple planar projection for failed charts
+            # Project onto the plane perpendicular to the mean normal
+            mean_normal = face_normals[chart_face_mask].mean(axis=0)
+            mean_normal = mean_normal / (np.linalg.norm(mean_normal) + 1e-10)
+            # Build tangent frame
+            up = np.array([0, 1, 0], dtype=np.float64)
+            if abs(np.dot(mean_normal, up)) > 0.9:
+                up = np.array([1, 0, 0], dtype=np.float64)
+            t1 = np.cross(mean_normal, up)
+            t1 = t1 / (np.linalg.norm(t1) + 1e-10)
+            t2 = np.cross(mean_normal, t1)
+            chart_uvs = np.column_stack([
+                (local_verts @ t1),
+                (local_verts @ t2),
+            ])
+
+        # Normalize chart UVs to [0, 1]
+        uv_min = chart_uvs.min(axis=0)
+        uv_max = chart_uvs.max(axis=0)
+        uv_span = uv_max - uv_min
+        uv_span = np.where(uv_span < 1e-10, 1.0, uv_span)
+        chart_uvs = (chart_uvs - uv_min) / uv_span
+
+        w = uv_span[0]
+        h = uv_span[1]
+
+        chart_uv_data.append((
+            chart_uvs.astype(np.float32),
+            local_faces,
+            local_verts,
+            unique_verts,
+            float(w), float(h),
+        ))
+
+    # Step 4: Pack charts into [0,1]² UV space
+    # Simple shelf packing: sort charts by height descending, place left-to-right
+    chart_uv_data.sort(key=lambda x: -x[5])
+
+    padding = 0.005
+    shelf_x = padding
+    shelf_y = padding
+    shelf_height = 0.0
+    total_area = sum(w * h for _, _, _, _, w, h in chart_uv_data) or 1.0
+
+    # Scale factor: fit all charts into unit square with padding
+    # Estimate: sqrt(total_area) gives the side length if charts were square
+    scale = (1.0 - padding * 2) / max(
+        sum(c[4] for c in chart_uv_data[:1]) if chart_uv_data else 1.0,
+        1e-10,
+    )
+    # Iteratively find a scale that fits
+    for attempt in range(20):
+        shelf_x = padding
+        shelf_y = padding
+        shelf_height = 0.0
+        fits = True
+        for _, _, _, _, w, h in chart_uv_data:
+            cw = w * scale + padding
+            ch = h * scale + padding
+            if shelf_x + cw > 1.0:
+                shelf_x = padding
+                shelf_y += shelf_height + padding
+                shelf_height = 0.0
+            if shelf_y + ch > 1.0:
+                fits = False
+                break
+            shelf_height = max(shelf_height, ch)
+            shelf_x += cw
+        if fits:
+            break
+        scale *= 0.8
+
+    # Final placement
+    shelf_x = padding
+    shelf_y = padding
+    shelf_height = 0.0
+
+    for i, (chart_uvs, local_faces, local_verts, unique_verts, w, h) in enumerate(chart_uv_data):
+        cw = w * scale
+        ch = h * scale
+
+        if shelf_x + cw + padding > 1.0:
+            shelf_x = padding
+            shelf_y += shelf_height + padding
+            shelf_height = 0.0
+
+        # Place chart
+        placed_uvs = chart_uvs.copy()
+        placed_uvs[:, 0] = shelf_x + placed_uvs[:, 0] * cw
+        placed_uvs[:, 1] = shelf_y + placed_uvs[:, 1] * ch
+
+        # Offset faces and accumulate
+        offset_faces = local_faces + vert_offset
+        all_new_verts.append(local_verts.astype(np.float32))
+        all_new_faces.append(offset_faces.astype(np.uint32))
+        all_uvs.append(placed_uvs)
+        all_vmapping.append(unique_verts)
+        vert_offset += len(local_verts)
+
+        shelf_x += cw + padding
+        shelf_height = max(shelf_height, ch)
+
+    if not all_new_verts:
+        return (vertices.astype(np.float32), faces.astype(np.uint32),
+                np.zeros((len(vertices), 2), dtype=np.float32),
+                np.arange(len(vertices), dtype=np.int64))
+
+    out_verts = np.concatenate(all_new_verts)
+    out_faces = np.concatenate(all_new_faces)
+    out_uvs = np.concatenate(all_uvs)
+    out_vmapping = np.concatenate(all_vmapping)
+
+    # Clamp UVs to [0, 1]
+    out_uvs = np.clip(out_uvs, 0.0, 1.0)
+
+    return out_verts, out_faces, out_uvs.astype(np.float32), out_vmapping
+
+
 def uv_unwrap_cube(vertices, faces):
     """UV unwrap via cube projection — fast replacement for xatlas on voxel geometry.
 
