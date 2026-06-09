@@ -100,16 +100,22 @@ def rasterize_uv_mlx(uvs, faces, texture_size=1024):
 
     start = 0
     while start < num_faces:
-        # Find chunk end that fits in memory budget
+        # Find chunk end that fits in memory budget, tracking true max dims
         end = start + 1
+        first_idx = face_order[start]
+        run_max_w = bb_max[first_idx, 0] - bb_min[first_idx, 0] + 1
+        run_max_h = bb_max[first_idx, 1] - bb_min[first_idx, 1] + 1
         while end < num_faces:
             idx = face_order[end]
             w = bb_max[idx, 0] - bb_min[idx, 0] + 1
             h = bb_max[idx, 1] - bb_min[idx, 1] + 1
-            # The largest face in a sorted chunk is the last one
-            chunk_elements = (end - start + 1) * int(w) * int(h) * 2
+            cand_max_w = max(run_max_w, w)
+            cand_max_h = max(run_max_h, h)
+            chunk_elements = (end - start + 1) * int(cand_max_w) * int(cand_max_h) * 2
             if chunk_elements > MAX_ELEMENTS:
                 break
+            run_max_w = cand_max_w
+            run_max_h = cand_max_h
             end += 1
         end = max(end, start + 1)  # always process at least one face
 
@@ -535,7 +541,7 @@ def inpaint_texture(image, mask, radius=3):
 
 def bake_texture(vertices, faces, uvs, vmapping,
                  voxel_coords, voxel_attrs, grid_size,
-                 texture_size=1024):
+                 texture_size=1024, backend="cpu"):
     """Full texture baking pipeline.
 
     Args:
@@ -547,6 +553,8 @@ def bake_texture(vertices, faces, uvs, vmapping,
         voxel_attrs: [M, 6] float32 PBR attrs (RGB, metallic, roughness, alpha)
         grid_size: int — decoder output coord space extent
         texture_size: output texture resolution
+        backend: "cpu" for numpy reference, "gpu" for MLX Metal rasterizer +
+                 vectorized sampler
 
     Returns:
         base_color: [H, W, 4] uint8 RGBA
@@ -556,10 +564,17 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     H = W = texture_size
 
+    if backend not in ("cpu", "gpu"):
+        raise ValueError(f"backend must be 'cpu' or 'gpu', got {backend!r}")
+
+    rasterize_fn = rasterize_uv_mlx if backend == "gpu" else rasterize_uv
+    sample_fn = sample_voxel_attrs_fast if backend == "gpu" else sample_voxel_attrs
+
     # Step 1: Rasterize in UV space
-    print(f"    Rasterizing UV space ({len(faces):,} tris, {H}x{W})...", flush=True)
+    label = "MLX" if backend == "gpu" else "numpy"
+    print(f"    Rasterizing UV space ({len(faces):,} tris, {H}x{W}, {label})...", flush=True)
     t0 = time.perf_counter()
-    mask, face_idx, bary = rasterize_uv_mlx(uvs, faces, texture_size)
+    mask, face_idx, bary = rasterize_fn(uvs, faces, texture_size)
     print(f"    {mask.sum():,} pixels covered ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 2: Interpolate 3D positions from barycentric coords
@@ -576,7 +591,7 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     # Step 3: Sample PBR attrs from voxel grid
     t0 = time.perf_counter()
-    sampled = sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size)
+    sampled = sample_fn(positions, voxel_coords, voxel_attrs, grid_size)
     print(f"    Sampled voxel attrs ({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Step 4: Build texture images

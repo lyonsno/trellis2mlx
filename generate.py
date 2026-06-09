@@ -176,6 +176,8 @@ def main():
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
+    parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
+                        help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
     args = parser.parse_args()
 
     mx.random.seed(args.seed)
@@ -497,6 +499,7 @@ def main():
         uv_verts, uv_faces, uvs, vmapping,
         tex_coords_spatial, tex_np, mesh_grid_size,
         texture_size=args.texture_size,
+        backend=args.texture_backend,
     )
 
     # === Export ===
