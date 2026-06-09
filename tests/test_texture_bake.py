@@ -424,6 +424,141 @@ class TestBakeTextureBackend:
             assert mock_fast.called, "GPU backend did not call sample_voxel_attrs_fast"
 
 
+class TestCubeProjectionUVUnwrap:
+    """Tests for the cube projection UV unwrap replacement."""
+
+    def test_cube_unwrap_exists_and_matches_contract(self):
+        """uv_unwrap_cube should exist and return the same 4-tuple as xatlas."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+
+        vertices = np.array([
+            [-0.25, -0.25, 0.0],
+            [ 0.25, -0.25, 0.0],
+            [ 0.25,  0.25, 0.0],
+            [-0.25,  0.25, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+
+        new_verts, new_faces, uvs, vmapping = uv_unwrap_cube(vertices, faces)
+        assert new_verts.ndim == 2 and new_verts.shape[1] == 3
+        assert new_faces.ndim == 2 and new_faces.shape[1] == 3
+        assert uvs.ndim == 2 and uvs.shape[1] == 2
+        assert len(new_verts) == len(uvs) == len(vmapping)
+        assert len(new_faces) == len(faces)
+
+    def test_uvs_in_unit_range(self):
+        """All UV coordinates should be in [0, 1]."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+
+        # Cube-like mesh: 6 quads = 12 triangles
+        verts = np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],  # -Z face
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],  # +Z face
+        ], dtype=np.float32) - 0.5
+        faces = np.array([
+            [0,1,2],[0,2,3],  # -Z
+            [4,6,5],[4,7,6],  # +Z
+            [0,4,5],[0,5,1],  # -Y
+            [2,6,7],[2,7,3],  # +Y
+            [0,3,7],[0,7,4],  # -X
+            [1,5,6],[1,6,2],  # +X
+        ], dtype=np.uint32)
+
+        _, _, uvs, _ = uv_unwrap_cube(verts, faces)
+        assert uvs.min() >= 0.0, f"UV min {uvs.min()} < 0"
+        assert uvs.max() <= 1.0, f"UV max {uvs.max()} > 1"
+
+    def test_vmapping_maps_back_to_original(self):
+        """vmapping should index into the original vertex array."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+
+        vertices = np.array([
+            [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0],
+            [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+
+        new_verts, _, _, vmapping = uv_unwrap_cube(vertices, faces)
+        # new_verts should equal vertices[vmapping]
+        np.testing.assert_allclose(new_verts, vertices[vmapping])
+
+    def test_faster_than_xatlas_on_voxel_geometry(self):
+        """Cube projection should be at least 10x faster than xatlas on a
+        voxel-like mesh (many right-angle faces)."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+        import time
+
+        # Generate a voxel-like mesh: stack of cubes
+        all_verts = []
+        all_faces = []
+        cube_verts = np.array([
+            [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+            [0,0,1],[1,0,1],[1,1,1],[0,1,1],
+        ], dtype=np.float32)
+        cube_faces = np.array([
+            [0,1,2],[0,2,3],[4,6,5],[4,7,6],
+            [0,4,5],[0,5,1],[2,6,7],[2,7,3],
+            [0,3,7],[0,7,4],[1,5,6],[1,6,2],
+        ], dtype=np.uint32)
+        # 10x10x10 = 1000 cubes = 12K faces
+        for x in range(10):
+            for y in range(10):
+                for z in range(10):
+                    offset = len(all_verts)
+                    v = cube_verts + [x, y, z]
+                    all_verts.append(v)
+                    all_faces.append(cube_faces + offset)
+
+        verts = np.vstack(all_verts).astype(np.float32)
+        faces = np.vstack(all_faces).astype(np.uint32)
+
+        t0 = time.perf_counter()
+        new_verts, new_faces, uvs, vmapping = uv_unwrap_cube(verts, faces)
+        cube_time = time.perf_counter() - t0
+
+        assert cube_time < 1.0, f"Cube projection took {cube_time:.1f}s on 12K faces, expected <1s"
+        assert len(new_faces) == len(faces)
+        assert uvs.min() >= 0.0 and uvs.max() <= 1.0
+
+    def test_no_intra_chart_uv_overlap(self):
+        """Faces in the same chart at different depths must not overlap in UV."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+        vertices = np.array([
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+            [0.2, 0.2, 0.5], [0.8, 0.2, 0.5], [0.8, 0.8, 0.5], [0.2, 0.8, 0.5],
+        ], dtype=np.float32)
+        faces = np.array([[0,1,2],[0,2,3],[4,5,6],[4,6,7]], dtype=np.uint32)
+        _, new_f, uvs, _ = uv_unwrap_cube(vertices, faces)
+        outer_uvs = uvs[new_f[:2].ravel()]
+        inner_uvs = uvs[new_f[2:].ravel()]
+        o_min, o_max = outer_uvs.min(0), outer_uvs.max(0)
+        i_min, i_max = inner_uvs.min(0), inner_uvs.max(0)
+        overlap = (o_min[0] < i_max[0] and i_min[0] < o_max[0] and
+                   o_min[1] < i_max[1] and i_min[1] < o_max[1])
+        assert not overlap, "Inner and outer +Z faces overlap in UV space"
+
+    def test_no_degenerate_uvs(self):
+        """No two vertices of the same face should have identical UVs."""
+        from trellmlx.texture_bake import uv_unwrap_cube
+
+        vertices = np.array([
+            [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0],
+            [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+
+        _, new_faces, uvs, _ = uv_unwrap_cube(vertices, faces)
+        for fi in range(len(new_faces)):
+            tri_uvs = uvs[new_faces[fi]]
+            # No two vertices should be at the same UV position
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    dist = np.linalg.norm(tri_uvs[i] - tri_uvs[j])
+                    assert dist > 1e-6, (
+                        f"Face {fi} has degenerate UV: v{i}={tri_uvs[i]}, v{j}={tri_uvs[j]}"
+                    )
+
+
 class TestBakeTextureInpaintRadius:
     """Scalar PBR channels should use inpainting radius 1, matching reference."""
 

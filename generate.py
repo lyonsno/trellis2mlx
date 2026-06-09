@@ -90,6 +90,44 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     return unique_coords
 
 
+def _select_uv_method(method, vertices, faces):
+    """Select UV unwrap function based on method and mesh geometry.
+
+    Returns (unwrap_fn, method_name).
+    """
+    from trellmlx.texture_bake import uv_unwrap, uv_unwrap_cube
+
+    if method == "cube":
+        return uv_unwrap_cube, "cube"
+    if method == "xatlas":
+        return uv_unwrap, "xatlas"
+
+    # Auto: use cube projection for voxel-heavy geometry, xatlas for smooth
+    # Heuristic: compute face normal variance — voxel meshes have normals
+    # tightly clustered around 6 axis directions
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    normals = np.cross(v1 - v0, v2 - v0)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-10, 1.0, norms)
+    normals = normals / norms
+
+    # For each face, measure how close its normal is to the nearest axis
+    abs_normals = np.abs(normals)
+    axis_alignment = abs_normals.max(axis=1)  # 1.0 = perfectly axis-aligned
+    mean_alignment = axis_alignment.mean()
+
+    # Voxel meshes: mean alignment > 0.95 (most faces are axis-aligned)
+    # Smooth meshes: mean alignment ~ 0.6-0.8
+    if mean_alignment > 0.9:
+        print(f"  Auto UV: cube projection (axis alignment {mean_alignment:.2f})", flush=True)
+        return uv_unwrap_cube, "cube"
+    else:
+        print(f"  Auto UV: xatlas (axis alignment {mean_alignment:.2f})", flush=True)
+        return uv_unwrap, "xatlas"
+
+
 def _cleanup_and_simplify_mesh(
     vertices,
     faces,
@@ -190,6 +228,8 @@ def main():
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
+    parser.add_argument("--uv-method", choices=["auto", "xatlas", "cube"], default="auto",
+                        help="UV unwrap method: auto (cube for voxel, xatlas for smooth), xatlas, or cube")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
@@ -226,10 +266,11 @@ def main():
             )
 
             # Jump straight to texture baking
-            from trellmlx.texture_bake import uv_unwrap, bake_texture
+            from trellmlx.texture_bake import bake_texture
+            unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
             t0 = time.perf_counter()
-            uv_verts, uv_faces, uvs, vmapping = uv_unwrap(vertices, faces)
-            print(f"  UV unwrap: {len(uv_verts):,}V {len(uv_faces):,}F "
+            uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
+            print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
             base_color, metallic_roughness, alpha_mode = bake_texture(
@@ -596,14 +637,15 @@ def main():
 
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
-    from trellmlx.texture_bake import uv_unwrap, bake_texture
+    from trellmlx.texture_bake import uv_unwrap, uv_unwrap_cube, bake_texture
 
     tex_coords_spatial = np.array(tex_coords)[:, 1:4]  # drop batch dim
 
     # UV unwrap
+    unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
     t0 = time.perf_counter()
-    uv_verts, uv_faces, uvs, vmapping = uv_unwrap(vertices, faces)
-    print(f"  UV unwrap: {len(uv_verts):,}V {len(uv_faces):,}F "
+    uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
+    print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Bake PBR textures

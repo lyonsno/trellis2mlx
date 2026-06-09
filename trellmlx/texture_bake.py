@@ -38,6 +38,162 @@ def uv_unwrap(vertices, faces):
     return new_vertices, new_faces, uvs, vmapping
 
 
+def uv_unwrap_cube(vertices, faces):
+    """UV unwrap via cube projection — fast replacement for xatlas on voxel geometry.
+
+    Classifies each face by dominant normal axis (±X, ±Y, ±Z), projects onto
+    that plane, then packs the 6 chart groups into [0,1]² UV space using a
+    simple 3×2 grid layout.
+
+    Much faster than xatlas on voxel/boxy geometry where chart boundary
+    optimization is pathologically slow. Quality is lower (no distortion
+    minimization), but acceptable when textures are sampled from voxel data
+    and seams are inpainted.
+
+    Args:
+        vertices: [V, 3] float32
+        faces: [F, 3] int
+
+    Returns:
+        new_vertices: [V', 3] float32 (vertices may be duplicated at chart seams)
+        new_faces: [F, 3] uint32
+        uvs: [V', 2] float32 in [0, 1]
+        vmapping: [V'] int — maps new vertex indices to original vertex indices
+    """
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    F = len(faces)
+
+    # Compute face normals
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    normals = np.cross(v1 - v0, v2 - v0)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-10, 1.0, norms)
+    normals = normals / norms
+
+    # Classify each face to one of 6 axis-aligned directions
+    abs_normals = np.abs(normals)
+    dominant_axis = abs_normals.argmax(axis=1)  # 0=X, 1=Y, 2=Z
+    sign = np.sign(normals[np.arange(F), dominant_axis])
+    sign = np.where(sign == 0, 1.0, sign)
+    # Chart ID: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+    chart_id = dominant_axis * 2 + (sign < 0).astype(np.int32)
+
+    # Projection axes for each chart:
+    # +X: project onto (Y, Z)  -X: project onto (Y, Z)
+    # +Y: project onto (X, Z)  -Y: project onto (X, Z)
+    # +Z: project onto (X, Y)  -Z: project onto (X, Y)
+    proj_u = np.array([1, 1, 0, 0, 0, 0], dtype=np.int32)  # which axis → U
+    proj_v = np.array([2, 2, 2, 2, 1, 1], dtype=np.int32)  # which axis → V
+
+    # Build new vertex arrays — each face gets its own 3 vertices
+    # (seam splitting: no shared vertices across chart boundaries)
+    # Vectorized: expand faces into [F*3] vertex indices
+    vmapping = faces.ravel()  # [F*3] original vertex indices
+    new_verts = vertices[vmapping]  # [F*3, 3]
+    new_faces = np.arange(F * 3, dtype=np.uint32).reshape(F, 3)
+
+    # Project UVs: for each vertex, pick axes based on its face's chart
+    per_face_u_axis = proj_u[chart_id]  # [F]
+    per_face_v_axis = proj_v[chart_id]  # [F]
+    # Expand to per-vertex (3 verts per face)
+    u_axis_per_vert = np.repeat(per_face_u_axis, 3)  # [F*3]
+    v_axis_per_vert = np.repeat(per_face_v_axis, 3)  # [F*3]
+
+    uvs = np.empty((F * 3, 2), dtype=np.float32)
+    uvs[:, 0] = new_verts[np.arange(F * 3), u_axis_per_vert]
+    uvs[:, 1] = new_verts[np.arange(F * 3), v_axis_per_vert]
+
+    # Compute per-face depth for sub-charting (prevents UV overlap at different depths)
+    face_centroids = (v0 + v1 + v2) / 3.0  # [F, 3]
+    depth_axis_map = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
+    per_face_depth_axis = depth_axis_map[chart_id]  # [F]
+    face_depth = face_centroids[np.arange(F), per_face_depth_axis]  # [F]
+
+    # Assign each face a unique sub-chart key: (chart_id, depth_rank_within_chart)
+    # Vectorized: no per-layer Python loops
+    face_depth_rounded = np.round(face_depth, decimals=4)
+
+    # Build composite key for unique (chart, depth) groups
+    # Offset depths per chart so different charts don't collide
+    chart_depth_key = chart_id.astype(np.float64) * 1e10 + face_depth_rounded
+
+    # Assign dense group IDs
+    unique_keys, face_group = np.unique(chart_depth_key, return_inverse=True)
+    n_groups = len(unique_keys)
+
+    # Expand to per-vertex
+    group_per_vert = np.repeat(face_group, 3)  # [F*3]
+    chart_per_vert = np.repeat(chart_id, 3)    # [F*3]
+
+    # For each group, compute the UV normalization (min/max) vectorized
+    # using a scatter-gather approach
+    vert_indices = np.arange(F * 3)
+
+    # Per-group min/max of projected UVs
+    group_u_min = np.full(n_groups, np.inf, dtype=np.float64)
+    group_u_max = np.full(n_groups, -np.inf, dtype=np.float64)
+    group_v_min = np.full(n_groups, np.inf, dtype=np.float64)
+    group_v_max = np.full(n_groups, -np.inf, dtype=np.float64)
+
+    np.minimum.at(group_u_min, group_per_vert, uvs[:, 0])
+    np.maximum.at(group_u_max, group_per_vert, uvs[:, 0])
+    np.minimum.at(group_v_min, group_per_vert, uvs[:, 1])
+    np.maximum.at(group_v_max, group_per_vert, uvs[:, 1])
+
+    # Per-group span
+    group_u_span = group_u_max - group_u_min
+    group_v_span = group_v_max - group_v_min
+    group_u_span = np.where(group_u_span < 1e-10, 1.0, group_u_span)
+    group_v_span = np.where(group_v_span < 1e-10, 1.0, group_v_span)
+
+    # Normalize UVs to [0,1] within each group
+    uvs[:, 0] = (uvs[:, 0] - group_u_min[group_per_vert]) / group_u_span[group_per_vert]
+    uvs[:, 1] = (uvs[:, 1] - group_v_min[group_per_vert]) / group_v_span[group_per_vert]
+
+    # Now pack groups into the 3x2 grid. Each chart cell is subdivided
+    # vertically by its depth layers.
+    padding = 0.02
+    grid_col = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
+    grid_row = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
+    cell_w = (1.0 - padding * 4) / 3
+    cell_h = (1.0 - padding * 3) / 2
+
+    # Count depth layers per chart and assign layer index within chart
+    # (which layer within this chart's cell does this group belong to?)
+    group_chart = np.round(unique_keys / 1e10).astype(np.int32)  # recover chart_id per group
+    layer_within_chart = np.zeros(n_groups, dtype=np.int32)
+    layers_per_chart = np.zeros(6, dtype=np.int32)
+
+    for cid in range(6):
+        gmask = group_chart == cid
+        n_layers = gmask.sum()
+        layers_per_chart[cid] = max(n_layers, 1)
+        if n_layers > 0:
+            layer_within_chart[gmask] = np.arange(n_layers)
+
+    # Compute per-group grid offsets (vectorized across all groups)
+    g_cid = group_chart  # [n_groups]
+    g_col = grid_col[g_cid]
+    g_row = grid_row[g_cid]
+    g_n_layers = layers_per_chart[g_cid]
+    g_layer = layer_within_chart
+
+    g_x_off = padding + g_col * (cell_w + padding)
+    g_y_off = padding + g_row * (cell_h + padding)
+    g_layer_h = cell_h / g_n_layers
+    g_layer_padding = padding * 0.5 / g_n_layers
+    g_ly_off = g_y_off + g_layer * (g_layer_h + g_layer_padding)
+
+    # Apply grid transform to all vertices at once
+    uvs[:, 0] = g_x_off[group_per_vert] + uvs[:, 0] * cell_w
+    uvs[:, 1] = g_ly_off[group_per_vert] + uvs[:, 1] * (g_layer_h[group_per_vert] - g_layer_padding[group_per_vert])
+
+    return new_verts, new_faces, uvs.astype(np.float32), vmapping
+
+
 def rasterize_uv_mlx(uvs, faces, texture_size=1024):
     """GPU-accelerated UV-space rasterization via MLX on Metal.
 
