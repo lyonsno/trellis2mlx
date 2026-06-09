@@ -19,7 +19,7 @@ def test_postprocess_skips_final_simplify_if_cleanup_drops_below_target():
     simplify_calls = []
     cleanup_calls = []
 
-    def cleanup_mesh(v, faces, verbose=True):
+    def cleanup_mesh(v, faces, keep_largest=False, verbose=True):
         cleanup_calls.append((len(faces), verbose))
         return v, cleanup_outputs.pop(0)
 

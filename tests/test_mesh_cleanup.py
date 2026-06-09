@@ -234,18 +234,52 @@ class TestCleanupMeshIntegration:
         # Add a duplicate face
         faces = np.vstack([faces, faces[0:1]])
 
+        # Default cleanup preserves all components (floater survives)
         cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
+        assert len(cleaned_f) >= 10  # dedup removes 1, both components remain
 
-        # Floater removed (1 face), duplicate removed (1 face), hole filled (adds faces).
-        # 12 input → 10 after dedup+floater → 14 after hole fill (4 fan tris for top).
-        # The key invariant: no floater vertices remain, no duplicate faces remain.
-        assert len(cleaned_f) >= 10  # at least the original non-duplicate faces
-
-        # Verify no floater vertices (all vertices should be within the box's range)
-        assert cleaned_v[:, 0].max() <= 0.01  # floater was at x=10
+        # With keep_largest, floater is removed
+        cleaned_v2, cleaned_f2 = cleanup_mesh(verts, faces, keep_largest=True, verbose=False)
+        assert len(cleaned_f2) >= 10
+        assert cleaned_v2[:, 0].max() <= 0.01  # floater at x=10 is gone
 
     def test_already_clean_mesh(self):
         verts, faces = _make_tetrahedron()
         cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
         # Tetrahedron is watertight, no floaters, no duplicates
         assert len(cleaned_f) == len(faces)
+
+
+class TestKeepLargestIsOptIn:
+    """keep_largest_component should NOT run by default in cleanup_mesh.
+
+    The default cleanup should preserve all components so we see everything
+    the model generated. keep_largest is opt-in via the keep_largest param.
+    """
+
+    def test_default_cleanup_preserves_multiple_components(self):
+        """Two separate tetrahedra should both survive default cleanup."""
+        v1, f1 = _make_tetrahedron()
+        v2, f2 = _make_tetrahedron(offset=[5, 5, 5])
+        # Combine into one mesh with two disconnected components
+        f2_shifted = f2 + len(v1)
+        verts = np.vstack([v1, v2])
+        faces = np.vstack([f1, f2_shifted])
+
+        cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
+        # Both components should survive — 8 faces total (4 + 4)
+        assert len(cleaned_f) == 8
+
+    def test_keep_largest_removes_smaller_component(self):
+        """With keep_largest=True, only the largest component survives."""
+        v1, f1 = _make_tetrahedron()
+        v2, f2 = _make_tetrahedron(offset=[5, 5, 5])
+        f2_shifted = f2 + len(v1)
+        verts = np.vstack([v1, v2])
+        faces = np.vstack([f1, f2_shifted])
+
+        cleaned_v, cleaned_f = cleanup_mesh(
+            verts, faces, keep_largest=True, verbose=False,
+        )
+        # Equal-size components: one gets kept, one removed → 4 faces
+        assert len(cleaned_f) == 4

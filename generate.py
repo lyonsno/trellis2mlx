@@ -92,6 +92,7 @@ def _cleanup_and_simplify_mesh(
     *,
     target_faces,
     no_cleanup,
+    keep_largest=False,
     cleanup_mesh=None,
     simplify=None,
     log=print,
@@ -101,7 +102,7 @@ def _cleanup_and_simplify_mesh(
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
         t0 = time.perf_counter()
-        vertices, faces = cleanup_mesh(vertices, faces)
+        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
         log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
 
     if not target_faces or len(faces) <= target_faces:
@@ -121,7 +122,7 @@ def _cleanup_and_simplify_mesh(
         )
         log(f"  Coarse simplify: {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
         if not no_cleanup:
-            vertices, faces = cleanup_mesh(vertices, faces, verbose=False)
+            vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, verbose=False)
 
     if len(faces) <= target_faces:
         return vertices, faces
@@ -146,7 +147,7 @@ def _cleanup_and_simplify_mesh(
         f"({time.perf_counter()-t0:.1f}s)", flush=True)
     if did_final_simplify and not no_cleanup:
         t0 = time.perf_counter()
-        vertices, faces = cleanup_mesh(vertices, faces)
+        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
         log(f"  Cleanup pass 2: {time.perf_counter()-t0:.1f}s", flush=True)
 
     return vertices, faces
@@ -170,7 +171,9 @@ def main():
     parser.add_argument("--no-rembg", action="store_true",
                         help="Skip background removal (rembg) preprocessing")
     parser.add_argument("--no-cleanup", action="store_true",
-                        help="Skip mesh cleanup (keep all components, no hole fill)")
+                        help="Skip mesh cleanup entirely (no dedup, no repair, no hole fill)")
+    parser.add_argument("--keep-largest", action="store_true",
+                        help="Keep only the largest connected component (removes floors, floaters, extra objects)")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     args = parser.parse_args()
@@ -413,6 +416,7 @@ def main():
         faces,
         target_faces=args.target_faces,
         no_cleanup=args.no_cleanup,
+        keep_largest=args.keep_largest,
     )
 
     # === Stage 4: Texture SLat ===

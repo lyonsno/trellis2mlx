@@ -18,23 +18,28 @@ def cleanup_mesh(
     faces: np.ndarray,
     *,
     max_hole_perimeter: float = 3e-2,
+    keep_largest: bool = False,
     do_fix_normals: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean up a raw decoder mesh.
 
-    Matches the reference TRELLIS.2 postprocessing pipeline:
+    Pipeline:
     1. Remove duplicate faces
     2. Repair non-manifold edges
-    3. Keep only the largest connected component
+    3. (Optional) Keep only the largest connected component
     4. Fill small holes
     5. Fix normals/winding consistency (optional, skip for intermediate passes)
+
+    By default, all components are preserved so multi-object generations
+    remain visible. Pass ``keep_largest=True`` for single-object output.
 
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
         max_hole_perimeter: Fill holes with perimeter smaller than this (world-space
             units). Matches reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
+        keep_largest: If True, discard all components except the largest.
         do_fix_normals: Run winding unification. The reference only does this once
             at the end, so callers can skip it for intermediate cleanup passes
             before simplification.
@@ -53,8 +58,9 @@ def cleanup_mesh(
     # Step 2: Repair non-manifold edges
     vertices, faces = repair_non_manifold_edges(vertices, faces, verbose)
 
-    # Step 3: Keep only the largest connected component
-    vertices, faces = keep_largest_component(vertices, faces, verbose)
+    # Step 3: Optionally keep only the largest connected component
+    if keep_largest:
+        vertices, faces = keep_largest_component(vertices, faces, verbose)
 
     # Step 4: Fill small holes on the remaining mesh
     vertices, faces = fill_small_holes(
