@@ -9,8 +9,11 @@ while avoiding the known Metal scheduler risk of hidden process fanout.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
+import socket
 import subprocess
 import sys
 import threading
@@ -68,6 +71,50 @@ class BatchRunOptions:
     report_path: Path | str | None = None
     log_dir: Path | str | None = None
     python_executable: str = sys.executable
+    command_line: tuple[str, ...] = field(default_factory=lambda: tuple(sys.argv))
+
+
+@dataclass(frozen=True)
+class BatchCheckoutIdentity:
+    """Source checkout identity for measurement evidence."""
+
+    repo_root: str
+    git_commit: str | None
+    git_branch: str | None
+    git_dirty: bool | None
+
+
+@dataclass(frozen=True)
+class BatchHostIdentity:
+    """Host identity for measurement evidence."""
+
+    hostname: str
+    os_system: str
+    os_release: str
+    os_version: str
+    machine: str
+    processor: str
+    chip: str | None
+    memory_bytes: int | None
+
+
+@dataclass(frozen=True)
+class BatchRuntimeIdentity:
+    """Python and MLX runtime identity for measurement evidence."""
+
+    python_version: str
+    python_executable: str
+    mlx_version: str | None
+
+
+@dataclass(frozen=True)
+class BatchRunIdentity:
+    """Route identity attached to every batch report."""
+
+    command_line: tuple[str, ...]
+    checkout: BatchCheckoutIdentity
+    host: BatchHostIdentity
+    runtime: BatchRuntimeIdentity
 
 
 @dataclass(frozen=True)
@@ -98,6 +145,7 @@ class BatchRunReport:
     effective_concurrency: int
     diagnostics: list[str]
     repo_root: str
+    identity: BatchRunIdentity
     results: list[BatchJobResult] = field(default_factory=list)
 
     @property
@@ -220,6 +268,11 @@ def run_batch(
         effective_concurrency=effective_concurrency,
         diagnostics=diagnostics,
         repo_root=str(repo_root),
+        identity=collect_run_identity(
+            repo_root=repo_root,
+            command_line=options.command_line,
+            python_executable=options.python_executable,
+        ),
         results=[results_by_index[index] for index in sorted(results_by_index)],
     )
 
@@ -374,6 +427,108 @@ def _subprocess_env(repo_root: Path) -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": pythonpath}
 
 
+def collect_run_identity(
+    repo_root: Path,
+    command_line: Sequence[str],
+    python_executable: str,
+) -> BatchRunIdentity:
+    """Collect route identity for evidence-bearing batch reports."""
+
+    return BatchRunIdentity(
+        command_line=tuple(command_line),
+        checkout=_collect_checkout_identity(repo_root),
+        host=_collect_host_identity(),
+        runtime=BatchRuntimeIdentity(
+            python_version=sys.version,
+            python_executable=python_executable,
+            mlx_version=_package_version("mlx"),
+        ),
+    )
+
+
+def _collect_checkout_identity(repo_root: Path) -> BatchCheckoutIdentity:
+    return BatchCheckoutIdentity(
+        repo_root=str(repo_root),
+        git_commit=_git_stdout(repo_root, "rev-parse", "HEAD"),
+        git_branch=_git_stdout(repo_root, "branch", "--show-current"),
+        git_dirty=_git_dirty(repo_root),
+    )
+
+
+def _collect_host_identity() -> BatchHostIdentity:
+    return BatchHostIdentity(
+        hostname=socket.gethostname(),
+        os_system=platform.system(),
+        os_release=platform.release(),
+        os_version=platform.version(),
+        machine=platform.machine(),
+        processor=platform.processor(),
+        chip=_sysctl_value("machdep.cpu.brand_string") or None,
+        memory_bytes=_sysctl_int("hw.memsize"),
+    )
+
+
+def _git_stdout(repo_root: Path, *args: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _git_dirty(repo_root: Path) -> bool | None:
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
+def _sysctl_value(name: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _sysctl_int(name: str) -> int | None:
+    value = _sysctl_value(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def _parse_ints(raw: str) -> tuple[int, ...]:
     values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
     if not values:
@@ -404,7 +559,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8])
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--no-cleanup", action="store_true")
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    raw_argv = list(argv) if argv is not None else None
+    args = parser.parse_args(raw_argv)
+    command_line = (
+        tuple(sys.argv)
+        if raw_argv is None
+        else ("python", "-m", "trellmlx.batch_inference", *raw_argv)
+    )
 
     request = BatchRequest(
         images=tuple(args.image),
@@ -429,6 +590,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             report_path=args.report,
             log_dir=args.log_dir,
             python_executable=args.python,
+            command_line=command_line,
         ),
     )
 

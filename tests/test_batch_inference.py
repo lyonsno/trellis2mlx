@@ -183,6 +183,52 @@ print("stdout-done", flush=True)
     assert json.loads(report_path.read_text())["results"][0]["stdout_log_path"] == str(stdout_log)
 
 
+def test_run_batch_persists_route_identity_for_measurement(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
+
+    def runner(cmd, cwd, env, capture_output, text):
+        output_path = cmd[cmd.index("--output") + 1]
+        with open(output_path, "wb") as handle:
+            handle.write(b"glb")
+        return subprocess.CompletedProcess(cmd, 0, stdout="saved\n", stderr="")
+
+    report_path = tmp_path / "report.json"
+
+    run_batch(
+        [BatchJob(images=("a.png",), seed=1, output_path=tmp_path / "out" / "one.glb")],
+        BatchRunOptions(
+            max_concurrent=1,
+            repo_root=tmp_path,
+            report_path=report_path,
+            python_executable="python-test",
+            command_line=("python", "-m", "trellmlx.batch_inference", "--seeds", "1"),
+        ),
+        runner=runner,
+    )
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["identity"]["command_line"] == [
+        "python",
+        "-m",
+        "trellmlx.batch_inference",
+        "--seeds",
+        "1",
+    ]
+    assert persisted["identity"]["checkout"]["repo_root"] == str(tmp_path)
+    assert set(persisted["identity"]["checkout"]) >= {
+        "repo_root",
+        "git_commit",
+        "git_branch",
+        "git_dirty",
+    }
+    assert persisted["identity"]["host"]["hostname"]
+    assert persisted["identity"]["host"]["os_system"]
+    assert "memory_bytes" in persisted["identity"]["host"]
+    assert persisted["identity"]["runtime"]["python_executable"] == "python-test"
+    assert persisted["identity"]["runtime"]["python_version"] == sys.version
+    assert "mlx_version" in persisted["identity"]["runtime"]
+
+
 def test_run_batch_prepends_repo_root_to_existing_pythonpath(tmp_path, monkeypatch):
     from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
 
