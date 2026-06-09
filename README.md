@@ -132,12 +132,28 @@ Divergence is monotonic precision accumulation (bf16 -> fp16), not architectural
 
 ### Quantization (experimental)
 
-INT4 quantization via MLX reduces model weight memory 6.4×:
+`generate.py --quantize 4` uses MLX INT4 quantization on the four flow models
+(sparse structure, LR shape SLat, HR shape SLat, and texture SLat). This reduces
+flow-model weight memory by about 6.4x, which is useful for packaging and tighter memory
+budgets, but there was no speedup on the measured M2 Pro route.
 
 | | FP16 | INT4 |
 |---|---|---|
 | Weight memory | 5.17 GB | 0.81 GB |
 | Forward pass | works | works |
+
+M2 Pro / MLX 0.31.2 stage benchmark, one warmup step plus two timed sampler
+steps:
+
+| Stage | FP16 | INT8 | INT4 |
+|---|---:|---:|---:|
+| Sparse-structure flow, 16³ grid | 9.56s/step | 10.62s/step | 10.70s/step |
+| SLat flow, 12,043 tokens | 47.57s/step | 49.94s/step | 52.35s/step |
+
+So the current tradeoff is memory/packaging only: INT8 and INT4 were slower than
+FP16 in this benchmark. Further speedups likely need fewer sampler steps,
+stage/model reuse, batching, or fused kernels rather than weight-only
+quantization.
 
 ### Roadmap
 
@@ -163,7 +179,7 @@ INT4 quantization via MLX reduces model weight memory 6.4×:
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
 - [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
 - [ ] Public demo polish and seed/input curation
-- [ ] INT4 speed benchmarks
+- [x] M2 Pro INT4/INT8 flow-stage speed benchmark (no speedup measured)
 - [x] `mx.compile` investigation (no speedup — eager dispatch is already optimal for 30-block DiT)
 - [ ] Native macOS/iOS app (PyObjC/SwiftUI shell first, MLX Swift route later)
 
