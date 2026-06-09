@@ -234,6 +234,41 @@ def new_job_traces(jobs: Iterable[GenerationJob]) -> dict[str, GenerationJobTrac
 
 
 @dataclass(frozen=True)
+class StageExecutionContext:
+    """Runtime-only reusable handles available to every stage handler.
+
+    Handles may be Python objects in this implementation, but metadata stays
+    scalar and portable so the same lifecycle contract can be reimplemented in
+    MLX Swift.
+    """
+
+    run_id: str
+    handles: Mapping[str, object] = field(default_factory=dict)
+    handle_metadata: Mapping[str, Mapping[str, StageArtifactValue]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            raise ValueError("StageExecutionContext requires a run_id")
+        handles = dict(self.handles)
+        metadata = {handle_id: _validate_artifacts(values) for handle_id, values in self.handle_metadata.items()}
+        unknown_metadata = sorted(set(metadata) - set(handles))
+        if unknown_metadata:
+            raise ValueError(f"metadata for unknown handle_id: {', '.join(unknown_metadata)}")
+        object.__setattr__(self, "handles", handles)
+        object.__setattr__(self, "handle_metadata", metadata)
+
+    @property
+    def handle_ids(self) -> tuple[str, ...]:
+        return tuple(self.handles)
+
+    def require_handle(self, handle_id: str) -> object:
+        try:
+            return self.handles[handle_id]
+        except KeyError as exc:
+            raise KeyError(f"missing stage execution handle: {handle_id}") from exc
+
+
+@dataclass(frozen=True)
 class StageRunnerOutput:
     """State update returned by a stage handler.
 
@@ -312,7 +347,20 @@ class JobState:
         return replace(self, artifacts=_validate_artifacts({**self.artifacts, **artifacts}))
 
 
-StageHandler = Callable[[GenerationStageInvocation, JobState], StageRunnerOutput | GenerationStageResult]
+StageHandler = Callable[
+    [GenerationStageInvocation, JobState, StageExecutionContext],
+    StageRunnerOutput | GenerationStageResult,
+]
+StageContextFactory = Callable[[InterleavedBatchPlan], StageExecutionContext]
+StageContextCloser = Callable[[StageExecutionContext], None]
+
+
+def _default_context_factory(plan: InterleavedBatchPlan) -> StageExecutionContext:
+    return StageExecutionContext(run_id="stage-runner", handles={})
+
+
+def _noop_context_closer(context: StageExecutionContext) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -320,6 +368,8 @@ class StageRunResult:
     """Final state for a stage-major runner invocation."""
 
     job_states: Mapping[str, JobState]
+    context: StageExecutionContext
+    context_closed: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "job_states", dict(self.job_states))
@@ -337,12 +387,16 @@ class StageRunner:
         plan: InterleavedBatchPlan,
         *,
         handlers: Mapping[str, StageHandler],
+        context_factory: StageContextFactory | None = None,
+        context_closer: StageContextCloser | None = None,
     ) -> None:
         missing = [stage for stage in plan.stages if stage not in handlers]
         if missing:
             raise ValueError(f"missing stage handlers: {', '.join(missing)}")
         self.plan = plan
         self.handlers = dict(handlers)
+        self.context_factory = context_factory or _default_context_factory
+        self.context_closer = context_closer or _noop_context_closer
 
     def run(self, initial_states: Mapping[str, JobState] | None = None) -> StageRunResult:
         planned_ids = {job.job_id for job in self.plan.jobs}
@@ -365,13 +419,19 @@ class StageRunner:
                     )
                 states[job.job_id] = state
 
-        for invocation in self.plan.iter_invocations():
-            state = states[invocation.job_id]
-            if not state.ok:
-                continue
-            output = self.handlers[invocation.stage](invocation, state)
-            if isinstance(output, GenerationStageResult):
-                output = StageRunnerOutput(result=output)
-            states[invocation.job_id] = state.record_stage(invocation, output)
+        context = self.context_factory(self.plan)
+        context_closed = False
+        try:
+            for invocation in self.plan.iter_invocations():
+                state = states[invocation.job_id]
+                if not state.ok:
+                    continue
+                output = self.handlers[invocation.stage](invocation, state, context)
+                if isinstance(output, GenerationStageResult):
+                    output = StageRunnerOutput(result=output)
+                states[invocation.job_id] = state.record_stage(invocation, output)
+        finally:
+            self.context_closer(context)
+            context_closed = True
 
-        return StageRunResult(job_states=states)
+        return StageRunResult(job_states=states, context=context, context_closed=context_closed)

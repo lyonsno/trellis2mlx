@@ -174,14 +174,14 @@ def test_stage_runner_executes_stage_major_and_preserves_job_state(tmp_path):
     plan = InterleavedBatchPlan(jobs=jobs, stages=("image_conditioning", "sparse_structure"))
     calls = []
 
-    def image_conditioning(invocation, state):
+    def image_conditioning(invocation, state, context):
         calls.append((invocation.stage, invocation.job_id, state.next_stage_index))
         return StageRunnerOutput(
             result=GenerationStageResult(invocation.stage, elapsed_seconds=0.01),
             artifacts={"conditioning_seed": invocation.stage_seed},
         )
 
-    def sparse_structure(invocation, state):
+    def sparse_structure(invocation, state, context):
         calls.append((invocation.stage, invocation.job_id, state.next_stage_index))
         assert state.artifacts["conditioning_seed"] == derive_stage_seed(
             job_seed=invocation.seed,
@@ -234,7 +234,7 @@ def test_stage_runner_captures_failure_phase_and_skips_failed_job(tmp_path):
     plan = InterleavedBatchPlan(jobs=jobs, stages=("sparse_structure", "export"))
     calls = []
 
-    def sparse_structure(invocation, state):
+    def sparse_structure(invocation, state, context):
         calls.append((invocation.stage, invocation.job_id))
         if invocation.job_id == "bad":
             return GenerationStageResult(
@@ -244,7 +244,7 @@ def test_stage_runner_captures_failure_phase_and_skips_failed_job(tmp_path):
             )
         return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
 
-    def export(invocation, state):
+    def export(invocation, state, context):
         calls.append((invocation.stage, invocation.job_id))
         return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
 
@@ -272,7 +272,7 @@ def test_stage_runner_requires_handlers_for_all_stages(tmp_path):
     plan = InterleavedBatchPlan(jobs=(job,), stages=("image_conditioning", "export"))
 
     with pytest.raises(ValueError, match="missing stage handlers: export"):
-        StageRunner(plan, handlers={"image_conditioning": lambda invocation, state: None})
+        StageRunner(plan, handlers={"image_conditioning": lambda invocation, state, context: None})
 
 
 def test_stage_state_rejects_nonportable_artifacts(tmp_path):
@@ -308,7 +308,12 @@ def test_stage_runner_rejects_initial_states_outside_plan(tmp_path):
     plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
     runner = StageRunner(
         plan,
-        handlers={"stage": lambda invocation, state: GenerationStageResult(invocation.stage, elapsed_seconds=0.0)},
+        handlers={
+            "stage": lambda invocation, state, context: GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.0,
+            )
+        },
     )
 
     with pytest.raises(ValueError, match="missing initial state for job_id: seed-101"):
@@ -325,3 +330,176 @@ def test_stage_runner_rejects_initial_states_outside_plan(tmp_path):
 
     with pytest.raises(ValueError, match="unexpected initial state job_id: unplanned-failed"):
         runner.run(initial_states={"seed-101": JobState.from_job(job), "unplanned-failed": extra})
+
+
+def test_stage_execution_context_validates_metadata_and_requires_handles():
+    from trellmlx.interleaved_generation import StageExecutionContext
+
+    handle = object()
+    context = StageExecutionContext(
+        run_id="fixture-run",
+        handles={"dinov3": handle},
+        handle_metadata={"dinov3": {"kind": "fixture", "warm": True}},
+    )
+
+    assert context.require_handle("dinov3") is handle
+    assert context.handle_ids == ("dinov3",)
+    assert context.handle_metadata["dinov3"] == {"kind": "fixture", "warm": True}
+
+    with pytest.raises(ValueError, match="artifact values must be bool, int, float, or str"):
+        StageExecutionContext(
+            run_id="bad-metadata",
+            handles={"dinov3": handle},
+            handle_metadata={"dinov3": {"tensor_like": [1, 2, 3]}},
+        )
+
+    with pytest.raises(KeyError, match="missing stage execution handle: sparse_structure"):
+        context.require_handle("sparse_structure")
+
+
+def test_stage_runner_passes_context_to_every_handler_and_closes_once(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageExecutionContext,
+        StageRunner,
+        StageRunnerOutput,
+    )
+
+    jobs = (
+        GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb"),
+        GenerationJob("seed-202", ("subject.png",), 202, tmp_path / "seed-202.glb"),
+    )
+    plan = InterleavedBatchPlan(jobs=jobs, stages=("image_conditioning", "sparse_structure"))
+    handle = object()
+    events = []
+    context_ids = []
+
+    def open_context(open_plan):
+        events.append(("open", tuple(job.job_id for job in open_plan.jobs)))
+        return StageExecutionContext(
+            run_id="fixture-run",
+            handles={"dinov3": handle},
+            handle_metadata={"dinov3": {"kind": "fixture"}},
+        )
+
+    def close_context(context):
+        events.append(("close", context.run_id, context.handle_ids))
+
+    def image_conditioning(invocation, state, context):
+        assert context.require_handle("dinov3") is handle
+        context_ids.append(id(context))
+        return StageRunnerOutput(
+            result=GenerationStageResult(invocation.stage, elapsed_seconds=0.01),
+            artifacts={"context_seen": context.run_id},
+        )
+
+    def sparse_structure(invocation, state, context):
+        assert state.artifacts["context_seen"] == "fixture-run"
+        assert context.require_handle("dinov3") is handle
+        context_ids.append(id(context))
+        return GenerationStageResult(invocation.stage, elapsed_seconds=0.02)
+
+    result = StageRunner(
+        plan,
+        handlers={
+            "image_conditioning": image_conditioning,
+            "sparse_structure": sparse_structure,
+        },
+        context_factory=open_context,
+        context_closer=close_context,
+    ).run()
+
+    assert result.ok is True
+    assert result.context.run_id == "fixture-run"
+    assert result.context_closed is True
+    assert len(set(context_ids)) == 1
+    assert events == [
+        ("open", ("seed-101", "seed-202")),
+        ("close", "fixture-run", ("dinov3",)),
+    ]
+
+
+def test_stage_runner_closes_context_when_one_job_fails(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageExecutionContext,
+        StageRunner,
+    )
+
+    jobs = (
+        GenerationJob("ok", ("subject.png",), 101, tmp_path / "ok.glb"),
+        GenerationJob("bad", ("subject.png",), 202, tmp_path / "bad.glb"),
+    )
+    plan = InterleavedBatchPlan(jobs=jobs, stages=("sparse_structure", "export"))
+    events = []
+
+    def open_context(open_plan):
+        events.append(("open", len(open_plan.jobs)))
+        return StageExecutionContext(run_id="failure-run", handles={"shape": object()})
+
+    def close_context(context):
+        events.append(("close", context.run_id))
+
+    def sparse_structure(invocation, state, context):
+        context.require_handle("shape")
+        if invocation.job_id == "bad":
+            return GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.01,
+                failure_phase="sparse_structure:model_error",
+            )
+        return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
+
+    def export(invocation, state, context):
+        context.require_handle("shape")
+        return GenerationStageResult(invocation.stage, elapsed_seconds=0.01)
+
+    result = StageRunner(
+        plan,
+        handlers={"sparse_structure": sparse_structure, "export": export},
+        context_factory=open_context,
+        context_closer=close_context,
+    ).run()
+
+    assert result.ok is False
+    assert result.context_closed is True
+    assert result.job_states["bad"].failure_phase == "sparse_structure:model_error"
+    assert events == [("open", 2), ("close", "failure-run")]
+
+
+def test_stage_runner_validates_initial_states_before_opening_context(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        StageExecutionContext,
+        StageRunner,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    events = []
+
+    def open_context(open_plan):
+        events.append(("open", len(open_plan.jobs)))
+        return StageExecutionContext(run_id="should-not-open")
+
+    runner = StageRunner(
+        plan,
+        handlers={
+            "stage": lambda invocation, state, context: GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.0,
+            )
+        },
+        context_factory=open_context,
+    )
+
+    with pytest.raises(ValueError, match="missing initial state for job_id: seed-101"):
+        runner.run(initial_states={})
+
+    assert events == []
