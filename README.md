@@ -164,8 +164,9 @@ PYTHONPATH=. python scripts/bench_quantization.py \
   --stages ss-flow,slat-flow
 ```
 
-The table above was recorded before the reusable harness was committed; use the
-command as a comparable rerun path for future reports.
+The table above was recorded before the reusable harness was committed. The command
+reruns the same sparse flow plus synthetic 512-shape-SLat stress benchmark for
+future reports; it is not a full four-flow `generate.py --quantize` rerun.
 
 The script writes an incremental JSON report and records the effective repo
 head, checkpoint files, host/MLX identity, asset route, variants, stages, and

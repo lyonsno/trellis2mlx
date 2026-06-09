@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark TRELLIS2MLX flow-model quantization variants.
 
-The benchmark intentionally isolates flow stages touched by ``generate.py
---quantize``. It writes an incremental JSON report so failed runs still leave
-route identity and the last trustworthy phase behind.
+This is a sparse flow and synthetic 512-shape-SLat stress benchmark, not a full
+four-flow rerun of ``generate.py --quantize``. It writes an incremental JSON
+report so failed runs still leave route identity and the last trustworthy phase
+behind.
 """
 
 from __future__ import annotations

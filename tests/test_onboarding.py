@@ -122,6 +122,8 @@ def test_readme_quantization_section_states_measured_tradeoff():
     assert "scripts/bench_quantization.py" in quant_section
     assert "checkpoint files" in quant_section
     assert "recorded before the reusable harness was committed" in quant_section
+    assert "sparse flow plus synthetic 512-shape-SLat stress benchmark" in quant_section
+    assert "not a full four-flow `generate.py --quantize` rerun" in quant_section
 
 
 def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch):

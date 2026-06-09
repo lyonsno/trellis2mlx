@@ -1,8 +1,8 @@
-"""Quantize trellis2mlx models for faster inference.
+"""Quantize trellis2mlx flow-model Linear layers.
 
-MLX's INT4 quantization reduces weight memory ~6.4x (5.17GB → 0.81GB)
-and proportionally reduces memory bandwidth, directly speeding up
-inference on bandwidth-bound Apple Silicon.
+MLX's INT4 quantization reduces flow-model weight memory ~6.4x
+(5.17GB -> 0.81GB). It is useful for packaging and tighter memory budgets, but
+there was no measured M2 Pro speedup in the current stage benchmark.
 
 Usage:
     from trellmlx.quantize import quantize_model

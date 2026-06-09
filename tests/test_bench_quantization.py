@@ -27,6 +27,21 @@ def test_parse_variants_maps_labels_to_bits():
         bench.parse_variants("fp16,q4")
 
 
+def test_benchmark_docstring_names_narrow_synthetic_scope():
+    text = SCRIPT.read_text()
+
+    assert "sparse flow and synthetic 512-shape-SLat" in text
+    assert "isolates flow stages touched by ``generate.py" not in text
+
+
+def test_quantize_docstring_does_not_promise_measured_speedup():
+    text = Path("trellmlx/quantize.py").read_text()
+
+    assert "weight memory" in text
+    assert "no measured M2 Pro speedup" in text
+    assert "directly speeding up" not in text
+
+
 def test_initial_report_records_route_identity(tmp_path):
     bench = _load_module()
 
