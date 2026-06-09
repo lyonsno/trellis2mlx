@@ -102,7 +102,7 @@ def _cleanup_and_simplify_mesh(
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
         t0 = time.perf_counter()
-        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
+        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
         log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
 
     if not target_faces or len(faces) <= target_faces:
@@ -122,7 +122,7 @@ def _cleanup_and_simplify_mesh(
         )
         log(f"  Coarse simplify: {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
         if not no_cleanup:
-            vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, verbose=False)
+            vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False, verbose=False)
 
     if len(faces) <= target_faces:
         return vertices, faces
@@ -495,7 +495,7 @@ def main():
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
     # Bake PBR textures
-    base_color, metallic_roughness = bake_texture(
+    base_color, metallic_roughness, alpha_mode = bake_texture(
         uv_verts, uv_faces, uvs, vmapping,
         tex_coords_spatial, tex_np, mesh_grid_size,
         texture_size=args.texture_size,
@@ -526,7 +526,7 @@ def main():
             metallicRoughnessTexture=Image.fromarray(metallic_roughness),
             metallicFactor=1.0,
             roughnessFactor=1.0,
-            alphaMode='OPAQUE',
+            alphaMode=alpha_mode,
             doubleSided=True,
         )
 

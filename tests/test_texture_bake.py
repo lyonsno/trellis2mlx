@@ -271,7 +271,7 @@ class TestBakeTexture:
         monkeypatch.setattr(texture_bake, "sample_voxel_attrs_fast", fake_sample_voxel_attrs_fast)
         monkeypatch.setattr(texture_bake, "inpaint_texture", fake_inpaint_texture)
 
-        base_color, metallic_roughness = texture_bake.bake_texture(
+        base_color, metallic_roughness, _ = texture_bake.bake_texture(
             vertices,
             faces,
             uvs,
@@ -334,7 +334,7 @@ class TestBakeTextureBackend:
         vertices, faces, uvs, vmapping, vc, va, gs = mesh
 
         # Should not raise — backend parameter must be accepted
-        bc, mr = bake_texture(
+        bc, mr, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=8, backend="gpu",
         )
@@ -347,7 +347,7 @@ class TestBakeTextureBackend:
         mesh = self._make_textured_mesh()
         vertices, faces, uvs, vmapping, vc, va, gs = mesh
 
-        bc, mr = bake_texture(
+        bc, mr, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=16, backend="gpu",
         )
@@ -365,11 +365,11 @@ class TestBakeTextureBackend:
         vertices, faces, uvs, vmapping, vc, va, gs = mesh
         sz = 16
 
-        bc_cpu, mr_cpu = bake_texture(
+        bc_cpu, mr_cpu, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=sz, backend="cpu",
         )
-        bc_gpu, mr_gpu = bake_texture(
+        bc_gpu, mr_gpu, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=sz, backend="gpu",
         )
@@ -388,7 +388,7 @@ class TestBakeTextureBackend:
         vertices, faces, uvs, vmapping, vc, va, gs = mesh
 
         # No backend param — should work as before (cpu)
-        bc, mr = bake_texture(
+        bc, mr, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=8,
         )
@@ -422,3 +422,50 @@ class TestBakeTextureBackend:
                 texture_size=8, backend="gpu",
             )
             assert mock_fast.called, "GPU backend did not call sample_voxel_attrs_fast"
+
+
+class TestBakeTextureInpaintRadius:
+    """Scalar PBR channels should use inpainting radius 1, matching reference."""
+
+    def test_metallic_roughness_inpaint_radius_matches_reference(self):
+        """Inpaint radius for scalar channels should be 1, not 3."""
+        from unittest.mock import patch, call
+        from trellmlx.texture_bake import bake_texture
+        mesh = TestBakeTextureBackend._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        inpaint_calls = []
+        original_inpaint = __import__("trellmlx.texture_bake",
+                                       fromlist=["inpaint_texture"]).inpaint_texture
+
+        def tracking_inpaint(image, mask, radius=3):
+            inpaint_calls.append(radius)
+            return original_inpaint(image, mask, radius=radius)
+
+        with patch("trellmlx.texture_bake.inpaint_texture", side_effect=tracking_inpaint):
+            bake_texture(
+                vertices, faces, uvs, vmapping, vc, va, gs,
+                texture_size=8,
+            )
+        # base_color RGB: radius 3, alpha: radius 1, metallic_roughness: radius 1
+        assert inpaint_calls == [3, 1, 1], (
+            f"Expected inpaint radii [3, 1, 1], got {inpaint_calls}"
+        )
+
+
+class TestBakeTextureAlphaDetection:
+    """bake_texture should return alpha mode based on baked alpha values."""
+
+    def test_returns_alpha_mode(self):
+        """bake_texture should return a third value: alpha_mode string."""
+        from trellmlx.texture_bake import bake_texture
+        mesh = TestBakeTextureBackend._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+
+        result = bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=8,
+        )
+        assert len(result) == 3, f"Expected 3 return values, got {len(result)}"
+        bc, mr, alpha_mode = result
+        assert alpha_mode in ("OPAQUE", "BLEND")

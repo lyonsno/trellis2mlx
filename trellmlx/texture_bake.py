@@ -609,10 +609,18 @@ def bake_texture(vertices, faces, uvs, vmapping,
     mr = np.clip(mr_f * 255, 0, 255).astype(np.uint8)
 
     # Step 5: Inpaint seams
+    # Reference uses radius=3 for RGB, radius=1 for scalar channels
     t0 = time.perf_counter()
-    base_color[:, :, :3] = inpaint_texture(base_color[:, :, :3], mask)
-    base_color[:, :, 3:] = inpaint_texture(base_color[:, :, 3:], mask)
-    mr = inpaint_texture(mr, mask)
+    base_color[:, :, :3] = inpaint_texture(base_color[:, :, :3], mask, radius=3)
+    base_color[:, :, 3:] = inpaint_texture(base_color[:, :, 3:], mask, radius=1)
+    mr = inpaint_texture(mr, mask, radius=1)
     print(f"    Inpainted seams ({time.perf_counter()-t0:.1f}s)", flush=True)
 
-    return base_color, mr
+    # Step 6: Auto-detect alpha transparency
+    alpha_valid = base_color[mask, 3]
+    if len(alpha_valid) > 0 and alpha_valid.min() < 250:
+        alpha_mode = "BLEND"
+    else:
+        alpha_mode = "OPAQUE"
+
+    return base_color, mr, alpha_mode

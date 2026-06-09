@@ -19,6 +19,7 @@ def cleanup_mesh(
     *,
     max_hole_perimeter: float = 3e-2,
     keep_largest: bool = False,
+    min_component_ratio: float = 1e-5,
     do_fix_normals: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -27,12 +28,11 @@ def cleanup_mesh(
     Pipeline:
     1. Remove duplicate faces
     2. Repair non-manifold edges
-    3. (Optional) Keep only the largest connected component
+    3. Remove small connected components (fractional threshold, matching
+       reference ``cumesh.remove_small_connected_components(1e-5)``), or
+       keep only the largest if ``keep_largest=True``
     4. Fill small holes
     5. Fix normals/winding consistency (optional, skip for intermediate passes)
-
-    By default, all components are preserved so multi-object generations
-    remain visible. Pass ``keep_largest=True`` for single-object output.
 
     Args:
         vertices: [V, 3] float32
@@ -40,6 +40,10 @@ def cleanup_mesh(
         max_hole_perimeter: Fill holes with perimeter smaller than this (world-space
             units). Matches reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
         keep_largest: If True, discard all components except the largest.
+            Overrides min_component_ratio.
+        min_component_ratio: Remove components with fewer faces than this
+            fraction of the largest component. Default 1e-5 matches the
+            reference pipeline.
         do_fix_normals: Run winding unification. The reference only does this once
             at the end, so callers can skip it for intermediate cleanup passes
             before simplification.
@@ -58,9 +62,13 @@ def cleanup_mesh(
     # Step 2: Repair non-manifold edges
     vertices, faces = repair_non_manifold_edges(vertices, faces, verbose)
 
-    # Step 3: Optionally keep only the largest connected component
+    # Step 3: Component removal
     if keep_largest:
         vertices, faces = keep_largest_component(vertices, faces, verbose)
+    else:
+        vertices, faces = remove_small_components(
+            vertices, faces, min_ratio=min_component_ratio, verbose=verbose,
+        )
 
     # Step 4: Fill small holes on the remaining mesh
     vertices, faces = fill_small_holes(

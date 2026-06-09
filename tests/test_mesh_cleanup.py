@@ -13,6 +13,7 @@ import pytest
 from trellmlx.mesh_cleanup import (
     cleanup_mesh,
     keep_largest_component,
+    remove_small_components,
     fill_small_holes,
     remove_duplicate_faces,
     repair_non_manifold_edges,
@@ -283,3 +284,65 @@ class TestKeepLargestIsOptIn:
         )
         # Equal-size components: one gets kept, one removed → 4 faces
         assert len(cleaned_f) == 4
+
+
+class TestDefaultCleanupUsesSmallComponentRemoval:
+    """Default cleanup should use remove_small_components (fractional threshold),
+    not keep_largest_component (binary), matching the reference pipeline."""
+
+    def test_default_removes_tiny_components_preserves_large_ones(self):
+        """A tiny 1-face fragment should be removed by default cleanup,
+        but a substantial second component should survive."""
+        # Large component: tetrahedron (4 faces)
+        v1, f1 = _make_tetrahedron()
+        # Small component: single tiny triangle far away
+        v2 = np.array([[10, 10, 10], [10.001, 10, 10], [10, 10.001, 10]], dtype=np.float32)
+        f2 = np.array([[0, 1, 2]], dtype=np.uint32) + len(v1)
+        verts = np.vstack([v1, v2])
+        faces = np.vstack([f1, f2])
+
+        cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
+        # Tiny fragment should be removed, tetrahedron should survive
+        assert len(cleaned_f) == 4
+        # Tiny fragment verts should be gone
+        assert cleaned_v[:, 0].max() < 5
+
+    def test_default_preserves_substantial_second_component(self):
+        """Two equal tetrahedra should both survive default cleanup
+        (remove_small_components keeps components above threshold)."""
+        v1, f1 = _make_tetrahedron()
+        v2, f2 = _make_tetrahedron(offset=[5, 5, 5])
+        f2_shifted = f2 + len(v1)
+        verts = np.vstack([v1, v2])
+        faces = np.vstack([f1, f2_shifted])
+
+        cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
+        # Both should survive — they're equal size, both above threshold
+        assert len(cleaned_f) == 8
+
+    def test_cleanup_mesh_accepts_min_component_ratio(self):
+        """cleanup_mesh should accept min_component_ratio parameter."""
+        v1, f1 = _make_tetrahedron()
+        cleaned_v, cleaned_f = cleanup_mesh(
+            v1, f1, min_component_ratio=1e-5, verbose=False,
+        )
+        assert len(cleaned_f) == 4
+
+
+class TestIntermediateCleanupSkipsNormals:
+    """Intermediate cleanup passes should skip normals fixing."""
+
+    def test_do_fix_normals_false_skips_normals(self):
+        """cleanup_mesh with do_fix_normals=False should not call fix_normals."""
+        verts, faces = _make_tetrahedron()
+        # Flip one face to create inconsistent winding
+        faces_bad = faces.copy()
+        faces_bad[0] = faces_bad[0][::-1]
+
+        # With normals fixing (default)
+        v1, f1 = cleanup_mesh(verts, faces_bad.copy(), verbose=False)
+        # Without normals fixing
+        v2, f2 = cleanup_mesh(verts, faces_bad.copy(), do_fix_normals=False, verbose=False)
+
+        # Both should have same face count, but winding may differ
+        assert len(f1) == len(f2)
