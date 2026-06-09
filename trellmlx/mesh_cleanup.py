@@ -323,35 +323,72 @@ def repair_non_manifold_edges(
     """Remove faces that create non-manifold edges (edges shared by 3+ faces).
 
     For each non-manifold edge, keeps the two largest adjacent faces and
-    removes the rest.
+    removes the rest. Vectorized: uses packed int64 edge keys, np.unique
+    for grouping, and batch area computation.
     """
     if len(faces) == 0:
         return vertices, faces
 
-    # Build edge → face list mapping
-    edge_faces: dict[tuple[int, int], list[int]] = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            e = tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
-            edge_faces.setdefault(e, []).append(fi)
+    n_faces = len(faces)
+    faces_i64 = faces.astype(np.int64)
 
-    # Find faces to remove: for non-manifold edges (3+ faces), keep the two
-    # faces with the most total area (heuristic: largest faces are most likely
-    # the intended geometry)
+    # Guard: packed int64 edge keys overflow at vertex index >= 2^31
+    max_vi = faces_i64.max()
+    if max_vi >= 2**31:
+        raise ValueError(
+            f"Vertex index {max_vi} exceeds 2^31-1; "
+            "packed int64 edge keys would overflow"
+        )
+
+    # Build all edges: 3 edges per face → [3F, 2] sorted pairs
+    e0 = np.stack([faces_i64[:, 0], faces_i64[:, 1]], axis=1)
+    e1 = np.stack([faces_i64[:, 1], faces_i64[:, 2]], axis=1)
+    e2 = np.stack([faces_i64[:, 2], faces_i64[:, 0]], axis=1)
+    all_edges = np.concatenate([e0, e1, e2], axis=0)  # [3F, 2]
+    all_edges.sort(axis=1)
+
+    # Face index for each edge
+    face_idx = np.tile(np.arange(n_faces, dtype=np.int64), 3)
+
+    # Pack edge pairs into single int64 for fast grouping
+    edge_keys = all_edges[:, 0] * (2**32) + all_edges[:, 1]
+
+    # Group by edge key
+    sort_order = np.argsort(edge_keys)
+    sorted_keys = edge_keys[sort_order]
+    sorted_face_idx = face_idx[sort_order]
+
+    # Find group boundaries
+    breaks = np.concatenate([
+        [0],
+        np.where(sorted_keys[1:] != sorted_keys[:-1])[0] + 1,
+        [len(sorted_keys)],
+    ])
+
+    # Find non-manifold edges (group size > 2)
+    group_sizes = np.diff(breaks)
+    non_manifold_mask = group_sizes > 2
+    if not non_manifold_mask.any():
+        return vertices, faces
+
+    # Precompute all face areas
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    cross = np.cross(v1 - v0, v2 - v0)
+    face_areas = 0.5 * np.sqrt((cross ** 2).sum(axis=1))
+
+    # For each non-manifold edge group, keep the 2 largest-area faces
     faces_to_remove = set()
-    for edge, face_list in edge_faces.items():
-        if len(face_list) <= 2:
-            continue
-        # Compute face areas for the candidates
-        areas = []
-        for fi in face_list:
-            v0, v1, v2 = vertices[faces[fi]]
-            area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
-            areas.append(area)
-        # Keep the two largest, remove the rest
-        sorted_idx = np.argsort(areas)[::-1]
-        for i in range(2, len(sorted_idx)):
-            faces_to_remove.add(face_list[sorted_idx[i]])
+    nm_indices = np.where(non_manifold_mask)[0]
+    for gi in nm_indices:
+        start, end = breaks[gi], breaks[gi + 1]
+        group_faces = sorted_face_idx[start:end]
+        group_areas = face_areas[group_faces]
+        keep_idx = np.argsort(group_areas)[-2:]
+        for i in range(len(group_faces)):
+            if i not in keep_idx:
+                faces_to_remove.add(group_faces[i])
 
     if not faces_to_remove:
         return vertices, faces
@@ -359,9 +396,8 @@ def repair_non_manifold_edges(
     if verbose:
         print(f"  Removed {len(faces_to_remove)} non-manifold faces", flush=True)
 
-    keep_mask = np.ones(len(faces), dtype=bool)
-    for fi in faces_to_remove:
-        keep_mask[fi] = False
+    keep_mask = np.ones(n_faces, dtype=bool)
+    keep_mask[list(faces_to_remove)] = False
     return _reindex_mesh(vertices, faces[keep_mask])
 
 
