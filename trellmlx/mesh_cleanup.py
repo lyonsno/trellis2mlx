@@ -121,7 +121,7 @@ def keep_largest_component(
 def remove_small_components(
     vertices: np.ndarray,
     faces: np.ndarray,
-    min_ratio: float = 0.01,
+    min_ratio: float = 1e-5,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Remove connected components smaller than min_ratio of the largest,
