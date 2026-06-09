@@ -15,6 +15,7 @@ from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 
 StageArtifactValue = bool | int | float | str
+_STAGE_ARTIFACT_TYPES = (bool, int, float, str)
 
 
 DEFAULT_STAGE_SEQUENCE: tuple[str, ...] = (
@@ -37,6 +38,17 @@ def derive_stage_seed(*, job_seed: int, stage_index: int) -> int:
 
     digest = hashlib.blake2s(f"{int(job_seed)}:{int(stage_index)}".encode("ascii"), digest_size=4).digest()
     return int.from_bytes(digest, "little")
+
+
+def _validate_artifacts(artifacts: Mapping[str, StageArtifactValue]) -> dict[str, StageArtifactValue]:
+    validated: dict[str, StageArtifactValue] = {}
+    for key, value in artifacts.items():
+        if not isinstance(key, str):
+            raise ValueError("artifact keys must be strings")
+        if not isinstance(value, _STAGE_ARTIFACT_TYPES):
+            raise ValueError("artifact values must be bool, int, float, or str")
+        validated[key] = value
+    return validated
 
 
 @dataclass(frozen=True)
@@ -233,7 +245,7 @@ class StageRunnerOutput:
     artifacts: Mapping[str, StageArtifactValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "artifacts", dict(self.artifacts))
+        object.__setattr__(self, "artifacts", _validate_artifacts(self.artifacts))
 
 
 @dataclass(frozen=True)
@@ -253,7 +265,7 @@ class JobState:
     def __post_init__(self) -> None:
         object.__setattr__(self, "images", tuple(self.images))
         object.__setattr__(self, "config", dict(self.config))
-        object.__setattr__(self, "artifacts", dict(self.artifacts))
+        object.__setattr__(self, "artifacts", _validate_artifacts(self.artifacts))
 
     @classmethod
     def from_job(cls, job: GenerationJob) -> "JobState":
@@ -292,9 +304,12 @@ class JobState:
             self,
             next_stage_index=self.next_stage_index + 1,
             stage_results=(*self.stage_results, output.result),
-            artifacts={**self.artifacts, **output.artifacts},
+            artifacts=_validate_artifacts({**self.artifacts, **output.artifacts}),
             failure_phase=output.result.failure_phase,
         )
+
+    def record_artifacts(self, artifacts: Mapping[str, StageArtifactValue]) -> "JobState":
+        return replace(self, artifacts=_validate_artifacts({**self.artifacts, **artifacts}))
 
 
 StageHandler = Callable[[GenerationStageInvocation, JobState], StageRunnerOutput | GenerationStageResult]
@@ -330,14 +345,25 @@ class StageRunner:
         self.handlers = dict(handlers)
 
     def run(self, initial_states: Mapping[str, JobState] | None = None) -> StageRunResult:
-        states = (
-            dict(initial_states)
-            if initial_states is not None
-            else {job.job_id: JobState.from_job(job) for job in self.plan.jobs}
-        )
-        for job in self.plan.jobs:
-            if job.job_id not in states:
-                raise ValueError(f"missing initial state for job_id: {job.job_id}")
+        planned_ids = {job.job_id for job in self.plan.jobs}
+        if initial_states is None:
+            states = {job.job_id: JobState.from_job(job) for job in self.plan.jobs}
+        else:
+            provided_ids = set(initial_states)
+            missing_ids = [job.job_id for job in self.plan.jobs if job.job_id not in provided_ids]
+            if missing_ids:
+                raise ValueError(f"missing initial state for job_id: {', '.join(missing_ids)}")
+            extra_ids = sorted(provided_ids - planned_ids)
+            if extra_ids:
+                raise ValueError(f"unexpected initial state job_id: {', '.join(extra_ids)}")
+            states = {}
+            for job in self.plan.jobs:
+                state = initial_states[job.job_id]
+                if state.job_id != job.job_id:
+                    raise ValueError(
+                        f"initial state key {job.job_id} does not match state job_id {state.job_id}"
+                    )
+                states[job.job_id] = state
 
         for invocation in self.plan.iter_invocations():
             state = states[invocation.job_id]

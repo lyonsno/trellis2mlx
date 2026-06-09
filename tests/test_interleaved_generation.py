@@ -273,3 +273,55 @@ def test_stage_runner_requires_handlers_for_all_stages(tmp_path):
 
     with pytest.raises(ValueError, match="missing stage handlers: export"):
         StageRunner(plan, handlers={"image_conditioning": lambda invocation, state: None})
+
+
+def test_stage_state_rejects_nonportable_artifacts(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        JobState,
+        StageRunnerOutput,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+
+    with pytest.raises(ValueError, match="artifact values must be bool, int, float, or str"):
+        StageRunnerOutput(
+            result=GenerationStageResult("stage", elapsed_seconds=0.0),
+            artifacts={"tensor_like": [1, 2, 3]},
+        )
+
+    with pytest.raises(ValueError, match="artifact keys must be strings"):
+        JobState.from_job(job).record_artifacts({7: "not-portable"})
+
+
+def test_stage_runner_rejects_initial_states_outside_plan(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        JobState,
+        StageRunner,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    runner = StageRunner(
+        plan,
+        handlers={"stage": lambda invocation, state: GenerationStageResult(invocation.stage, elapsed_seconds=0.0)},
+    )
+
+    with pytest.raises(ValueError, match="missing initial state for job_id: seed-101"):
+        runner.run(initial_states={})
+
+    extra = JobState(
+        job_id="unplanned-failed",
+        seed=202,
+        images=("subject.png",),
+        output_path=str(tmp_path / "extra.glb"),
+        config={},
+        failure_phase="stale_failure",
+    )
+
+    with pytest.raises(ValueError, match="unexpected initial state job_id: unplanned-failed"):
+        runner.run(initial_states={"seed-101": JobState.from_job(job), "unplanned-failed": extra})
