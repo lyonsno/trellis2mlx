@@ -103,6 +103,42 @@ def has_checkpoint(checkpoint_dir: str, stage: str) -> bool:
             or os.path.exists(os.path.join(checkpoint_dir, f"{stage}.json")))
 
 
+def inspect_checkpoints(checkpoint_dir: str):
+    """Print summary of all checkpoints in a directory."""
+    stages = list_checkpoints(checkpoint_dir)
+    if not stages:
+        print(f"No checkpoints in {checkpoint_dir}")
+        return
+
+    print(f"Checkpoints in {checkpoint_dir}:")
+    for stage in stages:
+        data = load_checkpoint(checkpoint_dir, stage)
+        parts = []
+        for key, val in sorted(data.items()):
+            if isinstance(val, np.ndarray):
+                size_mb = val.nbytes / 1e6
+                parts.append(f"{key}: {val.shape} {val.dtype} ({size_mb:.1f} MB)")
+            elif isinstance(val, list):
+                parts.append(f"{key}: list[{len(val)}]")
+            else:
+                parts.append(f"{key}: {val}")
+
+        # Compute file size on disk
+        npz_path = os.path.join(checkpoint_dir, f"{stage}.npz")
+        disk_mb = os.path.getsize(npz_path) / 1e6 if os.path.exists(npz_path) else 0
+
+        print(f"\n  {stage} ({disk_mb:.1f} MB on disk):")
+        for p in parts:
+            print(f"    {p}")
+
+        # PBR summary for texture checkpoints
+        if "tex_np" in data:
+            tex = data["tex_np"]
+            print(f"    PBR: RGB [{tex[:,:3].min():.2f}, {tex[:,:3].max():.2f}] "
+                  f"metallic [{tex[:,3].min():.2f}, {tex[:,3].max():.2f}] "
+                  f"roughness [{tex[:,4].min():.2f}, {tex[:,4].max():.2f}]")
+
+
 def list_checkpoints(checkpoint_dir: str) -> list[str]:
     """List available checkpoint stages."""
     if not os.path.isdir(checkpoint_dir):
@@ -112,3 +148,11 @@ def list_checkpoints(checkpoint_dir: str) -> list[str]:
         if f.endswith(".npz"):
             stages.add(f[:-4])
     return sorted(stages)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 3 or sys.argv[1] != "inspect":
+        print("Usage: python -m trellmlx.checkpoint inspect DIR")
+        sys.exit(1)
+    inspect_checkpoints(sys.argv[2])
