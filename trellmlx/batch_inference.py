@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -65,6 +66,7 @@ class BatchRunOptions:
     max_concurrent: int
     repo_root: Path | str = Path(".")
     report_path: Path | str | None = None
+    log_dir: Path | str | None = None
     python_executable: str = sys.executable
 
 
@@ -82,6 +84,8 @@ class BatchJobResult:
     output_size_bytes: int | None
     stdout: str
     stderr: str
+    stdout_log_path: str
+    stderr_log_path: str
     failure_phase: str | None = None
 
 
@@ -236,19 +240,32 @@ def _run_one_job(
 ) -> tuple[int, BatchJobResult]:
     cmd = build_generate_command(job, options.python_executable)
     env = _subprocess_env(repo_root)
+    stdout_log_path, stderr_log_path = _job_log_paths(index, job, options)
+    stdout_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     start = time.perf_counter()
     stdout = ""
     stderr = ""
     failure_phase = None
     try:
-        completed = runner(
-            cmd,
-            cwd=repo_root,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        if runner is subprocess.run:
+            completed = _run_process_with_live_logs(
+                cmd,
+                cwd=repo_root,
+                env=env,
+                stdout_log_path=stdout_log_path,
+                stderr_log_path=stderr_log_path,
+            )
+        else:
+            completed = runner(
+                cmd,
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            stdout_log_path.write_text(completed.stdout or "")
+            stderr_log_path.write_text(completed.stderr or "")
         returncode = completed.returncode
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
@@ -257,6 +274,8 @@ def _run_one_job(
     except Exception as exc:  # pragma: no cover - exercised by callers in production.
         returncode = 1
         stderr = f"{type(exc).__name__}: {exc}"
+        stdout_log_path.write_text(stdout)
+        stderr_log_path.write_text(stderr)
         failure_phase = "runner_exception"
 
     elapsed = time.perf_counter() - start
@@ -274,7 +293,76 @@ def _run_one_job(
         output_size_bytes=output_size,
         stdout=stdout,
         stderr=stderr,
+        stdout_log_path=str(stdout_log_path),
+        stderr_log_path=str(stderr_log_path),
         failure_phase=failure_phase,
+    )
+
+
+def _job_log_paths(index: int, job: BatchJob, options: BatchRunOptions) -> tuple[Path, Path]:
+    if options.log_dir is not None:
+        log_dir = Path(options.log_dir)
+    elif options.report_path is not None:
+        log_dir = Path(options.report_path).parent / "logs"
+    else:
+        log_dir = job.output_path.parent / "logs"
+    stem = f"job-{index:03d}-seed-{job.seed}"
+    return log_dir / f"{stem}.stdout.log", log_dir / f"{stem}.stderr.log"
+
+
+def _run_process_with_live_logs(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    stdout_log_path: Path,
+    stderr_log_path: Path,
+) -> subprocess.CompletedProcess:
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    with stdout_log_path.open("w") as stdout_log, stderr_log_path.open("w") as stderr_log:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        def pump(pipe, log_file, chunks: list[str]) -> None:
+            assert pipe is not None
+            try:
+                for chunk in iter(pipe.readline, ""):
+                    chunks.append(chunk)
+                    log_file.write(chunk)
+                    log_file.flush()
+            finally:
+                pipe.close()
+
+        stdout_thread = threading.Thread(
+            target=pump,
+            args=(process.stdout, stdout_log, stdout_chunks),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=pump,
+            args=(process.stderr, stderr_log, stderr_chunks),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        returncode = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+
+    return subprocess.CompletedProcess(
+        cmd,
+        returncode,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
     )
 
 
@@ -305,6 +393,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                         help="Optional explicit output GLB paths, one per seed.")
     parser.add_argument("--max-concurrent", type=int, default=2)
     parser.add_argument("--report", type=Path, default=Path("/tmp/trellis2mlx-batch/report.json"))
+    parser.add_argument("--log-dir", type=Path,
+                        help="Directory for per-job live stdout/stderr logs. Defaults beside the report.")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--resolution", type=int, default=1024)
@@ -337,6 +427,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             max_concurrent=args.max_concurrent,
             repo_root=args.repo_root,
             report_path=args.report,
+            log_dir=args.log_dir,
             python_executable=args.python,
         ),
     )

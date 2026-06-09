@@ -1,8 +1,11 @@
 """Batch inference scheduling contracts."""
 
+import concurrent.futures
 import json
 import os
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -101,6 +104,83 @@ def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path, m
     assert persisted["effective_concurrency"] == 3
     assert persisted["diagnostics"] == ["known_metal_deadlock_risk:max_concurrent>2"]
     assert persisted["results"][1]["stderr"] == "model exploded\n"
+    assert persisted["results"][1]["stdout_log_path"].endswith("job-001-seed-2.stdout.log")
+    assert persisted["results"][1]["stderr_log_path"].endswith("job-001-seed-2.stderr.log")
+    assert "started\n" in (tmp_path / "logs" / "job-001-seed-2.stdout.log").read_text()
+    assert "model exploded\n" in (tmp_path / "logs" / "job-001-seed-2.stderr.log").read_text()
+
+
+def test_run_batch_writes_live_job_logs_before_final_report(tmp_path, monkeypatch):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sentinel = tmp_path / "first-line-seen"
+    generate_py = repo_root / "generate.py"
+    generate_py.write_text(
+        """
+import argparse
+import os
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--image", nargs="+")
+parser.add_argument("--seed")
+parser.add_argument("--output")
+parser.add_argument("--resolution")
+parser.add_argument("--max-tokens")
+parser.add_argument("--target-faces")
+args = parser.parse_args()
+
+print("stdout-live", flush=True)
+print("stderr-live", file=sys.stderr, flush=True)
+with open(os.environ["TRELLIS2MLX_TEST_SENTINEL"], "w") as handle:
+    handle.write("seen")
+time.sleep(0.5)
+with open(args.output, "wb") as handle:
+    handle.write(b"glb")
+print("stdout-done", flush=True)
+""".lstrip()
+    )
+    monkeypatch.setenv("TRELLIS2MLX_TEST_SENTINEL", str(sentinel))
+
+    report_path = tmp_path / "report.json"
+    log_dir = tmp_path / "job-logs"
+    stdout_log = log_dir / "job-000-seed-7.stdout.log"
+    stderr_log = log_dir / "job-000-seed-7.stderr.log"
+    job = BatchJob(images=("a.png",), seed=7, output_path=tmp_path / "out" / "live.glb")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            run_batch,
+            [job],
+            BatchRunOptions(
+                max_concurrent=1,
+                repo_root=repo_root,
+                report_path=report_path,
+                log_dir=log_dir,
+                python_executable=sys.executable,
+            ),
+        )
+        deadline = time.monotonic() + 3
+        while not sentinel.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert sentinel.exists()
+        assert stdout_log.exists()
+        assert stderr_log.exists()
+        assert "stdout-live" in stdout_log.read_text()
+        assert "stderr-live" in stderr_log.read_text()
+        assert not report_path.exists()
+
+        report = future.result(timeout=5)
+
+    assert report.ok
+    assert report.results[0].stdout_log_path == str(stdout_log)
+    assert report.results[0].stderr_log_path == str(stderr_log)
+    assert "stdout-done" in stdout_log.read_text()
+    assert json.loads(report_path.read_text())["results"][0]["stdout_log_path"] == str(stdout_log)
 
 
 def test_run_batch_prepends_repo_root_to_existing_pythonpath(tmp_path, monkeypatch):
