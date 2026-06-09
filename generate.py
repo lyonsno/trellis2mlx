@@ -186,7 +186,92 @@ def main():
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
+    parser.add_argument("--save-checkpoints", metavar="DIR",
+                        help="Save intermediate representations to DIR for replay")
+    parser.add_argument("--resume", metavar="DIR",
+                        help="Resume from checkpoints in DIR (skips completed inference stages)")
     args = parser.parse_args()
+
+    # === Resume from checkpoints ===
+    if args.resume:
+        from trellmlx.checkpoint import load_checkpoint, has_checkpoint, list_checkpoints
+        available = list_checkpoints(args.resume)
+        print(f"Resuming from {args.resume} (stages: {', '.join(available)})", flush=True)
+
+        if has_checkpoint(args.resume, "texture") and has_checkpoint(args.resume, "mesh_raw"):
+            mesh_data = load_checkpoint(args.resume, "mesh_raw")
+            tex_data = load_checkpoint(args.resume, "texture")
+
+            vertices = mesh_data["vertices"]
+            faces = mesh_data["faces"]
+            mesh_grid_size = int(mesh_data["mesh_grid_size"])
+            tex_np = tex_data["tex_np"]
+            tex_coords_spatial = tex_data["tex_coords_spatial"]
+
+            print(f"  Loaded mesh: {len(vertices):,}V {len(faces):,}F", flush=True)
+            print(f"  Loaded texture: {tex_np.shape[0]:,} voxels, {tex_np.shape[1]} channels", flush=True)
+
+            t_total = time.perf_counter()
+
+            # Re-run cleanup + simplification with current settings
+            vertices, faces = _cleanup_and_simplify_mesh(
+                vertices, faces,
+                target_faces=args.target_faces,
+                no_cleanup=args.no_cleanup,
+                keep_largest=args.keep_largest,
+            )
+
+            # Jump straight to texture baking
+            from trellmlx.texture_bake import uv_unwrap, bake_texture
+            t0 = time.perf_counter()
+            uv_verts, uv_faces, uvs, vmapping = uv_unwrap(vertices, faces)
+            print(f"  UV unwrap: {len(uv_verts):,}V {len(uv_faces):,}F "
+                  f"({time.perf_counter()-t0:.1f}s)", flush=True)
+
+            base_color, metallic_roughness, alpha_mode = bake_texture(
+                uv_verts, uv_faces, uvs, vmapping,
+                tex_coords_spatial, tex_np, mesh_grid_size,
+                texture_size=args.texture_size,
+                backend=args.texture_backend,
+            )
+
+            # Export
+            import trimesh
+            from trimesh.visual.material import PBRMaterial
+            from PIL import Image
+
+            if len(uv_verts) > 0 and len(uv_faces) > 0:
+                export_verts = uv_verts.copy()
+                export_verts[:, 1], export_verts[:, 2] = uv_verts[:, 2].copy(), -uv_verts[:, 1].copy()
+                export_uvs = uvs.copy()
+                export_uvs[:, 1] = 1 - export_uvs[:, 1]
+                mesh = trimesh.Trimesh(vertices=export_verts, faces=uv_faces, process=False)
+                normals = mesh.vertex_normals
+
+                material = PBRMaterial(
+                    baseColorTexture=Image.fromarray(base_color),
+                    baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+                    metallicRoughnessTexture=Image.fromarray(metallic_roughness),
+                    metallicFactor=1.0, roughnessFactor=1.0,
+                    alphaMode=alpha_mode, doubleSided=True,
+                )
+                textured_mesh = trimesh.Trimesh(
+                    vertices=export_verts, faces=uv_faces,
+                    vertex_normals=normals, process=False,
+                    visual=trimesh.visual.TextureVisuals(uv=export_uvs, material=material),
+                )
+                textured_mesh.export(args.output)
+                print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
+            else:
+                print("  WARNING: Empty mesh!", flush=True)
+            print(f"\nResume total: {time.perf_counter()-t_total:.1f}s", flush=True)
+            return
+
+        elif has_checkpoint(args.resume, "mesh_raw"):
+            print("  Only mesh checkpoint found — will re-run texture stages", flush=True)
+            # Could add partial resume here later
+        else:
+            print(f"  No usable checkpoints in {args.resume}, running full pipeline", flush=True)
 
     mx.random.seed(args.seed)
     t_total = time.perf_counter()
@@ -421,6 +506,13 @@ def main():
     print(f"  Extracted: {time.perf_counter()-t0:.1f}s", flush=True)
     print(f"  {len(vertices):,} vertices, {len(faces):,} faces", flush=True)
 
+    # Save raw mesh checkpoint (before cleanup/simplification)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_raw",
+                        vertices=vertices, faces=faces,
+                        mesh_grid_size=mesh_grid_size)
+
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
         faces,
@@ -489,6 +581,14 @@ def main():
     cleanup_model(tex_decoder)
     del tex_decoder
     gc.collect()
+
+    # Save texture checkpoint (before baking)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "texture",
+                        tex_np=tex_np,
+                        tex_coords_spatial=np.array(tex_coords)[:, 1:4],
+                        mesh_grid_size=mesh_grid_size)
 
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
