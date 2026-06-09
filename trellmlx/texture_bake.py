@@ -111,6 +111,60 @@ def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
         n_charts = F_count
         chart_labels = np.arange(F_count)
 
+    # Sub-split large charts so LSCM gets disk-like patches, not near-closed
+    # surfaces. Uses spectral bisection (Fiedler vector of face adjacency
+    # Laplacian) to find natural cuts.
+    max_chart_faces = max(F_count // 8, 200)  # target ~8+ charts minimum
+    changed = True
+    while changed:
+        changed = False
+        new_labels = chart_labels.copy()
+        next_id = chart_labels.max() + 1
+        for cid in range(new_labels.max() + 1):
+            cmask = new_labels == cid
+            csize = cmask.sum()
+            if csize <= max_chart_faces:
+                continue
+            # Build sub-adjacency for this chart
+            c_indices = np.where(cmask)[0]
+            idx_map = {orig: local for local, orig in enumerate(c_indices)}
+            sub_rows, sub_cols = [], []
+            for fi in c_indices:
+                for i in range(3):
+                    e = tuple(sorted((int(faces[fi, i]), int(faces[fi, (i + 1) % 3]))))
+                    for fj in edge_faces.get(e, []):
+                        if fj != fi and fj in idx_map:
+                            sub_rows.append(idx_map[fi])
+                            sub_cols.append(idx_map[fj])
+            if not sub_rows:
+                continue
+            n = len(c_indices)
+            sub_adj = sparse.csr_matrix(
+                (np.ones(len(sub_rows), dtype=np.float64), (sub_rows, sub_cols)),
+                shape=(n, n),
+            )
+            degree = np.array(sub_adj.sum(axis=1)).ravel()
+            D = sparse.diags(degree)
+            L = D - sub_adj
+            # Fiedler vector: second-smallest eigenvector of the Laplacian
+            try:
+                from scipy.sparse.linalg import eigsh
+                _, evecs = eigsh(L, k=2, sigma=0, which='LM')
+                fiedler = evecs[:, 1]
+            except Exception:
+                # Fallback: split by face index median
+                fiedler = np.arange(n, dtype=np.float64)
+            # Bisect: faces with fiedler > median go to new chart
+            median = np.median(fiedler)
+            split_mask = fiedler > median
+            if split_mask.sum() == 0 or split_mask.sum() == n:
+                continue  # can't split
+            new_labels[c_indices[split_mask]] = next_id
+            next_id += 1
+            changed = True
+        chart_labels = new_labels
+    n_charts = chart_labels.max() + 1
+
     # Step 3: LSCM parameterization per chart
     # Build output arrays: each chart may duplicate vertices at seams
     all_new_verts = []
@@ -177,84 +231,79 @@ def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
         uv_span = np.where(uv_span < 1e-10, 1.0, uv_span)
         chart_uvs = (chart_uvs - uv_min) / uv_span
 
-        w = uv_span[0]
-        h = uv_span[1]
+        # Compute chart's 3D surface area for area-proportional packing
+        chart_3d_faces = local_faces
+        cv0 = local_verts[chart_3d_faces[:, 0]]
+        cv1 = local_verts[chart_3d_faces[:, 1]]
+        cv2 = local_verts[chart_3d_faces[:, 2]]
+        chart_area_3d = 0.5 * np.linalg.norm(
+            np.cross(cv1 - cv0, cv2 - cv0), axis=1
+        ).sum()
+
+        # Aspect ratio from UV span
+        aspect = uv_span[0] / uv_span[1] if uv_span[1] > 1e-10 else 1.0
 
         chart_uv_data.append((
             chart_uvs.astype(np.float32),
             local_faces,
             local_verts,
             unique_verts,
-            float(w), float(h),
+            float(chart_area_3d),
+            float(aspect),
         ))
 
     # Step 4: Pack charts into [0,1]² UV space
-    # Simple shelf packing: sort charts by height descending, place left-to-right
-    chart_uv_data.sort(key=lambda x: -x[5])
+    # Area-proportional shelf packing: each chart gets UV area proportional
+    # to its 3D surface area
+    if not chart_uv_data:
+        pass  # handled below
+    else:
+        total_3d_area = sum(a for _, _, _, _, a, _ in chart_uv_data) or 1.0
+        padding = 0.003
+        usable = (1.0 - padding * 2) ** 2
 
-    padding = 0.005
-    shelf_x = padding
-    shelf_y = padding
-    shelf_height = 0.0
-    total_area = sum(w * h for _, _, _, _, w, h in chart_uv_data) or 1.0
+        # Sort by area descending for better shelf packing
+        chart_uv_data.sort(key=lambda x: -x[4])
 
-    # Scale factor: fit all charts into unit square with padding
-    # Estimate: sqrt(total_area) gives the side length if charts were square
-    scale = (1.0 - padding * 2) / max(
-        sum(c[4] for c in chart_uv_data[:1]) if chart_uv_data else 1.0,
-        1e-10,
-    )
-    # Iteratively find a scale that fits
-    for attempt in range(20):
+        # Compute chart dimensions: area-proportional allocation
+        # Each chart gets a rectangle with area = (chart_3d_area / total) * usable
+        # and aspect ratio preserved from its UV parameterization
+        chart_rects = []
+        for _, _, _, _, area_3d, aspect in chart_uv_data:
+            frac = area_3d / total_3d_area
+            rect_area = frac * usable
+            # w/h = aspect, w*h = rect_area → w = sqrt(rect_area * aspect)
+            w = np.sqrt(rect_area * max(aspect, 0.01))
+            h = rect_area / max(w, 1e-10)
+            chart_rects.append((w, h))
+
+        # Shelf packing
         shelf_x = padding
         shelf_y = padding
         shelf_height = 0.0
-        fits = True
-        for _, _, _, _, w, h in chart_uv_data:
-            cw = w * scale + padding
-            ch = h * scale + padding
-            if shelf_x + cw > 1.0:
+
+        for i, (chart_uvs, local_faces, local_verts, unique_verts, _, _) in enumerate(chart_uv_data):
+            cw, ch = chart_rects[i]
+
+            if shelf_x + cw + padding > 1.0:
                 shelf_x = padding
                 shelf_y += shelf_height + padding
                 shelf_height = 0.0
-            if shelf_y + ch > 1.0:
-                fits = False
-                break
+
+            # Place chart: scale normalized [0,1] UVs into the packed rect
+            placed_uvs = chart_uvs.copy()
+            placed_uvs[:, 0] = shelf_x + placed_uvs[:, 0] * cw
+            placed_uvs[:, 1] = shelf_y + placed_uvs[:, 1] * ch
+
+            offset_faces = local_faces + vert_offset
+            all_new_verts.append(local_verts.astype(np.float32))
+            all_new_faces.append(offset_faces.astype(np.uint32))
+            all_uvs.append(placed_uvs)
+            all_vmapping.append(unique_verts)
+            vert_offset += len(local_verts)
+
+            shelf_x += cw + padding
             shelf_height = max(shelf_height, ch)
-            shelf_x += cw
-        if fits:
-            break
-        scale *= 0.8
-
-    # Final placement
-    shelf_x = padding
-    shelf_y = padding
-    shelf_height = 0.0
-
-    for i, (chart_uvs, local_faces, local_verts, unique_verts, w, h) in enumerate(chart_uv_data):
-        cw = w * scale
-        ch = h * scale
-
-        if shelf_x + cw + padding > 1.0:
-            shelf_x = padding
-            shelf_y += shelf_height + padding
-            shelf_height = 0.0
-
-        # Place chart
-        placed_uvs = chart_uvs.copy()
-        placed_uvs[:, 0] = shelf_x + placed_uvs[:, 0] * cw
-        placed_uvs[:, 1] = shelf_y + placed_uvs[:, 1] * ch
-
-        # Offset faces and accumulate
-        offset_faces = local_faces + vert_offset
-        all_new_verts.append(local_verts.astype(np.float32))
-        all_new_faces.append(offset_faces.astype(np.uint32))
-        all_uvs.append(placed_uvs)
-        all_vmapping.append(unique_verts)
-        vert_offset += len(local_verts)
-
-        shelf_x += cw + padding
-        shelf_height = max(shelf_height, ch)
 
     if not all_new_verts:
         return (vertices.astype(np.float32), faces.astype(np.uint32),
