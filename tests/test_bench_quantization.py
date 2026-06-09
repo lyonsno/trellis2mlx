@@ -71,6 +71,25 @@ def test_initial_report_records_route_identity(tmp_path):
     assert "host" in report
 
 
+def test_initial_report_marks_random_conditioning_as_nonrepresentative(tmp_path):
+    bench = _load_module()
+
+    args = bench.parse_args([
+        "--report",
+        str(tmp_path / "report.json"),
+        "--checkpoint-root",
+        str(tmp_path / "ckpts"),
+    ])
+
+    report = bench.initial_report(args, command_line=["bench"])
+
+    assert report["asset"]["path"] is None
+    assert {
+        "level": "warning",
+        "code": "random_conditioning_not_representative",
+    } in report["events"]
+
+
 def test_failure_report_is_written_before_primary_output(tmp_path):
     bench = _load_module()
 
@@ -96,3 +115,44 @@ def test_failure_report_is_written_before_primary_output(tmp_path):
     assert persisted["last_trustworthy_evidence"]["report_existed_before_write"] is False
     assert persisted["stage"] == "ss-flow"
     assert persisted["variant"] == "int4"
+
+
+def test_default_report_path_is_unique_within_one_second(monkeypatch):
+    bench = _load_module()
+
+    monkeypatch.setattr(bench.time, "strftime", lambda _: "20260608-220000")
+
+    first = bench.default_report_path()
+    second = bench.default_report_path()
+
+    assert first != second
+    assert first.parent != second.parent
+
+
+def test_existing_report_requires_explicit_overwrite(tmp_path):
+    bench = _load_module()
+
+    report_path = tmp_path / "report.json"
+    report_path.write_text('{"status": "old"}\n')
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        bench.ensure_report_writable(report_path, overwrite=False)
+
+    bench.ensure_report_writable(report_path, overwrite=True)
+
+
+def test_degenerate_result_records_warning():
+    bench = _load_module()
+
+    result = {
+        "status": "ok",
+        "sample_time_s": 0.0,
+        "sample_time_per_step_s": 0.0,
+        "output_std": 0.0,
+    }
+
+    bench.add_result_warnings(result)
+
+    warnings = result["warnings"]
+    assert "degenerate_output_std" in warnings
+    assert "implausible_sample_time" in warnings

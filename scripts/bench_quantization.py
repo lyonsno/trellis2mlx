@@ -93,13 +93,15 @@ def _stage_arg(value: str) -> str:
 
 def default_report_path() -> Path:
     run_id = time.strftime("%Y%m%d-%H%M%S")
-    return Path("/tmp") / f"trellis2mlx-quant-bench-{run_id}" / "report.json"
+    unique = f"{os.getpid()}-{time.time_ns()}"
+    return Path("/tmp") / f"trellis2mlx-quant-bench-{run_id}-{unique}" / "report.json"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, help="Input image for native MLX DINOv3 conditioning")
     parser.add_argument("--report", type=Path, default=None, help="JSON report path")
+    parser.add_argument("--overwrite-report", action="store_true", help="Overwrite an existing JSON report")
     parser.add_argument("--repo-root", type=Path, default=None, help="Effective trellis2mlx repo root")
     parser.add_argument(
         "--checkpoint-root",
@@ -121,6 +123,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.report is None:
         args.report = default_report_path()
     return args
+
+
+def ensure_report_writable(path: Path, *, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"report already exists: {path}; pass --overwrite-report to replace it")
 
 
 def _jsonable(value: Any) -> Any:
@@ -199,6 +206,12 @@ def initial_report(args: argparse.Namespace, command_line: list[str] | None = No
     variants = parse_variants(args.variants)
     stages = parse_stages(args.stages)
     image_path = args.image
+    events = []
+    if image_path is None:
+        events.append({
+            "level": "warning",
+            "code": "random_conditioning_not_representative",
+        })
     return {
         "schema": SCHEMA,
         "status": "running",
@@ -224,7 +237,7 @@ def initial_report(args: argparse.Namespace, command_line: list[str] | None = No
             "random_conditioning_tokens": args.random_conditioning_tokens,
         },
         "results": [],
-        "events": [],
+        "events": events,
     }
 
 
@@ -253,6 +266,11 @@ def _load_conditioning(args: argparse.Namespace, report: dict[str, Any], report_
     import mlx.core as mx
 
     if args.image is None:
+        print(
+            "warning: using random conditioning; timings are not representative of native-DINO image conditioning",
+            file=sys.stderr,
+            flush=True,
+        )
         mx.random.seed(args.seed)
         cond = mx.random.normal((1, args.random_conditioning_tokens, 1024))
         mx.eval(cond)
@@ -277,6 +295,25 @@ def _load_conditioning(args: argparse.Namespace, report: dict[str, Any], report_
     report["asset"]["feature_time_s"] = time.perf_counter() - t0
     write_report(report_path, report)
     return cond_np
+
+
+def add_result_warnings(result: dict[str, Any]) -> None:
+    if result.get("status") != "ok":
+        return
+    warnings = result.setdefault("warnings", [])
+    output_std = result.get("output_std")
+    if output_std is not None and output_std <= 1e-12:
+        warnings.append("degenerate_output_std")
+    sample_time = result.get("sample_time_s")
+    time_per_step = result.get("sample_time_per_step_s")
+    if (
+        sample_time is not None
+        and time_per_step is not None
+        and (sample_time <= 0 or time_per_step <= 0)
+    ):
+        warnings.append("implausible_sample_time")
+    if not warnings:
+        result.pop("warnings", None)
 
 
 def _cleanup_runtime(model=None) -> None:
@@ -455,6 +492,7 @@ def run_benchmark(args: argparse.Namespace, report: dict[str, Any], report_path:
                 result = _time_ss_flow(args=args, label=label, bits=bits, cond_np=cond_np)
             else:
                 result = _time_slat_flow(args=args, label=label, bits=bits, cond_np=cond_np)
+            add_result_warnings(result)
             report["results"].append(result)
             write_report(report_path, report)
             if result["status"] == "ok":
@@ -474,6 +512,11 @@ def run_benchmark(args: argparse.Namespace, report: dict[str, Any], report_path:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     report_path = args.report
+    try:
+        ensure_report_writable(report_path, overwrite=args.overwrite_report)
+    except FileExistsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     report = initial_report(args)
     write_report(report_path, report)
     try:

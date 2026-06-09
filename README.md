@@ -164,6 +164,9 @@ PYTHONPATH=. python scripts/bench_quantization.py \
   --stages ss-flow,slat-flow
 ```
 
+The table above was recorded before the reusable harness was committed; use the
+command as a comparable rerun path for future reports.
+
 The script writes an incremental JSON report and records the effective repo
 head, checkpoint files, host/MLX identity, asset route, variants, stages, and
 failure phase if the run stops early.

@@ -121,6 +121,7 @@ def test_readme_quantization_section_states_measured_tradeoff():
     assert "memory" in quant_section.lower()
     assert "scripts/bench_quantization.py" in quant_section
     assert "checkpoint files" in quant_section
+    assert "recorded before the reusable harness was committed" in quant_section
 
 
 def test_generate_image_conditioning_failure_is_not_random_fallback(monkeypatch):
