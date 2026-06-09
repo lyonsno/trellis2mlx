@@ -1,6 +1,7 @@
 """Onboarding and runtime-polish contracts."""
 
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -14,6 +15,18 @@ def test_readme_uses_current_huggingface_cli():
     assert "hf download microsoft/TRELLIS.2-4B" in text
     assert "hf download microsoft/TRELLIS-image-large" in text
     assert "hf download facebook/dinov3-vitl16-pretrain-lvd1689m" in text
+
+
+def test_readme_local_image_links_exist():
+    text = Path("README.md").read_text()
+    local_image_sources = [
+        src
+        for src in re.findall(r'<img\s+[^>]*src="([^"]+)"', text)
+        if not src.startswith(("http://", "https://"))
+    ]
+
+    assert local_image_sources
+    assert [src for src in local_image_sources if not Path(src).is_file()] == []
 
 
 def test_uv_lock_is_ignored_for_agent_review_runs():
