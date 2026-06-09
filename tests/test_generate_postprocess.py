@@ -15,12 +15,12 @@ def test_postprocess_skips_final_simplify_if_cleanup_drops_below_target():
     from generate import _cleanup_and_simplify_mesh
 
     vertices = FaceBag(10)
-    cleanup_outputs = [FaceBag(1_000_000), FaceBag(150_000)]
+    cleanup_outputs = [FaceBag(1_000_000), FaceBag(150_000), FaceBag(150_000)]
     simplify_calls = []
     cleanup_calls = []
 
     def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
-        cleanup_calls.append((len(faces), verbose))
+        cleanup_calls.append((len(faces), do_fix_normals, verbose))
         return v, cleanup_outputs.pop(0)
 
     def simplify(v, faces, target_reduction):
@@ -42,7 +42,40 @@ def test_postprocess_skips_final_simplify_if_cleanup_drops_below_target():
     assert out_vertices is vertices
     assert len(out_faces) == 150_000
     assert simplify_calls == [pytest.approx(0.4)]
-    assert cleanup_calls == [(1_000_000, True), (600_000, False)]
+    assert cleanup_calls == [
+        (1_000_000, False, True),
+        (600_000, False, False),
+        (150_000, True, False),
+    ]
+
+
+def test_postprocess_target_faces_zero_still_runs_final_normals_cleanup():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(500_000)]
+    cleanup_calls = []
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        cleanup_calls.append((len(faces), do_fix_normals, verbose))
+        return v, cleanup_outputs.pop(0)
+
+    out_vertices, out_faces = _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(500_000),
+        target_faces=0,
+        no_cleanup=False,
+        cleanup_mesh=cleanup_mesh,
+        simplify=None,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert out_vertices is vertices
+    assert len(out_faces) == 500_000
+    assert cleanup_calls == [
+        (500_000, False, True),
+        (500_000, True, False),
+    ]
 
 
 def test_postprocess_no_cleanup_still_simplifies_without_cleanup_import():

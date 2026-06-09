@@ -1,3 +1,4 @@
 trellis2mlx.egg-info/
 __pycache__/
+*.py[cod]
 /uv.lock

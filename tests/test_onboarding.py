@@ -1,6 +1,7 @@
 """Onboarding and runtime-polish contracts."""
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -19,6 +20,17 @@ def test_uv_lock_is_ignored_for_agent_review_runs():
     gitignore_lines = Path(".gitignore").read_text().splitlines()
 
     assert "/uv.lock" in gitignore_lines
+
+
+def test_python_bytecode_is_not_tracked():
+    result = subprocess.run(
+        ["git", "ls-files", "*__pycache__*", "*.pyc"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == ""
 
 
 def test_cleanup_prefers_modern_mlx_clear_cache(monkeypatch):

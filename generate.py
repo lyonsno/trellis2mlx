@@ -98,6 +98,14 @@ def _cleanup_and_simplify_mesh(
     log=print,
 ):
     """Run mesh cleanup and multi-pass simplification."""
+    def final_cleanup(vertices, faces):
+        if no_cleanup:
+            return vertices, faces
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, verbose=False)
+        log(f"  Cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
+        return vertices, faces
+
     if not no_cleanup:
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
@@ -106,6 +114,7 @@ def _cleanup_and_simplify_mesh(
         log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
 
     if not target_faces or len(faces) <= target_faces:
+        vertices, faces = final_cleanup(vertices, faces)
         return vertices, faces
 
     if simplify is None:
@@ -125,6 +134,7 @@ def _cleanup_and_simplify_mesh(
             vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False, verbose=False)
 
     if len(faces) <= target_faces:
+        vertices, faces = final_cleanup(vertices, faces)
         return vertices, faces
 
     # Pass 2: Final simplify to target, then cleanup
@@ -145,10 +155,8 @@ def _cleanup_and_simplify_mesh(
             break
     log(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
         f"({time.perf_counter()-t0:.1f}s)", flush=True)
-    if did_final_simplify and not no_cleanup:
-        t0 = time.perf_counter()
-        vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
-        log(f"  Cleanup pass 2: {time.perf_counter()-t0:.1f}s", flush=True)
+    if did_final_simplify:
+        vertices, faces = final_cleanup(vertices, faces)
 
     return vertices, faces
 
