@@ -103,10 +103,12 @@ def sample_features(feature_map: mx.array, queries_ndc: mx.array, BHWC: bool = T
     bottom_left = _gather_bhwc(feature_map, y1_i, x0_i)
     bottom_right = _gather_bhwc(feature_map, y1_i, x1_i)
 
-    wa = ((x1 - x) * (y1 - y))[..., None]
-    wb = ((x - x0) * (y1 - y))[..., None]
-    wc = ((x1 - x) * (y - y0))[..., None]
-    wd = ((x - x0) * (y - y0))[..., None]
+    dx = x - x0
+    dy = y - y0
+    wa = ((1.0 - dx) * (1.0 - dy))[..., None]
+    wb = (dx * (1.0 - dy))[..., None]
+    wc = ((1.0 - dx) * dy)[..., None]
+    wd = (dx * dy)[..., None]
     return top_left * wa + top_right * wb + bottom_left * wc + bottom_right * wd
 
 

@@ -68,6 +68,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--packed-flow-artifact", type=Path, help="Packed generic flow artifact directory for SLat diagnostics")
     parser.add_argument("--packed-flow-stage", default="shape-lr-slat", help="Expected packed generic flow stage")
     parser.add_argument("--run-packed-slat-width-diagnostic", action="store_true", help="Run packed SLat projected-context width diagnostic")
+    parser.add_argument("--projection-mode", choices=("native", "bilinear_hr_concat"), default="native", help="Projected feature mode for SLat diagnostics")
+    parser.add_argument("--hr-feature-size", type=_positive_int, default=None, help="Bilinear HR feature side length for SLat diagnostics")
     parser.add_argument("--image", type=Path, help="Image path for DINOv3/Pixal3D projected conditioning")
     parser.add_argument("--sparse-stage-steps", type=_positive_int, default=1)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
@@ -1109,6 +1111,8 @@ def pixal3d_context_from_features(
     *,
     image_size: int = 512,
     patch_size: int = 16,
+    projection_mode: str = "native",
+    hr_feature_size: int | tuple[int, int] | None = None,
 ) -> dict[str, mx.array]:
     from trellmlx.models.dinov3_proj import DINOv3ProjectionAdapter
 
@@ -1118,6 +1122,8 @@ def pixal3d_context_from_features(
         patch_size=patch_size,
         grid_resolution=config["resolution"],
         num_prefix_tokens=5,
+        projection_mode=projection_mode,
+        hr_feature_size=hr_feature_size,
     )
     context = adapter(
         feature_array,
@@ -1136,6 +1142,8 @@ def diagnose_packed_slat_projection_width(
     expected_stage: str = "shape-lr-slat",
     image_size: int = 512,
     patch_size: int = 16,
+    projection_mode: str = "native",
+    hr_feature_size: int | tuple[int, int] | None = None,
     token_count: int = 8,
     seed: int = 42,
     run_zero_augmented: bool = True,
@@ -1153,6 +1161,8 @@ def diagnose_packed_slat_projection_width(
         config,
         image_size=image_size,
         patch_size=patch_size,
+        projection_mode=projection_mode,
+        hr_feature_size=hr_feature_size,
     )
     if adapter_context["proj"].shape[1] < token_count:
         raise ValueError(
@@ -1204,6 +1214,8 @@ def diagnose_packed_slat_projection_width(
                 "input_feature_shape": list(feature_shape),
                 "global_shape": list(adapter_context["global"].shape),
                 "proj_shape": list(adapter_context["proj"].shape),
+                "projection_mode": projection_mode,
+                "hr_feature_size": hr_feature_size,
                 "expected_slat_proj_in_channels": config["proj_in_channels"],
                 "matches_slat_projection_width": adapter_context["proj"].shape[-1] == config["proj_in_channels"],
             },
@@ -1921,6 +1933,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "packed_flow_artifact": str(args.packed_flow_artifact) if args.packed_flow_artifact else None,
             "packed_flow_stage": args.packed_flow_stage,
             "run_packed_slat_width_diagnostic": args.run_packed_slat_width_diagnostic,
+            "projection_mode": args.projection_mode,
+            "hr_feature_size": args.hr_feature_size,
             "image": str(args.image) if args.image else None,
             "sparse_stage_steps": args.sparse_stage_steps,
         },
@@ -2049,6 +2063,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
                     expected_stage=args.packed_flow_stage,
                     image_size=args.image_size,
                     patch_size=args.patch_size,
+                    projection_mode=args.projection_mode,
+                    hr_feature_size=args.hr_feature_size,
                     seed=args.seed,
                     run_zero_augmented=True,
                 )

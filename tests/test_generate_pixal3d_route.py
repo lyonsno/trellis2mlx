@@ -733,6 +733,86 @@ def test_packed_slat_projection_width_diagnostic_separates_conditioning_from_loa
     assert report["zero_augmented_projection_forward"]["output_shape"] == [3, 32]
 
 
+def test_pixal3d_context_from_features_can_request_bilinear_hr_concat():
+    gen = _load_module()
+
+    config = {
+        "resolution": 2,
+        "cond_channels": 64,
+        "proj_in_channels": 128,
+    }
+    prefix = np.zeros((1, 5, 64), dtype=np.float32)
+    patches = np.ones((1, 4, 64), dtype=np.float32)
+    features = np.concatenate([prefix, patches], axis=1)
+
+    context = gen.pixal3d_context_from_features(
+        features,
+        config,
+        image_size=32,
+        patch_size=16,
+        projection_mode="bilinear_hr_concat",
+        hr_feature_size=4,
+    )
+    mx.eval(context["global"], context["proj"])
+
+    assert context["global"].shape == (1, 5, 64)
+    assert context["proj"].shape == (1, 8, 128)
+    assert np.allclose(np.array(context["proj"][..., :64]), 1.0, atol=1e-5)
+    assert np.allclose(np.array(context["proj"][..., 64:]), 1.0, atol=1e-5)
+
+
+def test_packed_slat_projection_width_diagnostic_can_use_bilinear_concat_mode(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "slat-width-bilinear.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 4,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 128,
+        },
+    }))
+    checkpoint = tmp_path / "slat-width-bilinear.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-slat-width-bilinear"
+    gen.export_packed_flow_artifact(checkpoint, config, artifact_dir, stage="shape-lr-slat", bits=4, group_size=64)
+
+    report = gen.diagnose_packed_slat_projection_width(
+        artifact_dir,
+        config,
+        expected_stage="shape-lr-slat",
+        image_size=32,
+        patch_size=16,
+        projection_mode="bilinear_hr_concat",
+        hr_feature_size=4,
+        token_count=3,
+        seed=13,
+    )
+
+    adapter = report["conditioning"]["current_mlx_projection_adapter"]
+    assert adapter["projection_mode"] == "bilinear_hr_concat"
+    assert adapter["proj_shape"] == [1, 64, 128]
+    assert adapter["matches_slat_projection_width"] is True
+    assert report["native_projection_forward"]["status"] == "ok"
+    assert report["zero_augmented_projection_forward"]["status"] == "ok"
+    assert report["zero_augmented_projection_forward"]["zero_augmented_projection_for_diagnostic_only"] is False
+
+
 def test_cli_packed_slat_width_diagnostic_marks_last_evidence_phase(tmp_path):
     gen = _load_module()
 

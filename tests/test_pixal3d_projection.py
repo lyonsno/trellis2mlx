@@ -139,3 +139,44 @@ def test_dinov3_projection_adapter_builds_pixal3d_context_dict():
     assert context["global"].shape == (1, 5, 3)
     assert context["proj"].shape == (1, 8, 3)
     assert np.allclose(np.array(context["proj"]), 1.0, atol=1e-5)
+
+
+def test_dinov3_projection_adapter_can_emit_bilinear_hr_concat_context():
+    from trellmlx.models.dinov3_proj import DINOv3ProjectionAdapter
+
+    prefix = mx.zeros((1, 5, 3), dtype=mx.float32)
+    patches = mx.ones((1, 4, 3), dtype=mx.float32)
+    features = mx.concatenate([prefix, patches], axis=1)
+
+    adapter = DINOv3ProjectionAdapter(
+        image_size=32,
+        patch_size=16,
+        grid_resolution=2,
+        num_prefix_tokens=5,
+        projection_mode="bilinear_hr_concat",
+        hr_feature_size=4,
+    )
+    context = adapter(
+        features,
+        camera_angle_x=mx.array([np.pi / 2], dtype=mx.float32),
+        distance=mx.array([2.0], dtype=mx.float32),
+        mesh_scale=mx.array([1.0], dtype=mx.float32),
+    )
+    mx.eval(context["global"], context["proj"])
+
+    assert set(context) == {"global", "proj"}
+    assert context["global"].shape == (1, 5, 3)
+    assert context["proj"].shape == (1, 8, 6)
+    assert np.allclose(np.array(context["proj"][..., :3]), 1.0, atol=1e-5)
+    assert np.allclose(np.array(context["proj"][..., 3:]), 1.0, atol=1e-5)
+
+
+def test_dinov3_projection_adapter_rejects_unknown_projection_mode():
+    from trellmlx.models.dinov3_proj import DINOv3ProjectionAdapter
+
+    try:
+        DINOv3ProjectionAdapter(projection_mode="mystery")
+    except ValueError as exc:
+        assert "projection_mode" in str(exc)
+    else:
+        raise AssertionError("expected unknown projection_mode to fail")
