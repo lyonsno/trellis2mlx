@@ -70,6 +70,44 @@ def test_default_stage_sequence_exposes_mesh_postprocess_boundary():
     assert mesh_extract_index < mesh_postprocess_index < texture_latent_index
 
 
+def test_no_generation_stage_insertion_preserves_downstream_stage_seed(tmp_path):
+    from trellmlx.interleaved_generation import DEFAULT_STAGE_SEQUENCE, GenerationJob, InterleavedBatchPlan
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    sequence_without_postprocess = tuple(
+        stage for stage in DEFAULT_STAGE_SEQUENCE if stage != "mesh_postprocess"
+    )
+
+    baseline_plan = InterleavedBatchPlan(jobs=(job,), stages=sequence_without_postprocess)
+    default_plan = InterleavedBatchPlan(jobs=(job,))
+
+    baseline_texture_seed = next(
+        invocation.stage_seed
+        for invocation in baseline_plan.iter_invocations()
+        if invocation.stage == "texture_latent"
+    )
+    default_texture_seed = next(
+        invocation.stage_seed
+        for invocation in default_plan.iter_invocations()
+        if invocation.stage == "texture_latent"
+    )
+
+    assert default_texture_seed == baseline_texture_seed
+
+
+def test_seed_neutral_stage_does_not_reuse_downstream_stage_seed(tmp_path):
+    from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    invocations = {
+        invocation.stage: invocation
+        for invocation in InterleavedBatchPlan(jobs=(job,)).iter_invocations()
+        if invocation.stage in {"mesh_postprocess", "texture_latent"}
+    }
+
+    assert invocations["mesh_postprocess"].stage_seed != invocations["texture_latent"].stage_seed
+
+
 def test_plan_rejects_duplicate_job_ids(tmp_path):
     from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan
 

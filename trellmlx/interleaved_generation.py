@@ -33,12 +33,28 @@ DEFAULT_STAGE_SEQUENCE: tuple[str, ...] = (
     "export",
 )
 
+SEED_NEUTRAL_STAGES: frozenset[str] = frozenset({"mesh_postprocess"})
+
 
 def derive_stage_seed(*, job_seed: int, stage_index: int) -> int:
     """Derive a deterministic per-job/per-stage uint32 seed."""
 
     digest = hashlib.blake2s(f"{int(job_seed)}:{int(stage_index)}".encode("ascii"), digest_size=4).digest()
     return int.from_bytes(digest, "little")
+
+
+def _derive_invocation_stage_seed(*, job_seed: int, stages: Sequence[str], stage_index: int) -> int:
+    """Derive a stage seed without letting seed-neutral stages shift later stages."""
+
+    stage = stages[stage_index]
+    if stage in SEED_NEUTRAL_STAGES:
+        digest = hashlib.blake2s(
+            f"{int(job_seed)}:seed-neutral:{stage}".encode("ascii"),
+            digest_size=4,
+        ).digest()
+        return int.from_bytes(digest, "little")
+    neutral_before = sum(1 for prior_stage in stages[:stage_index] if prior_stage in SEED_NEUTRAL_STAGES)
+    return derive_stage_seed(job_seed=job_seed, stage_index=stage_index - neutral_before)
 
 
 def _validate_artifacts(artifacts: Mapping[str, StageArtifactValue]) -> dict[str, StageArtifactValue]:
@@ -176,7 +192,11 @@ class InterleavedBatchPlan:
                     stage_index=stage_index,
                     job_id=job.job_id,
                     seed=job.seed,
-                    stage_seed=derive_stage_seed(job_seed=job.seed, stage_index=stage_index),
+                    stage_seed=_derive_invocation_stage_seed(
+                        job_seed=job.seed,
+                        stages=self.stages,
+                        stage_index=stage_index,
+                    ),
                     images=job.images,
                     output_path=str(job.output_path),
                     conditioning_route=job.conditioning_route,
