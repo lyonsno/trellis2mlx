@@ -286,6 +286,25 @@ StageHandleCloser = Callable[[StageHandleRuntime, object], None]
 _RESERVED_STAGE_HANDLE_METADATA_KEYS = frozenset({"close_phase", "error", "handle_id", "kind", "load_phase"})
 
 
+def _validate_handle_metadata(metadata: Mapping[str, StageArtifactValue]) -> dict[str, StageArtifactValue]:
+    metadata = _validate_artifacts(metadata)
+    reserved_keys = sorted(set(metadata) & _RESERVED_STAGE_HANDLE_METADATA_KEYS)
+    if reserved_keys:
+        raise ValueError(f"StageHandleSpec metadata cannot use reserved report keys: {', '.join(reserved_keys)}")
+    return metadata
+
+
+@dataclass(frozen=True)
+class StageHandleFactoryResult:
+    """Handle plus dynamic scalar metadata observed during factory execution."""
+
+    handle: object
+    metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _validate_handle_metadata(self.metadata))
+
+
 @dataclass(frozen=True)
 class StageHandleSpec:
     """Declarative fixture-loadable handle required by a stage execution run."""
@@ -301,11 +320,7 @@ class StageHandleSpec:
             raise ValueError("StageHandleSpec requires a handle_id")
         if not self.kind:
             raise ValueError("StageHandleSpec requires a kind")
-        metadata = _validate_artifacts(self.metadata)
-        reserved_keys = sorted(set(metadata) & _RESERVED_STAGE_HANDLE_METADATA_KEYS)
-        if reserved_keys:
-            raise ValueError(f"StageHandleSpec metadata cannot use reserved report keys: {', '.join(reserved_keys)}")
-        object.__setattr__(self, "metadata", metadata)
+        object.__setattr__(self, "metadata", _validate_handle_metadata(self.metadata))
 
 
 @dataclass(frozen=True)
@@ -380,7 +395,16 @@ class StageContextFactoryFromSpecs:
         for spec in self.specs:
             runtime = StageHandleRuntime(run_id=self.run_id, plan=plan, spec=spec)
             try:
-                handle = spec.factory(runtime)
+                loaded = spec.factory(runtime)
+                if isinstance(loaded, StageHandleFactoryResult):
+                    handle = loaded.handle
+                    dynamic_metadata = dict(loaded.metadata)
+                else:
+                    handle = loaded
+                    dynamic_metadata = {}
+                duplicate_metadata = sorted(set(spec.metadata) & set(dynamic_metadata))
+                if duplicate_metadata:
+                    raise ValueError(f"dynamic metadata duplicates static metadata keys: {', '.join(duplicate_metadata)}")
             except Exception as exc:
                 report_metadata = {"kind": spec.kind, "load_phase": "load_error", **spec.metadata}
                 report = StageHandleLoadReport(
@@ -395,7 +419,7 @@ class StageContextFactoryFromSpecs:
                 self.last_close_reports = self._close_loaded_handles(handles)
                 raise StageHandleLoadError(report) from exc
 
-            report_metadata = {"kind": spec.kind, "load_phase": "loaded", **spec.metadata}
+            report_metadata = {"kind": spec.kind, "load_phase": "loaded", **spec.metadata, **dynamic_metadata}
             report = StageHandleLoadReport(
                 handle_id=spec.handle_id,
                 kind=spec.kind,
