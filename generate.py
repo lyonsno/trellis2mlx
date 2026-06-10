@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 import time
 
@@ -85,6 +86,69 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     result[:, 1:4] = spatial
     unique_coords = np.unique(result, axis=0)
     return unique_coords
+
+
+def _filter_hr_support_components(
+    hr_slat_np,
+    quant_coords,
+    hr_coords_3d,
+    *,
+    mode,
+    min_component_ratio,
+):
+    """Filter HR sparse support while preserving row alignment."""
+    hr_slat_np = np.asarray(hr_slat_np)
+    quant_coords = np.asarray(quant_coords)
+    hr_coords_3d = np.asarray(hr_coords_3d)
+    if len(hr_slat_np) != len(hr_coords_3d):
+        raise ValueError(
+            f"SLat row count {len(hr_slat_np)} does not match HR coord count {len(hr_coords_3d)}"
+        )
+    if len(quant_coords) != len(hr_coords_3d):
+        raise ValueError(
+            f"quantized coord row count {len(quant_coords)} does not match HR coord count {len(hr_coords_3d)}"
+        )
+
+    from trellmlx.coord_components import filter_sparse_coordinate_components
+
+    filtered_spatial, filtered_slat, report = filter_sparse_coordinate_components(
+        hr_coords_3d,
+        hr_slat_np,
+        mode=mode,
+        min_component_ratio=min_component_ratio,
+        include_row_indices=True,
+    )
+    kept_row_indices = np.asarray(report.pop("kept_row_indices"), dtype=np.int64)
+    filtered_quant = quant_coords[kept_row_indices]
+    report = {
+        "route": "hr-support-component-filter",
+        "stage": "post_hr_slat_pre_shape_decode",
+        "filtered_keys": ["hr_slat", "quant_coords", "hr_coords_3d"],
+        "slat_normalization": "denormalized",
+        **report,
+    }
+    return filtered_slat, filtered_quant, filtered_spatial, report
+
+
+def _write_generation_component_filter_report(path, report):
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema": "trellis2mlx.generate_component_filter.v1",
+                "status": "ok",
+                "route": "generate-hr-support-component-filter",
+                "filter": report,
+            },
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+        handle.write("\n")
 
 
 def _cleanup_and_simplify_mesh(
@@ -183,6 +247,12 @@ def main():
                         help="Skip mesh cleanup entirely (no dedup, no repair, no hole fill)")
     parser.add_argument("--keep-largest", action="store_true",
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
+    parser.add_argument("--component-filter", choices=["none", "largest", "min_ratio"], default="none",
+                        help="Filter disconnected HR sparse-coordinate support before shape decode (default: none)")
+    parser.add_argument("--component-filter-min-ratio", type=float, default=1e-5,
+                        help="Minimum component/largest ratio for --component-filter=min_ratio")
+    parser.add_argument("--component-filter-report",
+                        help="Write a JSON report for the HR sparse-coordinate component filter stage")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
@@ -457,6 +527,33 @@ def main():
 
     hr_slat = _denormalize_slat(hr_slat)
     mx.eval(hr_slat)
+
+    if args.component_filter != "none" or args.component_filter_report:
+        t0 = time.perf_counter()
+        hr_slat_np = np.array(hr_slat)
+        filtered_slat_np, quant_coords, hr_coords_3d, component_filter_report = _filter_hr_support_components(
+            hr_slat_np,
+            quant_coords,
+            hr_coords_3d,
+            mode=args.component_filter,
+            min_component_ratio=args.component_filter_min_ratio,
+        )
+        num_tokens = len(quant_coords)
+        hr_slat = mx.array(filtered_slat_np)
+        mx.eval(hr_slat)
+        print(
+            "  Component filter: "
+            f"{component_filter_report['mode']} kept {component_filter_report['kept_count']:,}/"
+            f"{component_filter_report['input_count']:,} HR tokens "
+            f"(dropped {component_filter_report['dropped_count']:,}; "
+            f"components {component_filter_report['component_sizes']}) "
+            f"({time.perf_counter()-t0:.1f}s)",
+            flush=True,
+        )
+        _write_generation_component_filter_report(
+            args.component_filter_report,
+            component_filter_report,
+        )
 
     cleanup_model(hr_slat_flow)
     del hr_slat_flow
