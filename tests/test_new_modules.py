@@ -227,6 +227,28 @@ class TestWeightLoader:
         assert _remap_key("blocks.0.self_attn.to_qkv.weight") == "blocks.0.self_attn.to_qkv.weight"
         assert _remap_key("blocks.0.modulation") == "blocks.0.modulation"
 
+    def test_remap_pixal3d_wrapped_cross_attention(self):
+        from trellmlx.weight_loader import _remap_key
+        assert (
+            _remap_key("blocks.0.cross_attn.to_q.weight")
+            == "blocks.0.cross_attn.cross_attn_block.to_q.weight"
+        )
+        assert (
+            _remap_key("blocks.0.cross_attn.q_rms_norm.gamma")
+            == "blocks.0.cross_attn.cross_attn_block.q_rms_norm.gamma"
+        )
+
+    def test_remap_pixal3d_projection_keys_passthrough(self):
+        from trellmlx.weight_loader import _remap_key
+        assert (
+            _remap_key("blocks.0.cross_attn.proj_linear.weight")
+            == "blocks.0.cross_attn.proj_linear.weight"
+        )
+        assert (
+            _remap_key("blocks.0.cross_attn.cross_attn_block.to_q.weight")
+            == "blocks.0.cross_attn.cross_attn_block.to_q.weight"
+        )
+
     def test_conv_permute(self):
         from trellmlx.weight_loader import _should_permute_conv
         assert _should_permute_conv("blocks.0.conv1.weight", (128, 128, 3, 3, 3)) is True

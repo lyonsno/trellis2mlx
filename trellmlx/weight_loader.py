@@ -19,6 +19,9 @@ _REMAP_PATTERNS = [
     (r"^adaLN_modulation\.(\d+)\.", r"adaLN_modulation.layers.\1."),
     # FeedForward uses mlp_0/mlp_2 attrs instead of Sequential .0/.2
     (r"\.mlp\.mlp\.(\d+)\.", r".mlp.mlp_\1."),
+    # Pixal3D ProjectAttention wraps the original cross attention block.
+    # Per-block proj_linear keys live beside the wrapped block and must pass through.
+    (r"\.cross_attn\.(?!cross_attn_block\.|proj_linear\.)", r".cross_attn.cross_attn_block."),
     # Decoder ConvNeXt blocks: blocks.X.Y.mlp.0 → blocks.X.Y.mlp_0
     (r"(blocks\.\d+\.\d+)\.mlp\.(\d+)\.", r"\1.mlp_\2."),
     # TimestepEmbedder same pattern
