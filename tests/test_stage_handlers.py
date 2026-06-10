@@ -261,3 +261,50 @@ def test_model_role_stage_handler_rejects_malformed_consumer_stages_metadata(tmp
 
     with pytest.raises(ValueError, match="model role shape_decoder metadata consumer_stages must be a nonempty string"):
         handler(invocation, state, context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model_family", ""),
+        ("checkpoint", False),
+        ("requested_loader_route", ""),
+        ("effective_loader_route", True),
+    ),
+)
+def test_model_role_stage_handler_rejects_malformed_identity_metadata(tmp_path, field, value):
+    from trellmlx.interleaved_generation import JobState, StageExecutionContext
+    from trellmlx.stage_handlers import build_model_role_stage_handler
+
+    plan = _single_job_plan(tmp_path)
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+    metadata = {
+        "role": "dinov3_image_encoder",
+        "stage": "image_conditioning",
+        "model_family": "dinov3",
+        "checkpoint": "fixture://dinov3",
+        "requested_loader_route": "fixture",
+        "effective_loader_route": "fixture",
+    }
+    metadata[field] = value
+    context = StageExecutionContext(
+        run_id="stage-handler-probe",
+        handles={"dinov3_image_encoder": object()},
+        handle_metadata={"dinov3_image_encoder": metadata},
+    )
+
+    def fixture(runtime):
+        raise AssertionError("fixture should not run")
+
+    handler = build_model_role_stage_handler(
+        stage="image_conditioning",
+        role_ids=("dinov3_image_encoder",),
+        fixture=fixture,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"model role dinov3_image_encoder metadata {field} must be a nonempty string",
+    ):
+        handler(invocation, state, context)

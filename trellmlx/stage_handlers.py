@@ -112,10 +112,17 @@ def _validate_model_role_metadata(
     missing_keys = [key for key in required_keys if key not in metadata]
     if missing_keys:
         raise ValueError(f"model role {role_id} metadata missing keys: {', '.join(missing_keys)}")
+    for key in ("model_family", "checkpoint", "requested_loader_route", "effective_loader_route"):
+        _require_nonempty_string_metadata(role_id=role_id, key=key, value=metadata[key])
 
     declared_stages = _declared_consumer_stages(metadata)
     if stage not in declared_stages:
         raise ValueError(f"model role {role_id} is not declared for stage {stage}")
+
+
+def _require_nonempty_string_metadata(*, role_id: str, key: str, value: StageArtifactValue) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"model role {role_id} metadata {key} must be a nonempty string")
 
 
 def _declared_consumer_stages(metadata: Mapping[str, StageArtifactValue]) -> tuple[str, ...]:
