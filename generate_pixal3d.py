@@ -26,6 +26,9 @@ import numpy as np
 
 
 SCHEMA = "trellis2mlx.pixal3d_route.v1"
+PIXAL3D_DEFAULT_CAMERA_ANGLE_X = 0.8575560450553894
+PIXAL3D_DEFAULT_CAMERA_DISTANCE = 2.0
+PIXAL3D_DEFAULT_MESH_SCALE = 1.0
 
 
 def _positive_int(value: str) -> int:
@@ -70,6 +73,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-packed-slat-width-diagnostic", action="store_true", help="Run packed SLat projected-context width diagnostic")
     parser.add_argument("--projection-mode", choices=("native", "bilinear_hr_concat"), default="native", help="Projected feature mode for SLat diagnostics")
     parser.add_argument("--hr-feature-size", type=_positive_int, default=None, help="Bilinear HR feature side length for SLat diagnostics")
+    parser.add_argument("--camera-angle-x", type=float, default=PIXAL3D_DEFAULT_CAMERA_ANGLE_X, help="Pixal3D projection camera horizontal FOV/ray angle")
+    parser.add_argument("--camera-distance", type=float, default=PIXAL3D_DEFAULT_CAMERA_DISTANCE, help="Pixal3D projection camera distance")
+    parser.add_argument("--mesh-scale", type=float, default=PIXAL3D_DEFAULT_MESH_SCALE, help="Pixal3D projection mesh scale")
     parser.add_argument("--image", type=Path, help="Image path for DINOv3/Pixal3D projected conditioning")
     parser.add_argument("--sparse-stage-steps", type=_positive_int, default=1)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
@@ -1113,6 +1119,9 @@ def pixal3d_context_from_features(
     patch_size: int = 16,
     projection_mode: str = "native",
     hr_feature_size: int | tuple[int, int] | None = None,
+    camera_angle_x: float = PIXAL3D_DEFAULT_CAMERA_ANGLE_X,
+    distance: float = PIXAL3D_DEFAULT_CAMERA_DISTANCE,
+    mesh_scale: float = PIXAL3D_DEFAULT_MESH_SCALE,
 ) -> dict[str, mx.array]:
     from trellmlx.models.dinov3_proj import DINOv3ProjectionAdapter
 
@@ -1127,9 +1136,9 @@ def pixal3d_context_from_features(
     )
     context = adapter(
         feature_array,
-        camera_angle_x=mx.array([np.pi / 2], dtype=mx.float32),
-        distance=mx.array([2.0], dtype=mx.float32),
-        mesh_scale=mx.array([1.0], dtype=mx.float32),
+        camera_angle_x=mx.array([camera_angle_x], dtype=mx.float32),
+        distance=mx.array([distance], dtype=mx.float32),
+        mesh_scale=mx.array([mesh_scale], dtype=mx.float32),
     )
     mx.eval(context["global"], context["proj"])
     return context
@@ -1144,6 +1153,9 @@ def diagnose_packed_slat_projection_width(
     patch_size: int = 16,
     projection_mode: str = "native",
     hr_feature_size: int | tuple[int, int] | None = None,
+    camera_angle_x: float = PIXAL3D_DEFAULT_CAMERA_ANGLE_X,
+    distance: float = PIXAL3D_DEFAULT_CAMERA_DISTANCE,
+    mesh_scale: float = PIXAL3D_DEFAULT_MESH_SCALE,
     token_count: int = 8,
     seed: int = 42,
     run_zero_augmented: bool = True,
@@ -1163,6 +1175,9 @@ def diagnose_packed_slat_projection_width(
         patch_size=patch_size,
         projection_mode=projection_mode,
         hr_feature_size=hr_feature_size,
+        camera_angle_x=camera_angle_x,
+        distance=distance,
+        mesh_scale=mesh_scale,
     )
     if adapter_context["proj"].shape[1] < token_count:
         raise ValueError(
@@ -1216,6 +1231,9 @@ def diagnose_packed_slat_projection_width(
                 "proj_shape": list(adapter_context["proj"].shape),
                 "projection_mode": projection_mode,
                 "hr_feature_size": hr_feature_size,
+                "camera_angle_x": camera_angle_x,
+                "distance": distance,
+                "mesh_scale": mesh_scale,
                 "expected_slat_proj_in_channels": config["proj_in_channels"],
                 "matches_slat_projection_width": adapter_context["proj"].shape[-1] == config["proj_in_channels"],
             },
@@ -1580,6 +1598,9 @@ def run_image_conditioned_packed_sparse_structure_stage_smoke(
     feature_source: str | None = None,
     image_size: int = 512,
     patch_size: int = 16,
+    camera_angle_x: float = PIXAL3D_DEFAULT_CAMERA_ANGLE_X,
+    distance: float = PIXAL3D_DEFAULT_CAMERA_DISTANCE,
+    mesh_scale: float = PIXAL3D_DEFAULT_MESH_SCALE,
     steps: int = 1,
     seed: int = 42,
 ) -> dict[str, Any]:
@@ -1605,12 +1626,18 @@ def run_image_conditioned_packed_sparse_structure_stage_smoke(
         config,
         image_size=image_size,
         patch_size=patch_size,
+        camera_angle_x=camera_angle_x,
+        distance=distance,
+        mesh_scale=mesh_scale,
     )
     conditioning_report = {
         **feature_report,
         "synthetic_fallback_used": False,
         "image_projected_conditioning": True,
         "patch_size": patch_size,
+        "camera_angle_x": camera_angle_x,
+        "distance": distance,
+        "mesh_scale": mesh_scale,
         "context_global_shape": list(context["global"].shape),
         "context_proj_shape": list(context["proj"].shape),
     }
@@ -1834,9 +1861,9 @@ def build_synthetic_context(args: argparse.Namespace) -> dict[str, mx.array]:
     )
     return adapter(
         features,
-        camera_angle_x=mx.array([np.pi / 2], dtype=mx.float32),
-        distance=mx.array([2.0], dtype=mx.float32),
-        mesh_scale=mx.array([1.0], dtype=mx.float32),
+        camera_angle_x=mx.array([getattr(args, "camera_angle_x", PIXAL3D_DEFAULT_CAMERA_ANGLE_X)], dtype=mx.float32),
+        distance=mx.array([getattr(args, "camera_distance", PIXAL3D_DEFAULT_CAMERA_DISTANCE)], dtype=mx.float32),
+        mesh_scale=mx.array([getattr(args, "mesh_scale", PIXAL3D_DEFAULT_MESH_SCALE)], dtype=mx.float32),
     )
 
 
@@ -2070,6 +2097,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "run_packed_slat_width_diagnostic": args.run_packed_slat_width_diagnostic,
             "projection_mode": args.projection_mode,
             "hr_feature_size": args.hr_feature_size,
+            "camera_angle_x": args.camera_angle_x,
+            "camera_distance": args.camera_distance,
+            "mesh_scale": args.mesh_scale,
             "image": str(args.image) if args.image else None,
             "sparse_stage_steps": args.sparse_stage_steps,
         },
@@ -2178,6 +2208,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
                     image_path=args.image,
                     image_size=args.image_size,
                     patch_size=args.patch_size,
+                    camera_angle_x=args.camera_angle_x,
+                    distance=args.camera_distance,
+                    mesh_scale=args.mesh_scale,
                     steps=args.sparse_stage_steps,
                     seed=args.seed,
                 )
@@ -2200,6 +2233,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
                     patch_size=args.patch_size,
                     projection_mode=args.projection_mode,
                     hr_feature_size=args.hr_feature_size,
+                    camera_angle_x=args.camera_angle_x,
+                    distance=args.camera_distance,
+                    mesh_scale=args.mesh_scale,
                     seed=args.seed,
                     run_zero_augmented=True,
                 )

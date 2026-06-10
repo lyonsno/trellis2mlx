@@ -761,6 +761,43 @@ def test_pixal3d_context_from_features_can_request_bilinear_hr_concat():
     assert np.allclose(np.array(context["proj"][..., 64:]), 1.0, atol=1e-5)
 
 
+def test_pixal3d_context_from_features_uses_reference_camera_angle_by_default(monkeypatch):
+    gen = _load_module()
+
+    observed = {}
+
+    class RecordingAdapter:
+        def __init__(self, **kwargs):
+            observed["init"] = kwargs
+
+        def __call__(self, features, *, camera_angle_x, distance, mesh_scale):
+            observed["camera_angle_x"] = float(camera_angle_x[0].item())
+            observed["distance"] = float(distance[0].item())
+            observed["mesh_scale"] = float(mesh_scale[0].item())
+            return {
+                "global": features[:, :5, :],
+                "proj": mx.zeros((1, 8, features.shape[-1]), dtype=mx.float32),
+            }
+
+    monkeypatch.setattr(
+        "trellmlx.models.dinov3_proj.DINOv3ProjectionAdapter",
+        RecordingAdapter,
+    )
+    features = mx.zeros((1, 9, 4), dtype=mx.float32)
+
+    context = gen.pixal3d_context_from_features(
+        features,
+        {"resolution": 2},
+        image_size=32,
+        patch_size=16,
+    )
+
+    assert context["proj"].shape == (1, 8, 4)
+    assert observed["camera_angle_x"] == pytest.approx(0.8575560450553894)
+    assert observed["distance"] == pytest.approx(2.0)
+    assert observed["mesh_scale"] == pytest.approx(1.0)
+
+
 def test_packed_slat_projection_width_diagnostic_can_use_bilinear_concat_mode(tmp_path):
     gen = _load_module()
 
