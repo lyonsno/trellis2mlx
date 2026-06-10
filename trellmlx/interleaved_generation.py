@@ -240,11 +240,14 @@ class StageExecutionContext:
     Handles may be Python objects in this implementation, but metadata stays
     scalar and portable so the same lifecycle contract can be reimplemented in
     MLX Swift.
+    `runtime_objects` is an in-process registry for per-job objects referenced
+    by scalar artifact keys; entries are never serialized as artifacts.
     """
 
     run_id: str
     handles: Mapping[str, object] = field(default_factory=dict)
     handle_metadata: Mapping[str, Mapping[str, StageArtifactValue]] = field(default_factory=dict)
+    runtime_objects: Mapping[str, object] = field(default_factory=dict)
     load_reports: tuple["StageHandleLoadReport", ...] = ()
     close_reports: tuple["StageHandleCloseReport", ...] = ()
 
@@ -256,8 +259,14 @@ class StageExecutionContext:
         unknown_metadata = sorted(set(metadata) - set(handles))
         if unknown_metadata:
             raise ValueError(f"metadata for unknown handle_id: {', '.join(unknown_metadata)}")
+        runtime_objects = {}
+        for key, value in self.runtime_objects.items():
+            _validate_runtime_object_key(key)
+            _validate_runtime_object_value(value)
+            runtime_objects[key] = value
         object.__setattr__(self, "handles", handles)
         object.__setattr__(self, "handle_metadata", metadata)
+        object.__setattr__(self, "runtime_objects", runtime_objects)
         object.__setattr__(self, "load_reports", tuple(self.load_reports))
         object.__setattr__(self, "close_reports", tuple(self.close_reports))
 
@@ -270,6 +279,34 @@ class StageExecutionContext:
             return self.handles[handle_id]
         except KeyError as exc:
             raise KeyError(f"missing stage execution handle: {handle_id}") from exc
+
+    @property
+    def runtime_object_keys(self) -> tuple[str, ...]:
+        return tuple(self.runtime_objects)
+
+    def register_runtime_object(self, key: str, value: object) -> None:
+        _validate_runtime_object_key(key)
+        _validate_runtime_object_value(value)
+        if key in self.runtime_objects:
+            raise ValueError(f"runtime object already registered: {key}")
+        self.runtime_objects[key] = value
+
+    def require_runtime_object(self, key: str) -> object:
+        _validate_runtime_object_key(key)
+        try:
+            return self.runtime_objects[key]
+        except KeyError as exc:
+            raise KeyError(f"missing runtime object: {key}") from exc
+
+
+def _validate_runtime_object_key(key: str) -> None:
+    if not isinstance(key, str) or not key:
+        raise ValueError("runtime object key must be a nonempty string")
+
+
+def _validate_runtime_object_value(value: object) -> None:
+    if value is None:
+        raise ValueError("runtime object value cannot be None")
 
 
 @dataclass(frozen=True)

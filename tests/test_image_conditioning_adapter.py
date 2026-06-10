@@ -3,7 +3,7 @@
 import pytest
 
 
-def _plan(tmp_path, *, images=("front.png",), random_conditioning=False):
+def _plan(tmp_path, *, images=("front.png",), random_conditioning=False, stages=("image_conditioning",)):
     from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan
 
     job = GenerationJob(
@@ -13,7 +13,7 @@ def _plan(tmp_path, *, images=("front.png",), random_conditioning=False):
         tmp_path / "seed-101.glb",
         random_conditioning=random_conditioning,
     )
-    return InterleavedBatchPlan(jobs=(job,), stages=("image_conditioning",))
+    return InterleavedBatchPlan(jobs=(job,), stages=stages)
 
 
 def _context(*, handle=None, route="fixture-dino"):
@@ -84,6 +84,60 @@ def test_image_conditioning_adapter_records_feature_shape_and_route_identity(tmp
         "conditioning_channels": 1024,
     }
     assert calls == [("seed-101", ("front.png", "side.png"), True, "fixture-dino")]
+
+
+def test_image_conditioning_adapter_registers_runtime_object_for_downstream_stage(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationStageResult,
+        StageRunner,
+        StageRunnerOutput,
+    )
+    from trellmlx.image_conditioning_adapter import (
+        ImageConditioningFixtureResult,
+        build_image_conditioning_stage_handler,
+    )
+
+    plan = _plan(tmp_path, stages=("image_conditioning", "sparse_structure"))
+    feature_object = object()
+    downstream_calls = []
+
+    def extract(runtime):
+        return ImageConditioningFixtureResult(
+            conditioning_key="cond://seed-101",
+            context_tokens=257,
+            channels=1024,
+            views=1,
+            conditioning_object=feature_object,
+        )
+
+    def sparse_structure(invocation, state, context):
+        key = state.artifacts["conditioning_key"]
+        downstream_calls.append(
+            (
+                key,
+                context.require_runtime_object(key) is feature_object,
+                "conditioning_object" in state.artifacts,
+            )
+        )
+        return StageRunnerOutput(
+            result=GenerationStageResult(invocation.stage, elapsed_seconds=0.0),
+            artifacts={"consumed_conditioning_key": key},
+        )
+
+    context = _context()
+    result = StageRunner(
+        plan,
+        handlers={
+            "image_conditioning": build_image_conditioning_stage_handler(fixture=extract),
+            "sparse_structure": sparse_structure,
+        },
+        context_factory=lambda plan: context,
+    ).run()
+
+    assert result.ok is True
+    assert downstream_calls == [("cond://seed-101", True, False)]
+    assert result.job_states["seed-101"].artifacts["conditioning_key"] == "cond://seed-101"
+    assert "conditioning_object" not in result.job_states["seed-101"].artifacts
 
 
 def test_image_conditioning_adapter_rejects_random_route_without_calling_fixture(tmp_path):

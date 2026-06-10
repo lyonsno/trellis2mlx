@@ -56,6 +56,7 @@ class ImageConditioningFixtureResult:
     channels: int
     views: int
     elapsed_seconds: float = 0.0
+    conditioning_object: object | None = None
 
     def __post_init__(self) -> None:
         if not self.conditioning_key:
@@ -109,6 +110,11 @@ def build_image_conditioning_stage_handler(
         fixture_result = fixture(fixture_runtime)
         if fixture_result.views != len(invocation.images):
             raise ValueError("fixture views must match image count")
+        if fixture_result.conditioning_object is not None:
+            runtime.context.register_runtime_object(
+                fixture_result.conditioning_key,
+                fixture_result.conditioning_object,
+            )
 
         return StageRunnerOutput(
             result=GenerationStageResult(
