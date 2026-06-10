@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 SCHEMA = "trellis2mlx.greenroom_report.v1"
@@ -188,10 +189,12 @@ def validate_receipt(
         raise GreenroomReceiptError("effective_route must be present in Greenroom receipt")
 
     expected_output = request.expected_output_path
-    if str(expected_output) not in effective_route:
-        raise GreenroomReceiptError(
-            f"effective_route does not mention expected output {expected_output}"
-        )
+    route_tokens = _effective_route_tokens(effective_route)
+    _expect_route_flag(route_tokens, "--output", str(expected_output))
+    _expect_route_flag(route_tokens, "--seed", str(request.seed))
+    _expect_route_flag(route_tokens, "--resolution", str(request.resolution))
+    _expect_route_flag(route_tokens, "--target-faces", str(request.target_faces))
+    _expect_route_flag(route_tokens, "--texture-size", str(request.texture_size))
 
     if require_output and not expected_output.exists():
         raise GreenroomReceiptError(f"expected output does not exist: {expected_output}")
@@ -244,6 +247,28 @@ def _expect_equal(receipt: Mapping[str, Any], key: str, expected: str) -> None:
     actual = receipt.get(key)
     if actual != expected:
         raise GreenroomReceiptError(f"{key} mismatch: expected {expected!r}, got {actual!r}")
+
+
+def _effective_route_tokens(effective_route: str) -> list[str]:
+    try:
+        return shlex.split(effective_route)
+    except ValueError as exc:
+        raise GreenroomReceiptError(f"effective_route is not shell-tokenizable: {exc}") from exc
+
+
+def _expect_route_flag(route_tokens: Sequence[str], flag: str, expected: str) -> None:
+    try:
+        index = route_tokens.index(flag)
+    except ValueError as exc:
+        raise GreenroomReceiptError(f"effective_route missing {flag}") from exc
+    value_index = index + 1
+    if value_index >= len(route_tokens):
+        raise GreenroomReceiptError(f"effective_route missing value for {flag}")
+    actual = route_tokens[value_index]
+    if actual != expected:
+        raise GreenroomReceiptError(
+            f"effective_route {flag} mismatch: expected {expected!r}, got {actual!r}"
+        )
 
 
 def _parse_job_id(stdout: str) -> str:
