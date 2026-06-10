@@ -608,6 +608,95 @@ def test_packed_sparse_structure_stage_smoke_rejects_artifact_without_quantized_
         )
 
 
+def test_image_conditioned_packed_sparse_stage_uses_projected_features(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-image-stage.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "ss-image-stage.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 64), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+            "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "out_layer.weight": np.ones((8, 128), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-image-stage"
+    gen.export_packed_sparse_structure_artifact(checkpoint, config, artifact_dir, bits=4, group_size=64)
+    prefix = np.zeros((1, 5, 64), dtype=np.float32)
+    patches = np.ones((1, 4, 64), dtype=np.float32)
+    features = np.concatenate([prefix, patches], axis=1)
+
+    report = gen.run_image_conditioned_packed_sparse_structure_stage_smoke(
+        artifact_dir,
+        config,
+        features=features,
+        feature_source="fixture-image-features",
+        image_size=32,
+        patch_size=16,
+        steps=1,
+        seed=9,
+    )
+
+    assert report["stage"] == "sparse-structure"
+    assert report["route"]["effective"] == "packed-quantized-sparse-structure"
+    assert report["route"]["fp_checkpoint_loaded"] is False
+    assert report["conditioning"]["source"] == "fixture-image-features"
+    assert report["conditioning"]["synthetic_fallback_used"] is False
+    assert report["conditioning"]["image_projected_conditioning"] is True
+    assert report["conditioning"]["feature_shape"] == [1, 9, 64]
+    assert report["inputs"]["context_global_shape"] == [1, 5, 64]
+    assert report["inputs"]["context_proj_shape"] == [1, 8, 64]
+    assert report["output"]["shape"] == [1, 8, 2, 2, 2]
+    assert report["sample_modules"]["blocks.0.cross_attn.proj_linear"]["class"] == "QuantizedLinear"
+
+
+def test_image_conditioned_packed_sparse_stage_rejects_missing_image_features(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-image-missing.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 64,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+
+    with pytest.raises(RuntimeError, match="image conditioning requested"):
+        gen.run_image_conditioned_packed_sparse_structure_stage_smoke(
+            tmp_path / "missing-artifact",
+            config,
+            image_path=None,
+            features=None,
+        )
+
+
 def test_existing_report_requires_explicit_overwrite(tmp_path):
     gen = _load_module()
 

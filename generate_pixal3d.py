@@ -64,6 +64,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overwrite-artifact", action="store_true", help="Replace an existing packed artifact directory")
     parser.add_argument("--packed-sparse-artifact", type=Path, help="Packed sparse-structure artifact directory for stage smoke")
     parser.add_argument("--run-packed-sparse-stage", action="store_true", help="Run a packed sparse-structure sampler smoke")
+    parser.add_argument("--run-image-packed-sparse-stage", action="store_true", help="Run packed sparse stage using image-derived Pixal3D projected conditioning")
+    parser.add_argument("--image", type=Path, help="Image path for DINOv3/Pixal3D projected conditioning")
     parser.add_argument("--sparse-stage-steps", type=_positive_int, default=1)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
     parser.add_argument("--image-size", type=_positive_int, default=32)
@@ -809,12 +811,53 @@ def _synthetic_sparse_context(config: dict[str, Any]) -> dict[str, mx.array]:
     }
 
 
-def run_packed_sparse_structure_stage_smoke(
+def pixal3d_context_from_features(
+    features: mx.array | np.ndarray,
+    config: dict[str, Any],
+    *,
+    image_size: int = 512,
+    patch_size: int = 16,
+) -> dict[str, mx.array]:
+    from trellmlx.models.dinov3_proj import DINOv3ProjectionAdapter
+
+    feature_array = mx.array(features)
+    adapter = DINOv3ProjectionAdapter(
+        image_size=image_size,
+        patch_size=patch_size,
+        grid_resolution=config["resolution"],
+        num_prefix_tokens=5,
+    )
+    context = adapter(
+        feature_array,
+        camera_angle_x=mx.array([np.pi / 2], dtype=mx.float32),
+        distance=mx.array([2.0], dtype=mx.float32),
+        mesh_scale=mx.array([1.0], dtype=mx.float32),
+    )
+    mx.eval(context["global"], context["proj"])
+    return context
+
+
+def extract_pixal3d_image_features(image_path: Path, *, image_size: int = 512) -> tuple[mx.array, dict[str, Any]]:
+    from trellmlx.models.dinov3 import extract_features
+
+    features = extract_features(str(image_path), image_size=image_size)
+    mx.eval(features)
+    return features, {
+        "source": "native_mlx_dinov3",
+        "image_path": str(image_path),
+        "image_size": image_size,
+        "feature_shape": list(features.shape),
+    }
+
+
+def _run_packed_sparse_stage_with_context(
     artifact_dir: Path,
     config_path: Path,
+    context: dict[str, mx.array],
     *,
-    steps: int = 1,
-    seed: int = 42,
+    steps: int,
+    seed: int,
+    conditioning_report: dict[str, Any],
 ) -> dict[str, Any]:
     from trellmlx.samplers import flow_euler_sample
 
@@ -828,7 +871,6 @@ def run_packed_sparse_structure_stage_smoke(
     if load_report["loaded_quantized_module_count"] <= 0:
         raise RuntimeError("requested packed sparse stage loaded no quantized modules")
 
-    context = _synthetic_sparse_context(config)
     neg_context = {key: mx.zeros_like(value) for key, value in context.items()}
     noise = mx.random.normal(
         (
@@ -871,6 +913,7 @@ def run_packed_sparse_structure_stage_smoke(
             "checkpoint_config": str(config_path),
             "model_class": model.__class__.__name__,
         },
+        "conditioning": conditioning_report,
         "config": config,
         "load": load_report,
         "inputs": {
@@ -893,6 +936,82 @@ def run_packed_sparse_structure_stage_smoke(
             "abs_max": float(mx.max(mx.abs(out)).item()),
         },
     }
+
+
+def run_packed_sparse_structure_stage_smoke(
+    artifact_dir: Path,
+    config_path: Path,
+    *,
+    steps: int = 1,
+    seed: int = 42,
+) -> dict[str, Any]:
+    config = _flow_config_profile(config_path)
+    context = _synthetic_sparse_context(config)
+    return _run_packed_sparse_stage_with_context(
+        artifact_dir,
+        config_path,
+        context,
+        steps=steps,
+        seed=seed,
+        conditioning_report={
+            "source": "synthetic",
+            "synthetic_fallback_used": True,
+            "image_projected_conditioning": False,
+        },
+    )
+
+
+def run_image_conditioned_packed_sparse_structure_stage_smoke(
+    artifact_dir: Path,
+    config_path: Path,
+    *,
+    image_path: Path | None = None,
+    features: mx.array | np.ndarray | None = None,
+    feature_source: str | None = None,
+    image_size: int = 512,
+    patch_size: int = 16,
+    steps: int = 1,
+    seed: int = 42,
+) -> dict[str, Any]:
+    if features is None and image_path is None:
+        raise RuntimeError("image conditioning requested but no image path or feature tensor was supplied")
+
+    config = _flow_config_profile(config_path)
+    if features is None:
+        assert image_path is not None
+        features, feature_report = extract_pixal3d_image_features(image_path, image_size=image_size)
+    else:
+        features = mx.array(features)
+        mx.eval(features)
+        feature_report = {
+            "source": feature_source or "provided_features",
+            "image_path": str(image_path) if image_path is not None else None,
+            "image_size": image_size,
+            "feature_shape": list(features.shape),
+        }
+
+    context = pixal3d_context_from_features(
+        features,
+        config,
+        image_size=image_size,
+        patch_size=patch_size,
+    )
+    conditioning_report = {
+        **feature_report,
+        "synthetic_fallback_used": False,
+        "image_projected_conditioning": True,
+        "patch_size": patch_size,
+        "context_global_shape": list(context["global"].shape),
+        "context_proj_shape": list(context["proj"].shape),
+    }
+    return _run_packed_sparse_stage_with_context(
+        artifact_dir,
+        config_path,
+        context,
+        steps=steps,
+        seed=seed,
+        conditioning_report=conditioning_report,
+    )
 
 
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
@@ -1155,6 +1274,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "export_packed_sparse_structure": str(args.export_packed_sparse_structure) if args.export_packed_sparse_structure else None,
             "packed_sparse_artifact": str(args.packed_sparse_artifact) if args.packed_sparse_artifact else None,
             "run_packed_sparse_stage": args.run_packed_sparse_stage,
+            "run_image_packed_sparse_stage": args.run_image_packed_sparse_stage,
+            "image": str(args.image) if args.image else None,
             "sparse_stage_steps": args.sparse_stage_steps,
         },
         "last_trustworthy_evidence": {"phase": "initialized"},
@@ -1250,6 +1371,26 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             except Exception as exc:
                 mark_failure(report, args.report, phase="packed_sparse_stage", error=str(exc))
                 raise
+        if args.run_image_packed_sparse_stage:
+            if not args.packed_sparse_artifact or not args.checkpoint_config or not args.image:
+                exc = ValueError("--run-image-packed-sparse-stage requires --packed-sparse-artifact, --checkpoint-config, and --image")
+                mark_failure(report, args.report, phase="image_packed_sparse_stage", error=str(exc))
+                raise exc
+            try:
+                report["image_packed_sparse_stage"] = run_image_conditioned_packed_sparse_structure_stage_smoke(
+                    args.packed_sparse_artifact,
+                    args.checkpoint_config,
+                    image_path=args.image,
+                    image_size=args.image_size,
+                    patch_size=args.patch_size,
+                    steps=args.sparse_stage_steps,
+                    seed=args.seed,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "image_packed_sparse_stage"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="image_packed_sparse_stage", error=str(exc))
+                raise
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
@@ -1258,7 +1399,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "slat_flow_output_std": float(mx.std(slat_out).item()),
         }
         report["status"] = "ok"
-        if args.run_packed_sparse_stage:
+        if args.run_image_packed_sparse_stage:
+            final_phase = "image_packed_sparse_stage"
+        elif args.run_packed_sparse_stage:
             final_phase = "packed_sparse_stage"
         elif args.export_packed_sparse_structure:
             final_phase = "packed_artifact_export"
