@@ -17,6 +17,7 @@ from .interleaved_generation import (
     StageArtifactValue,
     StageHandleCloseError,
     StageHandleCloseReport,
+    StageHandleFactoryError,
     StageHandleFactoryResult,
     StageHandleLoadError,
     StageHandleLoadReport,
@@ -90,9 +91,10 @@ class StageHandleLoaderRequest:
             )
             loaded = self.factory(loader_runtime)
             if loaded.effective_loader_route != self.requested_loader_route:
-                raise ValueError(
+                raise StageHandleFactoryError(
                     f"effective loader route mismatch for {self.handle_id}: "
-                    f"requested {self.requested_loader_route}, got {loaded.effective_loader_route}"
+                    f"requested {self.requested_loader_route}, got {loaded.effective_loader_route}",
+                    metadata={"effective_loader_route": loaded.effective_loader_route},
                 )
             return StageHandleFactoryResult(
                 handle=loaded.handle,

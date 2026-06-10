@@ -305,6 +305,14 @@ class StageHandleFactoryResult:
         object.__setattr__(self, "metadata", _validate_handle_metadata(self.metadata))
 
 
+class StageHandleFactoryError(RuntimeError):
+    """Factory failure with scalar metadata that should survive in load reports."""
+
+    def __init__(self, message: str, *, metadata: Mapping[str, StageArtifactValue] | None = None):
+        super().__init__(message)
+        self.metadata = _validate_handle_metadata(metadata or {})
+
+
 @dataclass(frozen=True)
 class StageHandleSpec:
     """Declarative fixture-loadable handle required by a stage execution run."""
@@ -406,7 +414,16 @@ class StageContextFactoryFromSpecs:
                 if duplicate_metadata:
                     raise ValueError(f"dynamic metadata duplicates static metadata keys: {', '.join(duplicate_metadata)}")
             except Exception as exc:
-                report_metadata = {"kind": spec.kind, "load_phase": "load_error", **spec.metadata}
+                dynamic_metadata: dict[str, StageArtifactValue] = {}
+                if isinstance(exc, StageHandleFactoryError):
+                    dynamic_metadata = dict(exc.metadata)
+                    duplicate_metadata = sorted(set(spec.metadata) & set(dynamic_metadata))
+                    if duplicate_metadata:
+                        dynamic_metadata = {}
+                        exc = ValueError(
+                            f"dynamic metadata duplicates static metadata keys: {', '.join(duplicate_metadata)}"
+                        )
+                report_metadata = {"kind": spec.kind, "load_phase": "load_error", **spec.metadata, **dynamic_metadata}
                 report = StageHandleLoadReport(
                     handle_id=spec.handle_id,
                     kind=spec.kind,

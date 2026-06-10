@@ -122,6 +122,7 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
         "kind": "model",
         "load_phase": "load_error",
         "requested_loader_route": "mlx",
+        "effective_loader_route": "fallback",
     }
 
 
