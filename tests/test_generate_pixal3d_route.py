@@ -342,6 +342,7 @@ def test_chunked_sparse_structure_quantization_reports_real_packed_tensors(tmp_p
         {
             "blocks.0.self_attn.to_qkv.weight": np.arange(384 * 128, dtype=np.float32).reshape(384, 128),
             "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "out_layer.weight": np.ones((8, 128), dtype=np.float32),
             "blocks.0.self_attn.to_qkv.bias": np.zeros((384,), dtype=np.float32),
             "rope_phases": np.zeros((4, 2), dtype=np.float32),
         },
@@ -361,7 +362,7 @@ def test_chunked_sparse_structure_quantization_reports_real_packed_tensors(tmp_p
     assert report["profile"]["shape_mismatch_count"] == 0
     assert report["quantized_weight_count"] == 1
     assert report["eligible_weight_count"] == 1
-    assert report["skipped_weight_count"] == 1
+    assert report["skipped_weight_count"] == 2
     assert report["nonweight_key_count"] == 1
     assert report["extra_checkpoint_key_count"] == 1
     assert report["original_weight_bytes"] == 384 * 128 * 4
@@ -376,6 +377,7 @@ def test_chunked_sparse_structure_quantization_reports_real_packed_tensors(tmp_p
     assert report["sample_quantized_weights"][0]["packed_dtype"] == "uint32"
     assert report["sample_skipped_weights"][0]["key"] == "input_layer.weight"
     assert report["sample_skipped_weights"][0]["reason"] == "below_group_size"
+    assert {item["key"] for item in report["sample_skipped_weights"]} == {"input_layer.weight", "out_layer.weight"}
 
 
 def test_packed_sparse_structure_artifact_exports_and_loads_effective_runtime_weights(tmp_path):
@@ -403,6 +405,7 @@ def test_packed_sparse_structure_artifact_exports_and_loads_effective_runtime_we
             "blocks.0.self_attn.to_qkv.weight": np.arange(384 * 128, dtype=np.float32).reshape(384, 128),
             "blocks.0.self_attn.to_qkv.bias": np.arange(384, dtype=np.float32),
             "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "out_layer.weight": np.ones((8, 128), dtype=np.float32),
             "rope_phases": np.zeros((4, 2), dtype=np.float32),
         },
         checkpoint,
@@ -432,7 +435,9 @@ def test_packed_sparse_structure_artifact_exports_and_loads_effective_runtime_we
     assert tensors["blocks.0.self_attn.to_qkv.biases"].shape == (384, 2)
     assert tensors["blocks.0.self_attn.to_qkv.bias"].shape == (384,)
     assert tensors["input_layer.weight"].shape == (128, 8)
+    assert tensors["out_layer.weight"].shape == (8, 128)
     assert "rope_phases" not in tensors
+    assert "out_layer" not in manifest["quantized_module_names"]
 
     model = gen.sparse_structure_model_from_config(config)
     load = gen.load_packed_sparse_structure_artifact(model, artifact_dir)

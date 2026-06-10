@@ -355,8 +355,8 @@ def _array_nbytes(array: Any) -> int:
 def _quantized_linear_weight_skip_reason(shape: tuple[int, ...], group_size: int) -> str | None:
     if len(shape) != 2:
         return "not_2d_linear_weight"
-    in_features = shape[1]
-    if in_features < group_size:
+    out_features, in_features = shape
+    if out_features < group_size or in_features < group_size:
         return "below_group_size"
     if in_features % group_size != 0:
         return "input_dim_not_divisible_by_group_size"
