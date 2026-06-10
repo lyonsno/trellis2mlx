@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -55,6 +56,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--quantize-bits", type=int, choices=(4, 8), default=4)
     parser.add_argument("--quantize-group-size", type=_positive_int, default=64)
+    parser.add_argument(
+        "--export-packed-sparse-structure",
+        type=Path,
+        help="Write a packed sparse-structure quantized artifact directory",
+    )
+    parser.add_argument("--overwrite-artifact", action="store_true", help="Replace an existing packed artifact directory")
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
     parser.add_argument("--image-size", type=_positive_int, default=32)
     parser.add_argument("--patch-size", type=_positive_int, default=16)
@@ -356,6 +363,23 @@ def _quantized_linear_weight_skip_reason(shape: tuple[int, ...], group_size: int
     return None
 
 
+def sparse_structure_model_from_config(config_path: Path):
+    from trellmlx.models.pixal3d_flow import Pixal3DSparseStructureFlowModel
+
+    config = _flow_config_profile(config_path)
+    return Pixal3DSparseStructureFlowModel(
+        in_channels=config["in_channels"],
+        out_channels=config["out_channels"],
+        model_channels=config["model_channels"],
+        num_heads=config["num_heads"],
+        num_blocks=config["num_blocks"],
+        mlp_hidden=config["mlp_hidden"],
+        context_channels=config["cond_channels"],
+        proj_in_channels=config["proj_in_channels"],
+        resolution=config["resolution"],
+    )
+
+
 def chunked_quantize_sparse_structure_checkpoint(
     checkpoint: Path,
     config_path: Path,
@@ -501,6 +525,263 @@ def chunked_quantize_sparse_structure_checkpoint(
         "peak_materialized_tensor_bytes": peak_materialized_tensor_bytes,
         "sample_quantized_weights": quantized_weights[:10],
         "sample_skipped_weights": skipped_weights[:10],
+    }
+
+
+PACKED_SPARSE_ARTIFACT_SCHEMA = "trellis2mlx.pixal3d_sparse_quant_artifact.v1"
+
+
+def _prepare_artifact_dir(output_dir: Path, *, overwrite: bool) -> None:
+    if output_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"artifact directory already exists: {output_dir}")
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True)
+
+
+def _np_from_mx(array: mx.array) -> np.ndarray:
+    mx.eval(array)
+    return np.array(array)
+
+
+def export_packed_sparse_structure_artifact(
+    checkpoint: Path,
+    config_path: Path,
+    output_dir: Path,
+    *,
+    bits: int = 4,
+    group_size: int = 64,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+    from safetensors.numpy import save_file
+    from trellmlx.weight_loader import _remap_key
+
+    if bits not in (4, 8):
+        raise ValueError("packed sparse-structure export requires bits=4 or bits=8")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
+    if not config_path.exists():
+        raise FileNotFoundError(f"checkpoint config does not exist: {config_path}")
+
+    _prepare_artifact_dir(output_dir, overwrite=overwrite)
+    tensor_path = output_dir / "model.safetensors"
+    manifest_path = output_dir / "manifest.json"
+
+    config, expected_shapes = expected_flow_shapes_from_config(config_path)
+    profile = profile_checkpoint_architecture(checkpoint, config_path)
+    if profile["shape_mismatch_count"]:
+        raise RuntimeError(
+            "checkpoint/config shape mismatch blocks packed artifact export: "
+            f"{profile['shape_mismatch_samples'][:3]}"
+        )
+
+    entries = []
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        for raw_key in sf.keys():
+            tensor_slice = sf.get_slice(raw_key)
+            entries.append({
+                "raw_key": raw_key,
+                "key": _remap_key(raw_key),
+                "shape": tuple(tensor_slice.get_shape()),
+                "dtype": _dtype_name(tensor_slice.get_dtype()),
+            })
+    entries.sort(key=lambda item: item["key"])
+
+    tensors: dict[str, np.ndarray] = {}
+    quantized_modules = []
+    skipped_weights = []
+    extra_keys = []
+    fp_remainder_count = 0
+    original_weight_bytes = 0
+    packed_weight_bytes = 0
+    scale_bytes = 0
+    biases_bytes = 0
+    peak_materialized_tensor_bytes = 0
+
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        for entry in entries:
+            key = entry["key"]
+            raw_key = entry["raw_key"]
+            shape = entry["shape"]
+            if key not in expected_shapes:
+                extra_keys.append(key)
+                continue
+
+            if key.endswith(".weight"):
+                reason = _quantized_linear_weight_skip_reason(shape, group_size)
+            else:
+                reason = "not_weight"
+
+            if key.endswith(".weight") and reason is None:
+                tensor = sf.get_tensor(raw_key)
+                peak_materialized_tensor_bytes = max(peak_materialized_tensor_bytes, _array_nbytes(tensor))
+                source = mx.array(tensor)
+                packed, scales, biases = mx.quantize(source, group_size=group_size, bits=bits)
+                mx.eval(packed, scales, biases)
+                module_key = key.removesuffix(".weight")
+                packed_np = _np_from_mx(packed)
+                scales_np = _np_from_mx(scales)
+                biases_np = _np_from_mx(biases)
+                tensors[f"{module_key}.weight"] = packed_np
+                tensors[f"{module_key}.scales"] = scales_np
+                tensors[f"{module_key}.biases"] = biases_np
+                original_weight_bytes += _array_nbytes(tensor)
+                packed_weight_bytes += packed_np.nbytes
+                scale_bytes += scales_np.nbytes
+                biases_bytes += biases_np.nbytes
+                quantized_modules.append({
+                    "name": module_key,
+                    "raw_key": raw_key,
+                    "source_shape": list(shape),
+                    "source_dtype": entry["dtype"],
+                    "packed_shape": list(packed_np.shape),
+                    "packed_dtype": str(packed_np.dtype),
+                    "scale_shape": list(scales_np.shape),
+                    "biases_shape": list(biases_np.shape),
+                })
+                del tensor, source, packed, scales, biases, packed_np, scales_np, biases_np
+                mx.clear_cache()
+                continue
+
+            tensor = sf.get_tensor(raw_key)
+            peak_materialized_tensor_bytes = max(peak_materialized_tensor_bytes, _array_nbytes(tensor))
+            tensors[key] = np.array(tensor)
+            fp_remainder_count += 1
+            if key.endswith(".weight"):
+                skipped_weights.append({
+                    "key": key,
+                    "raw_key": raw_key,
+                    "shape": list(shape),
+                    "dtype": entry["dtype"],
+                    "reason": reason,
+                })
+
+    if not quantized_modules:
+        raise RuntimeError("packed sparse-structure export produced no quantized modules")
+
+    save_file(
+        tensors,
+        tensor_path,
+        metadata={
+            "schema": PACKED_SPARSE_ARTIFACT_SCHEMA,
+            "stage": "sparse-structure",
+            "bits": str(bits),
+            "group_size": str(group_size),
+        },
+    )
+
+    quantized_payload_bytes = packed_weight_bytes + scale_bytes + biases_bytes
+    manifest = {
+        "schema": PACKED_SPARSE_ARTIFACT_SCHEMA,
+        "stage": "sparse-structure",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source": {
+            "checkpoint": str(checkpoint),
+            "checkpoint_config": str(config_path),
+            "checkpoint_size_bytes": checkpoint.stat().st_size,
+        },
+        "artifact": {
+            "manifest": str(manifest_path),
+            "tensor_file": str(tensor_path),
+            "tensor_file_size_bytes": tensor_path.stat().st_size,
+            "saved_tensor_count": len(tensors),
+        },
+        "config": config,
+        "profile": profile,
+        "quantization": {
+            "bits": bits,
+            "group_size": group_size,
+            "mode": "mlx.core.quantize",
+        },
+        "quantized_weight_count": len(quantized_modules),
+        "quantized_module_names": [item["name"] for item in quantized_modules],
+        "fp_remainder_tensor_count": fp_remainder_count,
+        "skipped_weight_count": len(skipped_weights),
+        "extra_checkpoint_key_count": len(extra_keys),
+        "extra_checkpoint_key_samples": extra_keys[:10],
+        "original_weight_bytes": original_weight_bytes,
+        "packed_weight_bytes": packed_weight_bytes,
+        "scale_bytes": scale_bytes,
+        "biases_bytes": biases_bytes,
+        "quantized_payload_bytes": quantized_payload_bytes,
+        "compression_ratio_vs_quantized_weights": (
+            original_weight_bytes / quantized_payload_bytes
+            if quantized_payload_bytes
+            else None
+        ),
+        "peak_materialized_tensor_bytes": peak_materialized_tensor_bytes,
+        "sample_quantized_modules": quantized_modules[:10],
+        "sample_skipped_weights": skipped_weights[:10],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_jsonable) + "\n")
+    return manifest
+
+
+def load_packed_sparse_structure_artifact(model: Any, artifact_dir: Path) -> dict[str, Any]:
+    import mlx.nn as nn
+    from safetensors import safe_open
+    from trellmlx.quantize import quantize_model
+
+    manifest_path = artifact_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"packed artifact manifest does not exist: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema") != PACKED_SPARSE_ARTIFACT_SCHEMA:
+        raise RuntimeError(f"unsupported packed artifact schema: {manifest.get('schema')}")
+    quantized_names = manifest.get("quantized_module_names") or []
+    if not quantized_names:
+        raise RuntimeError("packed artifact contains no quantized module names")
+
+    tensor_path = Path(manifest["artifact"]["tensor_file"])
+    if not tensor_path.exists():
+        tensor_path = artifact_dir / "model.safetensors"
+    if not tensor_path.exists():
+        raise FileNotFoundError(f"packed artifact tensor file does not exist: {tensor_path}")
+
+    bits = int(manifest["quantization"]["bits"])
+    group_size = int(manifest["quantization"]["group_size"])
+    quantize_model(model, bits=bits, group_size=group_size)
+
+    weights = []
+    with safe_open(str(tensor_path), framework="numpy") as sf:
+        keys = list(sf.keys())
+        for key in keys:
+            weights.append((key, mx.array(sf.get_tensor(key))))
+    model.load_weights(weights, strict=False)
+
+    loaded = {}
+    for name in quantized_names:
+        module = _nested_getattr(model, name)
+        if not isinstance(module, nn.QuantizedLinear):
+            raise RuntimeError(f"packed artifact expected QuantizedLinear module at {name}")
+        dtype = _dtype_name(module.weight.dtype)
+        if dtype != "uint32":
+            raise RuntimeError(f"packed artifact module {name} did not load uint32 packed weight: {dtype}")
+        loaded[name] = {
+            "weight_shape": list(module.weight.shape),
+            "weight_dtype": dtype,
+            "scales_shape": list(module.scales.shape),
+            "biases_shape": list(module.biases.shape),
+        }
+
+    if not loaded:
+        raise RuntimeError("requested packed runtime loaded no quantized modules")
+
+    return {
+        "schema": PACKED_SPARSE_ARTIFACT_SCHEMA,
+        "effective_route": "packed-quantized-sparse-structure",
+        "artifact": {
+            "manifest": str(manifest_path),
+            "tensor_file": str(tensor_path),
+        },
+        "quantization": {
+            "bits": bits,
+            "group_size": group_size,
+        },
+        "loaded_tensor_count": len(weights),
+        "loaded_quantized_module_count": len(loaded),
+        "loaded_quantized_modules": loaded,
     }
 
 
@@ -761,6 +1042,7 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "chunked_quantize_sparse_structure": args.chunked_quantize_sparse_structure,
             "quantize_bits": args.quantize_bits,
             "quantize_group_size": args.quantize_group_size,
+            "export_packed_sparse_structure": str(args.export_packed_sparse_structure) if args.export_packed_sparse_structure else None,
         },
         "last_trustworthy_evidence": {"phase": "initialized"},
     }
@@ -819,6 +1101,25 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             except Exception as exc:
                 mark_failure(report, args.report, phase="chunked_quantization", error=str(exc))
                 raise
+        if args.export_packed_sparse_structure:
+            if not args.checkpoint or not args.checkpoint_config:
+                exc = ValueError("--export-packed-sparse-structure requires --checkpoint and --checkpoint-config")
+                mark_failure(report, args.report, phase="packed_artifact_export", error=str(exc))
+                raise exc
+            try:
+                report["packed_artifact_export"] = export_packed_sparse_structure_artifact(
+                    args.checkpoint,
+                    args.checkpoint_config,
+                    args.export_packed_sparse_structure,
+                    bits=args.quantize_bits,
+                    group_size=args.quantize_group_size,
+                    overwrite=args.overwrite_artifact,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "packed_artifact_export"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="packed_artifact_export", error=str(exc))
+                raise
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
@@ -827,7 +1128,13 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "slat_flow_output_std": float(mx.std(slat_out).item()),
         }
         report["status"] = "ok"
-        report["last_trustworthy_evidence"] = {"phase": "smoke_route"}
+        if args.export_packed_sparse_structure:
+            final_phase = "packed_artifact_export"
+        elif args.chunked_quantize_sparse_structure:
+            final_phase = "chunked_quantization"
+        else:
+            final_phase = "smoke_route"
+        report["last_trustworthy_evidence"] = {"phase": final_phase}
         write_report(args.report, report)
         return report
     except Exception as exc:

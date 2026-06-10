@@ -4,9 +4,10 @@ import importlib.util
 import json
 from pathlib import Path
 
+import mlx.nn as nn
 import numpy as np
 import pytest
-from safetensors.numpy import save_file
+from safetensors.numpy import load_file, save_file
 
 
 SCRIPT = Path("generate_pixal3d.py")
@@ -375,6 +376,131 @@ def test_chunked_sparse_structure_quantization_reports_real_packed_tensors(tmp_p
     assert report["sample_quantized_weights"][0]["packed_dtype"] == "uint32"
     assert report["sample_skipped_weights"][0]["key"] == "input_layer.weight"
     assert report["sample_skipped_weights"][0]["reason"] == "below_group_size"
+
+
+def test_packed_sparse_structure_artifact_exports_and_loads_effective_runtime_weights(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-flow.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 16,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "ss-export.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.arange(384 * 128, dtype=np.float32).reshape(384, 128),
+            "blocks.0.self_attn.to_qkv.bias": np.arange(384, dtype=np.float32),
+            "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "rope_phases": np.zeros((4, 2), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-ss"
+
+    export = gen.export_packed_sparse_structure_artifact(
+        checkpoint,
+        config,
+        artifact_dir,
+        bits=4,
+        group_size=64,
+    )
+    manifest = json.loads((artifact_dir / "manifest.json").read_text())
+    tensors = load_file(artifact_dir / "model.safetensors")
+
+    assert export["schema"] == "trellis2mlx.pixal3d_sparse_quant_artifact.v1"
+    assert export["artifact"]["manifest"] == str(artifact_dir / "manifest.json")
+    assert export["artifact"]["tensor_file"] == str(artifact_dir / "model.safetensors")
+    assert manifest["quantization"]["bits"] == 4
+    assert manifest["quantization"]["group_size"] == 64
+    assert manifest["quantized_weight_count"] == 1
+    assert "blocks.0.self_attn.to_qkv" in manifest["quantized_module_names"]
+    assert tensors["blocks.0.self_attn.to_qkv.weight"].dtype == np.uint32
+    assert tensors["blocks.0.self_attn.to_qkv.weight"].shape == (384, 16)
+    assert tensors["blocks.0.self_attn.to_qkv.scales"].shape == (384, 2)
+    assert tensors["blocks.0.self_attn.to_qkv.biases"].shape == (384, 2)
+    assert tensors["blocks.0.self_attn.to_qkv.bias"].shape == (384,)
+    assert tensors["input_layer.weight"].shape == (128, 8)
+    assert "rope_phases" not in tensors
+
+    model = gen.sparse_structure_model_from_config(config)
+    load = gen.load_packed_sparse_structure_artifact(model, artifact_dir)
+    module = model.blocks[0].self_attn.to_qkv
+
+    assert load["effective_route"] == "packed-quantized-sparse-structure"
+    assert load["loaded_quantized_module_count"] == 1
+    assert isinstance(module, nn.QuantizedLinear)
+    assert str(module.weight.dtype).replace("mlx.core.", "") == "uint32"
+    assert np.array_equal(np.array(module.weight), tensors["blocks.0.self_attn.to_qkv.weight"])
+
+
+def test_cli_packed_sparse_structure_export_marks_last_evidence_phase(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-flow-cli.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 16,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 64,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "ss-cli.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((192, 64), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((64, 64), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((64,), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    report_path = tmp_path / "route.json"
+    artifact_dir = tmp_path / "packed-cli"
+
+    status = gen.main([
+        "--smoke-route",
+        "--checkpoint",
+        str(checkpoint),
+        "--checkpoint-config",
+        str(config),
+        "--export-packed-sparse-structure",
+        str(artifact_dir),
+        "--report",
+        str(report_path),
+        "--grid-resolution",
+        "2",
+        "--image-size",
+        "32",
+        "--patch-size",
+        "16",
+        "--context-channels",
+        "64",
+    ])
+
+    persisted = json.loads(report_path.read_text())
+    assert status == 0
+    assert persisted["status"] == "ok"
+    assert persisted["packed_artifact_export"]["quantized_weight_count"] == 2
+    assert persisted["last_trustworthy_evidence"]["phase"] == "packed_artifact_export"
 
 
 def test_existing_report_requires_explicit_overwrite(tmp_path):
