@@ -64,7 +64,7 @@ The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
 5. **HR Shape Latent** — SLatFlowModel again at 1024 cascade resolution
 6. **Shape decode + mesh extraction** — sparse UNet decoder -> `flexible_dual_grid_to_mesh`
 7. **Texture SLat + decode** — per-voxel PBR attributes
-8. **UV unwrap + bake** — xatlas unwrap, trilinear voxel sampling, seam inpaint, GLB export
+8. **UV unwrap + bake** — xatlas unwrap (`max_iterations=0`), MLX Metal rasterizer, trilinear voxel sampling, seam inpaint, GLB export
 
 ### Performance: M2 Pro validation run
 
@@ -191,7 +191,8 @@ failure phase if the run stops early.
 - [x] 12-step numerical parity verified against PyTorch
 - [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
 - [x] Texture SLat flow + decoder → per-voxel PBR attributes
-- [x] UV unwrap (xatlas) + texture baking (trilinear sample + cv2 inpaint)
+- [x] UV unwrap (xatlas, `max_iterations=0`) + GPU texture baking (MLX Metal rasterizer + trilinear sample + cv2 inpaint)
+- [x] xatlas chart optimization bypass: 56x faster UV unwrap, <1% quality difference ([docs/uv-unwrap.md](docs/uv-unwrap.md))
 - [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
 - [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
