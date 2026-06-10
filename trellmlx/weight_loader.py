@@ -65,13 +65,14 @@ def _should_permute_conv(key: str, shape: tuple) -> bool:
     return False
 
 
-def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
+def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True, strict: bool = True):
     """Load TRELLIS.2 safetensors weights into an MLX model.
 
     Args:
         model: The MLX model to load weights into.
         checkpoint_path: Path to a .safetensors file.
         verbose: Print loading progress.
+        strict: Require every model parameter to be present in the checkpoint.
 
     Returns:
         List of checkpoint keys that were not loaded (missing in model).
@@ -150,7 +151,7 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
             print(f"    MISSING {k}")
 
     # Load into model
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=strict)
 
     if verbose:
         print(f"  Loaded {len(weights)}/{len(model_keys)} parameters")

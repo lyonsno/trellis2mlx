@@ -392,6 +392,142 @@ def build_smoke_models(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _tiny_sparse_structure_model(*, grid_resolution: int, context_channels: int):
+    from trellmlx.models.pixal3d_flow import Pixal3DSparseStructureFlowModel
+
+    return Pixal3DSparseStructureFlowModel(
+        in_channels=8,
+        out_channels=8,
+        model_channels=64,
+        num_heads=4,
+        num_blocks=1,
+        mlp_hidden=128,
+        context_channels=context_channels,
+        proj_in_channels=context_channels,
+        resolution=grid_resolution,
+    )
+
+
+def _nested_getattr(root: Any, path: str) -> Any:
+    value = root
+    for part in path.split("."):
+        if part.isdigit() and isinstance(value, list):
+            value = value[int(part)]
+        else:
+            value = getattr(value, part)
+    return value
+
+
+def _tensor_for_key(model: Any, key: str) -> mx.array:
+    module_path, attr = key.rsplit(".", 1)
+    return getattr(_nested_getattr(model, module_path), attr)
+
+
+def _quantized_module_report(model: Any) -> dict[str, Any]:
+    import mlx.nn as nn
+
+    quantized = {}
+    packed_dtypes = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.QuantizedLinear):
+            quantized[name] = {
+                "bits": module.bits,
+                "group_size": module.group_size,
+                "weight_shape": list(module.weight.shape),
+                "scale_shape": list(module.scales.shape),
+                "biases_shape": list(module.biases.shape),
+            }
+            packed_dtypes[name] = str(module.weight.dtype).replace("mlx.core.", "")
+    return {
+        "quantized_module_count": len(quantized),
+        "quantized_module_names": sorted(quantized),
+        "quantized_modules": quantized,
+        "packed_weight_dtypes": packed_dtypes,
+    }
+
+
+def quantized_sparse_structure_assignment_smoke(
+    checkpoint: Path,
+    *,
+    bits: int = 4,
+    group_size: int = 64,
+    grid_resolution: int = 2,
+    context_channels: int = 8,
+    sentinel_key: str | None = None,
+    sentinel_expected: np.ndarray | None = None,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+    from trellmlx.quantize import quantize_model
+    from trellmlx.weight_loader import load_weights
+
+    if bits not in (4, 8):
+        raise ValueError("quantized sparse-structure smoke requires bits=4 or bits=8")
+
+    model = _tiny_sparse_structure_model(
+        grid_resolution=grid_resolution,
+        context_channels=context_channels,
+    )
+    inventory = inspect_checkpoint(checkpoint, {"ss_flow": model})
+    validate_checkpoint_inventory(inventory)
+
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        checkpoint_keys = set(sf.keys())
+    if sentinel_key is not None and sentinel_key not in checkpoint_keys:
+        raise RuntimeError(f"sentinel key missing from checkpoint: {sentinel_key}")
+
+    load_weights(model, str(checkpoint), verbose=False, strict=False)
+
+    sentinel_assigned = None
+    sentinel_max_abs_diff = None
+    if sentinel_key is not None and sentinel_expected is not None:
+        loaded = np.array(_tensor_for_key(model, sentinel_key))
+        sentinel_max_abs_diff = float(np.max(np.abs(loaded - sentinel_expected)))
+        sentinel_assigned = sentinel_max_abs_diff < 1e-2
+        if not sentinel_assigned:
+            raise RuntimeError(
+                f"sentinel assignment mismatch for {sentinel_key}: max_abs_diff={sentinel_max_abs_diff}"
+            )
+
+    quantize_model(model, bits=bits, group_size=group_size)
+    quant_report = _quantized_module_report(model)
+    if quant_report["quantized_module_count"] == 0:
+        raise RuntimeError("quantization requested but no QuantizedLinear modules were installed")
+
+    context_args = argparse.Namespace(
+        image_size=32,
+        patch_size=16,
+        grid_resolution=grid_resolution,
+        context_channels=context_channels,
+    )
+    context = build_synthetic_context(context_args)
+    x_ss = mx.random.normal((1, 8, grid_resolution, grid_resolution, grid_resolution))
+    out = model(x_ss, mx.array([500.0]), context)
+    mx.eval(out)
+
+    return {
+        "stage": "sparse-structure",
+        "checkpoint": inventory,
+        "assignment": {
+            "mode": "shape-matched-load",
+            "matched_by_shape": inventory.get("matched_by_shape"),
+            "sentinel_key": sentinel_key,
+            "sentinel_assigned_before_quantize": sentinel_assigned,
+            "sentinel_max_abs_diff": sentinel_max_abs_diff,
+        },
+        "quantization": {
+            "requested_bits": bits,
+            "effective_bits": bits,
+            "group_size": group_size,
+            "order": "load_fp_then_quantize_in_memory",
+            **quant_report,
+        },
+        "smoke": {
+            "ss_flow_output_shape": list(out.shape),
+            "ss_flow_output_std": float(mx.std(out).item()),
+        },
+    }
+
+
 def validate_effective_route(route: dict[str, Any]) -> None:
     errors = []
     if route.get("requested") == "pixal3d-proj" and route.get("effective") != "pixal3d-proj":

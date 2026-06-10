@@ -255,6 +255,68 @@ def test_architecture_profile_reports_shape_mismatches(tmp_path):
     assert profile["shape_mismatch_samples"][0]["checkpoint_shape"] == [1536, 1024]
 
 
+def test_sparse_structure_quantized_assignment_loads_sentinel_then_quantizes(tmp_path):
+    gen = _load_module()
+
+    checkpoint = tmp_path / "ss-quant.safetensors"
+    sentinel = (np.arange(192 * 64, dtype=np.float32).reshape(192, 64) / 1000.0)
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": sentinel,
+            "blocks.0.self_attn.to_qkv.bias": np.zeros((192,), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((64, 8), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((64,), dtype=np.float32),
+        },
+        checkpoint,
+    )
+
+    report = gen.quantized_sparse_structure_assignment_smoke(
+        checkpoint,
+        bits=4,
+        group_size=64,
+        grid_resolution=2,
+        context_channels=8,
+        sentinel_key="blocks.0.self_attn.to_qkv.weight",
+        sentinel_expected=sentinel,
+    )
+
+    assert report["stage"] == "sparse-structure"
+    assert report["quantization"]["requested_bits"] == 4
+    assert report["quantization"]["effective_bits"] == 4
+    assert report["quantization"]["order"] == "load_fp_then_quantize_in_memory"
+    assert report["assignment"]["sentinel_key"] == "blocks.0.self_attn.to_qkv.weight"
+    assert report["assignment"]["sentinel_assigned_before_quantize"] is True
+    assert report["assignment"]["matched_by_shape"] == 4
+    assert "blocks.0.self_attn.to_qkv" in report["quantization"]["quantized_module_names"]
+    assert report["quantization"]["quantized_module_count"] > 0
+    assert report["quantization"]["packed_weight_dtypes"]["blocks.0.self_attn.to_qkv"] == "uint32"
+    assert report["smoke"]["ss_flow_output_shape"] == [1, 8, 2, 2, 2]
+
+
+def test_sparse_structure_quantized_assignment_rejects_missing_sentinel(tmp_path):
+    gen = _load_module()
+
+    checkpoint = tmp_path / "ss-missing.safetensors"
+    save_file(
+        {
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((64, 8), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((64,), dtype=np.float32),
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="sentinel"):
+        gen.quantized_sparse_structure_assignment_smoke(
+            checkpoint,
+            bits=4,
+            group_size=64,
+            grid_resolution=2,
+            context_channels=8,
+            sentinel_key="blocks.0.self_attn.to_qkv.weight",
+            sentinel_expected=np.zeros((192, 64), dtype=np.float32),
+        )
+
+
 def test_existing_report_requires_explicit_overwrite(tmp_path):
     gen = _load_module()
 
