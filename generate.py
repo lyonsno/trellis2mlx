@@ -117,6 +117,7 @@ def _cleanup_and_simplify_mesh(
     no_cleanup,
     keep_largest=False,
     simplify_first=False,
+    qem_simplify=False,
     cleanup_mesh=None,
     simplify=None,
     log=print,
@@ -140,22 +141,50 @@ def _cleanup_and_simplify_mesh(
 
     # Simplify-first mode: reduce face count before expensive cleanup
     if simplify_first and target_faces and len(faces) > target_faces:
-        if simplify is None:
-            import fast_simplification
-            simplify = fast_simplification.simplify
-        t0 = time.perf_counter()
-        for _ in range(3):
-            ratio = target_faces / len(faces)
-            if ratio >= 1: break
-            vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
-            if len(faces) <= target_faces * 1.1: break
-        log(f"  Pre-simplify: {len(vertices):,}V {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
-        # Single cleanup pass on the small mesh
-        if not no_cleanup:
+        if qem_simplify:
+            # QEM simplify-first: use fast-simplification for coarse pass,
+            # then QEM for final pass with topology guards
+            if simplify is None:
+                import fast_simplification
+                simplify = fast_simplification.simplify
+            coarse_target = target_faces * 3
+            if len(faces) > coarse_target:
+                t0 = time.perf_counter()
+                for _ in range(3):
+                    ratio = coarse_target / len(faces)
+                    if ratio >= 1: break
+                    vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
+                    if len(faces) <= coarse_target * 1.1: break
+                log(f"  Pre-simplify (coarse): {len(vertices):,}V {len(faces):,}F "
+                    f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            if not no_cleanup:
+                t0 = time.perf_counter()
+                vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
+                log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+            from trellmlx.simplify_qem_metal import simplify_qem
             t0 = time.perf_counter()
-            vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
-            log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
-        return vertices, faces
+            vertices, faces = simplify_qem(vertices, faces, target_faces, verbose=True)
+            log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
+                f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            vertices, faces = final_cleanup(vertices, faces)
+            return vertices, faces
+        else:
+            if simplify is None:
+                import fast_simplification
+                simplify = fast_simplification.simplify
+            t0 = time.perf_counter()
+            for _ in range(3):
+                ratio = target_faces / len(faces)
+                if ratio >= 1: break
+                vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
+                if len(faces) <= target_faces * 1.1: break
+            log(f"  Pre-simplify: {len(vertices):,}V {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
+            # Single cleanup pass on the small mesh
+            if not no_cleanup:
+                t0 = time.perf_counter()
+                vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
+                log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+            return vertices, faces
 
     if not no_cleanup:
         t0 = time.perf_counter()
@@ -188,24 +217,32 @@ def _cleanup_and_simplify_mesh(
 
     # Pass 2: Final simplify to target, then cleanup
     t0 = time.perf_counter()
-    did_final_simplify = False
-    for attempt in range(3):
-        if len(faces) <= target_faces:
-            break
-        ratio = target_faces / len(faces)
-        target_reduction = 1.0 - ratio
-        if target_reduction <= 0:
-            break
-        vertices, faces = simplify(
-            vertices, faces, target_reduction=target_reduction,
-        )
-        did_final_simplify = True
-        if len(faces) <= target_faces * 1.1:
-            break
-    log(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
-        f"({time.perf_counter()-t0:.1f}s)", flush=True)
-    if did_final_simplify:
+    if qem_simplify and len(faces) > target_faces:
+        from trellmlx.simplify_qem_metal import simplify_qem
+        vertices, faces = simplify_qem(
+            vertices, faces, target_faces, verbose=True)
+        log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
+            f"({time.perf_counter()-t0:.1f}s)", flush=True)
         vertices, faces = final_cleanup(vertices, faces)
+    else:
+        did_final_simplify = False
+        for attempt in range(3):
+            if len(faces) <= target_faces:
+                break
+            ratio = target_faces / len(faces)
+            target_reduction = 1.0 - ratio
+            if target_reduction <= 0:
+                break
+            vertices, faces = simplify(
+                vertices, faces, target_reduction=target_reduction,
+            )
+            did_final_simplify = True
+            if len(faces) <= target_faces * 1.1:
+                break
+        log(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
+            f"({time.perf_counter()-t0:.1f}s)", flush=True)
+        if did_final_simplify:
+            vertices, faces = final_cleanup(vertices, faces)
 
     return vertices, faces
 
@@ -239,6 +276,9 @@ def main():
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
     parser.add_argument("--uv-method", choices=["auto", "lscm", "xatlas", "cube"], default="auto",
                         help="UV unwrap method: auto (xatlas, default), lscm, xatlas, or cube")
+    parser.add_argument("--qem-simplify", action="store_true",
+                        help="Use QEM simplification with topology guards (Metal-accelerated, "
+                             "prevents holes from simplification). Slower but preserves mesh quality.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
@@ -273,6 +313,7 @@ def main():
                 no_cleanup=args.no_cleanup,
                 keep_largest=args.keep_largest,
                 simplify_first=args.simplify_first,
+                qem_simplify=args.qem_simplify,
             )
 
             # Jump straight to texture baking
@@ -575,6 +616,7 @@ def main():
         no_cleanup=args.no_cleanup,
         keep_largest=args.keep_largest,
         simplify_first=args.simplify_first,
+        qem_simplify=args.qem_simplify,
     )
 
     # === Stage 4: Texture SLat ===
