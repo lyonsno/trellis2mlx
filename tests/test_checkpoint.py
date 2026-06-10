@@ -66,6 +66,20 @@ class TestSaveLoadRoundTrip:
         for orig, loaded_arr in zip(masks, loaded["shape_subs"]):
             np.testing.assert_array_equal(loaded_arr, orig)
 
+    def test_list_of_array_like_values_roundtrip(self, ckpt_dir):
+        """Array-like list entries should not leave an impossible count."""
+        masks = [
+            np.array([True, False, True]),
+            [False, True, False, True],
+            np.array([True, True]),
+        ]
+        save_checkpoint(ckpt_dir, "shape_decode", shape_subs=masks)
+        loaded = load_checkpoint(ckpt_dir, "shape_decode")
+
+        assert len(loaded["shape_subs"]) == 3
+        for orig, loaded_arr in zip(masks, loaded["shape_subs"]):
+            np.testing.assert_array_equal(loaded_arr, np.asarray(orig))
+
     def test_empty_array_roundtrip(self, ckpt_dir):
         empty = np.zeros((0, 3), dtype=np.float32)
         save_checkpoint(ckpt_dir, "empty_stage", data=empty)
@@ -82,6 +96,19 @@ class TestSaveLoadRoundTrip:
         loaded = load_checkpoint(ckpt_dir, "stage")
 
         np.testing.assert_array_equal(loaded["data"], [4.0, 5.0])
+
+    def test_array_only_overwrite_removes_stale_metadata(self, ckpt_dir):
+        import os
+        save_checkpoint(ckpt_dir, "stage",
+                        data=np.array([1.0, 2.0, 3.0]),
+                        mesh_grid_size=1024)
+        save_checkpoint(ckpt_dir, "stage",
+                        data=np.array([4.0, 5.0]))
+        loaded = load_checkpoint(ckpt_dir, "stage")
+
+        np.testing.assert_array_equal(loaded["data"], [4.0, 5.0])
+        assert "mesh_grid_size" not in loaded
+        assert not os.path.exists(os.path.join(ckpt_dir, "stage.json"))
 
 
 class TestHasCheckpoint:
@@ -121,6 +148,12 @@ class TestListCheckpoints:
     def test_empty_dir(self, tmp_path):
         d = str(tmp_path / "empty")
         assert list_checkpoints(d) == []
+
+    def test_lists_json_only_stages(self, ckpt_dir):
+        save_checkpoint(ckpt_dir, "meta_only", mesh_grid_size=512)
+        stages = list_checkpoints(ckpt_dir)
+
+        assert "meta_only" in stages
 
     def test_ignores_non_npz_files(self, ckpt_dir):
         save_checkpoint(ckpt_dir, "real",

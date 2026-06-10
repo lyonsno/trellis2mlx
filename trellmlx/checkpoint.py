@@ -27,6 +27,8 @@ def save_checkpoint(checkpoint_dir: str, stage: str, **arrays):
         **arrays: Named numpy arrays or scalars to save.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
+    npz_path = os.path.join(checkpoint_dir, f"{stage}.npz")
+    meta_path = os.path.join(checkpoint_dir, f"{stage}.json")
 
     # Separate scalars/metadata from arrays
     metadata = {}
@@ -39,8 +41,7 @@ def save_checkpoint(checkpoint_dir: str, stage: str, **arrays):
         elif isinstance(val, list):
             # Subdivision masks: list of arrays
             for i, arr in enumerate(val):
-                if isinstance(arr, np.ndarray):
-                    np_arrays[f"{key}_{i}"] = arr
+                np_arrays[f"{key}_{i}"] = np.asarray(arr)
             metadata[f"{key}_count"] = len(val)
         else:
             # Try converting to numpy
@@ -52,15 +53,18 @@ def save_checkpoint(checkpoint_dir: str, stage: str, **arrays):
     # Save arrays
     if np_arrays:
         np.savez_compressed(
-            os.path.join(checkpoint_dir, f"{stage}.npz"),
+            npz_path,
             **np_arrays,
         )
+    elif os.path.exists(npz_path):
+        os.remove(npz_path)
 
     # Save metadata
     if metadata:
-        meta_path = os.path.join(checkpoint_dir, f"{stage}.json")
         with open(meta_path, "w") as f:
             json.dump(metadata, f)
+    elif os.path.exists(meta_path):
+        os.remove(meta_path)
 
     total_bytes = sum(a.nbytes for a in np_arrays.values())
     print(f"  Checkpoint saved: {stage} ({total_bytes / 1e6:.1f} MB)", flush=True)
@@ -147,6 +151,8 @@ def list_checkpoints(checkpoint_dir: str) -> list[str]:
     for f in os.listdir(checkpoint_dir):
         if f.endswith(".npz"):
             stages.add(f[:-4])
+        elif f.endswith(".json"):
+            stages.add(f[:-5])
     return sorted(stages)
 
 
