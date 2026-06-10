@@ -60,6 +60,9 @@ class ImageConditioningFixtureResult:
     def __post_init__(self) -> None:
         if not self.conditioning_key:
             raise ValueError("conditioning_key must be nonempty")
+        _require_integer_count("context_tokens", self.context_tokens)
+        _require_integer_count("channels", self.channels)
+        _require_integer_count("views", self.views)
         if self.context_tokens <= 0:
             raise ValueError("context_tokens must be positive")
         if self.channels <= 0:
@@ -68,6 +71,11 @@ class ImageConditioningFixtureResult:
             raise ValueError("views must be positive")
         if self.elapsed_seconds < 0:
             raise ValueError("elapsed_seconds must be non-negative")
+
+
+def _require_integer_count(field: str, value: object) -> None:
+    if type(value) is not int:
+        raise ValueError(f"{field} must be an integer")
 
 
 ImageConditioningFixture = Callable[[ImageConditioningRuntime], ImageConditioningFixtureResult]

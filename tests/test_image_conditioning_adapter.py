@@ -132,6 +132,30 @@ def test_image_conditioning_adapter_rejects_malformed_fixture_shape(tmp_path):
         handler(invocation, state, _context())
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("context_tokens", True),
+        ("channels", 1024.5),
+        ("views", True),
+        ("views", 1.0),
+    ),
+)
+def test_image_conditioning_fixture_result_rejects_non_integer_counts(field, value):
+    from trellmlx.image_conditioning_adapter import ImageConditioningFixtureResult
+
+    kwargs = {
+        "conditioning_key": "cond://bad-count",
+        "context_tokens": 257,
+        "channels": 1024,
+        "views": 1,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match=f"{field} must be an integer"):
+        ImageConditioningFixtureResult(**kwargs)
+
+
 def test_image_conditioning_adapter_rejects_fixture_view_count_mismatch(tmp_path):
     from trellmlx.interleaved_generation import JobState
     from trellmlx.image_conditioning_adapter import (
