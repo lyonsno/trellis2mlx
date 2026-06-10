@@ -283,6 +283,7 @@ class StageHandleRuntime:
 
 StageHandleFactory = Callable[[StageHandleRuntime], object]
 StageHandleCloser = Callable[[StageHandleRuntime, object], None]
+_RESERVED_STAGE_HANDLE_METADATA_KEYS = frozenset({"close_phase", "error", "handle_id", "kind", "load_phase"})
 
 
 @dataclass(frozen=True)
@@ -300,7 +301,11 @@ class StageHandleSpec:
             raise ValueError("StageHandleSpec requires a handle_id")
         if not self.kind:
             raise ValueError("StageHandleSpec requires a kind")
-        object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
+        metadata = _validate_artifacts(self.metadata)
+        reserved_keys = sorted(set(metadata) & _RESERVED_STAGE_HANDLE_METADATA_KEYS)
+        if reserved_keys:
+            raise ValueError(f"StageHandleSpec metadata cannot use reserved report keys: {', '.join(reserved_keys)}")
+        object.__setattr__(self, "metadata", metadata)
 
 
 @dataclass(frozen=True)

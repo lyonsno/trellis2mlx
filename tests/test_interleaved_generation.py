@@ -530,6 +530,14 @@ def test_stage_handle_specs_validate_identity_and_scalar_metadata():
             metadata={"tensor_like": [1, 2, 3]},
         )
 
+    with pytest.raises(ValueError, match="metadata cannot use reserved report keys: kind, load_phase"):
+        StageHandleSpec(
+            handle_id="reserved",
+            kind="fixture",
+            factory=lambda runtime: object(),
+            metadata={"kind": "caller-kind", "load_phase": "caller-load"},
+        )
+
     with pytest.raises(ValueError, match="duplicate handle_id: dinov3"):
         build_stage_context_factory(
             [
