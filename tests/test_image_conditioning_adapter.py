@@ -183,6 +183,97 @@ def test_image_conditioning_adapter_rejects_duplicate_conditioning_key_across_jo
     assert context.require_runtime_object("cond://shared") is first_object
 
 
+def test_image_encoder_fixture_registers_typed_feature_object(tmp_path):
+    from trellmlx.interleaved_generation import JobState
+    from trellmlx.image_conditioning_adapter import (
+        ImageEncoderFeatureResult,
+        build_image_conditioning_stage_handler,
+        build_image_encoder_fixture,
+    )
+
+    plan = _plan(tmp_path, images=("front.png", "side.png"))
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+    feature_object = object()
+    calls = []
+
+    class FakeImageEncoder:
+        def extract_features(self, images):
+            calls.append(tuple(images))
+            return ImageEncoderFeatureResult(
+                features=feature_object,
+                context_tokens=514,
+                channels=1024,
+                views=2,
+                elapsed_seconds=0.31,
+            )
+
+    context = _context(handle=FakeImageEncoder())
+    handler = build_image_conditioning_stage_handler(fixture=build_image_encoder_fixture())
+    output = handler(invocation, state, context)
+
+    assert calls == [("front.png", "side.png")]
+    assert output.result.elapsed_seconds == 0.31
+    assert output.result.output_counts == {"images": 2, "context_tokens": 514}
+    assert output.artifacts["conditioning_key"] == "cond://seed-101/image_conditioning"
+    assert output.artifacts["conditioning_context_tokens"] == 514
+    assert output.artifacts["conditioning_channels"] == 1024
+    assert output.artifacts["conditioning_view_count"] == 2
+    assert "conditioning_object" not in output.artifacts
+    assert context.require_runtime_object("cond://seed-101/image_conditioning") is feature_object
+
+
+def test_image_encoder_fixture_rejects_non_feature_result(tmp_path):
+    from trellmlx.interleaved_generation import JobState
+    from trellmlx.image_conditioning_adapter import (
+        build_image_conditioning_stage_handler,
+        build_image_encoder_fixture,
+    )
+
+    plan = _plan(tmp_path)
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+
+    class FakeImageEncoder:
+        def extract_features(self, images):
+            return object()
+
+    handler = build_image_conditioning_stage_handler(fixture=build_image_encoder_fixture())
+
+    with pytest.raises(TypeError, match="image encoder fixture must return ImageEncoderFeatureResult"):
+        handler(invocation, state, _context(handle=FakeImageEncoder()))
+
+
+def test_image_encoder_fixture_rejects_callable_handle_without_extract_features(tmp_path):
+    from trellmlx.interleaved_generation import JobState
+    from trellmlx.image_conditioning_adapter import (
+        ImageEncoderFeatureResult,
+        build_image_conditioning_stage_handler,
+        build_image_encoder_fixture,
+    )
+
+    plan = _plan(tmp_path)
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+
+    class CallableImageEncoder:
+        def __call__(self, images):
+            return ImageEncoderFeatureResult(
+                features=object(),
+                context_tokens=257,
+                channels=1024,
+                views=1,
+            )
+
+    handler = build_image_conditioning_stage_handler(fixture=build_image_encoder_fixture())
+
+    with pytest.raises(
+        TypeError,
+        match=r"image encoder handle must provide extract_features\(\.\.\.\)",
+    ):
+        handler(invocation, state, _context(handle=CallableImageEncoder()))
+
+
 def test_image_conditioning_adapter_rejects_random_route_without_calling_fixture(tmp_path):
     from trellmlx.interleaved_generation import JobState
     from trellmlx.image_conditioning_adapter import build_image_conditioning_stage_handler

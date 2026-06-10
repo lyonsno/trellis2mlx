@@ -79,7 +79,83 @@ def _require_integer_count(field: str, value: object) -> None:
         raise ValueError(f"{field} must be an integer")
 
 
+@dataclass(frozen=True)
+class ImageEncoderFeatureResult:
+    """Runtime feature object plus scalar shape facts from an image encoder."""
+
+    features: object
+    context_tokens: int
+    channels: int
+    views: int
+    elapsed_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.features is None:
+            raise ValueError("features cannot be None")
+        _require_integer_count("context_tokens", self.context_tokens)
+        _require_integer_count("channels", self.channels)
+        _require_integer_count("views", self.views)
+        if self.context_tokens <= 0:
+            raise ValueError("context_tokens must be positive")
+        if self.channels <= 0:
+            raise ValueError("channels must be positive")
+        if self.views <= 0:
+            raise ValueError("views must be positive")
+        if self.elapsed_seconds < 0:
+            raise ValueError("elapsed_seconds must be non-negative")
+
+
 ImageConditioningFixture = Callable[[ImageConditioningRuntime], ImageConditioningFixtureResult]
+ImageEncoderExtractor = Callable[[ImageConditioningRuntime], ImageEncoderFeatureResult]
+
+
+def build_image_encoder_fixture(
+    *,
+    extract_features: ImageEncoderExtractor | None = None,
+    key_template: str = "cond://{job_id}/{stage}",
+) -> ImageConditioningFixture:
+    """Build a fixture that adapts an image encoder handle into conditioning state.
+
+    The default extractor calls `runtime.image_encoder.extract_features(images)`.
+    Tests can pass a fixture encoder handle without importing or constructing
+    production DINO code.
+    """
+
+    if not key_template:
+        raise ValueError("key_template must be nonempty")
+
+    def fixture(runtime: ImageConditioningRuntime) -> ImageConditioningFixtureResult:
+        feature_result = (
+            extract_features(runtime)
+            if extract_features is not None
+            else _extract_features_from_handle(runtime)
+        )
+        if not isinstance(feature_result, ImageEncoderFeatureResult):
+            raise TypeError("image encoder fixture must return ImageEncoderFeatureResult")
+        conditioning_key = key_template.format(
+            job_id=runtime.invocation.job_id,
+            stage=runtime.invocation.stage,
+        )
+        return ImageConditioningFixtureResult(
+            conditioning_key=conditioning_key,
+            context_tokens=feature_result.context_tokens,
+            channels=feature_result.channels,
+            views=feature_result.views,
+            elapsed_seconds=feature_result.elapsed_seconds,
+            conditioning_object=feature_result.features,
+        )
+
+    return fixture
+
+
+def _extract_features_from_handle(runtime: ImageConditioningRuntime) -> ImageEncoderFeatureResult:
+    extractor = getattr(runtime.image_encoder, "extract_features", None)
+    if extractor is None:
+        raise TypeError("image encoder handle must provide extract_features(...)")
+    result = extractor(runtime.images)
+    if not isinstance(result, ImageEncoderFeatureResult):
+        raise TypeError("image encoder fixture must return ImageEncoderFeatureResult")
+    return result
 
 
 def build_image_conditioning_stage_handler(
@@ -88,9 +164,9 @@ def build_image_conditioning_stage_handler(
 ):
     """Build the image-conditioning `StageRunner` handler.
 
-    The fixture stands in for real feature extraction and returns only scalar
-    shape/provenance facts. The actual feature tensor/object handoff is left for
-    a later runtime registry slice.
+    The fixture stands in for feature extraction and returns scalar
+    shape/provenance facts plus an optional runtime object. Runtime objects stay
+    in `StageExecutionContext`, not portable job artifacts.
     """
 
     def image_fixture(runtime: StageHandlerRuntime) -> StageRunnerOutput:
