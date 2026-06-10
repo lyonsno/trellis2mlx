@@ -508,6 +508,106 @@ def test_cli_packed_sparse_structure_export_marks_last_evidence_phase(tmp_path):
     assert persisted["last_trustworthy_evidence"]["phase"] == "packed_artifact_export"
 
 
+def test_packed_sparse_structure_stage_smoke_routes_sampler_through_artifact(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-stage.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "ss-stage.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 64), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+            "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "out_layer.weight": np.ones((8, 128), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-stage"
+    gen.export_packed_sparse_structure_artifact(
+        checkpoint,
+        config,
+        artifact_dir,
+        bits=4,
+        group_size=64,
+    )
+
+    report = gen.run_packed_sparse_structure_stage_smoke(
+        artifact_dir,
+        config,
+        steps=1,
+        seed=7,
+    )
+
+    assert report["stage"] == "sparse-structure"
+    assert report["route"]["requested"] == "packed-quantized-sparse-structure"
+    assert report["route"]["effective"] == "packed-quantized-sparse-structure"
+    assert report["route"]["fp_checkpoint_loaded"] is False
+    assert report["load"]["loaded_quantized_module_count"] == 2
+    assert report["sampler"]["steps"] == 1
+    assert report["sampler"]["guidance_strength"] == 1.0
+    assert report["inputs"]["context_proj_shape"] == [1, 8, 64]
+    assert report["output"]["shape"] == [1, 8, 2, 2, 2]
+    assert report["sample_modules"]["blocks.0.cross_attn.proj_linear"]["class"] == "QuantizedLinear"
+    assert report["sample_modules"]["blocks.0.cross_attn.proj_linear"]["weight_dtype"] == "uint32"
+    assert report["sample_modules"]["out_layer"]["class"] == "Linear"
+
+
+def test_packed_sparse_structure_stage_smoke_rejects_artifact_without_quantized_modules(tmp_path):
+    gen = _load_module()
+    from safetensors.numpy import save_file as save_safetensors
+
+    config = tmp_path / "ss-stage-empty.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 64,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    artifact_dir = tmp_path / "bad-packed-stage"
+    artifact_dir.mkdir()
+    save_safetensors({"input_layer.weight": np.ones((64, 8), dtype=np.float32)}, artifact_dir / "model.safetensors")
+    (artifact_dir / "manifest.json").write_text(json.dumps({
+        "schema": "trellis2mlx.pixal3d_sparse_quant_artifact.v1",
+        "stage": "sparse-structure",
+        "artifact": {"tensor_file": str(artifact_dir / "model.safetensors")},
+        "quantization": {"bits": 4, "group_size": 64},
+        "quantized_module_names": [],
+    }))
+
+    with pytest.raises(RuntimeError, match="no quantized module names"):
+        gen.run_packed_sparse_structure_stage_smoke(
+            artifact_dir,
+            config,
+            steps=1,
+            seed=7,
+        )
+
+
 def test_existing_report_requires_explicit_overwrite(tmp_path):
     gen = _load_module()
 

@@ -62,6 +62,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write a packed sparse-structure quantized artifact directory",
     )
     parser.add_argument("--overwrite-artifact", action="store_true", help="Replace an existing packed artifact directory")
+    parser.add_argument("--packed-sparse-artifact", type=Path, help="Packed sparse-structure artifact directory for stage smoke")
+    parser.add_argument("--run-packed-sparse-stage", action="store_true", help="Run a packed sparse-structure sampler smoke")
+    parser.add_argument("--sparse-stage-steps", type=_positive_int, default=1)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
     parser.add_argument("--image-size", type=_positive_int, default=32)
     parser.add_argument("--patch-size", type=_positive_int, default=16)
@@ -785,6 +788,113 @@ def load_packed_sparse_structure_artifact(model: Any, artifact_dir: Path) -> dic
     }
 
 
+def _sample_module_routes(model: Any, names: list[str]) -> dict[str, Any]:
+    samples = {}
+    for name in names:
+        module = _nested_getattr(model, name)
+        samples[name] = {
+            "class": module.__class__.__name__,
+            "weight_shape": list(module.weight.shape),
+            "weight_dtype": _dtype_name(module.weight.dtype),
+        }
+    return samples
+
+
+def _synthetic_sparse_context(config: dict[str, Any]) -> dict[str, mx.array]:
+    token_count = config["resolution"] ** 3
+    context_channels = config["cond_channels"]
+    return {
+        "global": mx.zeros((1, 5, context_channels), dtype=mx.float32),
+        "proj": mx.zeros((1, token_count, context_channels), dtype=mx.float32),
+    }
+
+
+def run_packed_sparse_structure_stage_smoke(
+    artifact_dir: Path,
+    config_path: Path,
+    *,
+    steps: int = 1,
+    seed: int = 42,
+) -> dict[str, Any]:
+    from trellmlx.samplers import flow_euler_sample
+
+    if steps <= 0:
+        raise ValueError("packed sparse stage smoke requires positive steps")
+
+    mx.random.seed(seed)
+    config = _flow_config_profile(config_path)
+    model = sparse_structure_model_from_config(config_path)
+    load_report = load_packed_sparse_structure_artifact(model, artifact_dir)
+    if load_report["loaded_quantized_module_count"] <= 0:
+        raise RuntimeError("requested packed sparse stage loaded no quantized modules")
+
+    context = _synthetic_sparse_context(config)
+    neg_context = {key: mx.zeros_like(value) for key, value in context.items()}
+    noise = mx.random.normal(
+        (
+            1,
+            config["in_channels"],
+            config["resolution"],
+            config["resolution"],
+            config["resolution"],
+        )
+    )
+    mx.eval(noise, context["global"], context["proj"])
+    out = flow_euler_sample(
+        model,
+        noise,
+        context,
+        neg_context,
+        steps=steps,
+        guidance_strength=1.0,
+        guidance_rescale=0.0,
+        verbose=False,
+    )
+    mx.eval(out)
+
+    sample_names = [
+        "blocks.0.cross_attn.proj_linear",
+        "blocks.0.self_attn.to_qkv",
+        "adaLN_modulation.layers.1",
+        "out_layer",
+    ]
+    sample_names = [name for name in sample_names if name.split(".")[0] != "blocks" or config["num_blocks"] > 0]
+
+    return {
+        "schema": "trellis2mlx.pixal3d_sparse_stage_smoke.v1",
+        "stage": "sparse-structure",
+        "route": {
+            "requested": "packed-quantized-sparse-structure",
+            "effective": "packed-quantized-sparse-structure",
+            "fp_checkpoint_loaded": False,
+            "packed_artifact": str(artifact_dir),
+            "checkpoint_config": str(config_path),
+            "model_class": model.__class__.__name__,
+        },
+        "config": config,
+        "load": load_report,
+        "inputs": {
+            "noise_shape": list(noise.shape),
+            "context_keys": sorted(context),
+            "context_global_shape": list(context["global"].shape),
+            "context_proj_shape": list(context["proj"].shape),
+        },
+        "sampler": {
+            "steps": steps,
+            "guidance_strength": 1.0,
+            "guidance_rescale": 0.0,
+        },
+        "sample_modules": _sample_module_routes(model, sample_names),
+        "output": {
+            "shape": list(out.shape),
+            "dtype": _dtype_name(out.dtype),
+            "mean": float(mx.mean(out).item()),
+            "std": float(mx.std(out).item()),
+            "abs_max": float(mx.max(mx.abs(out)).item()),
+        },
+    }
+
+
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
     if inventory.get("path") is None:
         return
@@ -1043,6 +1153,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "quantize_bits": args.quantize_bits,
             "quantize_group_size": args.quantize_group_size,
             "export_packed_sparse_structure": str(args.export_packed_sparse_structure) if args.export_packed_sparse_structure else None,
+            "packed_sparse_artifact": str(args.packed_sparse_artifact) if args.packed_sparse_artifact else None,
+            "run_packed_sparse_stage": args.run_packed_sparse_stage,
+            "sparse_stage_steps": args.sparse_stage_steps,
         },
         "last_trustworthy_evidence": {"phase": "initialized"},
     }
@@ -1120,6 +1233,23 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             except Exception as exc:
                 mark_failure(report, args.report, phase="packed_artifact_export", error=str(exc))
                 raise
+        if args.run_packed_sparse_stage:
+            if not args.packed_sparse_artifact or not args.checkpoint_config:
+                exc = ValueError("--run-packed-sparse-stage requires --packed-sparse-artifact and --checkpoint-config")
+                mark_failure(report, args.report, phase="packed_sparse_stage", error=str(exc))
+                raise exc
+            try:
+                report["packed_sparse_stage"] = run_packed_sparse_structure_stage_smoke(
+                    args.packed_sparse_artifact,
+                    args.checkpoint_config,
+                    steps=args.sparse_stage_steps,
+                    seed=args.seed,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "packed_sparse_stage"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="packed_sparse_stage", error=str(exc))
+                raise
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
@@ -1128,7 +1258,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "slat_flow_output_std": float(mx.std(slat_out).item()),
         }
         report["status"] = "ok"
-        if args.export_packed_sparse_structure:
+        if args.run_packed_sparse_stage:
+            final_phase = "packed_sparse_stage"
+        elif args.export_packed_sparse_structure:
             final_phase = "packed_artifact_export"
         elif args.chunked_quantize_sparse_structure:
             final_phase = "chunked_quantization"
