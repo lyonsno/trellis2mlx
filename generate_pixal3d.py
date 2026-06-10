@@ -48,6 +48,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo-root", type=Path, default=None, help="Effective pixal3d-mlx repo root")
     parser.add_argument("--checkpoint", type=Path, help="Optional Pixal3D denoiser checkpoint to inventory")
     parser.add_argument("--checkpoint-config", type=Path, help="Optional Pixal3D checkpoint JSON config for no-allocation shape profiling")
+    parser.add_argument(
+        "--chunked-quantize-sparse-structure",
+        action="store_true",
+        help="Quantize eligible sparse-structure checkpoint weights one tensor at a time and report packed payload sizes",
+    )
+    parser.add_argument("--quantize-bits", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--quantize-group-size", type=_positive_int, default=64)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
     parser.add_argument("--image-size", type=_positive_int, default=32)
     parser.add_argument("--patch-size", type=_positive_int, default=16)
@@ -328,6 +335,175 @@ def profile_checkpoint_architecture(checkpoint: Path, config_path: Path) -> dict
     }
 
 
+def _dtype_name(value: Any) -> str:
+    return str(value).replace("mlx.core.", "").replace("numpy.", "")
+
+
+def _array_nbytes(array: Any) -> int:
+    if hasattr(array, "nbytes"):
+        return int(array.nbytes)
+    return int(np.prod(array.shape, dtype=np.int64)) * int(array.itemsize)
+
+
+def _quantized_linear_weight_skip_reason(shape: tuple[int, ...], group_size: int) -> str | None:
+    if len(shape) != 2:
+        return "not_2d_linear_weight"
+    in_features = shape[1]
+    if in_features < group_size:
+        return "below_group_size"
+    if in_features % group_size != 0:
+        return "input_dim_not_divisible_by_group_size"
+    return None
+
+
+def chunked_quantize_sparse_structure_checkpoint(
+    checkpoint: Path,
+    config_path: Path,
+    *,
+    bits: int = 4,
+    group_size: int = 64,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+    from trellmlx.weight_loader import _remap_key
+
+    if bits not in (4, 8):
+        raise ValueError("chunked sparse-structure quantization requires bits=4 or bits=8")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
+    if not config_path.exists():
+        raise FileNotFoundError(f"checkpoint config does not exist: {config_path}")
+
+    config, expected_shapes = expected_flow_shapes_from_config(config_path)
+    profile = profile_checkpoint_architecture(checkpoint, config_path)
+    if profile["shape_mismatch_count"]:
+        raise RuntimeError(
+            "checkpoint/config shape mismatch blocks chunked quantization: "
+            f"{profile['shape_mismatch_samples'][:3]}"
+        )
+
+    checkpoint_entries: list[dict[str, Any]] = []
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        for raw_key in sf.keys():
+            tensor_slice = sf.get_slice(raw_key)
+            shape = tuple(tensor_slice.get_shape())
+            checkpoint_entries.append({
+                "raw_key": raw_key,
+                "key": _remap_key(raw_key),
+                "shape": shape,
+                "dtype": _dtype_name(tensor_slice.get_dtype()),
+            })
+
+    checkpoint_entries.sort(key=lambda item: item["key"])
+    quantized_weights = []
+    skipped_weights = []
+    nonweight_key_count = 0
+    extra_keys = []
+    original_weight_bytes = 0
+    packed_weight_bytes = 0
+    scale_bytes = 0
+    biases_bytes = 0
+    peak_materialized_tensor_bytes = 0
+    projection_quantized_count = 0
+
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        for entry in checkpoint_entries:
+            key = entry["key"]
+            raw_key = entry["raw_key"]
+            shape = entry["shape"]
+            if key not in expected_shapes:
+                extra_keys.append(key)
+                continue
+            if not key.endswith(".weight"):
+                nonweight_key_count += 1
+                continue
+
+            reason = _quantized_linear_weight_skip_reason(shape, group_size)
+            if reason is not None:
+                skipped_weights.append({
+                    "key": key,
+                    "raw_key": raw_key,
+                    "shape": list(shape),
+                    "dtype": entry["dtype"],
+                    "reason": reason,
+                })
+                continue
+
+            tensor = sf.get_tensor(raw_key)
+            peak_materialized_tensor_bytes = max(
+                peak_materialized_tensor_bytes,
+                _array_nbytes(tensor),
+            )
+            source = mx.array(tensor)
+            packed, scales, biases = mx.quantize(source, group_size=group_size, bits=bits)
+            mx.eval(packed, scales, biases)
+            source_bytes = _array_nbytes(tensor)
+            packed_bytes = _array_nbytes(packed)
+            scales_bytes = _array_nbytes(scales)
+            per_weight_biases_bytes = _array_nbytes(biases)
+            original_weight_bytes += source_bytes
+            packed_weight_bytes += packed_bytes
+            scale_bytes += scales_bytes
+            biases_bytes += per_weight_biases_bytes
+            if ".cross_attn.proj_linear.weight" in key:
+                projection_quantized_count += 1
+            quantized_weights.append({
+                "key": key,
+                "raw_key": raw_key,
+                "shape": list(shape),
+                "source_dtype": entry["dtype"],
+                "source_bytes": source_bytes,
+                "packed_shape": list(packed.shape),
+                "packed_dtype": _dtype_name(packed.dtype),
+                "packed_bytes": packed_bytes,
+                "scale_shape": list(scales.shape),
+                "scale_dtype": _dtype_name(scales.dtype),
+                "scale_bytes": scales_bytes,
+                "biases_shape": list(biases.shape),
+                "biases_dtype": _dtype_name(biases.dtype),
+                "biases_bytes": per_weight_biases_bytes,
+            })
+            del source, packed, scales, biases, tensor
+            mx.clear_cache()
+
+    quantized_payload_bytes = packed_weight_bytes + scale_bytes + biases_bytes
+    return {
+        "mode": "chunked-header-guarded-mx-quantize",
+        "stage": "sparse-structure",
+        "allocates_full_model": False,
+        "loads_all_tensors_at_once": False,
+        "tensor_materialization": "one safetensors tensor per quantized weight",
+        "bits": bits,
+        "group_size": group_size,
+        "config": config,
+        "checkpoint": {
+            "path": str(checkpoint),
+            "size_bytes": checkpoint.stat().st_size,
+            "key_count": len(checkpoint_entries),
+        },
+        "profile": profile,
+        "eligible_weight_count": len(quantized_weights),
+        "quantized_weight_count": len(quantized_weights),
+        "projection_weight_quantized_count": projection_quantized_count,
+        "skipped_weight_count": len(skipped_weights),
+        "nonweight_key_count": nonweight_key_count,
+        "extra_checkpoint_key_count": len(extra_keys),
+        "extra_checkpoint_key_samples": extra_keys[:10],
+        "original_weight_bytes": original_weight_bytes,
+        "packed_weight_bytes": packed_weight_bytes,
+        "scale_bytes": scale_bytes,
+        "biases_bytes": biases_bytes,
+        "quantized_payload_bytes": quantized_payload_bytes,
+        "compression_ratio_vs_quantized_weights": (
+            original_weight_bytes / quantized_payload_bytes
+            if quantized_payload_bytes
+            else None
+        ),
+        "peak_materialized_tensor_bytes": peak_materialized_tensor_bytes,
+        "sample_quantized_weights": quantized_weights[:10],
+        "sample_skipped_weights": skipped_weights[:10],
+    }
+
+
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
     if inventory.get("path") is None:
         return
@@ -582,6 +758,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "patch_size": args.patch_size,
             "context_channels": args.context_channels,
             "checkpoint_config": str(args.checkpoint_config) if args.checkpoint_config else None,
+            "chunked_quantize_sparse_structure": args.chunked_quantize_sparse_structure,
+            "quantize_bits": args.quantize_bits,
+            "quantize_group_size": args.quantize_group_size,
         },
         "last_trustworthy_evidence": {"phase": "initialized"},
     }
@@ -623,6 +802,23 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             report["architecture_profile"] = profile_checkpoint_architecture(
                 args.checkpoint, args.checkpoint_config
             )
+        if args.chunked_quantize_sparse_structure:
+            if not args.checkpoint or not args.checkpoint_config:
+                exc = ValueError("--chunked-quantize-sparse-structure requires --checkpoint and --checkpoint-config")
+                mark_failure(report, args.report, phase="chunked_quantization", error=str(exc))
+                raise exc
+            try:
+                report["chunked_quantization"] = chunked_quantize_sparse_structure_checkpoint(
+                    args.checkpoint,
+                    args.checkpoint_config,
+                    bits=args.quantize_bits,
+                    group_size=args.quantize_group_size,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "chunked_quantization"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="chunked_quantization", error=str(exc))
+                raise
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),

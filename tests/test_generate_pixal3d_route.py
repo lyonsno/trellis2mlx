@@ -317,6 +317,66 @@ def test_sparse_structure_quantized_assignment_rejects_missing_sentinel(tmp_path
         )
 
 
+def test_chunked_sparse_structure_quantization_reports_real_packed_tensors(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss-flow.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 16,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "ss-chunked.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.arange(384 * 128, dtype=np.float32).reshape(384, 128),
+            "input_layer.weight": np.ones((128, 8), dtype=np.float32),
+            "blocks.0.self_attn.to_qkv.bias": np.zeros((384,), dtype=np.float32),
+            "rope_phases": np.zeros((4, 2), dtype=np.float32),
+        },
+        checkpoint,
+    )
+
+    report = gen.chunked_quantize_sparse_structure_checkpoint(
+        checkpoint,
+        config,
+        bits=4,
+        group_size=64,
+    )
+
+    assert report["mode"] == "chunked-header-guarded-mx-quantize"
+    assert report["allocates_full_model"] is False
+    assert report["loads_all_tensors_at_once"] is False
+    assert report["profile"]["shape_mismatch_count"] == 0
+    assert report["quantized_weight_count"] == 1
+    assert report["eligible_weight_count"] == 1
+    assert report["skipped_weight_count"] == 1
+    assert report["nonweight_key_count"] == 1
+    assert report["extra_checkpoint_key_count"] == 1
+    assert report["original_weight_bytes"] == 384 * 128 * 4
+    assert report["packed_weight_bytes"] == 384 * 16 * 4
+    assert report["scale_bytes"] == 384 * 2 * 4
+    assert report["biases_bytes"] == 384 * 2 * 4
+    assert report["quantized_payload_bytes"] == (384 * 16 * 4) + (384 * 2 * 4) + (384 * 2 * 4)
+    assert report["peak_materialized_tensor_bytes"] == 384 * 128 * 4
+    assert report["sample_quantized_weights"][0]["key"] == "blocks.0.self_attn.to_qkv.weight"
+    assert report["sample_quantized_weights"][0]["packed_shape"] == [384, 16]
+    assert report["sample_quantized_weights"][0]["scale_shape"] == [384, 2]
+    assert report["sample_quantized_weights"][0]["packed_dtype"] == "uint32"
+    assert report["sample_skipped_weights"][0]["key"] == "input_layer.weight"
+    assert report["sample_skipped_weights"][0]["reason"] == "below_group_size"
+
+
 def test_existing_report_requires_explicit_overwrite(tmp_path):
     gen = _load_module()
 
