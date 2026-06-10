@@ -26,6 +26,7 @@ DEFAULT_STAGE_SEQUENCE: tuple[str, ...] = (
     "hr_shape_latent",
     "shape_decode",
     "mesh_extract",
+    "mesh_postprocess",
     "texture_latent",
     "texture_decode",
     "texture_bake",

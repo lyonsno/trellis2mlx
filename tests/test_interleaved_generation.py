@@ -60,6 +60,16 @@ def test_stage_major_plan_groups_jobs_by_stage_before_advancing(tmp_path):
     ]
 
 
+def test_default_stage_sequence_exposes_mesh_postprocess_boundary():
+    from trellmlx.interleaved_generation import DEFAULT_STAGE_SEQUENCE
+
+    mesh_extract_index = DEFAULT_STAGE_SEQUENCE.index("mesh_extract")
+    mesh_postprocess_index = DEFAULT_STAGE_SEQUENCE.index("mesh_postprocess")
+    texture_latent_index = DEFAULT_STAGE_SEQUENCE.index("texture_latent")
+
+    assert mesh_extract_index < mesh_postprocess_index < texture_latent_index
+
+
 def test_plan_rejects_duplicate_job_ids(tmp_path):
     from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan
 
