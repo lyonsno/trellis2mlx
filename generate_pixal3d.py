@@ -112,6 +112,14 @@ def _model_keys(model) -> set[str]:
     return {key for key, _ in mlx.utils.tree_flatten(model.parameters())}
 
 
+def _model_shapes(models: dict[str, Any]) -> dict[str, tuple[int, ...]]:
+    shapes = {}
+    for model in models.values():
+        for key, value in mlx.utils.tree_flatten(model.parameters()):
+            shapes[key] = tuple(value.shape)
+    return shapes
+
+
 def inspect_checkpoint(checkpoint: Path | None, models: dict[str, Any]) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "path": str(checkpoint) if checkpoint is not None else None,
@@ -121,6 +129,7 @@ def inspect_checkpoint(checkpoint: Path | None, models: dict[str, Any]) -> dict[
         "missing": None,
         "skipped": 0,
         "projection_keys_present": None,
+        "inventory_mode": "header-only",
     }
     if checkpoint is None:
         return identity
@@ -131,24 +140,74 @@ def inspect_checkpoint(checkpoint: Path | None, models: dict[str, Any]) -> dict[
     from safetensors import safe_open
     from trellmlx.weight_loader import _remap_key
 
-    model_keys = set()
-    for model in models.values():
-        model_keys.update(_model_keys(model))
-
+    model_shapes = _model_shapes(models)
+    model_keys = set(model_shapes)
     checkpoint_keys = []
+    checkpoint_shapes = {}
     with safe_open(str(checkpoint), framework="numpy") as sf:
         checkpoint_keys = list(sf.keys())
+        for key in checkpoint_keys:
+            checkpoint_shapes[key] = tuple(sf.get_slice(key).get_shape())
 
     remapped = [_remap_key(key) for key in checkpoint_keys]
-    matched = [key for key in remapped if key in model_keys]
+    matched_by_name = [key for key in remapped if key in model_keys]
+    matched_by_shape = [
+        remapped_key
+        for raw_key, remapped_key in zip(checkpoint_keys, remapped)
+        if remapped_key in model_shapes and checkpoint_shapes[raw_key] == model_shapes[remapped_key]
+    ]
+    projection_keys = [key for key in remapped if ".cross_attn.proj_linear." in key]
+    wrapped_cross_attn_keys = [key for key in checkpoint_keys if ".cross_attn.cross_attn_block." in key]
+    plain_cross_attn_keys = [
+        key
+        for key in checkpoint_keys
+        if ".cross_attn." in key
+        and ".cross_attn.cross_attn_block." not in key
+        and ".cross_attn.proj_linear." not in key
+    ]
+    plain_cross_attn_remapped = [
+        remapped_key
+        for raw_key, remapped_key in zip(checkpoint_keys, remapped)
+        if raw_key in plain_cross_attn_keys and remapped_key != raw_key
+    ]
+    shape_mismatch = [
+        {
+            "key": raw_key,
+            "remapped_key": remapped_key,
+            "checkpoint_shape": list(checkpoint_shapes[raw_key]),
+            "model_shape": list(model_shapes[remapped_key]),
+        }
+        for raw_key, remapped_key in zip(checkpoint_keys, remapped)
+        if remapped_key in model_shapes and checkpoint_shapes[raw_key] != model_shapes[remapped_key]
+    ]
     identity.update({
         "total_keys": len(checkpoint_keys),
-        "loaded": len(matched),
-        "missing": len(model_keys - set(matched)),
-        "skipped": len(checkpoint_keys) - len(matched),
-        "projection_keys_present": any(".cross_attn.proj_linear." in key for key in remapped),
+        "loaded": len(matched_by_shape),
+        "missing": len(model_keys - set(matched_by_name)),
+        "skipped": len(checkpoint_keys) - len(matched_by_name),
+        "matched_by_name": len(matched_by_name),
+        "matched_by_shape": len(matched_by_shape),
+        "shape_mismatch_count": len(shape_mismatch),
+        "shape_mismatch_samples": shape_mismatch[:10],
+        "projection_keys_present": bool(projection_keys),
+        "projection_key_count": len(projection_keys),
+        "wrapped_cross_attn_key_count": len(wrapped_cross_attn_keys),
+        "plain_cross_attn_key_count": len(plain_cross_attn_keys),
+        "plain_cross_attn_remapped_count": len(plain_cross_attn_remapped),
+        "sample_projection_keys": projection_keys[:10],
     })
     return identity
+
+
+def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
+    if inventory.get("path") is None:
+        return
+    if not inventory.get("exists"):
+        raise RuntimeError(f"checkpoint does not exist: {inventory.get('path')}")
+    if not inventory.get("projection_keys_present"):
+        raise RuntimeError(
+            f"checkpoint lacks Pixal3D projection keys: {inventory.get('path')}"
+        )
 
 
 def build_synthetic_context(args: argparse.Namespace) -> dict[str, mx.array]:
@@ -275,6 +334,13 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "model_classes": {name: model.__class__.__name__ for name, model in models.items()},
         }
         validate_effective_route(route)
+        checkpoint_inventory = inspect_checkpoint(args.checkpoint, models)
+        try:
+            validate_checkpoint_inventory(checkpoint_inventory)
+        except Exception as exc:
+            report["checkpoint"] = checkpoint_inventory
+            mark_failure(report, args.report, phase="checkpoint_inventory", error=str(exc))
+            raise
 
         x_ss = mx.random.normal((1, 8, args.grid_resolution, args.grid_resolution, args.grid_resolution))
         t = mx.array([500.0])
@@ -286,7 +352,7 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
         slat_out = models["slat_flow"](x_slat, t, context, coords=coords)
         mx.eval(ss_out, slat_out)
 
-        report["checkpoint"] = inspect_checkpoint(args.checkpoint, models)
+        report["checkpoint"] = checkpoint_inventory
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
@@ -299,6 +365,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
         write_report(args.report, report)
         return report
     except Exception as exc:
+        if report.get("status") == "failed":
+            raise
         mark_failure(report, args.report, phase="smoke_route", error=str(exc))
         raise
 
