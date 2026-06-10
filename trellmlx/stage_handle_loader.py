@@ -95,6 +95,7 @@ class StageHandleLoaderRequest:
                     f"effective loader route mismatch for {self.handle_id}: "
                     f"requested {self.requested_loader_route}, got {loaded.effective_loader_route}",
                     metadata={"effective_loader_route": loaded.effective_loader_route},
+                    handle=loaded.handle,
                 )
             return StageHandleFactoryResult(
                 handle=loaded.handle,

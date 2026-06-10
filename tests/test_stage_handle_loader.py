@@ -84,13 +84,19 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
     )
 
     plan = _single_job_plan(tmp_path)
+    handle = object()
+    events = []
 
     def load_with_fallback(runtime):
+        events.append(("load", runtime.handle_id))
         return LoadedStageHandle(
-            handle=object(),
+            handle=handle,
             effective_loader_route="fallback",
             metadata={"weights_path": "fallback://dinov3"},
         )
+
+    def close_fallback(runtime, loaded_handle):
+        events.append(("close", runtime.handle_id, loaded_handle is handle))
 
     report_path = tmp_path / "handle-report.json"
     report = load_stage_handles(
@@ -101,6 +107,7 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
                 kind="model",
                 requested_loader_route="mlx",
                 factory=load_with_fallback,
+                close=close_fallback,
             )
         ],
         report_path=report_path,
@@ -112,7 +119,11 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
     assert "effective loader route mismatch for dinov3" in report.error
     assert report.loaded_handle_ids == ()
     assert [load_report.load_phase for load_report in report.load_reports] == ["load_error"]
-    assert report.close_reports == ()
+    assert events == [
+        ("load", "dinov3"),
+        ("close", "dinov3", True),
+    ]
+    assert [close_report.close_phase for close_report in report.close_reports] == ["closed"]
 
     persisted = json.loads(report_path.read_text())
     assert persisted["ok"] is False
@@ -123,6 +134,11 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
         "load_phase": "load_error",
         "requested_loader_route": "mlx",
         "effective_loader_route": "fallback",
+    }
+    assert persisted["close_reports"][0]["metadata"] == {
+        "kind": "model",
+        "close_phase": "closed",
+        "requested_loader_route": "mlx",
     }
 
 

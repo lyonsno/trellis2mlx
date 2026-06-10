@@ -284,6 +284,7 @@ class StageHandleRuntime:
 StageHandleFactory = Callable[[StageHandleRuntime], object]
 StageHandleCloser = Callable[[StageHandleRuntime, object], None]
 _RESERVED_STAGE_HANDLE_METADATA_KEYS = frozenset({"close_phase", "error", "handle_id", "kind", "load_phase"})
+_NO_FACTORY_ERROR_HANDLE = object()
 
 
 def _validate_handle_metadata(metadata: Mapping[str, StageArtifactValue]) -> dict[str, StageArtifactValue]:
@@ -308,9 +309,20 @@ class StageHandleFactoryResult:
 class StageHandleFactoryError(RuntimeError):
     """Factory failure with scalar metadata that should survive in load reports."""
 
-    def __init__(self, message: str, *, metadata: Mapping[str, StageArtifactValue] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        metadata: Mapping[str, StageArtifactValue] | None = None,
+        handle: object = _NO_FACTORY_ERROR_HANDLE,
+    ):
         super().__init__(message)
         self.metadata = _validate_handle_metadata(metadata or {})
+        self.handle = handle
+
+    @property
+    def has_handle(self) -> bool:
+        return self.handle is not _NO_FACTORY_ERROR_HANDLE
 
 
 @dataclass(frozen=True)
@@ -418,6 +430,8 @@ class StageContextFactoryFromSpecs:
                 dynamic_metadata: dict[str, StageArtifactValue] = {}
                 if isinstance(exc, StageHandleFactoryError):
                     dynamic_metadata = dict(exc.metadata)
+                    if exc.has_handle:
+                        handles[spec.handle_id] = exc.handle
                     duplicate_metadata = sorted(set(spec.metadata) & set(dynamic_metadata))
                     if duplicate_metadata:
                         dynamic_metadata = {}
