@@ -65,6 +65,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--packed-sparse-artifact", type=Path, help="Packed sparse-structure artifact directory for stage smoke")
     parser.add_argument("--run-packed-sparse-stage", action="store_true", help="Run a packed sparse-structure sampler smoke")
     parser.add_argument("--run-image-packed-sparse-stage", action="store_true", help="Run packed sparse stage using image-derived Pixal3D projected conditioning")
+    parser.add_argument("--packed-flow-artifact", type=Path, help="Packed generic flow artifact directory for SLat diagnostics")
+    parser.add_argument("--packed-flow-stage", default="shape-lr-slat", help="Expected packed generic flow stage")
+    parser.add_argument("--run-packed-slat-width-diagnostic", action="store_true", help="Run packed SLat projected-context width diagnostic")
     parser.add_argument("--image", type=Path, help="Image path for DINOv3/Pixal3D projected conditioning")
     parser.add_argument("--sparse-stage-steps", type=_positive_int, default=1)
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
@@ -1082,6 +1085,15 @@ def _sample_module_routes(model: Any, names: list[str]) -> dict[str, Any]:
     return samples
 
 
+def _mlx_peak_memory_bytes() -> int | None:
+    if hasattr(mx, "get_peak_memory"):
+        return int(mx.get_peak_memory())
+    metal = getattr(mx, "metal", None)
+    if metal is not None and hasattr(metal, "get_peak_memory"):
+        return int(metal.get_peak_memory())
+    return None
+
+
 def _synthetic_sparse_context(config: dict[str, Any]) -> dict[str, mx.array]:
     token_count = config["resolution"] ** 3
     context_channels = config["cond_channels"]
@@ -1115,6 +1127,177 @@ def pixal3d_context_from_features(
     )
     mx.eval(context["global"], context["proj"])
     return context
+
+
+def diagnose_packed_slat_projection_width(
+    artifact_dir: Path,
+    config_path: Path,
+    *,
+    expected_stage: str = "shape-lr-slat",
+    image_size: int = 512,
+    patch_size: int = 16,
+    token_count: int = 8,
+    seed: int = 42,
+    run_zero_augmented: bool = True,
+) -> dict[str, Any]:
+    """Distinguish packed SLat load viability from Pixal3D projection width mismatch."""
+    if token_count <= 0:
+        raise ValueError("packed SLat width diagnostic requires a positive token_count")
+
+    config = _flow_config_profile(config_path)
+    patch_grid = image_size // patch_size
+    feature_shape = (1, 5 + patch_grid * patch_grid, config["cond_channels"])
+    features = mx.zeros(feature_shape, dtype=mx.float32)
+    adapter_context = pixal3d_context_from_features(
+        features,
+        config,
+        image_size=image_size,
+        patch_size=patch_size,
+    )
+    if adapter_context["proj"].shape[1] < token_count:
+        raise ValueError(
+            f"packed SLat width diagnostic token_count {token_count} exceeds projected token count "
+            f"{adapter_context['proj'].shape[1]}"
+        )
+
+    model = flow_model_from_config(config_path)
+    load_report = load_packed_flow_artifact(model, artifact_dir, expected_stage=expected_stage)
+
+    mx.random.seed(seed)
+    x = mx.random.normal((token_count, config["in_channels"])).astype(mx.float32)
+    t = mx.array([1000.0], dtype=mx.float32)
+    coords = mx.array(
+        [
+            [
+                i % config["resolution"],
+                (i * 3) % config["resolution"],
+                (i * 5) % config["resolution"],
+            ]
+            for i in range(token_count)
+        ],
+        dtype=mx.int32,
+    )
+    native_context = {
+        "global": adapter_context["global"],
+        "proj": adapter_context["proj"][:, :token_count, :],
+    }
+
+    report: dict[str, Any] = {
+        "schema": "trellis2mlx.pixal3d_packed_slat_width_diagnostic.v1",
+        "stage": expected_stage,
+        "route": {
+            "requested": f"packed-quantized-{expected_stage}",
+            "effective": load_report["effective_route"],
+            "packed_artifact": str(artifact_dir),
+            "checkpoint_config": str(config_path),
+            "model_class": model.__class__.__name__,
+            "fp_checkpoint_loaded": False,
+        },
+        "config": config,
+        "load": {
+            "loaded_tensor_count": load_report["loaded_tensor_count"],
+            "loaded_quantized_module_count": load_report["loaded_quantized_module_count"],
+            "quantization": load_report["quantization"],
+        },
+        "conditioning": {
+            "current_mlx_projection_adapter": {
+                "input_feature_shape": list(feature_shape),
+                "global_shape": list(adapter_context["global"].shape),
+                "proj_shape": list(adapter_context["proj"].shape),
+                "expected_slat_proj_in_channels": config["proj_in_channels"],
+                "matches_slat_projection_width": adapter_context["proj"].shape[-1] == config["proj_in_channels"],
+            },
+            "upstream_contract": "Pixal3D projected SLat configs may require concat(lr 1024, hr 1024) NAF-upsampled features.",
+        },
+        "inputs": {
+            "token_count": token_count,
+            "x_shape": list(x.shape),
+            "coords_shape": list(coords.shape),
+            "native_global_shape": list(native_context["global"].shape),
+            "native_proj_shape": list(native_context["proj"].shape),
+        },
+        "sample_modules": _sample_module_routes(
+            model,
+            [
+                "blocks.0.cross_attn.proj_linear",
+                "blocks.0.self_attn.to_qkv",
+                "out_layer",
+            ],
+        ),
+    }
+
+    try:
+        native_out = model(x, t, native_context, coords=coords)
+        mx.eval(native_out)
+        report["native_projection_forward"] = {
+            "status": (
+                "ok"
+                if native_context["proj"].shape[-1] == config["proj_in_channels"]
+                else "unexpected_ok"
+            ),
+            "output_shape": list(native_out.shape),
+            "output_mean": float(mx.mean(native_out).item()),
+            "output_std": float(mx.std(native_out).item()),
+        }
+    except Exception as exc:
+        report["native_projection_forward"] = {
+            "status": (
+                "expected_failure"
+                if native_context["proj"].shape[-1] != config["proj_in_channels"]
+                else "failure"
+            ),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+    if not run_zero_augmented:
+        report["zero_augmented_projection_forward"] = {"status": "skipped"}
+        return report
+
+    width_delta = config["proj_in_channels"] - native_context["proj"].shape[-1]
+    if width_delta < 0:
+        report["zero_augmented_projection_forward"] = {
+            "status": "skipped",
+            "reason": "native projection width exceeds expected SLat projection width",
+        }
+        return report
+    if width_delta == 0:
+        augmented_context = native_context
+        zero_augmented = False
+    else:
+        pad = mx.zeros((*native_context["proj"].shape[:-1], width_delta), dtype=native_context["proj"].dtype)
+        augmented_context = {
+            "global": native_context["global"],
+            "proj": mx.concatenate([native_context["proj"], pad], axis=-1),
+        }
+        zero_augmented = True
+
+    start = time.time()
+    try:
+        augmented_out = model(x, t, augmented_context, coords=coords)
+        mx.eval(augmented_out)
+        report["zero_augmented_projection_forward"] = {
+            "status": "ok",
+            "zero_augmented_projection_for_diagnostic_only": zero_augmented,
+            "proj_shape": list(augmented_context["proj"].shape),
+            "output_shape": list(augmented_out.shape),
+            "output_mean": float(mx.mean(augmented_out).item()),
+            "output_std": float(mx.std(augmented_out).item()),
+            "elapsed_seconds": round(time.time() - start, 3),
+            "peak_mlx_memory_bytes": _mlx_peak_memory_bytes(),
+        }
+    except Exception as exc:
+        report["zero_augmented_projection_forward"] = {
+            "status": "failure",
+            "zero_augmented_projection_for_diagnostic_only": zero_augmented,
+            "proj_shape": list(augmented_context["proj"].shape),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "elapsed_seconds": round(time.time() - start, 3),
+            "peak_mlx_memory_bytes": _mlx_peak_memory_bytes(),
+        }
+
+    return report
 
 
 def extract_pixal3d_image_features(image_path: Path, *, image_size: int = 512) -> tuple[mx.array, dict[str, Any]]:
@@ -1735,6 +1918,9 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "packed_sparse_artifact": str(args.packed_sparse_artifact) if args.packed_sparse_artifact else None,
             "run_packed_sparse_stage": args.run_packed_sparse_stage,
             "run_image_packed_sparse_stage": args.run_image_packed_sparse_stage,
+            "packed_flow_artifact": str(args.packed_flow_artifact) if args.packed_flow_artifact else None,
+            "packed_flow_stage": args.packed_flow_stage,
+            "run_packed_slat_width_diagnostic": args.run_packed_slat_width_diagnostic,
             "image": str(args.image) if args.image else None,
             "sparse_stage_steps": args.sparse_stage_steps,
         },
@@ -1851,6 +2037,26 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             except Exception as exc:
                 mark_failure(report, args.report, phase="image_packed_sparse_stage", error=str(exc))
                 raise
+        if args.run_packed_slat_width_diagnostic:
+            if not args.packed_flow_artifact or not args.checkpoint_config:
+                exc = ValueError("--run-packed-slat-width-diagnostic requires --packed-flow-artifact and --checkpoint-config")
+                mark_failure(report, args.report, phase="packed_slat_width_diagnostic", error=str(exc))
+                raise exc
+            try:
+                report["packed_slat_width_diagnostic"] = diagnose_packed_slat_projection_width(
+                    args.packed_flow_artifact,
+                    args.checkpoint_config,
+                    expected_stage=args.packed_flow_stage,
+                    image_size=args.image_size,
+                    patch_size=args.patch_size,
+                    seed=args.seed,
+                    run_zero_augmented=True,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "packed_slat_width_diagnostic"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="packed_slat_width_diagnostic", error=str(exc))
+                raise
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
@@ -1861,6 +2067,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
         report["status"] = "ok"
         if args.run_image_packed_sparse_stage:
             final_phase = "image_packed_sparse_stage"
+        elif args.run_packed_slat_width_diagnostic:
+            final_phase = "packed_slat_width_diagnostic"
         elif args.run_packed_sparse_stage:
             final_phase = "packed_sparse_stage"
         elif args.export_packed_sparse_structure:

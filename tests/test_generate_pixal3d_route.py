@@ -669,6 +669,138 @@ def test_packed_projected_slat_artifact_loads_and_runs_sparse_tokens(tmp_path):
     assert out.shape == (3, 32)
 
 
+def test_packed_slat_projection_width_diagnostic_separates_conditioning_from_load(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "slat-width.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 4,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 128,
+        },
+    }))
+    checkpoint = tmp_path / "slat-width.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+            "input_layer.weight": np.ones((128, 32), dtype=np.float32),
+            "out_layer.weight": np.ones((32, 128), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-slat-width"
+    gen.export_packed_flow_artifact(
+        checkpoint,
+        config,
+        artifact_dir,
+        stage="shape-lr-slat",
+        bits=4,
+        group_size=64,
+    )
+
+    report = gen.diagnose_packed_slat_projection_width(
+        artifact_dir,
+        config,
+        expected_stage="shape-lr-slat",
+        image_size=32,
+        patch_size=16,
+        token_count=3,
+        seed=11,
+        run_zero_augmented=True,
+    )
+
+    assert report["stage"] == "shape-lr-slat"
+    assert report["route"]["effective"] == "packed-quantized-shape-lr-slat"
+    assert report["conditioning"]["current_mlx_projection_adapter"]["proj_shape"] == [1, 64, 64]
+    assert report["conditioning"]["current_mlx_projection_adapter"]["expected_slat_proj_in_channels"] == 128
+    assert report["conditioning"]["current_mlx_projection_adapter"]["matches_slat_projection_width"] is False
+    assert report["native_projection_forward"]["status"] == "expected_failure"
+    assert "128" in report["native_projection_forward"]["error"]
+    assert report["zero_augmented_projection_forward"]["status"] == "ok"
+    assert report["zero_augmented_projection_forward"]["zero_augmented_projection_for_diagnostic_only"] is True
+    assert report["zero_augmented_projection_forward"]["proj_shape"] == [1, 3, 128]
+    assert report["zero_augmented_projection_forward"]["output_shape"] == [3, 32]
+
+
+def test_cli_packed_slat_width_diagnostic_marks_last_evidence_phase(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "slat-width-cli.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 4,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 128,
+        },
+    }))
+    checkpoint = tmp_path / "slat-width-cli.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-slat-width-cli"
+    gen.export_packed_flow_artifact(
+        checkpoint,
+        config,
+        artifact_dir,
+        stage="shape-lr-slat",
+        bits=4,
+        group_size=64,
+    )
+    report_path = tmp_path / "route.json"
+
+    status = gen.main([
+        "--smoke-route",
+        "--checkpoint-config",
+        str(config),
+        "--packed-flow-artifact",
+        str(artifact_dir),
+        "--run-packed-slat-width-diagnostic",
+        "--packed-flow-stage",
+        "shape-lr-slat",
+        "--report",
+        str(report_path),
+        "--grid-resolution",
+        "2",
+        "--image-size",
+        "32",
+        "--patch-size",
+        "16",
+        "--context-channels",
+        "64",
+    ])
+
+    persisted = json.loads(report_path.read_text())
+    assert status == 0
+    assert persisted["status"] == "ok"
+    assert persisted["packed_slat_width_diagnostic"]["native_projection_forward"]["status"] == "expected_failure"
+    assert persisted["packed_slat_width_diagnostic"]["zero_augmented_projection_forward"]["status"] == "ok"
+    assert persisted["last_trustworthy_evidence"]["phase"] == "packed_slat_width_diagnostic"
+
+
 def test_image_conditioned_packed_sparse_stage_uses_projected_features(tmp_path):
     gen = _load_module()
 
