@@ -174,6 +174,87 @@ def test_checkpoint_without_projection_keys_fails_before_ok_report(tmp_path):
     assert persisted["last_trustworthy_evidence"]["phase"] == "checkpoint_inventory"
 
 
+def test_architecture_profile_matches_full_size_checkpoint_shapes(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "ss_flow.json"
+    config.write_text(json.dumps({
+        "name": "SparseStructureFlowModel",
+        "args": {
+            "resolution": 16,
+            "in_channels": 8,
+            "out_channels": 8,
+            "model_channels": 1536,
+            "cond_channels": 1024,
+            "num_blocks": 30,
+            "num_heads": 12,
+            "mlp_ratio": 5.3334,
+            "image_attn_mode": "proj",
+        },
+    }))
+    checkpoint = tmp_path / "pixal-profile.safetensors"
+    save_file(
+        {
+            "blocks.0.cross_attn.cross_attn_block.to_q.weight": np.zeros((1536, 1536), dtype=np.float32),
+            "blocks.0.cross_attn.cross_attn_block.to_kv.weight": np.zeros((3072, 1024), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.zeros((1536, 1024), dtype=np.float32),
+            "blocks.0.self_attn.to_qkv.weight": np.zeros((4608, 1536), dtype=np.float32),
+            "input_layer.weight": np.zeros((1536, 8), dtype=np.float32),
+            "out_layer.weight": np.zeros((8, 1536), dtype=np.float32),
+        },
+        checkpoint,
+    )
+
+    profile = gen.profile_checkpoint_architecture(checkpoint, config)
+
+    assert profile["mode"] == "config-header-no-allocation"
+    assert profile["config"]["name"] == "SparseStructureFlowModel"
+    assert profile["config"]["model_channels"] == 1536
+    assert profile["config"]["cond_channels"] == 1024
+    assert profile["config"]["proj_in_channels"] == 1024
+    assert profile["expected_shape_count"] >= 690
+    assert profile["matched_shape_count"] == 6
+    assert profile["shape_mismatch_count"] == 0
+    assert profile["projection_shape_match_count"] == 1
+    assert profile["wrapped_cross_attn_shape_match_count"] == 2
+    assert profile["allocates_model"] is False
+
+
+def test_architecture_profile_reports_shape_mismatches(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "slat_flow.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 32,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 1536,
+            "cond_channels": 1024,
+            "num_blocks": 30,
+            "num_heads": 12,
+            "mlp_ratio": 5.3334,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 2048,
+        },
+    }))
+    checkpoint = tmp_path / "bad-profile.safetensors"
+    save_file(
+        {
+            "blocks.0.cross_attn.proj_linear.weight": np.zeros((1536, 1024), dtype=np.float32),
+        },
+        checkpoint,
+    )
+
+    profile = gen.profile_checkpoint_architecture(checkpoint, config)
+
+    assert profile["projection_shape_match_count"] == 0
+    assert profile["shape_mismatch_count"] == 1
+    assert profile["shape_mismatch_samples"][0]["expected_shape"] == [1536, 2048]
+    assert profile["shape_mismatch_samples"][0]["checkpoint_shape"] == [1536, 1024]
+
+
 def test_existing_report_requires_explicit_overwrite(tmp_path):
     gen = _load_module()
 

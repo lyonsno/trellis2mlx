@@ -47,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overwrite-report", action="store_true", help="Overwrite an existing JSON report")
     parser.add_argument("--repo-root", type=Path, default=None, help="Effective pixal3d-mlx repo root")
     parser.add_argument("--checkpoint", type=Path, help="Optional Pixal3D denoiser checkpoint to inventory")
+    parser.add_argument("--checkpoint-config", type=Path, help="Optional Pixal3D checkpoint JSON config for no-allocation shape profiling")
     parser.add_argument("--grid-resolution", type=_positive_int, default=2)
     parser.add_argument("--image-size", type=_positive_int, default=32)
     parser.add_argument("--patch-size", type=_positive_int, default=16)
@@ -199,6 +200,134 @@ def inspect_checkpoint(checkpoint: Path | None, models: dict[str, Any]) -> dict[
     return identity
 
 
+def _flow_config_profile(config_path: Path) -> dict[str, Any]:
+    payload = json.loads(config_path.read_text())
+    args = payload.get("args", {})
+    channels = int(args["model_channels"])
+    num_heads = int(args["num_heads"])
+    head_dim = channels // num_heads
+    cond_channels = int(args.get("cond_channels", args.get("context_channels", channels)))
+    proj_in_channels = int(args.get("proj_in_channels", cond_channels))
+    mlp_hidden = int(round(float(args["mlp_ratio"]) * channels))
+    return {
+        "path": str(config_path),
+        "name": payload.get("name"),
+        "resolution": int(args.get("resolution", 0)),
+        "in_channels": int(args["in_channels"]),
+        "out_channels": int(args["out_channels"]),
+        "model_channels": channels,
+        "cond_channels": cond_channels,
+        "proj_in_channels": proj_in_channels,
+        "num_blocks": int(args["num_blocks"]),
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "mlp_hidden": mlp_hidden,
+        "image_attn_mode": args.get("image_attn_mode"),
+    }
+
+
+def _linear_shapes(prefix: str, out_features: int, in_features: int) -> dict[str, tuple[int, ...]]:
+    return {
+        f"{prefix}.weight": (out_features, in_features),
+        f"{prefix}.bias": (out_features,),
+    }
+
+
+def expected_flow_shapes_from_config(config_path: Path) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
+    config = _flow_config_profile(config_path)
+    C = config["model_channels"]
+    in_C = config["in_channels"]
+    out_C = config["out_channels"]
+    ctx_C = config["cond_channels"]
+    proj_C = config["proj_in_channels"]
+    H = config["num_heads"]
+    D = config["head_dim"]
+    mlp_hidden = config["mlp_hidden"]
+    shapes: dict[str, tuple[int, ...]] = {}
+
+    shapes.update(_linear_shapes("t_embedder.mlp_0", C, 256))
+    shapes.update(_linear_shapes("t_embedder.mlp_2", C, C))
+    shapes.update(_linear_shapes("input_layer", C, in_C))
+    shapes.update(_linear_shapes("out_layer", out_C, C))
+    shapes.update(_linear_shapes("adaLN_modulation.layers.1", 6 * C, C))
+
+    for i in range(config["num_blocks"]):
+        prefix = f"blocks.{i}"
+        shapes[f"{prefix}.modulation"] = (6 * C,)
+        shapes[f"{prefix}.norm2.weight"] = (C,)
+        shapes[f"{prefix}.norm2.bias"] = (C,)
+
+        shapes.update(_linear_shapes(f"{prefix}.self_attn.to_qkv", 3 * C, C))
+        shapes.update(_linear_shapes(f"{prefix}.self_attn.to_out", C, C))
+        shapes[f"{prefix}.self_attn.q_rms_norm.gamma"] = (H, D)
+        shapes[f"{prefix}.self_attn.k_rms_norm.gamma"] = (H, D)
+
+        cross = f"{prefix}.cross_attn.cross_attn_block"
+        shapes.update(_linear_shapes(f"{cross}.to_q", C, C))
+        shapes.update(_linear_shapes(f"{cross}.to_kv", 2 * C, ctx_C))
+        shapes.update(_linear_shapes(f"{cross}.to_out", C, C))
+        shapes[f"{cross}.q_rms_norm.gamma"] = (H, D)
+        shapes[f"{cross}.k_rms_norm.gamma"] = (H, D)
+        shapes.update(_linear_shapes(f"{prefix}.cross_attn.proj_linear", C, proj_C))
+
+        shapes.update(_linear_shapes(f"{prefix}.mlp.mlp_0", mlp_hidden, C))
+        shapes.update(_linear_shapes(f"{prefix}.mlp.mlp_2", C, mlp_hidden))
+
+    return config, shapes
+
+
+def profile_checkpoint_architecture(checkpoint: Path, config_path: Path) -> dict[str, Any]:
+    from safetensors import safe_open
+    from trellmlx.weight_loader import _remap_key
+
+    config, expected_shapes = expected_flow_shapes_from_config(config_path)
+    checkpoint_shapes = {}
+    with safe_open(str(checkpoint), framework="numpy") as sf:
+        for key in sf.keys():
+            checkpoint_shapes[key] = tuple(sf.get_slice(key).get_shape())
+
+    remapped_shapes = {_remap_key(key): shape for key, shape in checkpoint_shapes.items()}
+    matched = []
+    shape_mismatch = []
+    for key, expected in expected_shapes.items():
+        if key not in remapped_shapes:
+            continue
+        actual = remapped_shapes[key]
+        if actual == expected:
+            matched.append(key)
+        else:
+            shape_mismatch.append({
+                "key": key,
+                "expected_shape": list(expected),
+                "checkpoint_shape": list(actual),
+            })
+
+    projection_expected = [key for key in expected_shapes if ".cross_attn.proj_linear." in key]
+    wrapped_cross_expected = [key for key in expected_shapes if ".cross_attn.cross_attn_block." in key]
+    return {
+        "mode": "config-header-no-allocation",
+        "allocates_model": False,
+        "config": config,
+        "checkpoint": {
+            "path": str(checkpoint),
+            "exists": checkpoint.exists(),
+            "size_bytes": checkpoint.stat().st_size if checkpoint.exists() else None,
+        },
+        "expected_shape_count": len(expected_shapes),
+        "checkpoint_key_count": len(checkpoint_shapes),
+        "matched_shape_count": len(matched),
+        "missing_expected_count": len(set(expected_shapes) - set(remapped_shapes)),
+        "extra_checkpoint_key_count": len(set(remapped_shapes) - set(expected_shapes)),
+        "extra_checkpoint_key_samples": sorted(set(remapped_shapes) - set(expected_shapes))[:10],
+        "shape_mismatch_count": len(shape_mismatch),
+        "shape_mismatch_samples": shape_mismatch[:10],
+        "projection_expected_count": len(projection_expected),
+        "projection_shape_match_count": sum(1 for key in projection_expected if key in matched),
+        "wrapped_cross_attn_expected_count": len(wrapped_cross_expected),
+        "wrapped_cross_attn_shape_match_count": sum(1 for key in wrapped_cross_expected if key in matched),
+    }
+
+
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
     if inventory.get("path") is None:
         return
@@ -316,6 +445,7 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "image_size": args.image_size,
             "patch_size": args.patch_size,
             "context_channels": args.context_channels,
+            "checkpoint_config": str(args.checkpoint_config) if args.checkpoint_config else None,
         },
         "last_trustworthy_evidence": {"phase": "initialized"},
     }
@@ -353,6 +483,10 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
         mx.eval(ss_out, slat_out)
 
         report["checkpoint"] = checkpoint_inventory
+        if args.checkpoint and args.checkpoint_config:
+            report["architecture_profile"] = profile_checkpoint_architecture(
+                args.checkpoint, args.checkpoint_config
+            )
         report["route"] = route
         report["smoke"] = {
             "ss_flow_output_shape": list(ss_out.shape),
