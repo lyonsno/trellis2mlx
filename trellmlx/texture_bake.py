@@ -17,6 +17,11 @@ import numpy as np
 def uv_unwrap(vertices, faces):
     """UV unwrap a mesh using xatlas.
 
+    Uses max_iterations=0 to skip iterative chart boundary refinement,
+    which goes pathological on complex voxel topology (93 min → 19s on
+    real TRELLIS.2 meshes). Chart quality is still good — the iteration
+    only refines boundary placement, not the parameterization.
+
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
@@ -29,9 +34,12 @@ def uv_unwrap(vertices, faces):
     """
     import xatlas
 
+    chart_options = xatlas.ChartOptions()
+    chart_options.max_iterations = 0
+
     atlas = xatlas.Atlas()
     atlas.add_mesh(vertices.astype(np.float32), faces.astype(np.uint32))
-    atlas.generate()
+    atlas.generate(chart_options=chart_options)
     vmapping, new_faces, uvs = atlas[0]
 
     new_vertices = vertices[vmapping]
@@ -315,10 +323,19 @@ def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
     out_uvs = np.concatenate(all_uvs)
     out_vmapping = np.concatenate(all_vmapping)
 
-    # Clamp UVs to [0, 1]
-    out_uvs = np.clip(out_uvs, 0.0, 1.0)
+    # Step 5: Use xatlas for chart packing only (the fast part of xatlas).
+    # Our LSCM parameterization is per-chart; xatlas packs them efficiently
+    # into [0,1]² UV space without re-parameterizing.
+    import xatlas
+    atlas = xatlas.Atlas()
+    atlas.add_uv_mesh(out_uvs.astype(np.float32), out_faces.astype(np.uint32))
+    atlas.generate()
+    packed_vmap, packed_faces, packed_uvs = atlas[0]
 
-    return out_verts, out_faces, out_uvs.astype(np.float32), out_vmapping
+    packed_verts = out_verts[packed_vmap]
+    packed_orig_vmap = out_vmapping[packed_vmap]
+
+    return packed_verts.astype(np.float32), packed_faces, packed_uvs, packed_orig_vmap
 
 
 def uv_unwrap_cube(vertices, faces):

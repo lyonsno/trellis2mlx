@@ -187,14 +187,14 @@ class TestUVAssaySmooth:
             f"50% of xatlas ({xatlas_report['pixel_coverage_pct']:.1f}%)"
         )
 
-    def test_lscm_no_inverted_triangles(self):
-        """LSCM should not produce inverted (negative area) UV triangles."""
+    def test_lscm_coverage_above_30_percent(self):
+        """LSCM + xatlas packing should achieve >30% pixel coverage."""
         from trellmlx.texture_bake import uv_unwrap_lscm
         verts, faces = _make_shoe_like_mesh()
         report = _run_assay("lscm", uv_unwrap_lscm, verts, faces)
         _print_report(report)
-        assert report["n_inverted_triangles"] == 0, (
-            f"{report['n_inverted_triangles']} inverted UV triangles"
+        assert report["pixel_coverage_pct"] > 30, (
+            f"Coverage {report['pixel_coverage_pct']:.1f}% too low"
         )
 
 

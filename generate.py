@@ -104,9 +104,9 @@ def _select_uv_method(method, vertices, faces):
     if method == "lscm":
         return uv_unwrap_lscm, "lscm"
 
-    # Auto: LSCM handles both smooth and voxel geometry without pathological
-    # behavior. Use it by default.
-    return uv_unwrap_lscm, "lscm"
+    # Auto: xatlas with max_iterations=0 (fast, no pathological behavior).
+    # LSCM available as explicit option for experimentation.
+    return uv_unwrap, "xatlas"
 
 
 def _cleanup_and_simplify_mesh(
