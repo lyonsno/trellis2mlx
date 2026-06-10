@@ -1312,6 +1312,141 @@ def diagnose_packed_slat_projection_width(
     return report
 
 
+def _spatial_coords_array(coords: mx.array | np.ndarray) -> np.ndarray:
+    coords_np = np.array(coords, dtype=np.int32)
+    if coords_np.ndim != 2 or coords_np.shape[1] not in (3, 4):
+        raise ValueError(f"coords must have shape [N,3] or [N,4], got {list(coords_np.shape)}")
+    if coords_np.shape[1] == 4:
+        if np.any(coords_np[:, 0] != 0):
+            raise ValueError("only batch index 0 is supported for packed LR SLat stage smoke")
+        coords_np = coords_np[:, 1:4]
+    return coords_np
+
+
+def gather_projected_context_for_coords(
+    context: dict[str, mx.array],
+    coords: mx.array | np.ndarray,
+    *,
+    grid_resolution: int,
+) -> dict[str, mx.array]:
+    """Gather full-grid projected context rows at sparse SLat coordinates."""
+    if "global" not in context or "proj" not in context:
+        raise ValueError("projected context must contain 'global' and 'proj'")
+    coords_np = _spatial_coords_array(coords)
+    if np.any(coords_np < 0) or np.any(coords_np >= grid_resolution):
+        raise ValueError(f"coords must be within [0,{grid_resolution})")
+
+    expected_tokens = grid_resolution ** 3
+    if context["proj"].shape[1] != expected_tokens:
+        raise ValueError(
+            f"projected context token count {context['proj'].shape[1]} does not match "
+            f"grid_resolution^3={expected_tokens}"
+        )
+    flat_indices = (
+        coords_np[:, 0] * grid_resolution * grid_resolution
+        + coords_np[:, 1] * grid_resolution
+        + coords_np[:, 2]
+    ).astype(np.int32)
+    gathered = mx.take(context["proj"][0], mx.array(flat_indices), axis=0)[None, :, :]
+    mx.eval(gathered)
+    return {
+        "global": context["global"],
+        "proj": gathered,
+    }
+
+
+def run_packed_lr_slat_stage_smoke(
+    artifact_dir: Path,
+    config_path: Path,
+    context: dict[str, mx.array],
+    coords: mx.array | np.ndarray,
+    *,
+    steps: int = 1,
+    seed: int = 42,
+    conditioning_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from trellmlx.samplers import flow_euler_sample
+
+    if steps <= 0:
+        raise ValueError("packed LR SLat stage smoke requires positive steps")
+
+    config = _flow_config_profile(config_path)
+    coords_np = _spatial_coords_array(coords)
+    if len(coords_np) == 0:
+        raise ValueError("packed LR SLat stage smoke requires at least one coordinate")
+    gathered_context = gather_projected_context_for_coords(
+        context,
+        coords_np,
+        grid_resolution=config["resolution"],
+    )
+
+    mx.random.seed(seed)
+    model = flow_model_from_config(config_path)
+    load_report = load_packed_flow_artifact(model, artifact_dir, expected_stage="shape-lr-slat")
+    if load_report["loaded_quantized_module_count"] <= 0:
+        raise RuntimeError("requested packed LR SLat stage loaded no quantized modules")
+
+    noise = mx.random.normal((len(coords_np), config["in_channels"])).astype(mx.float32)
+    coords_mx = mx.array(coords_np, dtype=mx.int32)
+    neg_context = {key: mx.zeros_like(value) for key, value in gathered_context.items()}
+    mx.eval(noise, coords_mx, gathered_context["global"], gathered_context["proj"])
+    out = flow_euler_sample(
+        model,
+        noise,
+        gathered_context,
+        neg_context,
+        steps=steps,
+        guidance_strength=1.0,
+        guidance_rescale=0.0,
+        verbose=False,
+        coords=coords_mx,
+    )
+    mx.eval(out)
+
+    sample_names = [
+        "blocks.0.cross_attn.proj_linear",
+        "blocks.0.self_attn.to_qkv",
+        "out_layer",
+    ]
+    return {
+        "schema": "trellis2mlx.pixal3d_packed_lr_slat_stage_smoke.v1",
+        "stage": "shape-lr-slat",
+        "route": {
+            "requested": "packed-quantized-shape-lr-slat",
+            "effective": load_report["effective_route"],
+            "fp_checkpoint_loaded": False,
+            "packed_artifact": str(artifact_dir),
+            "checkpoint_config": str(config_path),
+            "model_class": model.__class__.__name__,
+        },
+        "conditioning": conditioning_report or {},
+        "config": config,
+        "load": load_report,
+        "inputs": {
+            "coords_shape": list(coords_np.shape),
+            "noise_shape": list(noise.shape),
+            "full_context_global_shape": list(context["global"].shape),
+            "full_context_proj_shape": list(context["proj"].shape),
+            "context_global_shape": list(gathered_context["global"].shape),
+            "context_proj_shape": list(gathered_context["proj"].shape),
+        },
+        "sampler": {
+            "steps": steps,
+            "guidance_strength": 1.0,
+            "guidance_rescale": 0.0,
+        },
+        "sample_modules": _sample_module_routes(model, sample_names),
+        "output": {
+            "shape": list(out.shape),
+            "dtype": _dtype_name(out.dtype),
+            "mean": float(mx.mean(out).item()),
+            "std": float(mx.std(out).item()),
+            "abs_max": float(mx.max(mx.abs(out)).item()),
+            "peak_mlx_memory_bytes": _mlx_peak_memory_bytes(),
+        },
+    }
+
+
 def extract_pixal3d_image_features(image_path: Path, *, image_size: int = 512) -> tuple[mx.array, dict[str, Any]]:
     from trellmlx.models.dinov3 import extract_features
 

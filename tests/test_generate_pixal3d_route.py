@@ -813,6 +813,86 @@ def test_packed_slat_projection_width_diagnostic_can_use_bilinear_concat_mode(tm
     assert report["zero_augmented_projection_forward"]["zero_augmented_projection_for_diagnostic_only"] is False
 
 
+def test_gather_projected_context_for_coords_uses_projgrid_flatten_order():
+    gen = _load_module()
+
+    context = {
+        "global": mx.zeros((1, 5, 4), dtype=mx.float32),
+        "proj": mx.array(np.arange(8, dtype=np.float32).reshape(1, 8, 1)),
+    }
+    coords = mx.array(np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=np.int32))
+
+    gathered = gen.gather_projected_context_for_coords(context, coords, grid_resolution=2)
+    mx.eval(gathered["global"], gathered["proj"])
+
+    assert gathered["global"].shape == (1, 5, 4)
+    assert gathered["proj"].shape == (1, 4, 1)
+    assert np.array_equal(np.array(gathered["proj"][0, :, 0]), np.array([0, 1, 2, 4], dtype=np.float32))
+
+
+def test_packed_lr_slat_stage_smoke_routes_sampler_through_gathered_context(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "lr-slat-stage.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 4,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 128,
+        },
+    }))
+    checkpoint = tmp_path / "lr-slat-stage.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+            "input_layer.weight": np.ones((128, 32), dtype=np.float32),
+            "out_layer.weight": np.ones((32, 128), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-lr-slat-stage"
+    gen.export_packed_flow_artifact(checkpoint, config, artifact_dir, stage="shape-lr-slat", bits=4, group_size=64)
+    context = {
+        "global": mx.zeros((1, 5, 64), dtype=mx.float32),
+        "proj": mx.zeros((1, 64, 128), dtype=mx.float32),
+    }
+    coords = mx.array(np.array([[0, 0, 0], [1, 1, 1], [3, 2, 1]], dtype=np.int32))
+
+    report = gen.run_packed_lr_slat_stage_smoke(
+        artifact_dir,
+        config,
+        context,
+        coords,
+        steps=1,
+        seed=17,
+        conditioning_report={
+            "source": "fixture-bilinear-context",
+            "projection_mode": "bilinear_hr_concat",
+            "synthetic_fallback_used": False,
+        },
+    )
+
+    assert report["stage"] == "shape-lr-slat"
+    assert report["route"]["effective"] == "packed-quantized-shape-lr-slat"
+    assert report["route"]["fp_checkpoint_loaded"] is False
+    assert report["conditioning"]["projection_mode"] == "bilinear_hr_concat"
+    assert report["inputs"]["coords_shape"] == [3, 3]
+    assert report["inputs"]["context_proj_shape"] == [1, 3, 128]
+    assert report["sampler"]["steps"] == 1
+    assert report["output"]["shape"] == [3, 32]
+    assert report["sample_modules"]["blocks.0.cross_attn.proj_linear"]["class"] == "QuantizedLinear"
+
+
 def test_cli_packed_slat_width_diagnostic_marks_last_evidence_phase(tmp_path):
     gen = _load_module()
 
