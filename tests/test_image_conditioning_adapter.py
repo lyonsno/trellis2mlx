@@ -140,6 +140,49 @@ def test_image_conditioning_adapter_registers_runtime_object_for_downstream_stag
     assert "conditioning_object" not in result.job_states["seed-101"].artifacts
 
 
+def test_image_conditioning_adapter_rejects_duplicate_conditioning_key_across_jobs(tmp_path):
+    from trellmlx.interleaved_generation import GenerationJob, InterleavedBatchPlan, StageRunner
+    from trellmlx.image_conditioning_adapter import (
+        ImageConditioningFixtureResult,
+        build_image_conditioning_stage_handler,
+    )
+
+    jobs = (
+        GenerationJob("seed-101", ("front.png",), 101, tmp_path / "seed-101.glb"),
+        GenerationJob("seed-202", ("side.png",), 202, tmp_path / "seed-202.glb"),
+    )
+    plan = InterleavedBatchPlan(jobs=jobs, stages=("image_conditioning",))
+    first_object = object()
+    second_object = object()
+
+    def extract(runtime):
+        conditioning_object = (
+            first_object if runtime.invocation.job_id == "seed-101" else second_object
+        )
+        return ImageConditioningFixtureResult(
+            conditioning_key="cond://shared",
+            context_tokens=257,
+            channels=1024,
+            views=1,
+            conditioning_object=conditioning_object,
+        )
+
+    context = _context()
+    runner = StageRunner(
+        plan,
+        handlers={"image_conditioning": build_image_conditioning_stage_handler(fixture=extract)},
+        context_factory=lambda plan: context,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="image conditioning key collision for cond://shared on job seed-202",
+    ):
+        runner.run()
+
+    assert context.require_runtime_object("cond://shared") is first_object
+
+
 def test_image_conditioning_adapter_rejects_random_route_without_calling_fixture(tmp_path):
     from trellmlx.interleaved_generation import JobState
     from trellmlx.image_conditioning_adapter import build_image_conditioning_stage_handler

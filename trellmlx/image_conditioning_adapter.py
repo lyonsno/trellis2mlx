@@ -111,6 +111,11 @@ def build_image_conditioning_stage_handler(
         if fixture_result.views != len(invocation.images):
             raise ValueError("fixture views must match image count")
         if fixture_result.conditioning_object is not None:
+            if fixture_result.conditioning_key in runtime.context.runtime_object_keys:
+                raise ValueError(
+                    "image conditioning key collision for "
+                    f"{fixture_result.conditioning_key} on job {invocation.job_id}"
+                )
             runtime.context.register_runtime_object(
                 fixture_result.conditioning_key,
                 fixture_result.conditioning_object,
