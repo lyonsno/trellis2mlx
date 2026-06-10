@@ -410,6 +410,7 @@ class StageContextFactoryFromSpecs:
                 else:
                     handle = loaded
                     dynamic_metadata = {}
+                handles[spec.handle_id] = handle
                 duplicate_metadata = sorted(set(spec.metadata) & set(dynamic_metadata))
                 if duplicate_metadata:
                     raise ValueError(f"dynamic metadata duplicates static metadata keys: {', '.join(duplicate_metadata)}")
@@ -443,7 +444,6 @@ class StageContextFactoryFromSpecs:
                 load_phase="loaded",
                 metadata=report_metadata,
             )
-            handles[spec.handle_id] = handle
             metadata[spec.handle_id] = dict(report_metadata)
             reports.append(report)
 

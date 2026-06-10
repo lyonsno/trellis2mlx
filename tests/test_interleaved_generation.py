@@ -719,6 +719,57 @@ def test_stage_context_factory_closes_loaded_handles_after_later_load_failure(tm
     assert context_closer.last_close_reports == ()
 
 
+def test_stage_context_factory_closes_current_handle_after_dynamic_metadata_rejection(tmp_path):
+    from trellmlx.interleaved_generation import (
+        GenerationJob,
+        InterleavedBatchPlan,
+        StageHandleFactoryResult,
+        StageHandleLoadError,
+        StageHandleSpec,
+        build_stage_context_factory,
+    )
+
+    job = GenerationJob("seed-101", ("subject.png",), 101, tmp_path / "seed-101.glb")
+    plan = InterleavedBatchPlan(jobs=(job,), stages=("stage",))
+    handle = object()
+    events = []
+
+    def load_handle(runtime):
+        events.append(("load", runtime.spec.handle_id))
+        return StageHandleFactoryResult(handle=handle, metadata={"weights_path": "runtime"})
+
+    def close_handle(runtime, loaded_handle):
+        events.append(("close", runtime.spec.handle_id, loaded_handle is handle))
+
+    context_factory, _ = build_stage_context_factory(
+        [
+            StageHandleSpec(
+                "dinov3",
+                "fixture",
+                load_handle,
+                close=close_handle,
+                metadata={"weights_path": "static"},
+            )
+        ],
+        run_id="metadata-rejection",
+    )
+
+    with pytest.raises(StageHandleLoadError, match="dynamic metadata duplicates static metadata keys: weights_path"):
+        context_factory(plan)
+
+    assert events == [
+        ("load", "dinov3"),
+        ("close", "dinov3", True),
+    ]
+    assert [report.handle_id for report in context_factory.last_close_reports] == ["dinov3"]
+    assert [report.close_phase for report in context_factory.last_close_reports] == ["closed"]
+    assert context_factory.last_load_reports[0].metadata == {
+        "kind": "fixture",
+        "load_phase": "load_error",
+        "weights_path": "static",
+    }
+
+
 def test_stage_context_closer_reports_close_errors_and_continues(tmp_path):
     from trellmlx.interleaved_generation import (
         GenerationJob,
