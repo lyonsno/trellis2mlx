@@ -124,8 +124,11 @@ def remove_small_components(
     min_ratio: float = 1e-5,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove connected components smaller than min_ratio of the largest,
-    plus flat 'floor' components regardless of size."""
+    """Remove connected components smaller than min_ratio of the largest.
+
+    Matches the reference ``cumesh.remove_small_connected_components(1e-5)``.
+    Pure size thresholding only — no shape heuristics.
+    """
     if len(faces) == 0:
         return vertices, faces
 
@@ -135,46 +138,18 @@ def remove_small_components(
     if n_components <= 1:
         return vertices, faces
 
-    # Count faces per component
     component_sizes = np.bincount(labels)
-    largest_idx = component_sizes.argmax()
-    largest = component_sizes[largest_idx]
+    largest = component_sizes.max()
     threshold = int(largest * min_ratio)
 
-    # Identify flat "floor" components: thin bounding box in at least one axis
-    floor_components = set()
-    for comp_id in range(n_components):
-        if comp_id == largest_idx:
-            continue  # never remove the largest component
-        if component_sizes[comp_id] < threshold:
-            continue  # already removed by size threshold
-        # Check if this component is flat
-        comp_face_mask = labels == comp_id
-        comp_verts = vertices[np.unique(faces[comp_face_mask])]
-        bbox = comp_verts.max(axis=0) - comp_verts.min(axis=0)
-        bbox_sorted = np.sort(bbox)
-        # Flat = thinnest dimension is < 10% of the thickest
-        if bbox_sorted[0] < bbox_sorted[2] * 0.10:
-            floor_components.add(comp_id)
-
-    # Keep: largest component + non-floor components above threshold
-    keep_mask = np.zeros(n_faces, dtype=bool)
-    for comp_id in range(n_components):
-        if component_sizes[comp_id] >= threshold and comp_id not in floor_components:
-            keep_mask[labels == comp_id] = True
+    keep_mask = component_sizes[labels] >= threshold
 
     kept_faces = faces[keep_mask]
     removed = n_faces - len(kept_faces)
-    removed_small = sum(1 for s in component_sizes if s < threshold)
-    removed_floors = len(floor_components)
+    removed_count = (component_sizes < threshold).sum()
 
     if verbose and removed > 0:
-        parts = []
-        if removed_small:
-            parts.append(f"{removed_small} small")
-        if removed_floors:
-            parts.append(f"{removed_floors} flat/floor")
-        print(f"  Removed {' + '.join(parts)} components "
+        print(f"  Removed {removed_count} small components "
               f"({removed:,} faces, {removed/n_faces*100:.1f}%)", flush=True)
 
     return _reindex_mesh(vertices, kept_faces)

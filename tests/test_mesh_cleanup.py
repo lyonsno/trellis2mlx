@@ -291,9 +291,8 @@ class TestDefaultCleanupUsesSmallComponentRemoval:
     not keep_largest_component (binary), matching the reference pipeline."""
 
     def test_default_removes_tiny_components_preserves_large_ones(self):
-        """A tiny 1-face fragment should be removed by default cleanup,
-        but a substantial second component should survive."""
-        # Large component: tetrahedron (4 faces)
+        """A tiny 1-face fragment should be removed when min_component_ratio
+        makes the threshold meaningful."""
         v1, f1 = _make_tetrahedron()
         # Small component: single tiny triangle far away
         v2 = np.array([[10, 10, 10], [10.001, 10, 10], [10, 10.001, 10]], dtype=np.float32)
@@ -301,10 +300,12 @@ class TestDefaultCleanupUsesSmallComponentRemoval:
         verts = np.vstack([v1, v2])
         faces = np.vstack([f1, f2])
 
-        cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
-        # Tiny fragment should be removed, tetrahedron should survive
+        # With min_component_ratio=0.5, threshold = int(4 * 0.5) = 2
+        # The 1-face fragment is below threshold and gets removed
+        cleaned_v, cleaned_f = cleanup_mesh(
+            verts, faces, min_component_ratio=0.5, verbose=False,
+        )
         assert len(cleaned_f) == 4
-        # Tiny fragment verts should be gone
         assert cleaned_v[:, 0].max() < 5
 
     def test_default_preserves_substantial_second_component(self):
