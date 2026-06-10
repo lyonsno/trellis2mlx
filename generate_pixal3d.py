@@ -1115,6 +1115,85 @@ def decode_sparse_structure_occupancy_boundary(
     }
 
 
+def export_occupancy_voxel_glb_boundary(
+    occupancy: mx.array | np.ndarray,
+    output_path: Path,
+    *,
+    route_report: dict[str, Any],
+    decoder_report: dict[str, Any],
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    _require_packed_sparse_route(route_report)
+    if decoder_report.get("stage") != "sparse-structure-decoder":
+        raise RuntimeError("occupancy GLB export requires sparse-structure-decoder report")
+
+    occ = np.asarray(occupancy)
+    if occ.ndim == 4 and occ.shape[0] == 1:
+        occ_grid = occ[0]
+    elif occ.ndim == 3:
+        occ_grid = occ
+    else:
+        raise ValueError(f"occupancy GLB export expects [1,D,H,W] or [D,H,W], got {list(occ.shape)}")
+    occ_grid = occ_grid.astype(bool)
+    occupied_count = int(occ_grid.sum())
+    if occupied_count <= 0:
+        raise RuntimeError("occupancy GLB export refuses empty occupancy")
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"output already exists: {output_path}")
+
+    import trimesh
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolution = int(occ_grid.shape[0])
+    voxel_grid = trimesh.voxel.VoxelGrid(
+        trimesh.voxel.encoding.DenseEncoding(occ_grid)
+    )
+    mesh = voxel_grid.marching_cubes
+    voxel_size = 1.0 / resolution
+    mesh.apply_scale(voxel_size)
+    mesh.apply_translation([-0.5, -0.5, -0.5])
+    mesh.export(output_path)
+
+    loaded = trimesh.load(output_path, force="mesh")
+    bounds = loaded.bounds.tolist() if loaded.bounds is not None else None
+    size_bytes = output_path.stat().st_size if output_path.exists() else 0
+    if len(loaded.vertices) <= 0 or len(loaded.faces) <= 0:
+        raise RuntimeError("occupancy GLB export wrote empty mesh geometry")
+
+    return {
+        "schema": "trellis2mlx.pixal3d_occupancy_voxel_glb_boundary.v1",
+        "stage": "occupancy-voxel-glb-export",
+        "route": {
+            "effective": route_report.get("effective"),
+            "fp_checkpoint_loaded": route_report.get("fp_checkpoint_loaded"),
+            "packed_artifact": route_report.get("packed_artifact"),
+        },
+        "decoder": {
+            "stage": decoder_report.get("stage"),
+            "checkpoint": (decoder_report.get("decoder") or {}).get("checkpoint"),
+            "logits_shape": (decoder_report.get("logits") or {}).get("shape"),
+        },
+        "occupancy": {
+            "input_shape": list(occ.shape),
+            "grid_shape": list(occ_grid.shape),
+            "occupied_count": occupied_count,
+            "total_count": int(occ_grid.size),
+            "occupied_ratio": occupied_count / int(occ_grid.size),
+        },
+        "mesh": {
+            "vertices": int(len(loaded.vertices)),
+            "faces": int(len(loaded.faces)),
+            "bounds": bounds,
+        },
+        "output": {
+            "path": str(output_path),
+            "exists": output_path.exists(),
+            "size_bytes": int(size_bytes),
+            "visually_inspected": False,
+        },
+    }
+
+
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
     if inventory.get("path") is None:
         return

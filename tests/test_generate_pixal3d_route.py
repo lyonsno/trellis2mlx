@@ -9,6 +9,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from safetensors.numpy import load_file, save_file
+import trimesh
 
 
 SCRIPT = Path("generate_pixal3d.py")
@@ -755,6 +756,62 @@ def test_sparse_decoder_boundary_rejects_synthetic_conditioning():
                 "image_projected_conditioning": False,
             },
             decoder=lambda sparse_sample: mx.zeros((1, 1, 4, 4, 4)),
+        )
+
+
+def test_export_occupancy_voxel_glb_writes_geometry(tmp_path):
+    gen = _load_module()
+
+    occupancy = np.zeros((1, 4, 4, 4), dtype=bool)
+    occupancy[0, 1:3, 1:3, 1:3] = True
+    output = tmp_path / "occupancy.glb"
+
+    report = gen.export_occupancy_voxel_glb_boundary(
+        occupancy,
+        output,
+        route_report={
+            "effective": "packed-quantized-sparse-structure",
+            "fp_checkpoint_loaded": False,
+        },
+        decoder_report={
+            "stage": "sparse-structure-decoder",
+            "occupancy": {"occupied_count": 8, "shape": [1, 4, 4, 4]},
+        },
+    )
+
+    loaded = trimesh.load(output, force="mesh")
+
+    assert output.exists()
+    assert report["stage"] == "occupancy-voxel-glb-export"
+    assert report["route"]["effective"] == "packed-quantized-sparse-structure"
+    assert report["decoder"]["stage"] == "sparse-structure-decoder"
+    assert report["occupancy"]["input_shape"] == [1, 4, 4, 4]
+    assert report["occupancy"]["occupied_count"] == 8
+    assert report["output"]["path"] == str(output)
+    assert report["output"]["exists"] is True
+    assert report["output"]["size_bytes"] > 0
+    assert report["mesh"]["vertices"] == len(loaded.vertices)
+    assert report["mesh"]["faces"] == len(loaded.faces)
+    assert report["mesh"]["vertices"] > 0
+    assert report["mesh"]["faces"] > 0
+    assert report["output"]["visually_inspected"] is False
+
+
+def test_export_occupancy_voxel_glb_rejects_empty_occupancy(tmp_path):
+    gen = _load_module()
+
+    with pytest.raises(RuntimeError, match="empty occupancy"):
+        gen.export_occupancy_voxel_glb_boundary(
+            np.zeros((1, 4, 4, 4), dtype=bool),
+            tmp_path / "empty.glb",
+            route_report={
+                "effective": "packed-quantized-sparse-structure",
+                "fp_checkpoint_loaded": False,
+            },
+            decoder_report={
+                "stage": "sparse-structure-decoder",
+                "occupancy": {"occupied_count": 0, "shape": [1, 4, 4, 4]},
+            },
         )
 
 
