@@ -96,7 +96,8 @@ class SLatFlowModel(nn.Module):
     ) -> mx.array:
         N = x.shape[0]
         B = t.shape[0] if len(t.shape) else 1
-        cond_B = cond.shape[0] if cond is not None and len(cond.shape) else B
+        cond_ref = cond.get("global") if isinstance(cond, dict) else cond
+        cond_B = cond_ref.shape[0] if cond_ref is not None and len(cond_ref.shape) else B
         if B != 1 or cond_B != 1:
             raise ValueError(
                 f"Only B=1 supported for SLatFlowModel inference, got t B={B}, cond B={cond_B}"
