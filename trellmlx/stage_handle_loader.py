@@ -15,6 +15,9 @@ from typing import Callable, Mapping, Sequence
 from .interleaved_generation import (
     InterleavedBatchPlan,
     StageArtifactValue,
+    StageContextCloser,
+    StageContextFactory,
+    StageExecutionContext,
     StageHandleCloseError,
     StageHandleCloseReport,
     StageHandleFactoryError,
@@ -192,11 +195,95 @@ def load_stage_handles(
             error=str(exc),
         )
 
-    if report_path is not None:
-        path = Path(report_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
+    _write_report(report, report_path)
     return report
+
+
+def build_stage_loader_context(
+    requests: Sequence[StageHandleLoaderRequest],
+    *,
+    report_path: Path | str | None = None,
+    run_id: str = "stage-runner",
+) -> tuple[StageContextFactory, StageContextCloser]:
+    """Build `StageRunner` context callbacks from no-generation loader requests.
+
+    The callbacks use the same `StageHandleLoaderReport` schema as
+    `load_stage_handles(...)`, but defer close/report finalization until the
+    runner closes its context.
+    """
+
+    requested_handle_ids = tuple(request.handle_id for request in requests)
+    try:
+        specs = [request.to_stage_handle_spec() for request in requests]
+        context_factory, context_closer = build_stage_context_factory(specs, run_id=run_id)
+    except Exception as exc:
+        _write_report(
+            StageHandleLoaderReport(
+                schema=SCHEMA,
+                run_id=run_id,
+                ok=False,
+                requested_handle_ids=requested_handle_ids,
+                loaded_handle_ids=(),
+                failure_phase="setup",
+                error=str(exc),
+            ),
+            report_path,
+        )
+        raise
+
+    def open_context(plan: InterleavedBatchPlan) -> StageExecutionContext:
+        try:
+            return context_factory(plan)
+        except StageHandleLoadError as exc:
+            _write_report(
+                StageHandleLoaderReport(
+                    schema=SCHEMA,
+                    run_id=run_id,
+                    ok=False,
+                    requested_handle_ids=requested_handle_ids,
+                    loaded_handle_ids=(),
+                    load_reports=context_factory.last_load_reports,
+                    close_reports=context_factory.last_close_reports,
+                    failure_phase="load",
+                    error=str(exc),
+                ),
+                report_path,
+            )
+            raise
+
+    def close_context(context: StageExecutionContext) -> None:
+        try:
+            context_closer(context)
+        except StageHandleCloseError as exc:
+            _write_report(
+                StageHandleLoaderReport(
+                    schema=SCHEMA,
+                    run_id=run_id,
+                    ok=False,
+                    requested_handle_ids=requested_handle_ids,
+                    loaded_handle_ids=context.handle_ids,
+                    load_reports=context.load_reports,
+                    close_reports=context.close_reports,
+                    failure_phase="close",
+                    error=str(exc),
+                ),
+                report_path,
+            )
+            raise
+        _write_report(
+            StageHandleLoaderReport(
+                schema=SCHEMA,
+                run_id=run_id,
+                ok=True,
+                requested_handle_ids=requested_handle_ids,
+                loaded_handle_ids=context.handle_ids,
+                load_reports=context.load_reports,
+                close_reports=context.close_reports,
+            ),
+            report_path,
+        )
+
+    return open_context, close_context
 
 
 def _validate_loader_metadata(metadata: Mapping[str, StageArtifactValue]) -> dict[str, StageArtifactValue]:
@@ -205,3 +292,11 @@ def _validate_loader_metadata(metadata: Mapping[str, StageArtifactValue]) -> dic
     if reserved_keys:
         raise ValueError(f"loader metadata cannot use reserved route keys: {', '.join(reserved_keys)}")
     return metadata
+
+
+def _write_report(report: StageHandleLoaderReport, report_path: Path | str | None) -> None:
+    if report_path is None:
+        return
+    path = Path(report_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
