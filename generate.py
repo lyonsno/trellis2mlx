@@ -78,12 +78,9 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     Returns:
         unique_coords: [M, 4] int array at hr_resolution
     """
-    spatial = hr_coords_np[:, 1:4].astype(np.float64)
     grid_res = hr_resolution // 16
-    spatial = np.clip(
-        np.round((spatial + 0.5) / lr_resolution * (grid_res - 1)),
-        0, grid_res - 1,
-    ).astype(np.int32)
+    spatial = ((hr_coords_np[:, 1:4].astype(np.float64) + 0.5) / lr_resolution * grid_res).astype(np.int32)
+    spatial = np.clip(spatial, 0, grid_res - 1)
     result = hr_coords_np.copy()
     result[:, 1:4] = spatial
     unique_coords = np.unique(result, axis=0)
