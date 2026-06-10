@@ -1014,6 +1014,107 @@ def run_image_conditioned_packed_sparse_structure_stage_smoke(
     )
 
 
+def _require_image_projected_conditioning(conditioning_report: dict[str, Any]) -> None:
+    if conditioning_report.get("synthetic_fallback_used") is True or not conditioning_report.get("image_projected_conditioning"):
+        raise RuntimeError("sparse decoder boundary requires real image-projected conditioning, not synthetic fallback")
+
+
+def _require_packed_sparse_route(route_report: dict[str, Any]) -> None:
+    if route_report.get("effective") != "packed-quantized-sparse-structure":
+        raise RuntimeError("sparse decoder boundary requires effective packed-quantized-sparse-structure route")
+    if route_report.get("fp_checkpoint_loaded") is not False:
+        raise RuntimeError("sparse decoder boundary refuses fp sparse checkpoint fallback")
+
+
+def decode_sparse_structure_occupancy_boundary(
+    sparse_sample: mx.array | np.ndarray,
+    *,
+    route_report: dict[str, Any],
+    conditioning_report: dict[str, Any],
+    decoder_checkpoint: Path | None = None,
+    decoder: Any | None = None,
+    threshold: float = 0.0,
+) -> dict[str, Any]:
+    _require_packed_sparse_route(route_report)
+    _require_image_projected_conditioning(conditioning_report)
+
+    sample = mx.array(sparse_sample)
+    if len(sample.shape) != 5:
+        raise ValueError(f"sparse decoder boundary expects rank-5 sparse sample, got shape {list(sample.shape)}")
+    if sample.shape[1] != 8:
+        raise ValueError(f"sparse decoder boundary expects 8 latent channels, got shape {list(sample.shape)}")
+
+    checkpoint_loaded = False
+    if decoder is None:
+        if decoder_checkpoint is None:
+            raise ValueError("decoder_checkpoint is required when decoder is not supplied")
+        from trellmlx.models.sparse_structure_decoder import SparseStructureDecoder
+        from trellmlx.weight_loader import load_weights
+
+        decoder = SparseStructureDecoder()
+        load_weights(decoder, str(decoder_checkpoint), verbose=False)
+        checkpoint_loaded = True
+    elif decoder_checkpoint is not None:
+        checkpoint_loaded = True
+
+    logits = decoder(sample.astype(mx.float32))
+    mx.eval(logits)
+    if len(logits.shape) != 5:
+        raise RuntimeError(f"sparse decoder produced non-rank-5 logits: {list(logits.shape)}")
+    if logits.shape[1] != 1:
+        raise RuntimeError(f"sparse decoder expected one occupancy logit channel, got {list(logits.shape)}")
+
+    occupancy = logits[:, 0] > threshold
+    mx.eval(occupancy)
+    occupied_count = int(mx.sum(occupancy).item())
+    total_count = int(np.prod(occupancy.shape))
+
+    return {
+        "schema": "trellis2mlx.pixal3d_sparse_decoder_boundary.v1",
+        "stage": "sparse-structure-decoder",
+        "route": {
+            "effective": route_report.get("effective"),
+            "fp_checkpoint_loaded": route_report.get("fp_checkpoint_loaded"),
+            "packed_artifact": route_report.get("packed_artifact"),
+        },
+        "conditioning": {
+            "source": conditioning_report.get("source"),
+            "synthetic_fallback_used": conditioning_report.get("synthetic_fallback_used"),
+            "image_projected_conditioning": conditioning_report.get("image_projected_conditioning"),
+            "image_path": conditioning_report.get("image_path"),
+            "feature_shape": conditioning_report.get("feature_shape"),
+            "context_global_shape": conditioning_report.get("context_global_shape"),
+            "context_proj_shape": conditioning_report.get("context_proj_shape"),
+        },
+        "decoder": {
+            "class": decoder.__class__.__name__,
+            "checkpoint": str(decoder_checkpoint) if decoder_checkpoint is not None else None,
+            "checkpoint_loaded": checkpoint_loaded,
+        },
+        "input": {
+            "shape": list(sample.shape),
+            "dtype": _dtype_name(sample.dtype),
+        },
+        "logits": {
+            "shape": list(logits.shape),
+            "dtype": _dtype_name(logits.dtype),
+            "min": float(mx.min(logits).item()),
+            "max": float(mx.max(logits).item()),
+            "mean": float(mx.mean(logits).item()),
+        },
+        "occupancy": {
+            "shape": list(occupancy.shape),
+            "threshold": float(threshold),
+            "occupied_count": occupied_count,
+            "total_count": total_count,
+            "occupied_ratio": occupied_count / total_count if total_count else None,
+        },
+        "output": {
+            "mesh_or_glb_exported": False,
+        },
+    }
+
+
 def validate_checkpoint_inventory(inventory: dict[str, Any]) -> None:
     if inventory.get("path") is None:
         return

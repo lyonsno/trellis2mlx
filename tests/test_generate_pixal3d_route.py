@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
@@ -694,6 +695,66 @@ def test_image_conditioned_packed_sparse_stage_rejects_missing_image_features(tm
             config,
             image_path=None,
             features=None,
+        )
+
+
+def test_sparse_decoder_boundary_consumes_image_packed_sparse_sample():
+    gen = _load_module()
+
+    class FixtureDecoder:
+        def __call__(self, sparse_sample):
+            assert list(sparse_sample.shape) == [1, 8, 2, 2, 2]
+            logits = np.zeros((1, 1, 4, 4, 4), dtype=np.float32)
+            logits[0, 0, 1:3, 1:3, 1:3] = 0.25
+            logits[0, 0, 0, 0, 0] = -0.25
+            return mx.array(logits)
+
+    report = gen.decode_sparse_structure_occupancy_boundary(
+        np.zeros((1, 8, 2, 2, 2), dtype=np.float32),
+        route_report={
+            "effective": "packed-quantized-sparse-structure",
+            "fp_checkpoint_loaded": False,
+            "packed_artifact": "/tmp/packed-fixture",
+        },
+        conditioning_report={
+            "source": "fixture-image-features",
+            "synthetic_fallback_used": False,
+            "image_projected_conditioning": True,
+        },
+        decoder=FixtureDecoder(),
+        threshold=0.0,
+    )
+
+    assert report["stage"] == "sparse-structure-decoder"
+    assert report["route"]["effective"] == "packed-quantized-sparse-structure"
+    assert report["route"]["fp_checkpoint_loaded"] is False
+    assert report["conditioning"]["image_projected_conditioning"] is True
+    assert report["decoder"]["checkpoint_loaded"] is False
+    assert report["input"]["shape"] == [1, 8, 2, 2, 2]
+    assert report["logits"]["shape"] == [1, 1, 4, 4, 4]
+    assert report["occupancy"]["shape"] == [1, 4, 4, 4]
+    assert report["occupancy"]["threshold"] == 0.0
+    assert report["occupancy"]["occupied_count"] == 8
+    assert report["occupancy"]["total_count"] == 64
+    assert report["output"]["mesh_or_glb_exported"] is False
+
+
+def test_sparse_decoder_boundary_rejects_synthetic_conditioning():
+    gen = _load_module()
+
+    with pytest.raises(RuntimeError, match="image-projected conditioning"):
+        gen.decode_sparse_structure_occupancy_boundary(
+            np.zeros((1, 8, 2, 2, 2), dtype=np.float32),
+            route_report={
+                "effective": "packed-quantized-sparse-structure",
+                "fp_checkpoint_loaded": False,
+            },
+            conditioning_report={
+                "source": "synthetic",
+                "synthetic_fallback_used": True,
+                "image_projected_conditioning": False,
+            },
+            decoder=lambda sparse_sample: mx.zeros((1, 1, 4, 4, 4)),
         )
 
 
