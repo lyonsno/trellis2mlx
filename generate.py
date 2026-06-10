@@ -116,11 +116,16 @@ def _cleanup_and_simplify_mesh(
     target_faces,
     no_cleanup,
     keep_largest=False,
+    simplify_first=False,
     cleanup_mesh=None,
     simplify=None,
     log=print,
 ):
-    """Run mesh cleanup and multi-pass simplification."""
+    """Run mesh cleanup and multi-pass simplification.
+
+    With simplify_first=True, simplifies the raw mesh before cleanup.
+    Much faster on large meshes (cleanup on 200K faces vs 6M faces).
+    """
     def final_cleanup(vertices, faces):
         if no_cleanup:
             return vertices, faces
@@ -132,6 +137,27 @@ def _cleanup_and_simplify_mesh(
     if not no_cleanup:
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
+
+    # Simplify-first mode: reduce face count before expensive cleanup
+    if simplify_first and target_faces and len(faces) > target_faces:
+        if simplify is None:
+            import fast_simplification
+            simplify = fast_simplification.simplify
+        t0 = time.perf_counter()
+        for _ in range(3):
+            ratio = target_faces / len(faces)
+            if ratio >= 1: break
+            vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
+            if len(faces) <= target_faces * 1.1: break
+        log(f"  Pre-simplify: {len(vertices):,}V {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
+        # Single cleanup pass on the small mesh
+        if not no_cleanup:
+            t0 = time.perf_counter()
+            vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
+            log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+        return vertices, faces
+
+    if not no_cleanup:
         t0 = time.perf_counter()
         vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
         log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
@@ -205,12 +231,14 @@ def main():
                         help="Skip mesh cleanup entirely (no dedup, no repair, no hole fill)")
     parser.add_argument("--keep-largest", action="store_true",
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
+    parser.add_argument("--simplify-first", action="store_true",
+                        help="Simplify before cleanup (much faster on large meshes, skips multi-pass)")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
     parser.add_argument("--uv-method", choices=["auto", "lscm", "xatlas", "cube"], default="auto",
-                        help="UV unwrap method: auto (LSCM, default), lscm, xatlas, or cube")
+                        help="UV unwrap method: auto (xatlas, default), lscm, xatlas, or cube")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
@@ -244,6 +272,7 @@ def main():
                 target_faces=args.target_faces,
                 no_cleanup=args.no_cleanup,
                 keep_largest=args.keep_largest,
+                simplify_first=args.simplify_first,
             )
 
             # Jump straight to texture baking
@@ -545,6 +574,7 @@ def main():
         target_faces=args.target_faces,
         no_cleanup=args.no_cleanup,
         keep_largest=args.keep_largest,
+        simplify_first=args.simplify_first,
     )
 
     # === Stage 4: Texture SLat ===

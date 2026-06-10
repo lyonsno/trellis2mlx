@@ -508,9 +508,15 @@ class TestLSCMUVUnwrap:
         # (or at least be very close — no chart boundary splitting on a flat quad)
         f0_uvs = uvs[new_faces[0]]
         f1_uvs = uvs[new_faces[1]]
-        # Find shared original vertices
+        # Find shared vertex indices between the two faces
         shared = set(new_faces[0].tolist()) & set(new_faces[1].tolist())
         assert len(shared) == 2, "Flat quad should share 2 vertices between faces"
+        # Shared vertices must have valid, non-NaN UVs
+        for vi in shared:
+            assert not np.any(np.isnan(uvs[vi])), f"Shared vertex {vi} has NaN UVs"
+            assert np.all(uvs[vi] >= -0.01) and np.all(uvs[vi] <= 1.01), (
+                f"Shared vertex {vi} UVs out of range: {uvs[vi]}"
+            )
 
     def test_faster_than_xatlas_on_voxel_geometry(self):
         """LSCM should complete in reasonable time on voxel geometry."""
