@@ -71,6 +71,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--packed-flow-artifact", type=Path, help="Packed generic flow artifact directory for SLat diagnostics")
     parser.add_argument("--packed-flow-stage", default="shape-lr-slat", help="Expected packed generic flow stage")
     parser.add_argument("--run-packed-slat-width-diagnostic", action="store_true", help="Run packed SLat projected-context width diagnostic")
+    parser.add_argument(
+        "--component-filter-artifact",
+        type=Path,
+        help="Saved Pixal3D HR SLat artifact to component-filter under the projected route smoke",
+    )
+    parser.add_argument("--component-filter", choices=("none", "largest", "min_ratio"), default="none")
+    parser.add_argument("--component-filter-min-ratio", type=float, default=1e-5)
+    parser.add_argument("--component-filter-slat-key", default="hr_slat")
+    parser.add_argument("--component-filter-coords-key", default="hr_coords_quantized_1024")
+    parser.add_argument("--component-filter-spatial-coords-key", default="hr_coords_3d_1024")
     parser.add_argument("--projection-mode", choices=("native", "bilinear_hr_concat"), default="native", help="Projected feature mode for SLat diagnostics")
     parser.add_argument("--hr-feature-size", type=_positive_int, default=None, help="Bilinear HR feature side length for SLat diagnostics")
     parser.add_argument("--camera-angle-x", type=float, default=PIXAL3D_DEFAULT_CAMERA_ANGLE_X, help="Pixal3D projection camera horizontal FOV/ray angle")
@@ -2049,6 +2059,131 @@ def validate_effective_route(route: dict[str, Any]) -> None:
     route["pixal3d_projected_conditioning"] = True
 
 
+def _checkpoint_family(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    normalized = str(path)
+    if "TencentARC" in normalized or "Pixal3D" in normalized:
+        return "TencentARC/Pixal3D"
+    if "microsoft" in normalized or "TRELLIS" in normalized:
+        return "microsoft/TRELLIS"
+    return "unknown"
+
+
+def _projection_width(route: dict[str, Any]) -> int | None:
+    projected_shape = route.get("projected_shape")
+    if not projected_shape:
+        return None
+    return int(projected_shape[-1])
+
+
+def _require_pixal3d_projected_route(route: dict[str, Any], *, phase: str) -> None:
+    errors = []
+    if route.get("effective") != "pixal3d-proj":
+        errors.append(f"effective route is {route.get('effective')!r}")
+    if route.get("fallback_detected") is True:
+        errors.append("fallback_detected is true")
+    if "proj" not in route.get("context_keys", []):
+        errors.append("projected conditioning key 'proj' is missing")
+    if route.get("projected_shape") is None:
+        errors.append("projected conditioning shape is missing")
+    for role, class_name in route.get("model_classes", {}).items():
+        if not str(class_name).startswith("Pixal3D"):
+            errors.append(f"{role} model is not Pixal3D: {class_name}")
+    if errors:
+        raise RuntimeError(f"{phase} is not Pixal3D projected: " + "; ".join(errors))
+
+
+def run_component_filter_artifact_smoke(
+    artifact_path: Path,
+    route: dict[str, Any],
+    *,
+    mode: str,
+    min_component_ratio: float,
+    slat_key: str = "hr_slat",
+    coords_key: str = "hr_coords_quantized_1024",
+    spatial_coords_key: str = "hr_coords_3d_1024",
+    checkpoint: Path | None = None,
+) -> dict[str, Any]:
+    _require_pixal3d_projected_route(route, phase="component filter artifact smoke")
+    if mode not in {"none", "largest", "min_ratio"}:
+        raise ValueError(f"unknown component filter mode: {mode!r}")
+    if min_component_ratio < 0:
+        raise ValueError("component filter min ratio must be non-negative")
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"component filter artifact does not exist: {artifact_path}")
+
+    from trellmlx.coord_components import filter_sparse_coordinate_components
+
+    with np.load(artifact_path) as data:
+        missing = [
+            key
+            for key in (slat_key, coords_key, spatial_coords_key)
+            if key not in data.files
+        ]
+        if missing:
+            raise KeyError(f"component filter artifact missing keys: {missing}")
+        slat = np.asarray(data[slat_key])
+        quant_coords = np.asarray(data[coords_key])
+        spatial_coords = np.asarray(data[spatial_coords_key])
+        keys = list(data.files)
+
+    if slat.ndim != 2:
+        raise ValueError(f"{slat_key} must be rank 2, got {list(slat.shape)}")
+    if quant_coords.ndim != 2 or quant_coords.shape[1] != 4:
+        raise ValueError(f"{coords_key} must have shape [N,4], got {list(quant_coords.shape)}")
+    if spatial_coords.ndim != 2 or spatial_coords.shape[1] != 3:
+        raise ValueError(f"{spatial_coords_key} must have shape [N,3], got {list(spatial_coords.shape)}")
+    row_count = slat.shape[0]
+    if quant_coords.shape[0] != row_count or spatial_coords.shape[0] != row_count:
+        raise ValueError(
+            "component filter artifact row mismatch: "
+            f"{slat_key}={slat.shape[0]}, {coords_key}={quant_coords.shape[0]}, "
+            f"{spatial_coords_key}={spatial_coords.shape[0]}"
+        )
+
+    filtered_spatial, filtered_slat, component_report = filter_sparse_coordinate_components(
+        spatial_coords,
+        slat,
+        mode=mode,
+        min_component_ratio=min_component_ratio,
+        include_row_indices=True,
+    )
+    kept_row_indices = np.asarray(component_report.pop("kept_row_indices"), dtype=np.int64)
+    filtered_quant_coords = quant_coords[kept_row_indices]
+    return {
+        "schema": "trellis2mlx.pixal3d_component_filter_artifact_smoke.v1",
+        "route": "pixal3d-hr-support-component-filter-artifact-smoke",
+        "status": "ok",
+        "effective_generation_route": route.get("effective"),
+        "not_vanilla_trellis": True,
+        "fallback_detected": route.get("fallback_detected"),
+        "context_keys": route.get("context_keys"),
+        "projected_shape": route.get("projected_shape"),
+        "projection_width": _projection_width(route),
+        "model_classes": route.get("model_classes"),
+        "checkpoint_family": _checkpoint_family(checkpoint),
+        "slat_normalization": "normalized",
+        "input": {
+            "path": artifact_path,
+            "keys": keys,
+            "slat_key": slat_key,
+            "slat_shape": list(slat.shape),
+            "coords_key": coords_key,
+            "coords_shape": list(quant_coords.shape),
+            "spatial_coords_key": spatial_coords_key,
+            "spatial_coords_shape": list(spatial_coords.shape),
+        },
+        "component_filter": component_report,
+        "filtered_keys": [slat_key, coords_key, spatial_coords_key],
+        "filtered_shapes": {
+            slat_key: list(filtered_slat.shape),
+            coords_key: list(filtered_quant_coords.shape),
+            spatial_coords_key: list(filtered_spatial.shape),
+        },
+    }
+
+
 def mark_failure(
     report: dict[str, Any],
     report_path: Path,
@@ -2095,6 +2230,12 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             "packed_flow_artifact": str(args.packed_flow_artifact) if args.packed_flow_artifact else None,
             "packed_flow_stage": args.packed_flow_stage,
             "run_packed_slat_width_diagnostic": args.run_packed_slat_width_diagnostic,
+            "component_filter_artifact": str(args.component_filter_artifact) if args.component_filter_artifact else None,
+            "component_filter": args.component_filter,
+            "component_filter_min_ratio": args.component_filter_min_ratio,
+            "component_filter_slat_key": args.component_filter_slat_key,
+            "component_filter_coords_key": args.component_filter_coords_key,
+            "component_filter_spatial_coords_key": args.component_filter_spatial_coords_key,
             "projection_mode": args.projection_mode,
             "hr_feature_size": args.hr_feature_size,
             "camera_angle_x": args.camera_angle_x,
@@ -2143,6 +2284,23 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             report["architecture_profile"] = profile_checkpoint_architecture(
                 args.checkpoint, args.checkpoint_config
             )
+        if args.component_filter_artifact:
+            try:
+                report["component_filter_artifact_smoke"] = run_component_filter_artifact_smoke(
+                    args.component_filter_artifact,
+                    route,
+                    mode=args.component_filter,
+                    min_component_ratio=args.component_filter_min_ratio,
+                    slat_key=args.component_filter_slat_key,
+                    coords_key=args.component_filter_coords_key,
+                    spatial_coords_key=args.component_filter_spatial_coords_key,
+                    checkpoint=args.checkpoint,
+                )
+                report["last_trustworthy_evidence"] = {"phase": "component_filter_artifact_smoke"}
+                write_report(args.report, report)
+            except Exception as exc:
+                mark_failure(report, args.report, phase="component_filter_artifact_smoke", error=str(exc))
+                raise
         if args.chunked_quantize_sparse_structure:
             if not args.checkpoint or not args.checkpoint_config:
                 exc = ValueError("--chunked-quantize-sparse-structure requires --checkpoint and --checkpoint-config")
@@ -2262,6 +2420,8 @@ def run_smoke_route(args: argparse.Namespace, command_line: list[str] | None = N
             final_phase = "packed_artifact_export"
         elif args.chunked_quantize_sparse_structure:
             final_phase = "chunked_quantization"
+        elif args.component_filter_artifact:
+            final_phase = "component_filter_artifact_smoke"
         else:
             final_phase = "smoke_route"
         report["last_trustworthy_evidence"] = {"phase": final_phase}

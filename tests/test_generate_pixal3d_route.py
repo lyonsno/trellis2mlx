@@ -73,6 +73,105 @@ def test_route_validation_rejects_global_only_fallback():
         gen.validate_effective_route(route)
 
 
+def test_component_filter_artifact_smoke_proves_pixal3d_route_and_counts(tmp_path):
+    gen = _load_module()
+
+    artifact_path = tmp_path / "hr-slat.npz"
+    np.savez(
+        artifact_path,
+        hr_slat=np.arange(4 * 32, dtype=np.float32).reshape(4, 32),
+        hr_coords_quantized_1024=np.array(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 1],
+                [0, 0, 1, 1],
+                [0, 9, 9, 9],
+            ],
+            dtype=np.int32,
+        ),
+        hr_coords_3d_1024=np.array(
+            [
+                [0, 0, 0],
+                [0, 0, 1],
+                [0, 1, 1],
+                [9, 9, 9],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    report_path = tmp_path / "route.json"
+
+    args = gen.parse_args([
+        "--smoke-route",
+        "--report",
+        str(report_path),
+        "--grid-resolution",
+        "2",
+        "--image-size",
+        "32",
+        "--patch-size",
+        "16",
+        "--context-channels",
+        "8",
+        "--component-filter-artifact",
+        str(artifact_path),
+        "--component-filter",
+        "largest",
+    ])
+
+    report = gen.run_smoke_route(args, command_line=["generate_pixal3d.py", "--smoke-route"])
+    artifact_smoke = report["component_filter_artifact_smoke"]
+
+    assert artifact_smoke["route"] == "pixal3d-hr-support-component-filter-artifact-smoke"
+    assert artifact_smoke["effective_generation_route"] == "pixal3d-proj"
+    assert artifact_smoke["not_vanilla_trellis"] is True
+    assert artifact_smoke["slat_normalization"] == "normalized"
+    assert artifact_smoke["model_classes"]["ss_flow"] == "Pixal3DSparseStructureFlowModel"
+    assert artifact_smoke["model_classes"]["slat_flow"] == "Pixal3DSLatFlowModel"
+    assert artifact_smoke["context_keys"] == ["global", "proj"]
+    assert artifact_smoke["component_filter"]["mode"] == "largest"
+    assert artifact_smoke["component_filter"]["input_count"] == 4
+    assert artifact_smoke["component_filter"]["kept_count"] == 3
+    assert artifact_smoke["component_filter"]["dropped_count"] == 1
+    assert artifact_smoke["filtered_keys"] == [
+        "hr_slat",
+        "hr_coords_quantized_1024",
+        "hr_coords_3d_1024",
+    ]
+    assert report["last_trustworthy_evidence"]["phase"] == "component_filter_artifact_smoke"
+
+
+def test_component_filter_artifact_smoke_rejects_vanilla_route(tmp_path):
+    gen = _load_module()
+
+    artifact_path = tmp_path / "hr-slat.npz"
+    np.savez(
+        artifact_path,
+        hr_slat=np.zeros((1, 32), dtype=np.float32),
+        hr_coords_quantized_1024=np.array([[0, 0, 0, 0]], dtype=np.int32),
+        hr_coords_3d_1024=np.array([[0, 0, 0]], dtype=np.int32),
+    )
+    route = {
+        "requested": "pixal3d-proj",
+        "effective": "trellis2mlx-global",
+        "context_keys": ["global"],
+        "projected_shape": None,
+        "model_classes": {
+            "ss_flow": "SparseStructureFlowModel",
+            "slat_flow": "SLatFlowModel",
+        },
+        "fallback_detected": True,
+    }
+
+    with pytest.raises(RuntimeError, match="not Pixal3D projected"):
+        gen.run_component_filter_artifact_smoke(
+            artifact_path,
+            route,
+            mode="largest",
+            min_component_ratio=1e-5,
+        )
+
+
 def test_cli_smoke_writes_report(tmp_path):
     gen = _load_module()
 
