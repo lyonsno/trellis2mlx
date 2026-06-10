@@ -257,10 +257,12 @@ def _effective_route_tokens(effective_route: str) -> list[str]:
 
 
 def _expect_route_flag(route_tokens: Sequence[str], flag: str, expected: str) -> None:
-    try:
-        index = route_tokens.index(flag)
-    except ValueError as exc:
-        raise GreenroomReceiptError(f"effective_route missing {flag}") from exc
+    indexes = [index for index, token in enumerate(route_tokens) if token == flag]
+    if not indexes:
+        raise GreenroomReceiptError(f"effective_route missing {flag}")
+    if len(indexes) > 1:
+        raise GreenroomReceiptError(f"effective_route duplicate {flag}")
+    index = indexes[0]
     value_index = index + 1
     if value_index >= len(route_tokens):
         raise GreenroomReceiptError(f"effective_route missing value for {flag}")

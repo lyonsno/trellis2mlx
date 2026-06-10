@@ -165,6 +165,35 @@ def test_validate_receipt_rejects_wrong_effective_generation_params(tmp_path):
         validate_receipt(receipt, request)
 
 
+def test_validate_receipt_rejects_duplicate_effective_generation_params(tmp_path):
+    from trellmlx.greenroom import GreenroomReceiptError, GreenroomRequest, validate_receipt
+
+    request = GreenroomRequest(
+        input_path=tmp_path / "subject.png",
+        output_dir=tmp_path / "out",
+        repo_root=tmp_path / "branch-worktree",
+        seed=101,
+        resolution=768,
+        target_faces=333_333,
+        texture_size=2048,
+    )
+    expected_output = request.expected_output_path
+    expected_output.parent.mkdir(parents=True)
+    expected_output.write_bytes(b"glb")
+    receipt = _done_receipt(request) | {
+        "effective_route": (
+            f"python -u generate.py --image {request.input_path} "
+            f"--output {expected_output} --seed 101 --seed 42 "
+            "--resolution 768 --resolution 512 "
+            "--target-faces 333333 --target-faces 200000 "
+            "--texture-size 2048 --texture-size 1024"
+        ),
+    }
+
+    with pytest.raises(GreenroomReceiptError, match="duplicate --seed"):
+        validate_receipt(receipt, request)
+
+
 def test_write_greenroom_report_records_effective_evidence(tmp_path):
     from trellmlx.greenroom import GreenroomRequest, write_greenroom_report
 
