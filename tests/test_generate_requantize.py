@@ -4,7 +4,7 @@ import pytest
 from generate import _filter_hr_support_components, _requantize_coords
 
 
-def test_requantize_coords_matches_pixal3d_reference_floor_formula():
+def test_requantize_coords_matches_pixal3d_run_round_gridres_minus_one_formula():
     raw = np.array(
         [
             [0, 216, 141, 140],
@@ -19,7 +19,7 @@ def test_requantize_coords_matches_pixal3d_reference_floor_formula():
     expected = np.array(
         [
             [0, 27, 17, 17],
-            [0, 52, 63, 48],
+            [0, 51, 62, 47],
         ],
         dtype=np.int32,
     )

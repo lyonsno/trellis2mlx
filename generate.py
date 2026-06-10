@@ -68,19 +68,23 @@ def _normalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) ->
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
-    Maps from the decoder's upsampled space back to hr_resolution,
-    deduplicates, and returns unique coords.
+    Matches Pixal3DImageTo3DPipeline.run: map from the decoder's upsampled
+    space to the HR SLat grid using round((coord + 0.5) / lr * (grid - 1)).
 
     Args:
-        hr_coords_np: [N, 4] int array (batch, z, y, x) at decoder output res
-        lr_resolution: input coordinate resolution (e.g. 32)
-        hr_resolution: target mesh resolution (e.g. 256)
+        hr_coords_np: [N, 4] int array at decoder output resolution.
+        lr_resolution: decoder output resolution (e.g. 512 after 4 upsamples).
+        hr_resolution: target mesh resolution (e.g. 1024).
 
     Returns:
         unique_coords: [M, 4] int array at hr_resolution
     """
     grid_res = hr_resolution // 16
-    spatial = ((hr_coords_np[:, 1:4].astype(np.float64) + 0.5) / lr_resolution * grid_res).astype(np.int32)
+    spatial = np.rint(
+        (hr_coords_np[:, 1:4].astype(np.float64) + 0.5)
+        / lr_resolution
+        * (grid_res - 1)
+    ).astype(np.int32)
     spatial = np.clip(spatial, 0, grid_res - 1)
     result = hr_coords_np.copy()
     result[:, 1:4] = spatial
@@ -480,8 +484,8 @@ def main():
 
     # Requantize: decoder output coords are at lr_resolution * 16 (= 512).
     # The HR model (1024 variant, resolution=64) expects coords in [0, 63].
-    # Formula: ((coord + 0.5) / decoder_output_res * (hr_resolution // 16)).int()
-    # With decoder_output_res=512, hr_resolution=1024: coords → [0, 63] ✓
+    # Formula mirrors Pixal3DImageTo3DPipeline.run:
+    #   round((coord + 0.5) / decoder_output_res * (grid_res - 1))
     decoder_output_res = lr_resolution * 16  # 32 * 16 = 512
     hr_resolution = args.resolution
     hr_coords_np = np.array(hr_coords_raw)
