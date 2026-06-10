@@ -610,6 +610,65 @@ def test_packed_sparse_structure_stage_smoke_rejects_artifact_without_quantized_
         )
 
 
+def test_packed_projected_slat_artifact_loads_and_runs_sparse_tokens(tmp_path):
+    gen = _load_module()
+
+    config = tmp_path / "slat-stage.json"
+    config.write_text(json.dumps({
+        "name": "ElasticSLatFlowModel",
+        "args": {
+            "resolution": 32,
+            "in_channels": 32,
+            "out_channels": 32,
+            "model_channels": 128,
+            "cond_channels": 64,
+            "num_blocks": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "image_attn_mode": "proj",
+            "proj_in_channels": 64,
+        },
+    }))
+    checkpoint = tmp_path / "slat-stage.safetensors"
+    save_file(
+        {
+            "blocks.0.self_attn.to_qkv.weight": np.ones((384, 128), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.weight": np.ones((128, 64), dtype=np.float32),
+            "blocks.0.cross_attn.proj_linear.bias": np.zeros((128,), dtype=np.float32),
+            "input_layer.weight": np.ones((128, 32), dtype=np.float32),
+            "out_layer.weight": np.ones((32, 128), dtype=np.float32),
+        },
+        checkpoint,
+    )
+    artifact_dir = tmp_path / "packed-slat"
+    export = gen.export_packed_flow_artifact(
+        checkpoint,
+        config,
+        artifact_dir,
+        stage="shape-lr-slat",
+        bits=4,
+        group_size=64,
+    )
+    model = gen.flow_model_from_config(config)
+    load = gen.load_packed_flow_artifact(model, artifact_dir, expected_stage="shape-lr-slat")
+    context = {
+        "global": mx.zeros((1, 5, 64), dtype=mx.float32),
+        "proj": mx.zeros((1, 3, 64), dtype=mx.float32),
+    }
+    x = mx.zeros((3, 32), dtype=mx.float32)
+    coords = mx.array(np.array([[0, 0, 0], [1, 1, 1], [2, 1, 0]], dtype=np.int32))
+    out = model(x, mx.array([1000.0], dtype=mx.float32), context, coords=coords)
+    mx.eval(out)
+
+    assert export["schema"] == "trellis2mlx.pixal3d_packed_flow_artifact.v1"
+    assert export["stage"] == "shape-lr-slat"
+    assert load["effective_route"] == "packed-quantized-shape-lr-slat"
+    assert load["loaded_quantized_module_count"] == 2
+    assert isinstance(model.blocks[0].cross_attn.proj_linear, nn.QuantizedLinear)
+    assert isinstance(model.blocks[0].self_attn.to_qkv, nn.QuantizedLinear)
+    assert out.shape == (3, 32)
+
+
 def test_image_conditioned_packed_sparse_stage_uses_projected_features(tmp_path):
     gen = _load_module()
 
