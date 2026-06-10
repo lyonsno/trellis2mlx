@@ -302,6 +302,15 @@ def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
             placed_uvs = chart_uvs.copy()
             placed_uvs[:, 0] = shelf_x + placed_uvs[:, 0] * cw
             placed_uvs[:, 1] = shelf_y + placed_uvs[:, 1] * ch
+            uv0 = placed_uvs[local_faces[:, 0]]
+            uv1 = placed_uvs[local_faces[:, 1]]
+            uv2 = placed_uvs[local_faces[:, 2]]
+            signed_area = 0.5 * (
+                (uv1[:, 0] - uv0[:, 0]) * (uv2[:, 1] - uv0[:, 1])
+                - (uv2[:, 0] - uv0[:, 0]) * (uv1[:, 1] - uv0[:, 1])
+            )
+            if signed_area.sum() < 0:
+                placed_uvs[:, 1] = shelf_y + ch - (placed_uvs[:, 1] - shelf_y)
 
             offset_faces = local_faces + vert_offset
             all_new_verts.append(local_verts.astype(np.float32))
@@ -323,19 +332,52 @@ def uv_unwrap_lscm(vertices, faces, cone_angle=np.radians(70.0)):
     out_uvs = np.concatenate(all_uvs)
     out_vmapping = np.concatenate(all_vmapping)
 
-    # Step 5: Use xatlas for chart packing only (the fast part of xatlas).
-    # Our LSCM parameterization is per-chart; xatlas packs them efficiently
-    # into [0,1]² UV space without re-parameterizing.
-    import xatlas
-    atlas = xatlas.Atlas()
-    atlas.add_uv_mesh(out_uvs.astype(np.float32), out_faces.astype(np.uint32))
-    atlas.generate()
-    packed_vmap, packed_faces, packed_uvs = atlas[0]
+    uv_min = out_uvs.min(axis=0)
+    uv_max = out_uvs.max(axis=0)
+    uv_span = uv_max - uv_min
+    fit = (1.0 - padding * 2) / np.maximum(uv_span, 1e-10)
+    out_uvs = (out_uvs - uv_min) * fit + padding
 
-    packed_verts = out_verts[packed_vmap]
-    packed_orig_vmap = out_vmapping[packed_vmap]
+    uv0 = out_uvs[out_faces[:, 0]]
+    uv1 = out_uvs[out_faces[:, 1]]
+    uv2 = out_uvs[out_faces[:, 2]]
+    signed_area = 0.5 * (
+        (uv1[:, 0] - uv0[:, 0]) * (uv2[:, 1] - uv0[:, 1])
+        - (uv2[:, 0] - uv0[:, 0]) * (uv1[:, 1] - uv0[:, 1])
+    )
+    inverted = signed_area < -1e-12
+    if inverted.any():
+        fixed_faces = out_faces.copy()
+        dup_verts = []
+        dup_uvs = []
+        dup_vmapping = []
+        next_index = len(out_verts)
+        for face_index in np.where(inverted)[0]:
+            face = out_faces[face_index]
+            dup_verts.append(out_verts[face])
+            dup_uvs.append(
+                np.array(
+                    [out_uvs[face[0]], out_uvs[face[2]], out_uvs[face[1]]],
+                    dtype=out_uvs.dtype,
+                )
+            )
+            dup_vmapping.append(out_vmapping[face])
+            fixed_faces[face_index] = np.array(
+                [next_index, next_index + 1, next_index + 2],
+                dtype=out_faces.dtype,
+            )
+            next_index += 3
+        out_verts = np.concatenate([out_verts, *dup_verts])
+        out_uvs = np.concatenate([out_uvs, *dup_uvs])
+        out_vmapping = np.concatenate([out_vmapping, *dup_vmapping])
+        out_faces = fixed_faces
 
-    return packed_verts.astype(np.float32), packed_faces, packed_uvs, packed_orig_vmap
+    return (
+        out_verts.astype(np.float32),
+        out_faces.astype(np.uint32),
+        out_uvs.astype(np.float32),
+        out_vmapping.astype(np.int64),
+    )
 
 
 def uv_unwrap_cube(vertices, faces):

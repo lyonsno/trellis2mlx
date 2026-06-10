@@ -167,6 +167,7 @@ class TestUVAssaySmooth:
         verts, faces = _make_shoe_like_mesh()
         report = _run_assay("lscm", uv_unwrap_lscm, verts, faces)
         _print_report(report)
+        assert report["n_inverted_triangles"] == 0
         assert report["pixel_coverage_pct"] > 20
 
     def test_lscm_vs_xatlas_coverage(self):
@@ -213,6 +214,7 @@ class TestUVAssayVoxel:
         verts, faces = _make_voxel_mesh()
         report = _run_assay("lscm", uv_unwrap_lscm, verts, faces)
         _print_report(report)
+        assert report["n_inverted_triangles"] == 0
         assert report["pixel_coverage_pct"] > 1
 
     def test_lscm_completes_in_reasonable_time(self):

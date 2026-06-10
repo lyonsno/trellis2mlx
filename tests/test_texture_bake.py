@@ -6,6 +6,8 @@ Uses synthetic meshes with known UV layouts for deterministic verification.
 
 import numpy as np
 import pytest
+import sys
+import types
 
 from trellmlx.texture_bake import rasterize_uv, sample_voxel_attrs
 
@@ -518,6 +520,30 @@ class TestLSCMUVUnwrap:
                 f"Shared vertex {vi} UVs out of range: {uvs[vi]}"
             )
 
+    def test_lscm_does_not_repack_shelf_uvs_with_xatlas(self, monkeypatch):
+        """LSCM area-proportional packing is the final packing step."""
+        from trellmlx.texture_bake import uv_unwrap_lscm
+
+        class FailingAtlas:
+            def __init__(self):
+                raise AssertionError("uv_unwrap_lscm must not invoke xatlas repacking")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "xatlas",
+            types.SimpleNamespace(Atlas=FailingAtlas),
+        )
+
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+
+        _, new_faces, uvs, _ = uv_unwrap_lscm(vertices, faces)
+        assert len(new_faces) == len(faces)
+        assert uvs.min() >= -0.01
+        assert uvs.max() <= 1.01
+
     def test_faster_than_xatlas_on_voxel_geometry(self):
         """LSCM should complete in reasonable time on voxel geometry."""
         from trellmlx.texture_bake import uv_unwrap_lscm
@@ -548,7 +574,7 @@ class TestLSCMUVUnwrap:
         new_verts, new_faces, uvs, vmapping = uv_unwrap_lscm(verts, faces)
         elapsed = time.perf_counter() - t0
 
-        assert elapsed < 120.0, f"LSCM took {elapsed:.1f}s on 12K faces, expected <120s"
+        assert elapsed < 30.0, f"LSCM took {elapsed:.1f}s on 12K faces, expected <30s"
         assert len(new_faces) == len(faces)
         assert uvs.min() >= -0.01 and uvs.max() <= 1.01
 
