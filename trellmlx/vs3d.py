@@ -10,6 +10,16 @@ import numpy as np
 import mlx.core as mx
 
 
+def _rasi_probe_direction(phi: mx.array, step_idx: int) -> mx.array:
+    """Return a deterministic +/- probe direction with phi's shape."""
+    total = int(np.prod(phi.shape))
+    direction = np.ones(total, dtype=np.float32)
+    direction[3::4] = -1.0
+    if total:
+        direction = np.roll(direction, step_idx % total)
+    return mx.array(direction.reshape(phi.shape), dtype=phi.dtype)
+
+
 # ---------------------------------------------------------------------------
 # RASI — Reconstruction-Anchored Source Injection
 # ---------------------------------------------------------------------------
@@ -58,7 +68,7 @@ def rasi_optimize(
     t_tensor = mx.array([1000.0 * t_k], dtype=mx.float32)
     phi = mx.array(neg_cond)  # copy
 
-    for _ in range(K):
+    for step_idx in range(K):
         # Forward pass to compute velocity with current phi
         v_pos = model(z_t, t_tensor, cond_src, **model_kwargs)
         v_neg = model(z_t, t_tensor, phi, **model_kwargs)
@@ -79,25 +89,21 @@ def rasi_optimize(
         if loss_val < early_stop:
             break
 
-        # Gradient of loss w.r.t. phi via finite differences.
-        # dL/d(v_neg) direction is carried by diff; we project it into phi-space
-        # by finite-differencing the neg branch along the residual direction.
-        # Perturbation: phi_plus = phi + eps * sign(residual_projected)
-        # where residual_projected is diff averaged to phi shape.
-        eps = 1e-4
-        # Project diff (z_hat shape) to a per-context-token direction for phi.
-        # Flatten diff to scalar direction per phi element via mean over non-ctx dims.
-        # phi: [1, L, C_ctx]; diff: [N, C] or [B, C, ...] — use mean as proxy.
-        diff_scalar = mx.mean(diff)  # scalar gradient signal direction
-        perturb_dir = mx.sign(diff_scalar * mx.ones_like(phi))
+        # Estimate a directional phi gradient with a central finite difference.
+        eps = 1e-2
+        perturb_dir = _rasi_probe_direction(phi, step_idx)
         phi_plus = phi + eps * perturb_dir
+        phi_minus = phi - eps * perturb_dir
         v_neg_plus = model(z_t, t_tensor, phi_plus, **model_kwargs)
-        mx.eval(v_neg_plus)
+        v_neg_minus = model(z_t, t_tensor, phi_minus, **model_kwargs)
+        mx.eval(v_neg_plus, v_neg_minus)
         v_src_plus = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg_plus
+        v_src_minus = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg_minus
         z_hat_plus = z_t - dt * v_src_plus
+        z_hat_minus = z_t - dt * v_src_minus
         loss_plus = float(mx.mean((z_hat_plus - x_src) ** 2).item())
-        # Finite-difference gradient: (L(phi+eps) - L(phi)) / eps
-        fd_grad = (loss_plus - loss_val) / eps
+        loss_minus = float(mx.mean((z_hat_minus - x_src) ** 2).item())
+        fd_grad = (loss_plus - loss_minus) / (2.0 * eps)
         phi = phi - lr * fd_grad * perturb_dir
         mx.eval(phi)
 
