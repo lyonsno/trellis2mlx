@@ -64,17 +64,21 @@ def test_load_stage_handles_records_effective_loader_route_and_writes_report(tmp
         "effective_loader_route": "fixture",
         "weights_path": "fixture://dinov3",
     }
+    assert report.load_reports[0].elapsed_seconds >= 0.0
     assert report.close_reports[0].metadata == {
         "kind": "model",
         "close_phase": "closed",
         "requested_loader_route": "fixture",
         "model_family": "dinov3",
     }
+    assert report.close_reports[0].elapsed_seconds >= 0.0
 
     persisted = json.loads(report_path.read_text())
     assert persisted["schema"] == "trellis2mlx.stage_handle_loader_report.v1"
     assert persisted["ok"] is True
     assert persisted["loaded_handle_ids"] == ["dinov3"]
+    assert persisted["load_reports"][0]["elapsed_seconds"] >= 0.0
+    assert persisted["close_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["load_reports"][0]["metadata"]["effective_loader_route"] == "fixture"
 
 
@@ -121,16 +125,20 @@ def test_load_stage_handles_writes_failure_report_on_loader_route_mismatch(tmp_p
     assert "effective loader route mismatch for dinov3" in report.error
     assert report.loaded_handle_ids == ()
     assert [load_report.load_phase for load_report in report.load_reports] == ["load_error"]
+    assert report.load_reports[0].elapsed_seconds >= 0.0
     assert events == [
         ("load", "dinov3"),
         ("close", "dinov3", True),
     ]
     assert [close_report.close_phase for close_report in report.close_reports] == ["closed"]
+    assert report.close_reports[0].elapsed_seconds >= 0.0
 
     persisted = json.loads(report_path.read_text())
     assert persisted["ok"] is False
     assert persisted["failure_phase"] == "load"
     assert "effective loader route mismatch for dinov3" in persisted["error"]
+    assert persisted["load_reports"][0]["elapsed_seconds"] >= 0.0
+    assert persisted["close_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["load_reports"][0]["metadata"] == {
         "kind": "model",
         "load_phase": "load_error",

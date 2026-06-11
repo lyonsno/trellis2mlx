@@ -658,6 +658,7 @@ def test_stage_context_factory_loads_named_handles_once_and_reports_close_order(
     }
     assert [report.handle_id for report in context.load_reports] == ["dinov3", "sparse_structure"]
     assert [report.load_phase for report in context.load_reports] == ["loaded", "loaded"]
+    assert all(report.elapsed_seconds >= 0.0 for report in context.load_reports)
     assert context.load_reports[0].metadata == {
         "kind": "fixture",
         "load_phase": "loaded",
@@ -674,6 +675,7 @@ def test_stage_context_factory_loads_named_handles_once_and_reports_close_order(
     ]
     assert [report.close_phase for report in context.close_reports] == ["closed", "closed"]
     assert [report.handle_id for report in context.close_reports] == ["sparse_structure", "dinov3"]
+    assert all(report.elapsed_seconds >= 0.0 for report in context.close_reports)
 
 
 def test_stage_runner_context_factory_failure_reports_without_stage_calls(tmp_path):
@@ -714,6 +716,7 @@ def test_stage_runner_context_factory_failure_reports_without_stage_calls(tmp_pa
     assert calls == []
     assert context_factory.last_load_reports[0].handle_id == "dinov3"
     assert context_factory.last_load_reports[0].load_phase == "load_error"
+    assert context_factory.last_load_reports[0].elapsed_seconds >= 0.0
     assert "fixture loader exploded" in context_factory.last_load_reports[0].error
 
 
@@ -762,8 +765,10 @@ def test_stage_context_factory_closes_loaded_handles_after_later_load_failure(tm
         "loaded",
         "load_error",
     ]
+    assert all(report.elapsed_seconds >= 0.0 for report in context_factory.last_load_reports)
     assert [report.handle_id for report in context_factory.last_close_reports] == ["first"]
     assert [report.close_phase for report in context_factory.last_close_reports] == ["closed"]
+    assert context_factory.last_close_reports[0].elapsed_seconds >= 0.0
     assert context_closer.last_close_reports == ()
 
 
@@ -811,6 +816,8 @@ def test_stage_context_factory_closes_current_handle_after_dynamic_metadata_reje
     ]
     assert [report.handle_id for report in context_factory.last_close_reports] == ["dinov3"]
     assert [report.close_phase for report in context_factory.last_close_reports] == ["closed"]
+    assert context_factory.last_load_reports[0].elapsed_seconds >= 0.0
+    assert context_factory.last_close_reports[0].elapsed_seconds >= 0.0
     assert context_factory.last_load_reports[0].metadata == {
         "kind": "fixture",
         "load_phase": "load_error",
@@ -857,5 +864,6 @@ def test_stage_context_closer_reports_close_errors_and_continues(tmp_path):
     ]
     assert [report.handle_id for report in context.close_reports] == ["second", "first"]
     assert [report.close_phase for report in context.close_reports] == ["close_error", "closed"]
+    assert all(report.elapsed_seconds >= 0.0 for report in context.close_reports)
     assert "second close failed" in context.close_reports[0].error
     assert context_closer.last_close_reports == context.close_reports

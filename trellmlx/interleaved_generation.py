@@ -9,6 +9,7 @@ sparse tensor batching exists.
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
@@ -408,10 +409,13 @@ class StageHandleLoadReport:
     handle_id: str
     kind: str
     load_phase: str
+    elapsed_seconds: float
     metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
     error: str | None = None
 
     def __post_init__(self) -> None:
+        if self.elapsed_seconds < 0.0:
+            raise ValueError("StageHandleLoadReport elapsed_seconds must be nonnegative")
         object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
 
 
@@ -422,10 +426,13 @@ class StageHandleCloseReport:
     handle_id: str
     kind: str
     close_phase: str
+    elapsed_seconds: float
     metadata: Mapping[str, StageArtifactValue] = field(default_factory=dict)
     error: str | None = None
 
     def __post_init__(self) -> None:
+        if self.elapsed_seconds < 0.0:
+            raise ValueError("StageHandleCloseReport elapsed_seconds must be nonnegative")
         object.__setattr__(self, "metadata", _validate_artifacts(self.metadata))
 
 
@@ -472,6 +479,7 @@ class StageContextFactoryFromSpecs:
         self.last_close_reports = ()
         for spec in self.specs:
             runtime = StageHandleRuntime(run_id=self.run_id, plan=plan, spec=spec)
+            start_time = time.perf_counter()
             try:
                 loaded = spec.factory(runtime)
                 if isinstance(loaded, StageHandleFactoryResult):
@@ -501,6 +509,7 @@ class StageContextFactoryFromSpecs:
                     handle_id=spec.handle_id,
                     kind=spec.kind,
                     load_phase="load_error",
+                    elapsed_seconds=_elapsed_seconds_since(start_time),
                     metadata=report_metadata,
                     error=str(exc),
                 )
@@ -514,6 +523,7 @@ class StageContextFactoryFromSpecs:
                 handle_id=spec.handle_id,
                 kind=spec.kind,
                 load_phase="loaded",
+                elapsed_seconds=_elapsed_seconds_since(start_time),
                 metadata=report_metadata,
             )
             metadata[spec.handle_id] = dict(report_metadata)
@@ -570,6 +580,7 @@ class StageContextCloserFromSpecs:
 
 def _close_stage_handle(run_id: str, spec: StageHandleSpec, handle: object) -> StageHandleCloseReport:
     runtime = StageHandleRuntime(run_id=run_id, plan=None, spec=spec)
+    start_time = time.perf_counter()
     try:
         if spec.close is not None:
             spec.close(runtime, handle)
@@ -578,6 +589,7 @@ def _close_stage_handle(run_id: str, spec: StageHandleSpec, handle: object) -> S
             handle_id=spec.handle_id,
             kind=spec.kind,
             close_phase="close_error",
+            elapsed_seconds=_elapsed_seconds_since(start_time),
             metadata={"kind": spec.kind, "close_phase": "close_error", **spec.metadata},
             error=str(exc),
         )
@@ -587,8 +599,13 @@ def _close_stage_handle(run_id: str, spec: StageHandleSpec, handle: object) -> S
         handle_id=spec.handle_id,
         kind=spec.kind,
         close_phase="closed",
+        elapsed_seconds=_elapsed_seconds_since(start_time),
         metadata={"kind": spec.kind, "close_phase": "closed", **spec.metadata},
     )
+
+
+def _elapsed_seconds_since(start_time: float) -> float:
+    return max(0.0, time.perf_counter() - start_time)
 
 
 def build_stage_context_factory(
