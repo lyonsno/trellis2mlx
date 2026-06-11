@@ -540,51 +540,13 @@ def main():
     lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
 
     t0 = time.perf_counter()
-    if vs3d_mode:
-        from trellmlx.vs3d import vs3d_flow_sample
-        # Source SLat pass — anchor for RASI
-        print(f"  VS3D: source LR SLat pass...", flush=True)
-        mx.random.seed(args.seed)
-        lr_src_noise = mx.random.normal((N_lr, 32))
-        lr_slat_src = flow_euler_sample(
-            lr_slat_flow, lr_src_noise, cond_src, neg_cond,
-            verbose=False,
-            coords=mx.array(lr_coords),
-            **SHAPE_SAMPLER,
-        )
-        mx.eval(lr_slat_src)
-        print(f"  VS3D: source LR SLat done ({time.perf_counter()-t0:.1f}s)", flush=True)
-        # VS3D-guided LR SLat editing pass
-        t1 = time.perf_counter()
-        mx.random.seed(args.seed)
-        lr_noise = mx.random.normal((N_lr, 32))
-        lr_slat = vs3d_flow_sample(
-            model=lr_slat_flow,
-            noise=lr_noise,
-            cond_src=cond_src,
-            cond_tgt=cond_tgt,
-            neg_cond=neg_cond,
-            x_src=lr_slat_src,
-            stage="dense",
-            steps=SHAPE_SAMPLER["steps"],
-            cfg_w_src=args.vs3d_cfg_src,
-            cfg_w_tgt=args.vs3d_cfg_tgt,
-            guidance_interval=SHAPE_SAMPLER["guidance_interval"],
-            guidance_rescale=SHAPE_SAMPLER["guidance_rescale"],
-            rescale_t=SHAPE_SAMPLER["rescale_t"],
-            verbose=False,
-            coords=mx.array(lr_coords),
-        )
-        mx.eval(lr_slat)
-        print(f"  VS3D: LR SLat editing done ({time.perf_counter()-t1:.1f}s)", flush=True)
-    else:
-        lr_slat = flow_euler_sample(
-            lr_slat_flow, lr_noise, cond, neg_cond,
-            verbose=False,
-            coords=mx.array(lr_coords),
-            **SHAPE_SAMPLER,
-        )
-        mx.eval(lr_slat)
+    lr_slat = flow_euler_sample(
+        lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+        verbose=False,
+        coords=mx.array(lr_coords),
+        **SHAPE_SAMPLER,
+    )
+    mx.eval(lr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N_lr} tokens)", flush=True)
 
     lr_slat = _denormalize_slat(lr_slat)
@@ -644,51 +606,13 @@ def main():
     hr_noise = mx.random.normal((num_tokens, 32))
 
     t0 = time.perf_counter()
-    if vs3d_mode:
-        from trellmlx.vs3d import vs3d_flow_sample
-        # Source HR SLat pass — anchor for RASI
-        print(f"  VS3D: source HR SLat pass...", flush=True)
-        mx.random.seed(args.seed)
-        hr_src_noise = mx.random.normal((num_tokens, 32))
-        hr_slat_src = flow_euler_sample(
-            hr_slat_flow, hr_src_noise, cond_src, neg_cond,
-            verbose=False,
-            coords=mx.array(hr_coords_3d),
-            **SHAPE_SAMPLER,
-        )
-        mx.eval(hr_slat_src)
-        print(f"  VS3D: source HR SLat done ({time.perf_counter()-t0:.1f}s)", flush=True)
-        # VS3D-guided HR SLat editing pass
-        t1 = time.perf_counter()
-        mx.random.seed(args.seed)
-        hr_noise = mx.random.normal((num_tokens, 32))
-        hr_slat = vs3d_flow_sample(
-            model=hr_slat_flow,
-            noise=hr_noise,
-            cond_src=cond_src,
-            cond_tgt=cond_tgt,
-            neg_cond=neg_cond,
-            x_src=hr_slat_src,
-            stage="dense",
-            steps=SHAPE_SAMPLER["steps"],
-            cfg_w_src=args.vs3d_cfg_src,
-            cfg_w_tgt=args.vs3d_cfg_tgt,
-            guidance_interval=SHAPE_SAMPLER["guidance_interval"],
-            guidance_rescale=SHAPE_SAMPLER["guidance_rescale"],
-            rescale_t=SHAPE_SAMPLER["rescale_t"],
-            verbose=False,
-            coords=mx.array(hr_coords_3d),
-        )
-        mx.eval(hr_slat)
-        print(f"  VS3D: HR SLat editing done ({time.perf_counter()-t1:.1f}s)", flush=True)
-    else:
-        hr_slat = flow_euler_sample(
-            hr_slat_flow, hr_noise, cond, neg_cond,
-            verbose=False,
-            coords=mx.array(hr_coords_3d),
-            **SHAPE_SAMPLER,
-        )
-        mx.eval(hr_slat)
+    hr_slat = flow_euler_sample(
+        hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+        verbose=False,
+        coords=mx.array(hr_coords_3d),
+        **SHAPE_SAMPLER,
+    )
+    mx.eval(hr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
 
     hr_slat = _denormalize_slat(hr_slat)

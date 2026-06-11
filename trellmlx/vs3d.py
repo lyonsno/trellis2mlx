@@ -114,6 +114,7 @@ def pmg_velocity(
     t_tensor: mx.array,
     cond_tgt: mx.array,
     phi: mx.array,
+    cfg_w: float = 9.0,
     S: int = 5,
     L: int = 2,
     w: float = 1.2,
@@ -139,9 +140,10 @@ def pmg_velocity(
         t_tensor: Timestep tensor, shape [1].
         cond_tgt: Target conditioning, shape [1, L_ctx, C_ctx].
         phi: Optimized unconditional embedding from RASI, shape [1, L_ctx, C_ctx].
+        cfg_w: CFG guidance strength applied within each sample.
         S: Number of Monte Carlo samples.
         L: Number of partial-mean samples (L < S).
-        w: Amplification weight.
+        w: PMG amplification weight (applied after per-sample CFG).
 
     Returns:
         PMG velocity, same shape as z_t.
@@ -158,8 +160,8 @@ def pmg_velocity(
         v_pos = model(z_t, t_tensor, cond_tgt, **model_kwargs)
         v_neg = model(z_t, t_tensor, phi, **model_kwargs)
         mx.eval(v_pos, v_neg)
-        # CFG combination for this sample
-        v_cfg = (1.0 + w) * v_pos - w * v_neg  # equivalent to w*(v_pos - v_neg) + v_pos
+        # CFG combination at full guidance strength for this sample
+        v_cfg = v_pos + cfg_w * (v_pos - v_neg)
         cfg_velocities.append(v_cfg)
 
     # Stack: [S, *shape]
@@ -395,13 +397,14 @@ def vs3d_flow_sample(
                 **model_kwargs,
             )
 
-            # PMG: compute target velocity with partial-mean amplification
+            # PMG: compute target velocity with full CFG + partial-mean amplification
             pred = pmg_velocity(
                 model=model,
                 z_t=sample,
                 t_tensor=t_tensor,
                 cond_tgt=cond_tgt,
                 phi=phi,
+                cfg_w=cfg_w_tgt,
                 S=pmg_S,
                 L=pmg_L,
                 w=pmg_w,
