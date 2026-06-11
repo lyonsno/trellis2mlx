@@ -12,13 +12,28 @@ import mlx.nn as nn
 import numpy as np
 
 
+def _pack_coords(coords_np: np.ndarray) -> np.ndarray:
+    """Pack (batch, z, y, x) into int64 keys."""
+    return (
+        coords_np[:, 0].astype(np.int64) << 48 |
+        coords_np[:, 1].astype(np.int64) << 32 |
+        coords_np[:, 2].astype(np.int64) << 16 |
+        coords_np[:, 3].astype(np.int64)
+    )
+
+
+# Module-level cache: coords content hash → neighbor map
+_neighbor_map_cache: dict[int, tuple] = {}
+
+
 def build_neighbor_map(coords: mx.array, kernel_size: int = 3) -> tuple:
     """Build source/target index pairs for sparse convolution.
 
     For each active voxel, find which of its 3³=27 neighbors are also active.
     Returns (src_indices, tgt_indices, kernel_indices) as MLX arrays.
 
-    Uses packed int64 dict lookup (same approach as our mesh extraction).
+    Results are cached by coords content — safe to call repeatedly with the
+    same coords (e.g. across ODE steps or decoder blocks at the same level).
 
     Args:
         coords: [N, 4] as (batch_idx, z, y, x), int
@@ -30,34 +45,48 @@ def build_neighbor_map(coords: mx.array, kernel_size: int = 3) -> tuple:
         k_idx: [E] kernel position indices (0..26 for 3x3x3)
     """
     coords_np = np.array(coords)
+
+    # Cache key: hash of coords content + shape + kernel_size
+    cache_key = hash((coords_np.data.tobytes(), coords_np.shape, kernel_size))
+    cached = _neighbor_map_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = _build_neighbor_map_impl(coords_np, kernel_size)
+    _neighbor_map_cache[cache_key] = result
+    return result
+
+
+def clear_neighbor_map_cache():
+    """Clear the neighbor map cache (call between generations)."""
+    _neighbor_map_cache.clear()
+
+
+def _build_neighbor_map_impl(coords_np: np.ndarray, kernel_size: int) -> tuple:
+    """Build neighbor map — vectorized inner loop."""
     N = len(coords_np)
     K = kernel_size
     half = K // 2
 
     # Build spatial hash: packed int64 → voxel index
-    packed = (
-        coords_np[:, 0].astype(np.int64) << 48 |
-        coords_np[:, 1].astype(np.int64) << 32 |
-        coords_np[:, 2].astype(np.int64) << 16 |
-        coords_np[:, 3].astype(np.int64)
-    )
-    coord_to_idx = {}
+    packed = _pack_coords(coords_np)
+    packed_set = set(packed.tolist())
+    packed_to_idx = np.empty(N, dtype=np.int32)
+    coord_lookup = {}
     for i in range(N):
-        coord_to_idx[packed[i]] = i
+        coord_lookup[packed[i]] = i
 
-    src_list = []
-    tgt_list = []
-    k_list = []
+    src_parts = []
+    tgt_parts = []
+    k_parts = []
 
     for kz in range(K):
         for ky in range(K):
             for kx in range(K):
-                oz = kz - half
-                oy = ky - half
-                ox = kx - half
+                oz, oy, ox = kz - half, ky - half, kx - half
                 k_idx = kz * K * K + ky * K + kx
 
-                # Vectorized: compute all neighbor coords at once
+                # Vectorized neighbor lookup
                 neighbor_packed = (
                     coords_np[:, 0].astype(np.int64) << 48 |
                     (coords_np[:, 1] + oz).astype(np.int64) << 32 |
@@ -65,17 +94,32 @@ def build_neighbor_map(coords: mx.array, kernel_size: int = 3) -> tuple:
                     (coords_np[:, 3] + ox).astype(np.int64)
                 )
 
-                for i in range(N):
-                    j = coord_to_idx.get(neighbor_packed[i])
-                    if j is not None:
-                        src_list.append(j)
-                        tgt_list.append(i)
-                        k_list.append(k_idx)
+                # Vectorized set membership check
+                mask = np.array([p in packed_set for p in neighbor_packed.tolist()], dtype=bool)
+                if not mask.any():
+                    continue
+
+                tgt_indices = np.where(mask)[0].astype(np.int32)
+                src_indices = np.array(
+                    [coord_lookup[neighbor_packed[i]] for i in tgt_indices],
+                    dtype=np.int32,
+                )
+
+                src_parts.append(src_indices)
+                tgt_parts.append(tgt_indices)
+                k_parts.append(np.full(len(tgt_indices), k_idx, dtype=np.int32))
+
+    if not src_parts:
+        return (
+            mx.array(np.zeros(0, dtype=np.int32)),
+            mx.array(np.zeros(0, dtype=np.int32)),
+            mx.array(np.zeros(0, dtype=np.int32)),
+        )
 
     return (
-        mx.array(np.array(src_list, dtype=np.int32)),
-        mx.array(np.array(tgt_list, dtype=np.int32)),
-        mx.array(np.array(k_list, dtype=np.int32)),
+        mx.array(np.concatenate(src_parts)),
+        mx.array(np.concatenate(tgt_parts)),
+        mx.array(np.concatenate(k_parts)),
     )
 
 
