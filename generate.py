@@ -283,6 +283,16 @@ def main():
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
+    parser.add_argument("--edit-target", metavar="IMAGE",
+                        help="VS3D editing: target reference image showing desired appearance. "
+                             "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
+                             "anchored to the source latent, steered toward this target image.")
+    parser.add_argument("--vs3d-cfg-src", type=float, default=1.5,
+                        help="VS3D CFG weight for source branch in RASI (default: 1.5)")
+    parser.add_argument("--vs3d-cfg-tgt", type=float, default=9.0,
+                        help="VS3D CFG weight for target branch in PMG (default: 9.0)")
+    parser.add_argument("--vs3d-steps-src", type=int, default=12,
+                        help="Steps for source Stage 1 run to get x_src anchor (default: 12)")
     args = parser.parse_args()
 
     # === Resume from checkpoints ===
@@ -385,6 +395,8 @@ def main():
     from trellmlx.samplers import flow_euler_sample
     from trellmlx.cleanup import cleanup_model, cleanup
 
+    vs3d_mode = bool(args.edit_target)
+
     if args.quantize:
         from trellmlx.quantize import quantize_model
 
@@ -419,6 +431,24 @@ def main():
         cond = mx.random.normal((1, 10, 1024))
     neg_cond = mx.zeros_like(cond)
 
+    # VS3D: extract target conditioning and relabel source cond
+    if vs3d_mode:
+        if not args.image:
+            raise ValueError("--edit-target requires --image (source image)")
+        print(f"  VS3D mode: extracting target features from {args.edit_target}...", flush=True)
+        if not args.no_rembg:
+            from trellmlx.preprocess import preprocess_image
+            import tempfile
+            tgt_processed = preprocess_image(args.edit_target)
+            tgt_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tgt_processed.save(tgt_tmp.name)
+            tgt_image_path = tgt_tmp.name
+        else:
+            tgt_image_path = args.edit_target
+        cond_src = cond          # source image conditioning
+        cond_tgt = _extract_image_features(tgt_image_path)
+        print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
+
     # === Stage 1: Sparse Structure ===
     print("=== Stage 1: Sparse Structure ===", flush=True)
     from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
@@ -435,8 +465,43 @@ def main():
 
     noise = mx.random.normal((1, 8, 16, 16, 16))
     t0 = time.perf_counter()
-    z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=12, verbose=False)
-    mx.eval(z_s)
+
+    if vs3d_mode:
+        from trellmlx.vs3d import vs3d_flow_sample
+        # Step 1: run source generation to get x_src anchor
+        print(f"  VS3D: source pass ({args.vs3d_steps_src} steps) to get x_src...", flush=True)
+        mx.random.seed(args.seed)
+        src_noise = mx.random.normal((1, 8, 16, 16, 16))
+        x_src = flow_euler_sample(
+            ss_flow, src_noise, cond_src, neg_cond,
+            steps=args.vs3d_steps_src, verbose=False,
+        )
+        mx.eval(x_src)
+        print(f"  VS3D: source pass done ({time.perf_counter()-t0:.1f}s)", flush=True)
+        # Step 2: VS3D editing pass
+        t1 = time.perf_counter()
+        mx.random.seed(args.seed)
+        noise = mx.random.normal((1, 8, 16, 16, 16))
+        z_s = vs3d_flow_sample(
+            model=ss_flow,
+            noise=noise,
+            cond_src=cond_src,
+            cond_tgt=cond_tgt,
+            neg_cond=neg_cond,
+            x_src=x_src,
+            stage="dense",
+            steps=12,
+            cfg_w_src=args.vs3d_cfg_src,
+            cfg_w_tgt=args.vs3d_cfg_tgt,
+            guidance_interval=(0.6, 1.0),
+            verbose=True,
+        )
+        mx.eval(z_s)
+        print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
+    else:
+        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=12, verbose=False)
+        mx.eval(z_s)
+
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
 
     logits = ss_dec(z_s.astype(mx.float32))
@@ -476,7 +541,7 @@ def main():
 
     t0 = time.perf_counter()
     lr_slat = flow_euler_sample(
-        lr_slat_flow, lr_noise, cond, neg_cond,
+        lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
         verbose=False,
         coords=mx.array(lr_coords),
         **SHAPE_SAMPLER,
@@ -542,7 +607,7 @@ def main():
 
     t0 = time.perf_counter()
     hr_slat = flow_euler_sample(
-        hr_slat_flow, hr_noise, cond, neg_cond,
+        hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
         verbose=False,
         coords=mx.array(hr_coords_3d),
         **SHAPE_SAMPLER,
@@ -639,7 +704,7 @@ def main():
     tex_noise = mx.random.normal((num_tokens, 32))
     t0 = time.perf_counter()
     tex_slat = flow_euler_sample(
-        tex_flow, tex_noise, cond, neg_cond,
+        tex_flow, tex_noise, cond_tgt if vs3d_mode else cond, neg_cond,
         verbose=False,
         coords=mx.array(hr_coords_3d),
         concat_cond=shape_cond,
