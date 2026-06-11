@@ -193,6 +193,40 @@ def test_run_interleaved_batch_reports_context_load_failure(tmp_path):
     assert persisted["results"][0]["failure_phase"] == "context_load"
 
 
+def test_run_interleaved_batch_reports_generic_context_load_timing(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult
+
+    def fail_context_load(plan):
+        raise RuntimeError("plain context load failed")
+
+    report_path = tmp_path / "reports" / "generic-load-failure.json"
+    report = run_interleaved_batch(
+        [BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb")],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=report_path),
+        stages=("image_conditioning",),
+        handlers={
+            "image_conditioning": lambda invocation, state, context: GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.0,
+            )
+        },
+        context_factory=fail_context_load,
+        run_id="generic-load-failure",
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "context_load"
+    assert report.load_reports[0]["handle_id"] == ""
+    assert report.load_reports[0]["load_phase"] == "load_error"
+    assert report.load_reports[0]["elapsed_seconds"] >= 0.0
+    assert "plain context load failed" in report.load_reports[0]["error"]
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "context_load"
+    assert persisted["load_reports"][0]["elapsed_seconds"] >= 0.0
+
+
 def test_run_interleaved_batch_preserves_stage_evidence_on_close_failure(tmp_path):
     from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
     from trellmlx.interleaved_generation import (
@@ -265,6 +299,46 @@ def test_run_interleaved_batch_preserves_stage_evidence_on_close_failure(tmp_pat
     assert persisted["close_reports"][0]["close_phase"] == "close_error"
     assert persisted["close_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["results"][0]["stage_results"][0]["output_counts"] == {"tokens": 19}
+
+
+def test_run_interleaved_batch_reports_generic_context_close_timing(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult, StageExecutionContext
+
+    def context_factory(plan):
+        return StageExecutionContext(run_id="generic-close-failure")
+
+    def fail_context_close(context):
+        raise RuntimeError("plain context close failed")
+
+    report_path = tmp_path / "reports" / "generic-close-failure.json"
+    report = run_interleaved_batch(
+        [BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb")],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=report_path),
+        stages=("image_conditioning",),
+        handlers={
+            "image_conditioning": lambda invocation, state, context: GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.0,
+            )
+        },
+        context_factory=context_factory,
+        context_closer=fail_context_close,
+        run_id="generic-close-failure",
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "context_close"
+    assert report.close_reports[0]["handle_id"] == ""
+    assert report.close_reports[0]["close_phase"] == "close_error"
+    assert report.close_reports[0]["elapsed_seconds"] >= 0.0
+    assert "plain context close failed" in report.close_reports[0]["error"]
+    assert report.results[0].failure_phase is None
+    assert report.results[0].stage_results[0]["stage"] == "image_conditioning"
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "context_close"
+    assert persisted["close_reports"][0]["elapsed_seconds"] >= 0.0
 
 
 def test_run_interleaved_batch_writes_setup_failure_report(tmp_path):
