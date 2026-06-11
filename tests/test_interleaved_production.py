@@ -62,7 +62,7 @@ def test_production_route_plan_declares_stage_order_and_model_roles():
         "hr_coordinate_key",
         "conditioning_key",
     )
-    assert routes_by_stage["texture_decode"].required_artifacts == ("texture_latent_key",)
+    assert routes_by_stage["texture_decode"].required_artifacts == ("texture_latent_key", "shape_key")
     assert routes_by_stage["texture_bake"].required_artifacts == ("mesh_key", "texture_key")
     assert routes_by_stage["export"].required_artifacts == ("mesh_key", "texture_bake_key")
     assert production_model_role_ids() == (
@@ -388,6 +388,40 @@ def test_production_stage_handlers_reject_texture_latent_without_shape_inputs(tm
         ),
     ):
         handlers["texture_latent"](invocation, state, context)
+
+
+def test_production_stage_handlers_reject_texture_decode_without_shape_decode(tmp_path):
+    import pytest
+
+    from trellmlx.interleaved_generation import JobState, StageExecutionContext
+    from trellmlx.interleaved_production import build_trellis_production_stage_handlers
+
+    plan = _single_job_plan(tmp_path, stages=("texture_decode",))
+
+    def texture_decode(runtime):
+        raise AssertionError("fixture should not run without shape decode output")
+
+    handlers = build_trellis_production_stage_handlers(
+        fixtures={"texture_decode": texture_decode},
+        stages=plan.stages,
+    )
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0]).record_artifacts(
+        {"texture_latent_key": "texture-latent://seed-101"}
+    )
+    context = StageExecutionContext(
+        run_id="production-route",
+        handles={"texture_decoder": object()},
+        handle_metadata={
+            "texture_decoder": _minimal_model_metadata("texture_decoder", "texture_decode"),
+        },
+    )
+
+    with pytest.raises(
+        KeyError,
+        match="missing required state artifact for texture_decode: shape_key",
+    ):
+        handlers["texture_decode"](invocation, state, context)
 
 
 def test_production_stage_handlers_reject_missing_no_model_stage_artifacts(tmp_path):
