@@ -10,6 +10,17 @@ def _single_job_plan(tmp_path, *, stages=("image_conditioning",)):
     return InterleavedBatchPlan(jobs=(job,), stages=stages)
 
 
+def _minimal_model_metadata(role_id, stage):
+    return {
+        "role": role_id,
+        "stage": stage,
+        "model_family": "fixture",
+        "checkpoint": f"fixture://{role_id}",
+        "requested_loader_route": "fixture",
+        "effective_loader_route": "fixture",
+    }
+
+
 def test_production_route_plan_declares_stage_order_and_model_roles():
     from trellmlx.interleaved_generation import DEFAULT_STAGE_SEQUENCE
     from trellmlx.interleaved_production import (
@@ -32,6 +43,18 @@ def test_production_route_plan_declares_stage_order_and_model_roles():
     assert routes_by_stage["mesh_postprocess"].role_ids == ()
     assert routes_by_stage["texture_bake"].role_ids == ()
     assert routes_by_stage["export"].role_ids == ()
+    assert routes_by_stage["image_conditioning"].required_artifacts == ()
+    assert routes_by_stage["sparse_structure"].required_artifacts == ("conditioning_key",)
+    assert routes_by_stage["lr_shape_latent"].required_artifacts == ("sparse_structure_key",)
+    assert routes_by_stage["hr_coordinates"].required_artifacts == ("lr_shape_latent_key",)
+    assert routes_by_stage["hr_shape_latent"].required_artifacts == ("hr_coordinate_key",)
+    assert routes_by_stage["shape_decode"].required_artifacts == ("hr_shape_latent_key",)
+    assert routes_by_stage["mesh_extract"].required_artifacts == ("shape_key",)
+    assert routes_by_stage["mesh_postprocess"].required_artifacts == ("raw_mesh_key",)
+    assert routes_by_stage["texture_latent"].required_artifacts == ("mesh_key", "conditioning_key")
+    assert routes_by_stage["texture_decode"].required_artifacts == ("texture_latent_key",)
+    assert routes_by_stage["texture_bake"].required_artifacts == ("mesh_key", "texture_key")
+    assert routes_by_stage["export"].required_artifacts == ("mesh_key", "texture_bake_key")
     assert production_model_role_ids() == (
         "dinov3_image_encoder",
         "sparse_structure_flow",
@@ -101,22 +124,36 @@ def test_production_stage_handlers_wire_model_and_no_model_stages(tmp_path):
 
     plan = _single_job_plan(
         tmp_path,
-        stages=("image_conditioning", "hr_coordinates", "mesh_extract"),
+        stages=(
+            "image_conditioning",
+            "sparse_structure",
+            "lr_shape_latent",
+            "hr_coordinates",
+            "hr_shape_latent",
+            "shape_decode",
+            "mesh_extract",
+        ),
     )
     events = []
 
-    def load_dinov3(runtime):
-        return LoadedStageHandle(handle="dinov3-handle", effective_loader_route="fixture")
+    def make_load(role_id):
+        def load(runtime):
+            return LoadedStageHandle(handle=f"{role_id}-handle", effective_loader_route="fixture")
 
-    def load_shape_decoder(runtime):
-        return LoadedStageHandle(handle="shape-decoder-handle", effective_loader_route="fixture")
+        return load
+
+    role_ids = (
+        "dinov3_image_encoder",
+        "sparse_structure_flow",
+        "sparse_structure_decoder",
+        "shape_flow_lr",
+        "shape_flow_hr",
+        "shape_decoder",
+    )
 
     context_factory, context_closer = build_trellis_production_loader_context(
-        factories={
-            "dinov3_image_encoder": load_dinov3,
-            "shape_decoder": load_shape_decoder,
-        },
-        role_ids=("dinov3_image_encoder", "shape_decoder"),
+        factories={role_id: make_load(role_id) for role_id in role_ids},
+        role_ids=role_ids,
         requested_loader_route="fixture",
         run_id="production-route",
     )
@@ -134,6 +171,20 @@ def test_production_stage_handlers_wire_model_and_no_model_stages(tmp_path):
             artifacts={"conditioning_key": "conditioning://seed-101"},
         )
 
+    def sparse_structure(runtime):
+        events.append((runtime.invocation.stage, tuple(runtime.handles)))
+        return StageRunnerOutput(
+            result=GenerationStageResult(runtime.invocation.stage, elapsed_seconds=0.01),
+            artifacts={"sparse_structure_key": "sparse://seed-101"},
+        )
+
+    def lr_shape_latent(runtime):
+        events.append((runtime.invocation.stage, tuple(runtime.handles)))
+        return StageRunnerOutput(
+            result=GenerationStageResult(runtime.invocation.stage, elapsed_seconds=0.01),
+            artifacts={"lr_shape_latent_key": "shape-lr://seed-101"},
+        )
+
     def hr_coordinates(runtime):
         events.append(
             (
@@ -147,6 +198,26 @@ def test_production_stage_handlers_wire_model_and_no_model_stages(tmp_path):
             artifacts={"hr_coordinate_key": "hr://seed-101"},
         )
 
+    def hr_shape_latent(runtime):
+        events.append((runtime.invocation.stage, tuple(runtime.handles)))
+        return StageRunnerOutput(
+            result=GenerationStageResult(runtime.invocation.stage, elapsed_seconds=0.01),
+            artifacts={"hr_shape_latent_key": "shape-hr://seed-101"},
+        )
+
+    def shape_decode(runtime):
+        events.append(
+            (
+                runtime.invocation.stage,
+                tuple(runtime.handles),
+                runtime.handle_metadata["shape_decoder"]["consumer_stages"],
+            )
+        )
+        return StageRunnerOutput(
+            result=GenerationStageResult(runtime.invocation.stage, elapsed_seconds=0.01),
+            artifacts={"shape_key": "shape://seed-101"},
+        )
+
     def mesh_extract(runtime):
         events.append((runtime.invocation.stage, tuple(runtime.handles), tuple(runtime.handle_metadata)))
         return StageRunnerOutput(
@@ -157,7 +228,11 @@ def test_production_stage_handlers_wire_model_and_no_model_stages(tmp_path):
     handlers = build_trellis_production_stage_handlers(
         fixtures={
             "image_conditioning": image_conditioning,
+            "sparse_structure": sparse_structure,
+            "lr_shape_latent": lr_shape_latent,
             "hr_coordinates": hr_coordinates,
+            "hr_shape_latent": hr_shape_latent,
+            "shape_decode": shape_decode,
             "mesh_extract": mesh_extract,
         },
         stages=plan.stages,
@@ -173,11 +248,85 @@ def test_production_stage_handlers_wire_model_and_no_model_stages(tmp_path):
     assert result.ok is True
     assert events == [
         ("image_conditioning", ("dinov3_image_encoder",), "fixture"),
+        ("sparse_structure", ("sparse_structure_flow", "sparse_structure_decoder")),
+        ("lr_shape_latent", ("shape_flow_lr",)),
         ("hr_coordinates", ("shape_decoder",), "hr_coordinates,shape_decode"),
+        ("hr_shape_latent", ("shape_flow_hr",)),
+        ("shape_decode", ("shape_decoder",), "hr_coordinates,shape_decode"),
         ("mesh_extract", (), ()),
     ]
     assert result.job_states["seed-101"].artifacts == {
         "conditioning_key": "conditioning://seed-101",
+        "sparse_structure_key": "sparse://seed-101",
+        "lr_shape_latent_key": "shape-lr://seed-101",
         "hr_coordinate_key": "hr://seed-101",
+        "hr_shape_latent_key": "shape-hr://seed-101",
+        "shape_key": "shape://seed-101",
         "raw_mesh_key": "mesh://seed-101",
     }
+
+
+def test_production_stage_handlers_reject_missing_model_stage_artifacts(tmp_path):
+    import pytest
+
+    from trellmlx.interleaved_generation import GenerationStageInvocation, JobState, StageExecutionContext
+    from trellmlx.interleaved_production import build_trellis_production_stage_handlers
+
+    plan = _single_job_plan(tmp_path, stages=("sparse_structure",))
+
+    def sparse_structure(runtime):
+        raise AssertionError("fixture should not run without conditioning_key")
+
+    handlers = build_trellis_production_stage_handlers(
+        fixtures={"sparse_structure": sparse_structure},
+        stages=plan.stages,
+    )
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+    context = StageExecutionContext(
+        run_id="production-route",
+        handles={
+            "sparse_structure_flow": object(),
+            "sparse_structure_decoder": object(),
+        },
+        handle_metadata={
+            "sparse_structure_flow": _minimal_model_metadata("sparse_structure_flow", "sparse_structure"),
+            "sparse_structure_decoder": _minimal_model_metadata(
+                "sparse_structure_decoder",
+                "sparse_structure",
+            ),
+        },
+    )
+
+    assert isinstance(invocation, GenerationStageInvocation)
+    with pytest.raises(
+        KeyError,
+        match="missing required state artifact for sparse_structure: conditioning_key",
+    ):
+        handlers["sparse_structure"](invocation, state, context)
+
+
+def test_production_stage_handlers_reject_missing_no_model_stage_artifacts(tmp_path):
+    import pytest
+
+    from trellmlx.interleaved_generation import JobState, StageExecutionContext
+    from trellmlx.interleaved_production import build_trellis_production_stage_handlers
+
+    plan = _single_job_plan(tmp_path, stages=("mesh_postprocess",))
+
+    def mesh_postprocess(runtime):
+        raise AssertionError("fixture should not run without raw_mesh_key")
+
+    handlers = build_trellis_production_stage_handlers(
+        fixtures={"mesh_postprocess": mesh_postprocess},
+        stages=plan.stages,
+    )
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0])
+    context = StageExecutionContext(run_id="production-route")
+
+    with pytest.raises(
+        KeyError,
+        match="missing required state artifact for mesh_postprocess: raw_mesh_key",
+    ):
+        handlers["mesh_postprocess"](invocation, state, context)
