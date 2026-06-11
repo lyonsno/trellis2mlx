@@ -93,7 +93,7 @@ TRELLIS_PRODUCTION_STAGE_ROUTES: tuple[TrellisProductionStageRoute, ...] = (
         ("texture_flow",),
         ("hr_shape_latent_key", "hr_coordinate_key", "conditioning_key"),
     ),
-    TrellisProductionStageRoute("texture_decode", ("texture_decoder",), ("texture_latent_key",)),
+    TrellisProductionStageRoute("texture_decode", ("texture_decoder",), ("texture_latent_key", "shape_key")),
     TrellisProductionStageRoute("texture_bake", required_artifacts=("mesh_key", "texture_key")),
     TrellisProductionStageRoute("export", required_artifacts=("mesh_key", "texture_bake_key")),
 )
