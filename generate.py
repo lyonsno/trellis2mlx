@@ -293,6 +293,12 @@ def main():
                         help="VS3D CFG weight for target branch in PMG (default: 9.0)")
     parser.add_argument("--vs3d-steps-src", type=int, default=12,
                         help="Steps for source Stage 1 run to get x_src anchor (default: 12)")
+    parser.add_argument("--vs3d-guidance-low", type=float, default=0.0,
+                        help="VS3D guidance interval lower bound (default: 0.0). "
+                             "VS3D guidance fires when guidance_low <= t <= guidance_high. "
+                             "Lower values = later/detail steps only; higher = structural steps.")
+    parser.add_argument("--vs3d-guidance-high", type=float, default=0.4,
+                        help="VS3D guidance interval upper bound (default: 0.4).")
     args = parser.parse_args()
 
     # === Resume from checkpoints ===
@@ -493,7 +499,7 @@ def main():
             steps=12,
             cfg_w_src=args.vs3d_cfg_src,
             cfg_w_tgt=args.vs3d_cfg_tgt,
-            guidance_interval=(0.6, 1.0),
+            guidance_interval=(args.vs3d_guidance_low, args.vs3d_guidance_high),
             verbose=True,
         )
         mx.eval(z_s)
