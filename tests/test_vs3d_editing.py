@@ -84,6 +84,41 @@ class TestRASI:
         diff = float(mx.mean(mx.abs(phi - neg_cond)).item())
         assert diff > 0, "phi must differ from neg_cond after optimization"
 
+    def test_rasi_update_has_directional_phi_signal(self):
+        """RASI must not apply one uniform scalar delta to every phi element."""
+        from trellmlx.vs3d import rasi_optimize
+
+        z_t = mx.ones((4, 2))
+        cond_src = mx.zeros((1, 2, 4))
+        neg_cond = mx.zeros((1, 2, 4))
+        x_src = mx.zeros((4, 2))
+        weights = mx.array(
+            [[[1.0, -2.0, 0.5, -0.25], [1.5, -0.75, 0.25, -1.25]]],
+            dtype=mx.float32,
+        )
+
+        def element_sensitive_model(x, t, cond, **kw):
+            cond_signal = mx.sum(cond * weights)
+            return x * 0.1 + cond_signal * mx.ones_like(x)
+
+        phi = rasi_optimize(
+            model=element_sensitive_model,
+            z_t=z_t,
+            t_k=0.8,
+            dt=0.05,
+            cond_src=cond_src,
+            neg_cond=neg_cond,
+            x_src=x_src,
+            cfg_w_src=1.5,
+            K=2,
+            lr=1e-3,
+        )
+
+        delta = np.array(phi - neg_cond).reshape(-1)
+        assert np.max(delta) - np.min(delta) > 1e-8, (
+            "RASI phi update must carry element-wise direction, not a uniform scalar delta"
+        )
+
 
 # ---------------------------------------------------------------------------
 # PMG tests
