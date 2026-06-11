@@ -63,12 +63,13 @@ class TestRASI:
         neg_cond = mx.zeros((1, 10, 1024))
         x_src = mx.ones((N, C))  # non-trivial target
 
-        def stub_model(x, t, cond, **kw):
-            # Returns something non-zero so gradient has signal
-            return x * 0.1
+        def cond_sensitive_model(x, t, cond, **kw):
+            # Returns signal that depends on cond so perturbing phi changes the loss
+            cond_signal = mx.mean(cond)
+            return x * 0.1 + cond_signal * 0.01 * mx.ones_like(x)
 
         phi = rasi_optimize(
-            model=stub_model,
+            model=cond_sensitive_model,
             z_t=z_t,
             t_k=0.8,
             dt=0.05,
@@ -168,9 +169,9 @@ class TestPMG:
             L=2,
             w=1.2,
         )
-        # S samples all use the same cond/phi but different noise seeds
-        assert call_count["n"] == 5, (
-            f"Expected 5 model calls (S=5), got {call_count['n']}"
+        # Each of the S samples requires 2 model calls (pos + neg CFG)
+        assert call_count["n"] == 2 * 5, (
+            f"Expected 10 model calls (S=5, 2 per sample for CFG), got {call_count['n']}"
         )
 
 

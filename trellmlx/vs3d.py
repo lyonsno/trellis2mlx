@@ -27,6 +27,7 @@ def rasi_optimize(
     K: int = 3,
     lr: float = 1e-5,
     early_stop: float = 1e-5,
+    **model_kwargs,
 ) -> mx.array:
     """Optimize unconditional embedding φ to anchor source reconstruction.
 
@@ -59,8 +60,8 @@ def rasi_optimize(
 
     for _ in range(K):
         # Forward pass to compute velocity with current phi
-        v_pos = model(z_t, t_tensor, cond_src)
-        v_neg = model(z_t, t_tensor, phi)
+        v_pos = model(z_t, t_tensor, cond_src, **model_kwargs)
+        v_neg = model(z_t, t_tensor, phi, **model_kwargs)
         mx.eval(v_pos, v_neg)
 
         # CFG-combined source velocity
@@ -78,26 +79,26 @@ def rasi_optimize(
         if loss_val < early_stop:
             break
 
-        # Gradient of loss w.r.t. phi via finite differences on the neg branch.
-        # We need d(loss)/d(phi). Since v_neg = model(z_t, t_tensor, phi),
-        # and loss = mean((z_t - dt*(w_src*v_pos + (1-w_src)*v_neg) - x_src)^2),
-        # dL/d(v_neg) = -2*dt*(1-w_src)*diff/N_elements
-        # We use a first-order finite-difference gradient for phi:
-        # phi ← phi - lr * (dL/dv_neg) * (dv_neg/dphi_approx)
-        # Approximation: treat phi gradient as proportional to the residual
-        # in the cond channel, via the identity:
-        #   delta_phi ≈ grad w.r.t. v_neg projected through the model sensitivity.
-        # Since we can't auto-diff through a generic callable model, we use the
-        # sign of the reconstruction residual to update phi:
-        #   phi ← phi - lr * sign(diff_broadcast_to_phi_shape) * |dL/dv_neg|
-
-        # d(loss)/d(v_neg) = 2*(z_hat - x_src)*(-dt*(1-cfg_w_src))/numel
-        scale = -2.0 * dt * (1.0 - cfg_w_src) / float(diff.size)
-        # Sum gradient signal over spatial/token dims to get a per-context-token grad
-        # phi shape: [1, L, C_ctx]; diff shape like z_t: [N, C] or [B, C, ...]
-        # Project: use the loss value as a scalar correction (stable for frozen model)
-        grad_phi = loss_val * scale * mx.ones_like(phi)
-        phi = phi - lr * grad_phi
+        # Gradient of loss w.r.t. phi via finite differences.
+        # dL/d(v_neg) direction is carried by diff; we project it into phi-space
+        # by finite-differencing the neg branch along the residual direction.
+        # Perturbation: phi_plus = phi + eps * sign(residual_projected)
+        # where residual_projected is diff averaged to phi shape.
+        eps = 1e-4
+        # Project diff (z_hat shape) to a per-context-token direction for phi.
+        # Flatten diff to scalar direction per phi element via mean over non-ctx dims.
+        # phi: [1, L, C_ctx]; diff: [N, C] or [B, C, ...] — use mean as proxy.
+        diff_scalar = mx.mean(diff)  # scalar gradient signal direction
+        perturb_dir = mx.sign(diff_scalar * mx.ones_like(phi))
+        phi_plus = phi + eps * perturb_dir
+        v_neg_plus = model(z_t, t_tensor, phi_plus, **model_kwargs)
+        mx.eval(v_neg_plus)
+        v_src_plus = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg_plus
+        z_hat_plus = z_t - dt * v_src_plus
+        loss_plus = float(mx.mean((z_hat_plus - x_src) ** 2).item())
+        # Finite-difference gradient: (L(phi+eps) - L(phi)) / eps
+        fd_grad = (loss_plus - loss_val) / eps
+        phi = phi - lr * fd_grad * perturb_dir
         mx.eval(phi)
 
     return phi
@@ -116,6 +117,7 @@ def pmg_velocity(
     S: int = 5,
     L: int = 2,
     w: float = 1.2,
+    **model_kwargs,
 ) -> mx.array:
     """Compute Partial-Mean Guidance velocity.
 
@@ -144,32 +146,52 @@ def pmg_velocity(
     Returns:
         PMG velocity, same shape as z_t.
     """
-    velocities = []
+    # Collect S CFG velocity estimates.
+    # Each sample uses the same cond_tgt and phi but the stochasticity comes
+    # from the model (e.g. dropout, if any). For a fully deterministic frozen
+    # model these will be identical; PMG still applies — the variance collapses
+    # and (1+w)*mu_S - w*mu_L = mu_S (the partial mean cancels). With any
+    # stochastic element (dropout active, quantization noise, etc.) the
+    # partial mean meaningfully filters low-consistency directions.
+    cfg_velocities = []
     for _ in range(S):
-        v = model(z_t, t_tensor, cond_tgt)
-        mx.eval(v)
-        velocities.append(v)
+        v_pos = model(z_t, t_tensor, cond_tgt, **model_kwargs)
+        v_neg = model(z_t, t_tensor, phi, **model_kwargs)
+        mx.eval(v_pos, v_neg)
+        # CFG combination for this sample
+        v_cfg = (1.0 + w) * v_pos - w * v_neg  # equivalent to w*(v_pos - v_neg) + v_pos
+        cfg_velocities.append(v_cfg)
 
-    # Stack along a new axis: [S, *shape]
-    stacked = mx.stack(velocities, axis=0)
+    # Stack: [S, *shape]
+    stacked = mx.stack(cfg_velocities, axis=0)
 
-    # Full mean over S samples
+    # Full mean over S samples: mu_S shape = [*shape]
     mu_S = mx.mean(stacked, axis=0)
 
-    # Partial mean: take L samples with smallest ||v||² per token/element
-    # Compute per-sample scalar norms for ranking
-    norms = []
-    for v in velocities:
-        n = float(mx.mean(v * v).item())
-        norms.append(n)
+    # Partial mean: for each token/element, pick the L samples whose CFG velocity
+    # magnitude is smallest (most conservative, highest agreement).
+    # Per-token norms: [S, N] where N = prod(spatial dims)
+    flat = [mx.reshape(v, (v.shape[0], -1)) if v.ndim > 2 else v for v in cfg_velocities]
+    # Per-token norm for each sample: shape [S, N_tokens]
+    per_token_norms = mx.stack(
+        [mx.sqrt(mx.sum(f * f, axis=-1)) for f in flat], axis=0
+    )  # [S, N_tokens]
+    mx.eval(per_token_norms)
 
-    # Pick L indices with smallest norm
-    sorted_indices = sorted(range(S), key=lambda i: norms[i])
-    l_indices = sorted_indices[:L]
-    partial_stacked = mx.stack([velocities[i] for i in l_indices], axis=0)
-    mu_L = mx.mean(partial_stacked, axis=0)
+    # For each token, find the L sample indices with smallest norm
+    per_token_norms_np = np.array(per_token_norms)  # [S, N_tokens]
+    N_tokens = per_token_norms_np.shape[1]
+    # Build per-token partial mean by selecting L best samples per token
+    # Result shape matches cfg_velocities[0]
+    v_shape = cfg_velocities[0].shape
+    flat_np = np.stack([np.array(f) for f in flat], axis=0)  # [S, N_tokens, C]
+    partial_mean_flat = np.zeros_like(flat_np[0])  # [N_tokens, C]
+    for tok in range(N_tokens):
+        best_L = np.argsort(per_token_norms_np[:, tok])[:L]
+        partial_mean_flat[tok] = flat_np[best_L, tok, :].mean(axis=0)
+    mu_L = mx.reshape(mx.array(partial_mean_flat), v_shape)
 
-    # PMG combination
+    # PMG combination: (1+w)*mu_S - w*mu_L
     v_pmg = (1.0 + w) * mu_S - w * mu_L
     mx.eval(v_pmg)
     return v_pmg
@@ -279,6 +301,8 @@ def vs3d_flow_sample(
     pmg_L: int = 2,
     pmg_w: float = 1.2,
     verbose: bool = False,
+    concat_cond: mx.array = None,
+    **model_kwargs,
 ) -> mx.array:
     """VS3D-augmented flow Euler sampler.
 
@@ -325,6 +349,8 @@ def vs3d_flow_sample(
             rescale_t=rescale_t,
             sigma_min=sigma_min,
             verbose=verbose,
+            concat_cond=concat_cond,
+            **model_kwargs,
         )
 
     # Dense Stage 1: VS3D RASI + PMG loop
@@ -336,6 +362,9 @@ def vs3d_flow_sample(
     t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
 
     phi = neg_cond  # initial unconditional embedding; will be updated by RASI
+
+    if concat_cond is not None:
+        model_kwargs['concat_cond'] = concat_cond
 
     for step_idx, (t, t_prev) in enumerate(t_pairs):
         if verbose:
@@ -363,6 +392,7 @@ def vs3d_flow_sample(
                 cfg_w_tgt=cfg_w_tgt,
                 K=rasi_K,
                 lr=rasi_lr,
+                **model_kwargs,
             )
 
             # PMG: compute target velocity with partial-mean amplification
@@ -375,11 +405,12 @@ def vs3d_flow_sample(
                 S=pmg_S,
                 L=pmg_L,
                 w=pmg_w,
+                **model_kwargs,
             )
         else:
             # Outside guidance interval: plain CFG
-            pred_pos = model(sample, t_tensor, cond_tgt)
-            pred_neg = model(sample, t_tensor, phi)
+            pred_pos = model(sample, t_tensor, cond_tgt, **model_kwargs)
+            pred_neg = model(sample, t_tensor, phi, **model_kwargs)
             mx.eval(pred_pos, pred_neg)
             pred = cfg_w_tgt * pred_pos + (1.0 - cfg_w_tgt) * pred_neg
 
