@@ -180,6 +180,7 @@ def test_run_interleaved_batch_reports_context_load_failure(tmp_path):
     assert report.context_closed is False
     assert report.load_reports[0]["handle_id"] == "dinov3"
     assert report.load_reports[0]["load_phase"] == "load_error"
+    assert report.load_reports[0]["elapsed_seconds"] >= 0.0
     assert "weights missing" in report.load_reports[0]["error"]
     assert report.close_reports == []
     assert report.results[0].job_id == "seed-101"
@@ -188,6 +189,7 @@ def test_run_interleaved_batch_reports_context_load_failure(tmp_path):
 
     persisted = json.loads(report_path.read_text())
     assert persisted["failure_phase"] == "context_load"
+    assert persisted["load_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["results"][0]["failure_phase"] == "context_load"
 
 
@@ -247,8 +249,10 @@ def test_run_interleaved_batch_preserves_stage_evidence_on_close_failure(tmp_pat
     assert report.context_closed is False
     assert report.load_reports[0]["handle_id"] == "shape_flow"
     assert report.load_reports[0]["load_phase"] == "loaded"
+    assert report.load_reports[0]["elapsed_seconds"] >= 0.0
     assert report.close_reports[0]["handle_id"] == "shape_flow"
     assert report.close_reports[0]["close_phase"] == "close_error"
+    assert report.close_reports[0]["elapsed_seconds"] >= 0.0
     assert "close exploded" in report.close_reports[0]["error"]
     assert report.results[0].failure_phase is None
     assert report.results[0].stage_results[0]["stage"] == "shape"
@@ -257,7 +261,9 @@ def test_run_interleaved_batch_preserves_stage_evidence_on_close_failure(tmp_pat
 
     persisted = json.loads(report_path.read_text())
     assert persisted["failure_phase"] == "context_close"
+    assert persisted["load_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["close_reports"][0]["close_phase"] == "close_error"
+    assert persisted["close_reports"][0]["elapsed_seconds"] >= 0.0
     assert persisted["results"][0]["stage_results"][0]["output_counts"] == {"tokens": 19}
 
 
