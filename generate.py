@@ -816,6 +816,8 @@ def main():
 
     total = time.perf_counter() - t_total
     print(f"\nTotal: {total:.1f}s", flush=True)
+    from trellmlx.modules.sparse_conv import clear_neighbor_map_cache
+    clear_neighbor_map_cache()
     cleanup()
 
 

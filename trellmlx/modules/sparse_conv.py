@@ -71,7 +71,6 @@ def _build_neighbor_map_impl(coords_np: np.ndarray, kernel_size: int) -> tuple:
     # Build spatial hash: packed int64 → voxel index
     packed = _pack_coords(coords_np)
     packed_set = set(packed.tolist())
-    packed_to_idx = np.empty(N, dtype=np.int32)
     coord_lookup = {}
     for i in range(N):
         coord_lookup[packed[i]] = i
