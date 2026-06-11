@@ -69,17 +69,25 @@ def _validate_unique_strings(label: str, values: Sequence[str]) -> tuple[str, ..
 
 TRELLIS_PRODUCTION_STAGE_ROUTES: tuple[TrellisProductionStageRoute, ...] = (
     TrellisProductionStageRoute("image_conditioning", ("dinov3_image_encoder",)),
-    TrellisProductionStageRoute("sparse_structure", ("sparse_structure_flow", "sparse_structure_decoder")),
-    TrellisProductionStageRoute("lr_shape_latent", ("shape_flow_lr",)),
-    TrellisProductionStageRoute("hr_coordinates", ("shape_decoder",)),
-    TrellisProductionStageRoute("hr_shape_latent", ("shape_flow_hr",)),
-    TrellisProductionStageRoute("shape_decode", ("shape_decoder",)),
-    TrellisProductionStageRoute("mesh_extract"),
-    TrellisProductionStageRoute("mesh_postprocess"),
-    TrellisProductionStageRoute("texture_latent", ("texture_flow",)),
-    TrellisProductionStageRoute("texture_decode", ("texture_decoder",)),
-    TrellisProductionStageRoute("texture_bake"),
-    TrellisProductionStageRoute("export"),
+    TrellisProductionStageRoute(
+        "sparse_structure",
+        ("sparse_structure_flow", "sparse_structure_decoder"),
+        ("conditioning_key",),
+    ),
+    TrellisProductionStageRoute("lr_shape_latent", ("shape_flow_lr",), ("sparse_structure_key",)),
+    TrellisProductionStageRoute("hr_coordinates", ("shape_decoder",), ("lr_shape_latent_key",)),
+    TrellisProductionStageRoute("hr_shape_latent", ("shape_flow_hr",), ("hr_coordinate_key",)),
+    TrellisProductionStageRoute("shape_decode", ("shape_decoder",), ("hr_shape_latent_key",)),
+    TrellisProductionStageRoute("mesh_extract", required_artifacts=("shape_key",)),
+    TrellisProductionStageRoute("mesh_postprocess", required_artifacts=("raw_mesh_key",)),
+    TrellisProductionStageRoute(
+        "texture_latent",
+        ("texture_flow",),
+        ("mesh_key", "conditioning_key"),
+    ),
+    TrellisProductionStageRoute("texture_decode", ("texture_decoder",), ("texture_latent_key",)),
+    TrellisProductionStageRoute("texture_bake", required_artifacts=("mesh_key", "texture_key")),
+    TrellisProductionStageRoute("export", required_artifacts=("mesh_key", "texture_bake_key")),
 )
 
 
