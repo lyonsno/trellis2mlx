@@ -293,12 +293,13 @@ def main():
                         help="VS3D CFG weight for target branch in PMG (default: 9.0)")
     parser.add_argument("--vs3d-steps-src", type=int, default=12,
                         help="Steps for source Stage 1 run to get x_src anchor (default: 12)")
-    parser.add_argument("--vs3d-guidance-low", type=float, default=0.0,
-                        help="VS3D guidance interval lower bound (default: 0.0). "
-                             "VS3D guidance fires when guidance_low <= t <= guidance_high. "
-                             "Lower values = later/detail steps only; higher = structural steps.")
-    parser.add_argument("--vs3d-guidance-high", type=float, default=0.4,
-                        help="VS3D guidance interval upper bound (default: 0.4).")
+    parser.add_argument("--vs3d-guidance-low", type=float, default=0.6,
+                        help="VS3D guidance interval lower bound (default: 0.6).")
+    parser.add_argument("--vs3d-guidance-high", type=float, default=1.0,
+                        help="VS3D guidance interval upper bound (default: 1.0).")
+    parser.add_argument("--vs3d-rasi-k", type=int, default=0,
+                        help="RASI inner optimization steps (default: 0 = RASI disabled). "
+                             "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
 
     # === Resume from checkpoints ===
@@ -500,6 +501,7 @@ def main():
             cfg_w_src=args.vs3d_cfg_src,
             cfg_w_tgt=args.vs3d_cfg_tgt,
             guidance_interval=(args.vs3d_guidance_low, args.vs3d_guidance_high),
+            rasi_K=args.vs3d_rasi_k,
             verbose=True,
         )
         mx.eval(z_s)
