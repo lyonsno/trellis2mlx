@@ -45,13 +45,23 @@ def test_production_route_plan_declares_stage_order_and_model_roles():
     assert routes_by_stage["export"].role_ids == ()
     assert routes_by_stage["image_conditioning"].required_artifacts == ()
     assert routes_by_stage["sparse_structure"].required_artifacts == ("conditioning_key",)
-    assert routes_by_stage["lr_shape_latent"].required_artifacts == ("sparse_structure_key",)
+    assert routes_by_stage["lr_shape_latent"].required_artifacts == (
+        "sparse_structure_key",
+        "conditioning_key",
+    )
     assert routes_by_stage["hr_coordinates"].required_artifacts == ("lr_shape_latent_key",)
-    assert routes_by_stage["hr_shape_latent"].required_artifacts == ("hr_coordinate_key",)
+    assert routes_by_stage["hr_shape_latent"].required_artifacts == (
+        "hr_coordinate_key",
+        "conditioning_key",
+    )
     assert routes_by_stage["shape_decode"].required_artifacts == ("hr_shape_latent_key",)
     assert routes_by_stage["mesh_extract"].required_artifacts == ("shape_key",)
     assert routes_by_stage["mesh_postprocess"].required_artifacts == ("raw_mesh_key",)
-    assert routes_by_stage["texture_latent"].required_artifacts == ("mesh_key", "conditioning_key")
+    assert routes_by_stage["texture_latent"].required_artifacts == (
+        "hr_shape_latent_key",
+        "hr_coordinate_key",
+        "conditioning_key",
+    )
     assert routes_by_stage["texture_decode"].required_artifacts == ("texture_latent_key",)
     assert routes_by_stage["texture_bake"].required_artifacts == ("mesh_key", "texture_key")
     assert routes_by_stage["export"].required_artifacts == ("mesh_key", "texture_bake_key")
@@ -304,6 +314,80 @@ def test_production_stage_handlers_reject_missing_model_stage_artifacts(tmp_path
         match="missing required state artifact for sparse_structure: conditioning_key",
     ):
         handlers["sparse_structure"](invocation, state, context)
+
+
+def test_production_stage_handlers_reject_shape_flow_without_conditioning(tmp_path):
+    import pytest
+
+    from trellmlx.interleaved_generation import JobState, StageExecutionContext
+    from trellmlx.interleaved_production import build_trellis_production_stage_handlers
+
+    plan = _single_job_plan(tmp_path, stages=("lr_shape_latent",))
+
+    def lr_shape_latent(runtime):
+        raise AssertionError("fixture should not run without conditioning_key")
+
+    handlers = build_trellis_production_stage_handlers(
+        fixtures={"lr_shape_latent": lr_shape_latent},
+        stages=plan.stages,
+    )
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0]).record_artifacts(
+        {"sparse_structure_key": "sparse://seed-101"}
+    )
+    context = StageExecutionContext(
+        run_id="production-route",
+        handles={"shape_flow_lr": object()},
+        handle_metadata={
+            "shape_flow_lr": _minimal_model_metadata("shape_flow_lr", "lr_shape_latent"),
+        },
+    )
+
+    with pytest.raises(
+        KeyError,
+        match="missing required state artifact for lr_shape_latent: conditioning_key",
+    ):
+        handlers["lr_shape_latent"](invocation, state, context)
+
+
+def test_production_stage_handlers_reject_texture_latent_without_shape_inputs(tmp_path):
+    import pytest
+
+    from trellmlx.interleaved_generation import JobState, StageExecutionContext
+    from trellmlx.interleaved_production import build_trellis_production_stage_handlers
+
+    plan = _single_job_plan(tmp_path, stages=("texture_latent",))
+
+    def texture_latent(runtime):
+        raise AssertionError("fixture should not run without shape latent and coordinates")
+
+    handlers = build_trellis_production_stage_handlers(
+        fixtures={"texture_latent": texture_latent},
+        stages=plan.stages,
+    )
+    invocation = next(plan.iter_invocations())
+    state = JobState.from_job(plan.jobs[0]).record_artifacts(
+        {
+            "mesh_key": "mesh://seed-101/postprocessed",
+            "conditioning_key": "conditioning://seed-101",
+        }
+    )
+    context = StageExecutionContext(
+        run_id="production-route",
+        handles={"texture_flow": object()},
+        handle_metadata={
+            "texture_flow": _minimal_model_metadata("texture_flow", "texture_latent"),
+        },
+    )
+
+    with pytest.raises(
+        KeyError,
+        match=(
+            "missing required state artifact for texture_latent: "
+            "hr_shape_latent_key, hr_coordinate_key"
+        ),
+    ):
+        handlers["texture_latent"](invocation, state, context)
 
 
 def test_production_stage_handlers_reject_missing_no_model_stage_artifacts(tmp_path):
