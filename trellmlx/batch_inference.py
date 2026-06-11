@@ -438,6 +438,7 @@ def run_interleaved_batch(
     if context_factory is None:
         context_factory = lambda runner_plan: StageExecutionContext(run_id=context_run_id, handles={})
 
+    context_load_started_at = time.perf_counter()
     try:
         context = context_factory(plan)
         context_run_id_observed = context.run_id
@@ -470,6 +471,7 @@ def run_interleaved_batch(
             "handle_id": "",
             "kind": "interleaved_runner",
             "load_phase": "load_error",
+            "elapsed_seconds": _elapsed_seconds_since(context_load_started_at),
             "metadata": {},
             "error": error_message,
         }]
@@ -490,6 +492,7 @@ def run_interleaved_batch(
             if "invocation" in locals() and "state" in locals():
                 stage_failure = f"{invocation.stage}:exception"
                 job_states[invocation.job_id] = replace(state, failure_phase=stage_failure)
+        context_close_started_at = time.perf_counter()
         try:
             if context_closer is not None:
                 context_closer(context)
@@ -511,6 +514,7 @@ def run_interleaved_batch(
                     "handle_id": "",
                     "kind": "interleaved_runner",
                     "close_phase": "close_error",
+                    "elapsed_seconds": _elapsed_seconds_since(context_close_started_at),
                     "metadata": {},
                     "error": f"{type(exc).__name__}: {exc}",
                 }]
@@ -605,6 +609,10 @@ def _interleaved_job_result(state) -> InterleavedBatchJobResult:
 
 def _dataclass_to_dict(value) -> dict:
     return asdict(value)
+
+
+def _elapsed_seconds_since(start_time: float) -> float:
+    return max(0.0, time.perf_counter() - start_time)
 
 
 def _write_interleaved_report(
