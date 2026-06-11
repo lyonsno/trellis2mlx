@@ -21,13 +21,15 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 
 SCHEMA = "trellis2mlx.batch_report.v1"
+INTERLEAVED_SCHEMA = "trellis2mlx.interleaved_batch_report.v1"
 METAL_RISK_DIAGNOSTIC = "known_metal_deadlock_risk:max_concurrent>2"
+INTERLEAVED_SERIAL_DIAGNOSTIC = "interleaved_stage_runner_serial:max_concurrent>1"
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,21 @@ class BatchJobResult:
 
 
 @dataclass(frozen=True)
+class InterleavedBatchJobResult:
+    """Portable final state for one in-process stage-major job."""
+
+    job_id: str
+    seed: int
+    images: tuple[str, ...]
+    output_path: str
+    config: dict[str, int | bool | str]
+    next_stage_index: int
+    stage_results: list[dict]
+    artifacts: dict[str, bool | int | float | str]
+    failure_phase: str | None = None
+
+
+@dataclass(frozen=True)
 class BatchRunReport:
     """Durable report for one batch invocation."""
 
@@ -156,6 +173,37 @@ class BatchRunReport:
     @property
     def ok(self) -> bool:
         return all(result.returncode == 0 for result in self.results)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class InterleavedBatchRunReport:
+    """Durable report for one in-process stage-major batch invocation."""
+
+    schema: str
+    execution_mode: str
+    batch_run_id: str
+    started_at: str
+    finished_at: str
+    requested_concurrency: int
+    effective_concurrency: int
+    diagnostics: list[str]
+    repo_root: str
+    identity: BatchRunIdentity
+    stages: tuple[str, ...]
+    context_run_id: str
+    context_closed: bool
+    failure_phase: str | None = None
+    error_message: str | None = None
+    load_reports: list[dict] = field(default_factory=list)
+    close_reports: list[dict] = field(default_factory=list)
+    results: list[InterleavedBatchJobResult] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_phase is None and all(result.failure_phase is None for result in self.results)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -292,6 +340,282 @@ def run_batch(
         report_path.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
 
     return report
+
+
+def run_interleaved_batch(
+    jobs: Sequence[BatchJob],
+    options: BatchRunOptions,
+    *,
+    stages: Sequence[str],
+    handlers,
+    context_factory=None,
+    context_closer=None,
+    run_id: str | None = None,
+) -> InterleavedBatchRunReport:
+    """Run jobs through the in-process stage-major runner and persist evidence.
+
+    This is the first executable boundary for interleaved generation. It reuses
+    model/stage handles across jobs via `StageRunner`; it does not launch
+    subprocesses and it does not imply tensor-level sparse batching.
+    """
+
+    from .interleaved_generation import (
+        GenerationJob,
+        GenerationStageResult,
+        InterleavedBatchPlan,
+        JobState,
+        StageExecutionContext,
+        StageHandleCloseError,
+        StageHandleLoadError,
+        StageRunnerOutput,
+    )
+
+    repo_root = Path(options.repo_root)
+    batch_run_id = str(uuid.uuid4())
+    context_run_id = run_id or getattr(context_factory, "run_id", batch_run_id)
+    stages_tuple = tuple(stages)
+    started_at = _utc_now_iso()
+    diagnostics: list[str] = []
+    if options.max_concurrent > 1:
+        diagnostics.append(INTERLEAVED_SERIAL_DIAGNOSTIC)
+
+    identity = collect_run_identity(
+        repo_root=repo_root,
+        command_line=options.command_line,
+        python_executable=options.python_executable,
+    )
+
+    failure_phase = None
+    error_message = None
+    context_run_id_observed = context_run_id
+    context_closed = False
+    load_reports: list[dict] = []
+    close_reports: list[dict] = []
+    job_states: dict[str, JobState]
+    generation_jobs: tuple[GenerationJob, ...] = ()
+
+    def setup_failure_report(error: Exception) -> InterleavedBatchRunReport:
+        failure_phase = "setup"
+        return InterleavedBatchRunReport(
+            schema=INTERLEAVED_SCHEMA,
+            execution_mode="interleaved",
+            batch_run_id=batch_run_id,
+            started_at=started_at,
+            finished_at=_utc_now_iso(),
+            requested_concurrency=options.max_concurrent,
+            effective_concurrency=0,
+            diagnostics=diagnostics,
+            repo_root=str(repo_root),
+            identity=identity,
+            stages=stages_tuple,
+            context_run_id=context_run_id_observed,
+            context_closed=False,
+            failure_phase=failure_phase,
+            error_message=f"{type(error).__name__}: {error}",
+            results=_setup_failure_results(jobs, generation_jobs, failure_phase),
+        )
+
+    if options.max_concurrent < 1:
+        report = setup_failure_report(ValueError("max_concurrent must be >= 1"))
+        _write_interleaved_report(report, options.report_path)
+        return report
+    if not jobs:
+        report = setup_failure_report(ValueError("run_interleaved_batch requires at least one job"))
+        _write_interleaved_report(report, options.report_path)
+        return report
+
+    try:
+        generation_jobs = tuple(GenerationJob.from_batch_job(job) for job in jobs)
+        plan = InterleavedBatchPlan(generation_jobs, stages=stages_tuple)
+        missing = [stage for stage in plan.stages if stage not in handlers]
+        if missing:
+            raise ValueError(f"missing stage handlers: {', '.join(missing)}")
+    except Exception as exc:
+        report = setup_failure_report(exc)
+        _write_interleaved_report(report, options.report_path)
+        return report
+
+    if context_factory is None:
+        context_factory = lambda runner_plan: StageExecutionContext(run_id=context_run_id, handles={})
+
+    try:
+        context = context_factory(plan)
+        context_run_id_observed = context.run_id
+        load_reports = [_dataclass_to_dict(report) for report in context.load_reports]
+    except StageHandleLoadError as exc:
+        failure_phase = "context_load"
+        error_message = str(exc)
+        context_run_id_observed = getattr(context_factory, "run_id", context_run_id_observed)
+        load_reports = [_dataclass_to_dict(report) for report in getattr(context_factory, "last_load_reports", ())]
+        close_reports = [_dataclass_to_dict(report) for report in getattr(context_factory, "last_close_reports", ())]
+        if not load_reports:
+            load_reports = [_dataclass_to_dict(exc.report)]
+        job_states = {
+            job.job_id: JobState.from_job(job)
+            for job in generation_jobs
+        }
+        job_states = {
+            job_id: replace(state, failure_phase=failure_phase)
+            for job_id, state in job_states.items()
+        }
+    except Exception as exc:
+        failure_phase = "context_load"
+        error_message = f"{type(exc).__name__}: {exc}"
+        context_run_id_observed = getattr(context_factory, "run_id", context_run_id_observed)
+        job_states = {
+            job.job_id: replace(JobState.from_job(job), failure_phase=failure_phase)
+            for job in generation_jobs
+        }
+        load_reports = [{
+            "handle_id": "",
+            "kind": "interleaved_runner",
+            "load_phase": "load_error",
+            "metadata": {},
+            "error": error_message,
+        }]
+    else:
+        job_states = {job.job_id: JobState.from_job(job) for job in generation_jobs}
+        try:
+            for invocation in plan.iter_invocations():
+                state = job_states[invocation.job_id]
+                if not state.ok:
+                    continue
+                output = handlers[invocation.stage](invocation, state, context)
+                if isinstance(output, GenerationStageResult):
+                    output = StageRunnerOutput(result=output)
+                job_states[invocation.job_id] = state.record_stage(invocation, output)
+        except Exception as exc:
+            failure_phase = "stage_execution"
+            error_message = f"{type(exc).__name__}: {exc}"
+            if "invocation" in locals() and "state" in locals():
+                stage_failure = f"{invocation.stage}:exception"
+                job_states[invocation.job_id] = replace(state, failure_phase=stage_failure)
+        try:
+            if context_closer is not None:
+                context_closer(context)
+            context_closed = True
+        except StageHandleCloseError as exc:
+            if failure_phase is None:
+                failure_phase = "context_close"
+                error_message = str(exc)
+            close_reports = [_dataclass_to_dict(report) for report in context.close_reports]
+            if not close_reports:
+                close_reports = [_dataclass_to_dict(exc.report)]
+        except Exception as exc:
+            if failure_phase is None:
+                failure_phase = "context_close"
+                error_message = f"{type(exc).__name__}: {exc}"
+            close_reports = [_dataclass_to_dict(report) for report in getattr(context, "close_reports", ())]
+            if not close_reports:
+                close_reports = [{
+                    "handle_id": "",
+                    "kind": "interleaved_runner",
+                    "close_phase": "close_error",
+                    "metadata": {},
+                    "error": f"{type(exc).__name__}: {exc}",
+                }]
+        else:
+            close_reports = [_dataclass_to_dict(report) for report in context.close_reports]
+
+    report = InterleavedBatchRunReport(
+        schema=INTERLEAVED_SCHEMA,
+        execution_mode="interleaved",
+        batch_run_id=batch_run_id,
+        started_at=started_at,
+        finished_at=_utc_now_iso(),
+        requested_concurrency=options.max_concurrent,
+        effective_concurrency=1,
+        diagnostics=diagnostics,
+        repo_root=str(repo_root),
+        identity=identity,
+        stages=stages_tuple,
+        context_run_id=context_run_id_observed,
+        context_closed=context_closed,
+        failure_phase=failure_phase,
+        error_message=error_message,
+        load_reports=load_reports,
+        close_reports=close_reports,
+        results=[
+            _interleaved_job_result(job_states[job.job_id])
+            for job in generation_jobs
+        ],
+    )
+
+    _write_interleaved_report(report, options.report_path)
+    return report
+
+
+def _setup_failure_results(
+    jobs: Sequence[BatchJob],
+    generation_jobs: Sequence,
+    failure_phase: str,
+) -> list[InterleavedBatchJobResult]:
+    if generation_jobs:
+        return [
+            InterleavedBatchJobResult(
+                job_id=job.job_id,
+                seed=job.seed,
+                images=job.images,
+                output_path=str(job.output_path),
+                config=job.config_dict(),
+                next_stage_index=0,
+                stage_results=[],
+                artifacts={},
+                failure_phase=failure_phase,
+            )
+            for job in generation_jobs
+        ]
+    return [
+        InterleavedBatchJobResult(
+            job_id=f"seed-{job.seed}",
+            seed=job.seed,
+            images=tuple(job.images),
+            output_path=str(job.output_path),
+            config={
+                "resolution": job.resolution,
+                "max_tokens": job.max_tokens,
+                "target_faces": job.target_faces,
+                "compile": job.compile,
+                "quantize": job.quantize,
+                "no_rembg": job.no_rembg,
+                "no_cleanup": job.no_cleanup,
+            },
+            next_stage_index=0,
+            stage_results=[],
+            artifacts={},
+            failure_phase=failure_phase,
+        )
+        for job in jobs
+    ]
+
+
+def _interleaved_job_result(state) -> InterleavedBatchJobResult:
+    return InterleavedBatchJobResult(
+        job_id=state.job_id,
+        seed=state.seed,
+        images=state.images,
+        output_path=state.output_path,
+        config=dict(state.config),
+        next_stage_index=state.next_stage_index,
+        stage_results=[_dataclass_to_dict(result) for result in state.stage_results],
+        artifacts=dict(state.artifacts),
+        failure_phase=state.failure_phase,
+    )
+
+
+def _dataclass_to_dict(value) -> dict:
+    return asdict(value)
+
+
+def _write_interleaved_report(
+    report: InterleavedBatchRunReport,
+    report_path: Path | str | None,
+) -> None:
+    if report_path is None:
+        return
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
 
 
 def _utc_now_iso() -> str:
@@ -552,6 +876,8 @@ def _parse_ints(raw: str) -> tuple[int, ...]:
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a trellis2mlx generation batch.")
+    parser.add_argument("--mode", choices=("subprocess", "interleaved"), default="subprocess",
+                        help="Execution backend. 'interleaved' is programmatic-only until production stage handlers are wired.")
     parser.add_argument("--image", nargs="+", required=True,
                         help="Input image(s). Multiple values are treated as multi-view conditioning for every job.")
     parser.add_argument("--seeds", type=_parse_ints, default=(42, 123),
@@ -575,6 +901,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--no-cleanup", action="store_true")
     raw_argv = list(argv) if argv is not None else None
     args = parser.parse_args(raw_argv)
+    if args.mode == "interleaved":
+        parser.error(
+            "interleaved CLI mode requires production stage handlers; "
+            "use run_interleaved_batch(...) with explicit handlers for fixture-safe in-process runs"
+        )
     command_line = (
         tuple(sys.argv)
         if raw_argv is None

@@ -50,6 +50,423 @@ def test_build_batch_jobs_requires_output_count_to_match_seed_count(tmp_path):
         build_batch_jobs(request)
 
 
+def test_run_interleaved_batch_records_stage_major_report(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult, StageRunnerOutput
+
+    calls = []
+
+    def image_conditioning(invocation, state, context):
+        calls.append((invocation.stage, invocation.job_id, invocation.stage_seed, state.next_stage_index))
+        return StageRunnerOutput(
+            result=GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.01,
+                output_counts={"images": len(invocation.images)},
+            ),
+            artifacts={"conditioning_key": f"conditioning://{invocation.job_id}"},
+        )
+
+    def sparse_structure(invocation, state, context):
+        calls.append((invocation.stage, invocation.job_id, invocation.stage_seed, state.next_stage_index))
+        assert state.artifacts["conditioning_key"] == f"conditioning://{invocation.job_id}"
+        return StageRunnerOutput(
+            result=GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.02,
+                output_counts={"sparse_tokens": 17},
+            ),
+            artifacts={"sparse_tokens": 17},
+        )
+
+    report_path = tmp_path / "reports" / "interleaved.json"
+    jobs = [
+        BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb", resolution=512),
+        BatchJob(images=("subject.png",), seed=202, output_path=tmp_path / "seed-202.glb", resolution=512),
+    ]
+
+    report = run_interleaved_batch(
+        jobs,
+        BatchRunOptions(
+            max_concurrent=1,
+            repo_root=tmp_path,
+            report_path=report_path,
+            command_line=("python", "-m", "trellmlx.batch_inference", "--mode", "interleaved"),
+        ),
+        stages=("image_conditioning", "sparse_structure"),
+        handlers={
+            "image_conditioning": image_conditioning,
+            "sparse_structure": sparse_structure,
+        },
+        run_id="fixture-interleaved",
+    )
+
+    assert report.schema == "trellis2mlx.interleaved_batch_report.v1"
+    assert report.requested_concurrency == 1
+    assert report.effective_concurrency == 1
+    assert report.diagnostics == []
+    assert report.context_run_id == "fixture-interleaved"
+    assert report.context_closed is True
+    assert report.ok is True
+    assert [(call[0], call[1], call[3]) for call in calls] == [
+        ("image_conditioning", "seed-101", 0),
+        ("image_conditioning", "seed-202", 0),
+        ("sparse_structure", "seed-101", 1),
+        ("sparse_structure", "seed-202", 1),
+    ]
+    assert calls[0][2] != calls[1][2]
+    assert [result.job_id for result in report.results] == ["seed-101", "seed-202"]
+    assert report.results[0].stage_results[0]["stage"] == "image_conditioning"
+    assert report.results[0].stage_results[1]["output_counts"] == {"sparse_tokens": 17}
+    assert report.results[0].artifacts == {
+        "conditioning_key": "conditioning://seed-101",
+        "sparse_tokens": 17,
+    }
+    assert report.results[0].failure_phase is None
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["schema"] == "trellis2mlx.interleaved_batch_report.v1"
+    assert persisted["execution_mode"] == "interleaved"
+    assert persisted["stages"] == ["image_conditioning", "sparse_structure"]
+    assert persisted["results"][1]["job_id"] == "seed-202"
+    assert persisted["results"][1]["config"]["resolution"] == 512
+    assert persisted["identity"]["command_line"] == [
+        "python",
+        "-m",
+        "trellmlx.batch_inference",
+        "--mode",
+        "interleaved",
+    ]
+
+
+def test_run_interleaved_batch_reports_context_load_failure(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult, StageHandleSpec, build_stage_context_factory
+
+    calls = []
+
+    def fail_load(runtime):
+        raise RuntimeError("weights missing")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [
+            StageHandleSpec(
+                "dinov3",
+                "fixture",
+                fail_load,
+                metadata={"role": "dinov3"},
+            )
+        ],
+        run_id="load-failure",
+    )
+    report_path = tmp_path / "reports" / "interleaved-load-failure.json"
+
+    report = run_interleaved_batch(
+        [BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb")],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=report_path),
+        stages=("image_conditioning",),
+        handlers={
+            "image_conditioning": lambda invocation, state, context: calls.append(invocation.job_id)
+            or GenerationStageResult(invocation.stage, elapsed_seconds=0.0)
+        },
+        context_factory=context_factory,
+        context_closer=context_closer,
+        run_id="load-failure",
+    )
+
+    assert calls == []
+    assert report.ok is False
+    assert report.failure_phase == "context_load"
+    assert report.context_closed is False
+    assert report.load_reports[0]["handle_id"] == "dinov3"
+    assert report.load_reports[0]["load_phase"] == "load_error"
+    assert "weights missing" in report.load_reports[0]["error"]
+    assert report.close_reports == []
+    assert report.results[0].job_id == "seed-101"
+    assert report.results[0].failure_phase == "context_load"
+    assert report.results[0].stage_results == []
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "context_load"
+    assert persisted["results"][0]["failure_phase"] == "context_load"
+
+
+def test_run_interleaved_batch_preserves_stage_evidence_on_close_failure(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import (
+        GenerationStageResult,
+        StageHandleSpec,
+        StageRunnerOutput,
+        build_stage_context_factory,
+    )
+
+    handle = object()
+
+    def close_handle(runtime, loaded_handle):
+        assert loaded_handle is handle
+        raise RuntimeError("close exploded")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [
+            StageHandleSpec(
+                "shape_flow",
+                "fixture",
+                lambda runtime: handle,
+                close=close_handle,
+                metadata={"role": "shape_flow"},
+            )
+        ],
+        run_id="close-failure-context",
+    )
+
+    def stage(invocation, state, context):
+        assert context.require_handle("shape_flow") is handle
+        return StageRunnerOutput(
+            result=GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.01,
+                output_counts={"tokens": 19},
+            ),
+            artifacts={"shape_key": f"shape://{invocation.job_id}"},
+        )
+
+    report_path = tmp_path / "reports" / "close-failure.json"
+
+    report = run_interleaved_batch(
+        [BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb")],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=report_path),
+        stages=("shape",),
+        handlers={"shape": stage},
+        context_factory=context_factory,
+        context_closer=context_closer,
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "context_close"
+    assert report.context_run_id == "close-failure-context"
+    assert report.context_closed is False
+    assert report.load_reports[0]["handle_id"] == "shape_flow"
+    assert report.load_reports[0]["load_phase"] == "loaded"
+    assert report.close_reports[0]["handle_id"] == "shape_flow"
+    assert report.close_reports[0]["close_phase"] == "close_error"
+    assert "close exploded" in report.close_reports[0]["error"]
+    assert report.results[0].failure_phase is None
+    assert report.results[0].stage_results[0]["stage"] == "shape"
+    assert report.results[0].stage_results[0]["output_counts"] == {"tokens": 19}
+    assert report.results[0].artifacts == {"shape_key": "shape://seed-101"}
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "context_close"
+    assert persisted["close_reports"][0]["close_phase"] == "close_error"
+    assert persisted["results"][0]["stage_results"][0]["output_counts"] == {"tokens": 19}
+
+
+def test_run_interleaved_batch_writes_setup_failure_report(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult
+
+    report_path = tmp_path / "reports" / "setup-failure.json"
+
+    report = run_interleaved_batch(
+        [
+            BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101-a.glb"),
+            BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101-b.glb"),
+        ],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=report_path),
+        stages=("shape",),
+        handlers={"shape": lambda invocation, state, context: GenerationStageResult(invocation.stage, 0.0)},
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "setup"
+    assert "duplicate job_id: seed-101" in report.error_message
+    assert [result.job_id for result in report.results] == ["seed-101", "seed-101"]
+    assert [result.failure_phase for result in report.results] == ["setup", "setup"]
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "setup"
+    assert "duplicate job_id: seed-101" in persisted["error_message"]
+    assert len(persisted["results"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("jobs", "stages", "handlers", "expected_error", "expected_result_count"),
+    [
+        (
+            [
+                ("subject.png", 101, "seed-101-a.glb"),
+                ("subject.png", 101, "seed-101-b.glb"),
+            ],
+            ("shape",),
+            {"shape": lambda invocation, state, context: None},
+            "duplicate job_id: seed-101",
+            2,
+        ),
+        (
+            [("subject.png", 101, "seed-101.glb")],
+            ("shape", "texture"),
+            {"shape": lambda invocation, state, context: None},
+            "missing stage handlers: texture",
+            1,
+        ),
+    ],
+)
+def test_run_interleaved_batch_setup_failures_report_zero_effective_concurrency(
+    tmp_path,
+    jobs,
+    stages,
+    handlers,
+    expected_error,
+    expected_result_count,
+):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+
+    report_path = tmp_path / "reports" / "setup-zero-concurrency.json"
+    batch_jobs = [
+        BatchJob(images=(image,), seed=seed, output_path=tmp_path / output_name)
+        for image, seed, output_name in jobs
+    ]
+
+    report = run_interleaved_batch(
+        batch_jobs,
+        BatchRunOptions(max_concurrent=4, repo_root=tmp_path, report_path=report_path),
+        stages=stages,
+        handlers=handlers,
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "setup"
+    assert expected_error in report.error_message
+    assert report.requested_concurrency == 4
+    assert report.effective_concurrency == 0
+    assert len(report.results) == expected_result_count
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "setup"
+    assert expected_error in persisted["error_message"]
+    assert persisted["requested_concurrency"] == 4
+    assert persisted["effective_concurrency"] == 0
+    assert len(persisted["results"]) == expected_result_count
+
+
+@pytest.mark.parametrize(
+    ("job_count", "options", "expected_error", "expected_concurrency", "expected_result_count"),
+    [
+        (
+            1,
+            {"max_concurrent": 0},
+            "max_concurrent must be >= 1",
+            0,
+            1,
+        ),
+        (
+            0,
+            {"max_concurrent": 1},
+            "run_interleaved_batch requires at least one job",
+            0,
+            0,
+        ),
+    ],
+)
+def test_run_interleaved_batch_writes_early_setup_failure_report(
+    tmp_path,
+    job_count,
+    options,
+    expected_error,
+    expected_concurrency,
+    expected_result_count,
+):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+
+    report_path = tmp_path / "reports" / "early-setup-failure.json"
+    jobs = [
+        BatchJob(
+            images=("subject.png",),
+            seed=101 + index,
+            output_path=tmp_path / f"seed-{101 + index}.glb",
+        )
+        for index in range(job_count)
+    ]
+
+    report = run_interleaved_batch(
+        jobs,
+        BatchRunOptions(
+            max_concurrent=options["max_concurrent"],
+            repo_root=tmp_path,
+            report_path=report_path,
+        ),
+        stages=("shape",),
+        handlers={"shape": lambda invocation, state, context: None},
+    )
+
+    assert report.ok is False
+    assert report.failure_phase == "setup"
+    assert expected_error in report.error_message
+    assert report.effective_concurrency == expected_concurrency
+    assert len(report.results) == expected_result_count
+    assert [result.failure_phase for result in report.results] == ["setup"] * expected_result_count
+
+    persisted = json.loads(report_path.read_text())
+    assert persisted["failure_phase"] == "setup"
+    assert expected_error in persisted["error_message"]
+    assert persisted["effective_concurrency"] == expected_concurrency
+    assert len(persisted["results"]) == expected_result_count
+
+
+def test_run_interleaved_batch_load_failure_uses_factory_run_id(tmp_path):
+    from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_interleaved_batch
+    from trellmlx.interleaved_generation import GenerationStageResult, StageHandleSpec, build_stage_context_factory
+
+    def fail_load(runtime):
+        assert runtime.run_id == "actual-context-run"
+        raise RuntimeError("weights missing")
+
+    context_factory, context_closer = build_stage_context_factory(
+        [StageHandleSpec("dinov3", "fixture", fail_load)],
+        run_id="actual-context-run",
+    )
+
+    report = run_interleaved_batch(
+        [BatchJob(images=("subject.png",), seed=101, output_path=tmp_path / "seed-101.glb")],
+        BatchRunOptions(max_concurrent=1, repo_root=tmp_path, report_path=tmp_path / "report.json"),
+        stages=("image_conditioning",),
+        handlers={
+            "image_conditioning": lambda invocation, state, context: GenerationStageResult(
+                invocation.stage,
+                elapsed_seconds=0.0,
+            )
+        },
+        context_factory=context_factory,
+        context_closer=context_closer,
+    )
+
+    assert report.failure_phase == "context_load"
+    assert report.context_run_id == "actual-context-run"
+    assert json.loads((tmp_path / "report.json").read_text())["context_run_id"] == "actual-context-run"
+
+
+def test_batch_cli_rejects_interleaved_mode_until_handlers_are_wired(tmp_path, capsys):
+    from trellmlx.batch_inference import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "--mode",
+            "interleaved",
+            "--image",
+            "subject.png",
+            "--seeds",
+            "101",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--report",
+            str(tmp_path / "report.json"),
+        ])
+
+    assert exc_info.value.code == 2
+    assert "interleaved CLI mode requires production stage handlers" in capsys.readouterr().err
+    assert not (tmp_path / "report.json").exists()
+
+
 def test_run_batch_records_effective_concurrency_and_mohel_indicator(tmp_path, monkeypatch):
     from trellmlx.batch_inference import BatchJob, BatchRunOptions, run_batch
 
