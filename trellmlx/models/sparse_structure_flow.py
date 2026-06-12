@@ -349,7 +349,7 @@ class SparseStructureFlowModel(nn.Module):
 
         # Run through DiT blocks (B=1 only for inference)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
-        if self._compiled:
+        if self._compiled and cross_kv_cache is None:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):

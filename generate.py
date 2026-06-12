@@ -506,7 +506,7 @@ def main():
             neg_cond=neg_cond,
             x_src=x_src,
             stage="dense",
-            steps=12,
+            steps=n_steps,
             cfg_w_src=args.vs3d_cfg_src,
             cfg_w_tgt=args.vs3d_cfg_tgt,
             guidance_interval=(args.vs3d_guidance_low, args.vs3d_guidance_high),
@@ -580,6 +580,7 @@ def main():
         quant_coords = lr_coords_4d
         num_tokens = N_lr
         hr_resolution = lr_resolution * 16  # 512 mesh grid for 32 LR coords
+        hr_coords_3d = quant_coords[:, 1:4]
         print(f"  No-cascade: using LR SLat directly ({num_tokens:,} tokens, "
               f"grid_size={hr_resolution})", flush=True)
     else:

@@ -134,7 +134,8 @@ class SLatFlowModel(nn.Module):
             rope_phases = self._coords_to_rope_phases(coords)
 
         # Run through blocks (B=1 assumed)
-        if self._compiled:
+        # KV cache is incompatible with compiled path (fixed function signature)
+        if self._compiled and cross_kv_cache is None:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
