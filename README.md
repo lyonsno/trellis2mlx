@@ -49,8 +49,14 @@ This is not a claim to be the first TRELLIS.2 project on Mac. [trellis-mac](http
 Full pipeline: image → textured GLB with PBR materials.
 
 ```bash
-# Full pipeline (two-pass, high quality):
+# Full pipeline (two-pass cascade, high quality):
 PYTHONPATH=. python generate.py --image photo.png --output mesh.glb
+
+# Fast preview (single-pass, 6 steps — ~4-6x faster):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 6 --no-cascade
+
+# Higher quality mesh topology (Metal-accelerated QEM simplification):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --qem-simplify
 
 # Stage 1+2 only (fast preview, colored voxels):
 PYTHONPATH=. python smoke_stage2.py --image photo.png
@@ -190,11 +196,15 @@ failure phase if the run stops early.
 - [x] INT4 quantization utility
 - [x] 12-step numerical parity verified against PyTorch
 - [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
+- [x] Metal-accelerated QEM mesh simplification (`--qem-simplify`) — topology-preserving edge collapse with normal-flip guard, adapted from [mtlmesh](https://github.com/pedronaugusto/trellis2-apple)
 - [x] Texture SLat flow + decoder → per-voxel PBR attributes
 - [x] UV unwrap (xatlas, `max_iterations=0`) + GPU texture baking (MLX Metal rasterizer + trilinear sample + cv2 inpaint)
 - [x] xatlas chart optimization bypass: 56x faster UV unwrap, <1% quality difference ([docs/uv-unwrap.md](docs/uv-unwrap.md))
 - [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
+- [x] `--no-cascade` + `--steps` flags for speed/quality control (6-step no-cascade for fast previews)
+- [x] Cross-attention KV cache (eliminates redundant KV projection across ODE steps)
+- [x] Sparse conv neighbor map caching (313x cache hit speedup)
 - [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
 - [ ] Public demo polish and seed/input curation
 - [x] M2 Pro INT4/INT8 flow-stage speed benchmark (no speedup measured)
