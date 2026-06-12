@@ -213,6 +213,35 @@ def build_stage_loader_context(
     """
 
     requested_handle_ids = tuple(request.handle_id for request in requests)
+    if not requests:
+        def open_context(plan: InterleavedBatchPlan) -> StageExecutionContext:
+            open_context.last_load_reports = ()
+            open_context.last_close_reports = ()
+            return StageExecutionContext(run_id=run_id, handles={})
+
+        def close_context(context: StageExecutionContext) -> None:
+            close_context.last_close_reports = tuple(context.close_reports)
+            open_context.last_close_reports = close_context.last_close_reports
+            _write_report(
+                StageHandleLoaderReport(
+                    schema=SCHEMA,
+                    run_id=run_id,
+                    ok=True,
+                    requested_handle_ids=requested_handle_ids,
+                    loaded_handle_ids=context.handle_ids,
+                    load_reports=context.load_reports,
+                    close_reports=context.close_reports,
+                ),
+                report_path,
+            )
+
+        open_context.run_id = run_id
+        open_context.last_load_reports = ()
+        open_context.last_close_reports = ()
+        close_context.run_id = run_id
+        close_context.last_close_reports = ()
+        return open_context, close_context
+
     try:
         specs = [request.to_stage_handle_spec() for request in requests]
         context_factory, context_closer = build_stage_context_factory(specs, run_id=run_id)
@@ -235,6 +264,8 @@ def build_stage_loader_context(
         try:
             return context_factory(plan)
         except StageHandleLoadError as exc:
+            open_context.last_load_reports = context_factory.last_load_reports
+            open_context.last_close_reports = context_factory.last_close_reports
             _write_report(
                 StageHandleLoaderReport(
                     schema=SCHEMA,
@@ -255,6 +286,8 @@ def build_stage_loader_context(
         try:
             context_closer(context)
         except StageHandleCloseError as exc:
+            close_context.last_close_reports = context.close_reports
+            open_context.last_close_reports = context.close_reports
             _write_report(
                 StageHandleLoaderReport(
                     schema=SCHEMA,
@@ -270,6 +303,8 @@ def build_stage_loader_context(
                 report_path,
             )
             raise
+        close_context.last_close_reports = context.close_reports
+        open_context.last_close_reports = context.close_reports
         _write_report(
             StageHandleLoaderReport(
                 schema=SCHEMA,
@@ -283,6 +318,11 @@ def build_stage_loader_context(
             report_path,
         )
 
+    open_context.run_id = run_id
+    open_context.last_load_reports = ()
+    open_context.last_close_reports = ()
+    close_context.run_id = run_id
+    close_context.last_close_reports = ()
     return open_context, close_context
 
 
