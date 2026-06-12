@@ -573,6 +573,8 @@ def main():
     del lr_slat_flow
     gc.collect()
 
+    from trellmlx.models.shape_slat_decoder import SLatDecoder
+
     if args.no_cascade:
         # No-cascade mode: use LR SLat directly for decoding.
         # Skips upsample + HR SLat pass. Much faster but lower quality.
@@ -586,7 +588,6 @@ def main():
     else:
         # === Stage 2b: Upsample to get HR coordinates ===
         print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
-        from trellmlx.models.shape_slat_decoder import SLatDecoder
 
         decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
         load_weights(decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
