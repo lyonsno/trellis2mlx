@@ -64,13 +64,33 @@ class MultiHeadAttention(nn.Module):
         self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
 
-    def __call__(self, x: mx.array, context: mx.array = None, rope_phases: mx.array = None) -> mx.array:
+    def project_kv(self, context: mx.array) -> tuple[mx.array, mx.array]:
+        """Project context to K, V and apply RMSNorm. Cache-friendly."""
+        kv = self.to_kv(context)
+        if kv.ndim == 3:
+            S = kv.shape[1]
+            kv = kv.reshape(-1, S, 2, self.num_heads, self.head_dim)
+            k = kv[:, :, 0]
+            v = kv[:, :, 1]
+        else:
+            B_T = kv.shape[0]
+            kv = kv.reshape(B_T, 2, self.num_heads, self.head_dim)
+            k, v = kv[:, 0], kv[:, 1]
+        k = self.k_rms_norm(k)
+        return k, v
+
+    def __call__(self, x: mx.array, context: mx.array = None, rope_phases: mx.array = None,
+                 cached_kv: tuple = None) -> mx.array:
         B_T = x.shape[0]
 
-        if context is None:
+        if context is None and cached_kv is None:
             qkv = self.to_qkv(x)
             qkv = qkv.reshape(B_T, 3, self.num_heads, self.head_dim)
             q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        elif cached_kv is not None:
+            # Use precomputed K, V from cache
+            q = self.to_q(x).reshape(B_T, self.num_heads, self.head_dim)
+            k, v = cached_kv
         else:
             q = self.to_q(x).reshape(B_T, self.num_heads, self.head_dim)
             kv = self.to_kv(context)
@@ -85,7 +105,8 @@ class MultiHeadAttention(nn.Module):
 
         # QK RMSNorm (per-head)
         q = self.q_rms_norm(q)
-        k = self.k_rms_norm(k)
+        if cached_kv is None:
+            k = self.k_rms_norm(k)
 
         # Apply RoPE to self-attention Q and K (not cross-attention)
         if rope_phases is not None and context is None:
@@ -167,6 +188,7 @@ class ModulatedBlock(nn.Module):
         mod: mx.array,       # [6*C] shared modulation from timestep
         context: mx.array,   # [B, L, C_ctx]
         rope_phases: mx.array = None,  # [T, D//2, 2]
+        cross_kv_cache: tuple = None,  # precomputed (K, V) for cross-attention
     ) -> mx.array:
         # Add per-block learned bias
         mod = mod + self.modulation
@@ -189,7 +211,10 @@ class ModulatedBlock(nn.Module):
 
         # Cross-attention (uses its own affine LayerNorm, no adaLN, no RoPE)
         h = self.norm2(x)
-        h = self.cross_attn(h, context)
+        if cross_kv_cache is not None:
+            h = self.cross_attn(h, cached_kv=cross_kv_cache)
+        else:
+            h = self.cross_attn(h, context)
         x = x + h
 
         # FFN with adaLN-Zero
@@ -287,43 +312,50 @@ class SparseStructureFlowModel(nn.Module):
         self._compiled = False
         self._run_blocks = self._run_blocks_impl
 
+    def build_cross_kv_cache(self, cond: mx.array) -> list[tuple]:
+        """Precompute cross-attention K, V for all blocks."""
+        cache = []
+        for block in self.blocks:
+            k, v = block.cross_attn.project_kv(cond)
+            cache.append((k, v))
+        mx.eval(*[t for pair in cache for t in pair])
+        return cache
+
     def __call__(
         self,
         x: mx.array,           # [B, in_channels, R, R, R]
         t: mx.array,           # [B] timestep (scalar per batch)
         cond: mx.array,        # [B, L, context_channels] image conditioning
+        cross_kv_cache: list = None,
     ) -> mx.array:
         B = x.shape[0]
-        R = x.shape[2]  # derive resolution from actual input, not stored config
+        R = x.shape[2]
 
         # Timestep embedding → shared modulation
-        t_emb = self.t_embedder(t)                    # [B, C]
-        mod = self.adaLN_modulation(t_emb)            # [B, 6*C]
+        t_emb = self.t_embedder(t)
+        mod = self.adaLN_modulation(t_emb)
 
         # Flatten 3D grid to token sequence
-        # [B, in_C, R, R, R] → [B, R³, in_C] → [B*R³, in_C]
-        x = x.reshape(B, self.in_channels, -1)        # [B, in_C, R³]
-        x = x.transpose(0, 2, 1)                      # [B, R³, in_C]
-        x = x.reshape(B * R * R * R, self.in_channels) # [B*R³, in_C]
+        x = x.reshape(B, self.in_channels, -1)
+        x = x.transpose(0, 2, 1)
+        x = x.reshape(B * R * R * R, self.in_channels)
 
         # Project to model channels
-        x = self.input_layer(x)                        # [B*R³, C]
+        x = self.input_layer(x)
 
         # Compute 3D RoPE phases from actual input resolution
         head_dim = self.model_channels // self.num_heads
         rope_phases = build_rope_phases(R, head_dim)
 
-        # Run through DiT blocks
-        # NOTE: B=1 only for inference (TRELLIS.2 generates one mesh at a time)
+        # Run through DiT blocks (B=1 only for inference)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
         if self._compiled:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
-                x = block(x, mod[0], cond, rope_phases=rope_phases)
-                # Evaluate every 6 blocks to avoid starving the CPU/display
-                # with a single massive GPU burst. Slight throughput cost but
-                # prevents beachballing on shared unified memory.
+                block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+                x = block(x, mod[0], cond, rope_phases=rope_phases,
+                          cross_kv_cache=block_kv)
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 
