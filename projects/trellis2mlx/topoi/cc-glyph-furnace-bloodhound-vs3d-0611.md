@@ -53,21 +53,29 @@ Three VS3D modules + sampler:
 - **Result:** Blobby/molten. Different failure mode.
 - **Finding:** Without RASI, voxel count still 1083. Blobbing = PMG at cfg=9.0 over-guidance even without RASI. RASI is not the voxel-eater; the loss is in PMG.
 
-### Runs 6–9 — cfg sweep at 3.0 and 5.0 (pending / queue paused for aposkepsis)
-- Hypothesis: cfg_w_tgt=9.0 too high for Stage 1; structural loss and blobbing both point at over-guidance.
+### Runs 6–9 — CANCELLED (cfg sweep superseded by architecture rewrite)
+- All prior failures traced to missing FlowEdit dual-branch coupling (aposkepsis finding). Parameter sweeps of broken architecture were abandoned.
 
-## Current hypotheses
+### Run 6 (job `dc4b26e6cd31`) — FlowEdit rewrite, paper hyperparams
+- **Implementation:** Full rewrite of `vs3d.py`. z_edit starts at x_src. S eps samples form (z_t_src, z_t_tgt) pairs. PMG on v_delta = v_tgt_cfg - v_src_cfg. RASI uses c_src on both branches. CFG unified to additive form. Euler step: z_edit += dt * u.
+- **Params:** omega_src=1.5, omega_tgt=9.0, S=5, L=2, w=1.2, K=3, guidance_interval=(0.6, 1.0), steps=25
+- **Status:** Queued. 15 tests pass.
 
-1. **PMG over-guidance at cfg_w=9.0**: `v_pos + 9.0*(v_pos - v_neg)` = 10×v_pos − 9×v_neg is destroying voxel structure at high-t steps. The paper likely uses lower guidance for Stage 1.
-2. **RASI finite-difference is degenerate**: Scalar proxy (`mean(diff) * ones_like(phi)`) moves all of φ uniformly. Not per-token. With K=3 and lr=1e-5 it barely moves — but the direction may be adversarial. True RASI requires autograd through the model's cross-attention.
-3. **Voxel loss is in the sparse decoder threshold**: After Stage 1, `logits > 0` thresholds the sparse structure. If guided velocities shift the logit distribution down slightly at body tokens, 13% fall below threshold. This is independent of guidance strength.
+## Architecture state (post-rewrite)
 
-## Open questions for aposkepsis
+Correct FlowEdit dual-branch coupling is now implemented. Root causes from aposkepsis all addressed:
+- ✓ z_edit starts at x_src, not noise
+- ✓ PMG on v_delta (not single-branch CFG velocities)
+- ✓ S samples use different eps draws (real variance for partial mean)
+- ✓ CFG unified: `(1+omega)*v_pos - omega*v_neg` everywhere
+- ✓ RASI uses c_src on both branches
+- ✓ Euler step: `z_edit += dt * u`
 
-1. Is the PMG formula correct? `v_pmg = (1+w)*mu_S - w*mu_L` after per-sample CFG — is w the right lever or does the paper use something different?
-2. Is the voxel loss in Stage 1 output (logit threshold) or in the guidance itself?
-3. Should RASI be disabled entirely until we have autograd-capable φ optimization?
-4. Is `cfg_w_tgt=9.0` the paper's Stage 1 value, or is that for SLat stages?
+## Open questions (post-rewrite)
+
+1. Voxel count: will dual-branch coupling prevent the 1250→1083 structural loss? Hypothesis: yes, because z_edit starts at x_src and v_delta is a differential — body token logits should stay near source.
+2. RASI FD gradient still limited in dimensionality — but the objective is now correct. If voxel loss is resolved, assess whether K=3 RASI adds value or can stay K=0.
+3. Steps=25 vs prior steps=12 — paper uses T=25 total steps; check whether worktree default still says 12 and if generate.py needs updating.
 
 ## SLAT scout pointer
 
