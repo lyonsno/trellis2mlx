@@ -4,20 +4,24 @@ Training-free, mask-free, inversion-free local 3D editing.
 Three modules: RASI + PMG + TAR.
 
 Reference: arXiv:2605.07385 (VS3D, May 2026)
+
+Architecture: FlowEdit dual-branch coupling.
+  - z_edit starts at x_src (not noise)
+  - At each step, S noise samples eps_s form COUPLED (z_t_src, z_t_tgt) pairs:
+      z_t_src = (1-t)*x_src + t*eps_s
+      z_t_tgt = z_edit + (z_t_src - x_src)
+  - PMG operates on velocity DIFFERENCES v_delta = v_tgt_cfg - v_src_cfg
+  - Step: z_edit += dt * u  (NOTE: += not -=)
+  - RASI optimizes phi with c_src on BOTH branches via coupled velocity difference
 """
 
 import numpy as np
 import mlx.core as mx
 
 
-def _rasi_probe_direction(phi: mx.array, step_idx: int) -> mx.array:
-    """Return a deterministic +/- probe direction with phi's shape."""
-    total = int(np.prod(phi.shape))
-    direction = np.ones(total, dtype=np.float32)
-    direction[3::4] = -1.0
-    if total:
-        direction = np.roll(direction, step_idx % total)
-    return mx.array(direction.reshape(phi.shape), dtype=phi.dtype)
+def _cfg(v_pos: mx.array, v_neg: mx.array, omega: float) -> mx.array:
+    """Additive CFG: (1+omega)*v_pos - omega*v_neg."""
+    return (1.0 + omega) * v_pos - omega * v_neg
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +30,8 @@ def _rasi_probe_direction(phi: mx.array, step_idx: int) -> mx.array:
 
 def rasi_optimize(
     model,
-    z_t: mx.array,
+    z_t_src: mx.array,
+    z_t_tgt: mx.array,
     t_k: float,
     dt: float,
     cond_src: mx.array,
@@ -41,23 +46,26 @@ def rasi_optimize(
 ) -> mx.array:
     """Optimize unconditional embedding φ to anchor source reconstruction.
 
-    RASI turns the unconditional embedding into a per-step source anchor.
-    For each timestep t_k, we want a φ such that one Euler step of the
-    source-conditioned ODE (with φ as negative cond) reconstructs x_src.
+    Per VS3D Section 3.1: RASI objective is to find φ such that one Euler step
+    of the COUPLED dual-branch system (using c_src on BOTH branches) reconstructs x_src.
 
-    Objective: minimize ||x_src - (z_t - dt * v_src(z_t, t_k, cond_src, φ))||²
-    where v_src uses CFG with cond_src and φ.
+    Objective:
+        minimize ||z_edit + dt*(v_tgt_cfg(z_t_tgt, c_src, φ; ω_tgt)
+                               - v_src_cfg(z_t_src, c_src, φ; ω_src)) - x_src||²
+
+    Both branches see c_src (not c_tgt) — this is what drives source reconstruction.
 
     Args:
         model: Frozen flow model callable (x, t_tensor, cond, **kw) → velocity.
-        z_t: Current latent at timestep t_k, shape [N, C] or [B, C, ...].
+        z_t_src: Coupled source latent (1-t)*x_src + t*eps at this step.
+        z_t_tgt: Coupled target latent z_edit + (z_t_src - x_src).
         t_k: Current timestep (float in [0, 1]).
-        dt: Step size (t_k - t_{k+1}).
+        dt: Step size (positive, same sign as z_edit += dt*u).
         cond_src: Source conditioning, shape [1, L, C_ctx].
-        neg_cond: Initial unconditional embedding, shape [1, L, C_ctx].
-        x_src: Source latent to reconstruct, same shape as z_t.
-        cfg_w_src: CFG weight for source branch.
-        cfg_w_tgt: CFG weight for target branch (not used in RASI but kept for interface parity).
+        neg_cond: Initial unconditional embedding φ, shape [1, L, C_ctx].
+        x_src: Source latent to reconstruct, same shape as z_t_src.
+        cfg_w_src: CFG omega for source branch.
+        cfg_w_tgt: CFG omega for target branch.
         K: Number of inner optimization steps.
         lr: Learning rate for φ update.
         early_stop: Stop early if loss drops below this value.
@@ -65,22 +73,29 @@ def rasi_optimize(
     Returns:
         Optimized φ with same shape as neg_cond.
     """
+    # z_edit is z_t_tgt when the coupled offset is zero at this noise sample;
+    # we need z_edit to compute the step prediction. Recover it:
+    #   z_t_tgt = z_edit + (z_t_src - x_src)  =>  z_edit = z_t_tgt - (z_t_src - x_src)
+    z_edit = z_t_tgt - (z_t_src - x_src)
+
     t_tensor = mx.array([1000.0 * t_k], dtype=mx.float32)
     phi = mx.array(neg_cond)  # copy
 
     for step_idx in range(K):
-        # Forward pass to compute velocity with current phi
-        v_pos = model(z_t, t_tensor, cond_src, **model_kwargs)
-        v_neg = model(z_t, t_tensor, phi, **model_kwargs)
-        mx.eval(v_pos, v_neg)
+        # Forward pass: c_src on BOTH branches for both model calls
+        v_tgt_pos = model(z_t_tgt, t_tensor, cond_src, **model_kwargs)
+        v_tgt_neg = model(z_t_tgt, t_tensor, phi, **model_kwargs)
+        v_src_pos = model(z_t_src, t_tensor, cond_src, **model_kwargs)
+        v_src_neg = model(z_t_src, t_tensor, phi, **model_kwargs)
+        mx.eval(v_tgt_pos, v_tgt_neg, v_src_pos, v_src_neg)
 
-        # CFG-combined source velocity
-        v_src = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg
+        v_tgt_cfg = _cfg(v_tgt_pos, v_tgt_neg, cfg_w_tgt)
+        v_src_cfg = _cfg(v_src_pos, v_src_neg, cfg_w_src)
+        v_delta = v_tgt_cfg - v_src_cfg
 
-        # One Euler step prediction: z_hat = z_t - dt * v_src
-        z_hat = z_t - dt * v_src
+        # One Euler step prediction: z_hat = z_edit + dt * v_delta
+        z_hat = z_edit + dt * v_delta
 
-        # Loss: squared reconstruction error
         diff = z_hat - x_src
         loss = mx.mean(diff * diff)
         mx.eval(loss)
@@ -89,21 +104,32 @@ def rasi_optimize(
         if loss_val < early_stop:
             break
 
-        # Estimate a directional phi gradient with a central finite difference.
+        # Central finite-difference gradient w.r.t. phi
         eps = 1e-2
-        perturb_dir = _rasi_probe_direction(phi, step_idx)
+        # Deterministic probe direction: alternating +1/-1 rolled by step
+        total = int(np.prod(phi.shape))
+        direction_np = np.ones(total, dtype=np.float32)
+        direction_np[3::4] = -1.0
+        if total:
+            direction_np = np.roll(direction_np, step_idx % total)
+        perturb_dir = mx.array(direction_np.reshape(phi.shape), dtype=phi.dtype)
+
         phi_plus = phi + eps * perturb_dir
         phi_minus = phi - eps * perturb_dir
-        v_neg_plus = model(z_t, t_tensor, phi_plus, **model_kwargs)
-        v_neg_minus = model(z_t, t_tensor, phi_minus, **model_kwargs)
-        mx.eval(v_neg_plus, v_neg_minus)
-        v_src_plus = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg_plus
-        v_src_minus = cfg_w_src * v_pos + (1.0 - cfg_w_src) * v_neg_minus
-        z_hat_plus = z_t - dt * v_src_plus
-        z_hat_minus = z_t - dt * v_src_minus
-        loss_plus = float(mx.mean((z_hat_plus - x_src) ** 2).item())
-        loss_minus = float(mx.mean((z_hat_minus - x_src) ** 2).item())
-        fd_grad = (loss_plus - loss_minus) / (2.0 * eps)
+
+        # Perturb both branches
+        v_tgt_neg_p = model(z_t_tgt, t_tensor, phi_plus, **model_kwargs)
+        v_src_neg_p = model(z_t_src, t_tensor, phi_plus, **model_kwargs)
+        v_tgt_neg_m = model(z_t_tgt, t_tensor, phi_minus, **model_kwargs)
+        v_src_neg_m = model(z_t_src, t_tensor, phi_minus, **model_kwargs)
+        mx.eval(v_tgt_neg_p, v_src_neg_p, v_tgt_neg_m, v_src_neg_m)
+
+        v_delta_p = _cfg(v_tgt_pos, v_tgt_neg_p, cfg_w_tgt) - _cfg(v_src_pos, v_src_neg_p, cfg_w_src)
+        v_delta_m = _cfg(v_tgt_pos, v_tgt_neg_m, cfg_w_tgt) - _cfg(v_src_pos, v_src_neg_m, cfg_w_src)
+
+        loss_p = float(mx.mean((z_edit + dt * v_delta_p - x_src) ** 2).item())
+        loss_m = float(mx.mean((z_edit + dt * v_delta_m - x_src) ** 2).item())
+        fd_grad = (loss_p - loss_m) / (2.0 * eps)
         phi = phi - lr * fd_grad * perturb_dir
         mx.eval(phi)
 
@@ -115,83 +141,47 @@ def rasi_optimize(
 # ---------------------------------------------------------------------------
 
 def pmg_velocity(
-    model,
-    z_t: mx.array,
-    t_tensor: mx.array,
-    cond_tgt: mx.array,
-    phi: mx.array,
-    cfg_w: float = 9.0,
-    S: int = 5,
-    L: int = 2,
+    v_delta_samples: list,
     w: float = 1.2,
-    **model_kwargs,
+    L: int = 2,
 ) -> mx.array:
-    """Compute Partial-Mean Guidance velocity.
+    """Compute Partial-Mean Guidance velocity from a list of v_delta samples.
 
-    PMG reduces the variance of the CFG velocity estimate by averaging S
-    samples and using a partial mean of L < S samples to amplify the edit
-    signal that is consistently present.
+    PMG operates on velocity DIFFERENCES (v_delta = v_tgt_cfg - v_src_cfg),
+    not on raw CFG velocities. The S samples come from S different noise draws
+    eps_s forming S different (z_t_src, z_t_tgt) pairs — this is what provides
+    the variance that makes PMG meaningful.
 
     Formula:
-        v_PMG = (1 + w) * mu_S(z_t, t, cond_tgt, phi)
-                - w * mu_L(z_t, t, cond_tgt, phi)
+        u = (1 + w) * mu_S - w * mu_L
 
-    where mu_S is the mean of S model calls and mu_L is the mean of the L
-    calls with smallest velocity magnitude (partial mean). This amplifies
-    directions that are robustly present.
+    where mu_S is the mean of all S v_delta samples and mu_L is the mean of
+    the L samples with smallest per-token norm (most conservative, highest agreement).
 
     Args:
-        model: Frozen flow model.
-        z_t: Current latent, shape [N, C] or [B, C, ...].
-        t_tensor: Timestep tensor, shape [1].
-        cond_tgt: Target conditioning, shape [1, L_ctx, C_ctx].
-        phi: Optimized unconditional embedding from RASI, shape [1, L_ctx, C_ctx].
-        cfg_w: CFG guidance strength applied within each sample.
-        S: Number of Monte Carlo samples.
+        v_delta_samples: List of S v_delta arrays, each shape [N, C] or [B, C, ...].
+        w: PMG amplification weight.
         L: Number of partial-mean samples (L < S).
-        w: PMG amplification weight (applied after per-sample CFG).
 
     Returns:
-        PMG velocity, same shape as z_t.
+        PMG guidance velocity, same shape as v_delta_samples[0].
     """
-    # Collect S CFG velocity estimates.
-    # Each sample uses the same cond_tgt and phi but the stochasticity comes
-    # from the model (e.g. dropout, if any). For a fully deterministic frozen
-    # model these will be identical; PMG still applies — the variance collapses
-    # and (1+w)*mu_S - w*mu_L = mu_S (the partial mean cancels). With any
-    # stochastic element (dropout active, quantization noise, etc.) the
-    # partial mean meaningfully filters low-consistency directions.
-    cfg_velocities = []
-    for _ in range(S):
-        v_pos = model(z_t, t_tensor, cond_tgt, **model_kwargs)
-        v_neg = model(z_t, t_tensor, phi, **model_kwargs)
-        mx.eval(v_pos, v_neg)
-        # CFG combination at full guidance strength for this sample
-        v_cfg = v_pos + cfg_w * (v_pos - v_neg)
-        cfg_velocities.append(v_cfg)
+    S = len(v_delta_samples)
+    assert L < S, f"L={L} must be < S={S}"
 
-    # Stack: [S, *shape]
-    stacked = mx.stack(cfg_velocities, axis=0)
-
-    # Full mean over S samples: mu_S shape = [*shape]
+    stacked = mx.stack(v_delta_samples, axis=0)  # [S, *shape]
     mu_S = mx.mean(stacked, axis=0)
 
-    # Partial mean: for each token/element, pick the L samples whose CFG velocity
-    # magnitude is smallest (most conservative, highest agreement).
-    # Per-token norms: [S, N] where N = prod(spatial dims)
-    flat = [mx.reshape(v, (v.shape[0], -1)) if v.ndim > 2 else v for v in cfg_velocities]
-    # Per-token norm for each sample: shape [S, N_tokens]
+    # Per-token norms for partial mean selection
+    v_shape = v_delta_samples[0].shape
+    flat = [mx.reshape(v, (v.shape[0], -1)) if v.ndim > 2 else v for v in v_delta_samples]
     per_token_norms = mx.stack(
         [mx.sqrt(mx.sum(f * f, axis=-1)) for f in flat], axis=0
     )  # [S, N_tokens]
     mx.eval(per_token_norms)
 
-    # For each token, find the L sample indices with smallest norm
     per_token_norms_np = np.array(per_token_norms)  # [S, N_tokens]
     N_tokens = per_token_norms_np.shape[1]
-    # Build per-token partial mean by selecting L best samples per token
-    # Result shape matches cfg_velocities[0]
-    v_shape = cfg_velocities[0].shape
     flat_np = np.stack([np.array(f) for f in flat], axis=0)  # [S, N_tokens, C]
     partial_mean_flat = np.zeros_like(flat_np[0])  # [N_tokens, C]
     for tok in range(N_tokens):
@@ -199,7 +189,6 @@ def pmg_velocity(
         partial_mean_flat[tok] = flat_np[best_L, tok, :].mean(axis=0)
     mu_L = mx.reshape(mx.array(partial_mean_flat), v_shape)
 
-    # PMG combination: (1+w)*mu_S - w*mu_L
     v_pmg = (1.0 + w) * mu_S - w * mu_L
     mx.eval(v_pmg)
     return v_pmg
@@ -227,7 +216,6 @@ def tar_inject(
     - Compute twin agreement score between z_src_enc and z_src_twin
     - Only inject if agreement score > theta (cosine similarity threshold)
     - Inject residual: z_tgt[i] ← alpha*z_src_enc[j] + beta*z_tgt[i]
-      where the blend is clipped/weighted by tau
 
     Tokens not in the intersection are unchanged.
 
@@ -251,7 +239,6 @@ def tar_inject(
     z_src_enc_np = np.array(z_src_enc)
     z_src_twin_np = np.array(z_src_twin)
 
-    # Build intersection: tokens present in both tgt_coords and src_coords
     tgt_set = {int(c): i for i, c in enumerate(tgt_coords)}
     src_set = {int(c): i for i, c in enumerate(src_coords)}
     common_coords = set(tgt_set.keys()) & set(src_set.keys())
@@ -260,7 +247,6 @@ def tar_inject(
         tgt_idx = tgt_set[coord]
         src_idx = src_set[coord]
 
-        # Twin agreement: cosine similarity between z_src_enc[src_idx] and z_src_twin[tgt_idx]
         enc_vec = z_src_enc_np[src_idx]
         twin_vec = z_src_twin_np[tgt_idx]
 
@@ -268,24 +254,20 @@ def tar_inject(
         twin_norm = np.linalg.norm(twin_vec)
 
         if enc_norm < 1e-10 or twin_norm < 1e-10:
-            # Zero vectors — no meaningful agreement
             agreement = 0.0
         else:
             cosine = np.dot(enc_vec, twin_vec) / (enc_norm * twin_norm)
-            # Map cosine [-1, 1] → [0, 1] and apply temperature sharpening
             cosine_01 = (cosine + 1.0) * 0.5
-            agreement = float(np.exp(tau * (cosine_01 - 1.0)))  # peaks at 1.0
+            agreement = float(np.exp(tau * (cosine_01 - 1.0)))
 
-        # Gate injection on agreement threshold
         if agreement >= theta:
-            # Residual injection: weighted blend
             z_out_np[tgt_idx] = alpha * enc_vec + beta * z_out_np[tgt_idx]
 
     return mx.array(z_out_np)
 
 
 # ---------------------------------------------------------------------------
-# vs3d_flow_sample — Full VS3D sampler wrapping flow_euler_sample
+# vs3d_flow_sample — Full VS3D sampler (FlowEdit dual-branch coupling)
 # ---------------------------------------------------------------------------
 
 def vs3d_flow_sample(
@@ -296,7 +278,7 @@ def vs3d_flow_sample(
     neg_cond: mx.array,
     x_src: mx.array,
     stage: str = "dense",
-    steps: int = 12,
+    steps: int = 25,
     cfg_w_src: float = 1.5,
     cfg_w_tgt: float = 9.0,
     guidance_interval: tuple = (0.6, 1.0),
@@ -312,41 +294,52 @@ def vs3d_flow_sample(
     concat_cond: mx.array = None,
     **model_kwargs,
 ) -> mx.array:
-    """VS3D-augmented flow Euler sampler.
+    """VS3D-augmented flow sampler using FlowEdit dual-branch coupling.
 
-    For Stage 1 (dense): at each guidance-interval step, run RASI to obtain
-    an optimized φ, then use PMG to compute the velocity.
+    z_edit starts at x_src (identity initialization).
 
-    For sparse stages (2a, 2c, 4): run the base flow sampler — TAR is applied
-    once by the caller at the sparse latent level (not per-step here).
+    At each guided step:
+      For s in range(pmg_S):
+        eps_s ~ N(0, I)   [different per sample = variance for PMG]
+        z_t_src = (1-t)*x_src + t*eps_s
+        z_t_tgt = z_edit + (z_t_src - x_src)   [coupled offset]
+        v_tgt_cfg = CFG(z_t_tgt, c_tgt, phi; omega_tgt)
+        v_src_cfg = CFG(z_t_src, c_src, phi; omega_src)
+        v_delta_s = v_tgt_cfg - v_src_cfg
+      u = PMG({v_delta_s}, w, L)
+      z_edit = z_edit + dt * u   [NOTE: +=, not -=]
+
+    RASI is applied before PMG using a representative noise sample.
+
+    For Stage != "dense": falls back to base flow sampler (TAR applied externally).
 
     Args:
         model: Frozen flow model.
-        noise: Initial noise, shape [B, C, ...] (dense) or [N, C] (sparse).
+        noise: Ignored for dense stage (x_src is the start). Used for sparse fallback.
         cond_src: Source conditioning [1, L, C_ctx].
         cond_tgt: Target conditioning [1, L, C_ctx].
         neg_cond: Negative conditioning (initial φ) [1, L, C_ctx].
-        x_src: Source latent for reconstruction anchor, same shape as noise.
+        x_src: Source latent — starting point and reconstruction anchor.
         stage: "dense" for Stage 1, "sparse" for Stages 2a/2c/4.
-        steps: Number of Euler integration steps.
-        cfg_w_src: CFG weight for source branch in RASI.
-        cfg_w_tgt: CFG guidance strength for target in PMG.
+        steps: Number of Euler integration steps (paper: T=25).
+        cfg_w_src: CFG omega for source branch (paper: omega_src=1.5).
+        cfg_w_tgt: CFG omega for target branch (paper: omega_tgt=9.0).
         guidance_interval: (low, high) fraction of timesteps to apply VS3D guidance.
-        guidance_rescale: CFG rescale factor (passed through to base sampler if not VS3D).
+        guidance_rescale: CFG rescale factor (for sparse fallback).
         rescale_t: Timestep rescaling factor.
         sigma_min: Minimum noise floor.
-        rasi_K: RASI inner optimization steps.
+        rasi_K: RASI inner optimization steps (paper: K=3).
         rasi_lr: RASI learning rate.
-        pmg_S: PMG Monte Carlo samples.
-        pmg_L: PMG partial-mean count.
-        pmg_w: PMG amplification weight.
+        pmg_S: PMG Monte Carlo noise samples (paper: S=5).
+        pmg_L: PMG partial-mean count (paper: L=2).
+        pmg_w: PMG amplification weight (paper: w=1.2).
         verbose: Print step progress.
+        concat_cond: Optional concatenated conditioning (passed to model).
 
     Returns:
-        Denoised sample, same shape as noise.
+        Edited latent z_edit, same shape as x_src.
     """
     if stage != "dense":
-        # Sparse stages: delegate to base sampler (TAR applied externally per-stage)
         from trellmlx.samplers import flow_euler_sample
         return flow_euler_sample(
             model, noise, cond_tgt, neg_cond,
@@ -361,25 +354,26 @@ def vs3d_flow_sample(
             **model_kwargs,
         )
 
-    # Dense Stage 1: VS3D RASI + PMG loop
-    sample = noise
+    # Dense Stage 1: FlowEdit dual-branch coupling
+    z_edit = mx.array(x_src)  # start at source, NOT noise
 
-    # Build timestep schedule (same as flow_euler_sample)
+    # Build timestep schedule (same convention as flow_euler_sample)
     t_seq = np.linspace(1, 0, steps + 1)
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
-    t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
+    t_pairs = [(float(t_seq[i]), float(t_seq[i + 1])) for i in range(steps)]
 
-    phi = neg_cond  # initial unconditional embedding; will be updated by RASI
+    phi = mx.array(neg_cond)  # mutable phi, updated by RASI each step
 
+    kw = dict(model_kwargs)
     if concat_cond is not None:
-        model_kwargs['concat_cond'] = concat_cond
+        kw['concat_cond'] = concat_cond
 
     for step_idx, (t, t_prev) in enumerate(t_pairs):
         if verbose:
             print(f"  VS3D Step {step_idx + 1}/{steps} (t={t:.4f}→{t_prev:.4f})", end="", flush=True)
 
         t_tensor = mx.array([1000.0 * t], dtype=mx.float32)
-        dt = t - t_prev
+        dt = t - t_prev  # positive value (t decreasing)
 
         apply_guidance = (
             cfg_w_tgt != 1.0
@@ -387,47 +381,69 @@ def vs3d_flow_sample(
         )
 
         if apply_guidance:
-            # RASI: optimize φ to anchor source reconstruction at this timestep
-            phi = rasi_optimize(
-                model=model,
-                z_t=sample,
-                t_k=t,
-                dt=dt,
-                cond_src=cond_src,
-                neg_cond=phi,
-                x_src=x_src,
-                cfg_w_src=cfg_w_src,
-                cfg_w_tgt=cfg_w_tgt,
-                K=rasi_K,
-                lr=rasi_lr,
-                **model_kwargs,
-            )
+            # Draw S independent noise samples for this step
+            # Shape matches x_src
+            x_shape = x_src.shape
 
-            # PMG: compute target velocity with full CFG + partial-mean amplification
-            pred = pmg_velocity(
-                model=model,
-                z_t=sample,
-                t_tensor=t_tensor,
-                cond_tgt=cond_tgt,
-                phi=phi,
-                cfg_w=cfg_w_tgt,
-                S=pmg_S,
-                L=pmg_L,
-                w=pmg_w,
-                **model_kwargs,
-            )
+            eps_list = [
+                mx.array(np.random.randn(*x_shape).astype(np.float32))
+                for _ in range(pmg_S)
+            ]
+
+            # RASI: optimize phi using the first noise sample as representative
+            eps_rasi = eps_list[0]
+            z_t_src_rasi = (1.0 - t) * x_src + t * eps_rasi
+            z_t_tgt_rasi = z_edit + (z_t_src_rasi - x_src)
+
+            if rasi_K > 0:
+                phi = rasi_optimize(
+                    model=model,
+                    z_t_src=z_t_src_rasi,
+                    z_t_tgt=z_t_tgt_rasi,
+                    t_k=t,
+                    dt=dt,
+                    cond_src=cond_src,
+                    neg_cond=phi,
+                    x_src=x_src,
+                    cfg_w_src=cfg_w_src,
+                    cfg_w_tgt=cfg_w_tgt,
+                    K=rasi_K,
+                    lr=rasi_lr,
+                    **kw,
+                )
+
+            # PMG: S noise samples → S v_delta estimates → partial-mean guidance
+            v_delta_samples = []
+            for eps_s in eps_list:
+                z_t_src_s = (1.0 - t) * x_src + t * eps_s
+                z_t_tgt_s = z_edit + (z_t_src_s - x_src)
+
+                v_tgt_pos = model(z_t_tgt_s, t_tensor, cond_tgt, **kw)
+                v_tgt_neg = model(z_t_tgt_s, t_tensor, phi, **kw)
+                v_src_pos = model(z_t_src_s, t_tensor, cond_src, **kw)
+                v_src_neg = model(z_t_src_s, t_tensor, phi, **kw)
+                mx.eval(v_tgt_pos, v_tgt_neg, v_src_pos, v_src_neg)
+
+                v_tgt_cfg = _cfg(v_tgt_pos, v_tgt_neg, cfg_w_tgt)
+                v_src_cfg = _cfg(v_src_pos, v_src_neg, cfg_w_src)
+                v_delta_samples.append(v_tgt_cfg - v_src_cfg)
+
+            u = pmg_velocity(v_delta_samples, w=pmg_w, L=pmg_L)
+
+            # FlowEdit Euler step: z_edit += dt * u
+            z_edit = z_edit + dt * u
+            mx.eval(z_edit)
+
         else:
-            # Outside guidance interval: plain CFG
-            pred_pos = model(sample, t_tensor, cond_tgt, **model_kwargs)
-            pred_neg = model(sample, t_tensor, phi, **model_kwargs)
-            mx.eval(pred_pos, pred_neg)
-            pred = cfg_w_tgt * pred_pos + (1.0 - cfg_w_tgt) * pred_neg
-
-        # Euler step
-        sample = sample - dt * pred
-        mx.eval(sample)
+            # Outside guidance interval: plain CFG on z_edit directly
+            v_pos = model(z_edit, t_tensor, cond_tgt, **kw)
+            v_neg = model(z_edit, t_tensor, phi, **kw)
+            mx.eval(v_pos, v_neg)
+            pred = _cfg(v_pos, v_neg, cfg_w_tgt)
+            z_edit = z_edit - dt * pred  # standard flow: -= for non-guided steps
+            mx.eval(z_edit)
 
         if verbose:
             print(" done", flush=True)
 
-    return sample
+    return z_edit

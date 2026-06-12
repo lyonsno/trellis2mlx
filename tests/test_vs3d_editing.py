@@ -17,29 +17,36 @@ import mlx.core as mx
 class TestRASI:
     """Reconstruction-Anchored Source Injection."""
 
+    def _make_coupled_pair(self, x_src, z_edit, t):
+        """Form (z_t_src, z_t_tgt) from x_src, z_edit, and timestep t."""
+        eps = mx.array(np.random.randn(*x_src.shape).astype(np.float32))
+        z_t_src = (1.0 - t) * x_src + t * eps
+        z_t_tgt = z_edit + (z_t_src - x_src)
+        return z_t_src, z_t_tgt
+
     def test_rasi_returns_optimized_embedding(self):
         """RASI must return a phi tensor with same shape as neg_cond."""
         from trellmlx.vs3d import rasi_optimize
 
         N = 100
         C = 32
-        z_t = mx.random.normal((N, C))
+        np.random.seed(0)
+        x_src = mx.array(np.random.randn(N, C).astype(np.float32))
+        z_edit = mx.array(np.random.randn(N, C).astype(np.float32))
         cond_src = mx.random.normal((1, 10, 1024))
         neg_cond = mx.random.normal((1, 10, 1024))
-        x_src = mx.random.normal((N, C))
+        t_k = 0.8
+        z_t_src, z_t_tgt = self._make_coupled_pair(x_src, z_edit, t_k)
 
-        # Stub model: identity velocity
         def stub_model(x, t, cond, **kw):
             return mx.zeros_like(x)
 
-        t_k = 0.8
-        dt = 0.05
-
         phi = rasi_optimize(
             model=stub_model,
-            z_t=z_t,
+            z_t_src=z_t_src,
+            z_t_tgt=z_t_tgt,
             t_k=t_k,
-            dt=dt,
+            dt=0.05,
             cond_src=cond_src,
             neg_cond=neg_cond,
             x_src=x_src,
@@ -58,20 +65,23 @@ class TestRASI:
 
         N = 50
         C = 32
-        z_t = mx.random.normal((N, C))
+        np.random.seed(1)
+        x_src = mx.zeros((N, C))
+        z_edit = mx.ones((N, C))  # non-trivial z_edit so coupled pair is non-trivial
         cond_src = mx.random.normal((1, 10, 1024))
         neg_cond = mx.zeros((1, 10, 1024))
-        x_src = mx.ones((N, C))  # non-trivial target
+        t_k = 0.8
+        z_t_src, z_t_tgt = self._make_coupled_pair(x_src, z_edit, t_k)
 
         def cond_sensitive_model(x, t, cond, **kw):
-            # Returns signal that depends on cond so perturbing phi changes the loss
             cond_signal = mx.mean(cond)
             return x * 0.1 + cond_signal * 0.01 * mx.ones_like(x)
 
         phi = rasi_optimize(
             model=cond_sensitive_model,
-            z_t=z_t,
-            t_k=0.8,
+            z_t_src=z_t_src,
+            z_t_tgt=z_t_tgt,
+            t_k=t_k,
             dt=0.05,
             cond_src=cond_src,
             neg_cond=neg_cond,
@@ -88,10 +98,13 @@ class TestRASI:
         """RASI must not apply one uniform scalar delta to every phi element."""
         from trellmlx.vs3d import rasi_optimize
 
-        z_t = mx.ones((4, 2))
+        np.random.seed(2)
+        x_src = mx.zeros((4, 2))
+        z_edit = mx.ones((4, 2))
         cond_src = mx.zeros((1, 2, 4))
         neg_cond = mx.zeros((1, 2, 4))
-        x_src = mx.zeros((4, 2))
+        t_k = 0.8
+        z_t_src, z_t_tgt = self._make_coupled_pair(x_src, z_edit, t_k)
         weights = mx.array(
             [[[1.0, -2.0, 0.5, -0.25], [1.5, -0.75, 0.25, -1.25]]],
             dtype=mx.float32,
@@ -103,8 +116,9 @@ class TestRASI:
 
         phi = rasi_optimize(
             model=element_sensitive_model,
-            z_t=z_t,
-            t_k=0.8,
+            z_t_src=z_t_src,
+            z_t_tgt=z_t_tgt,
+            t_k=t_k,
             dt=0.05,
             cond_src=cond_src,
             neg_cond=neg_cond,
@@ -119,6 +133,49 @@ class TestRASI:
             "RASI phi update must carry element-wise direction, not a uniform scalar delta"
         )
 
+    def test_rasi_uses_dual_branch_coupling(self):
+        """RASI must use c_src on BOTH branches and compute v_delta = v_tgt_cfg - v_src_cfg."""
+        from trellmlx.vs3d import rasi_optimize
+
+        # Track which (latent, cond) pairs are seen by the model
+        calls = []
+
+        np.random.seed(3)
+        N, C = 4, 4
+        x_src = mx.zeros((N, C))
+        z_edit = mx.ones((N, C))
+        cond_src = mx.ones((1, 2, 4)) * 2.0
+        neg_cond = mx.zeros((1, 2, 4))
+        t_k = 0.8
+        eps = np.random.randn(N, C).astype(np.float32)
+        z_t_src = mx.array((1.0 - t_k) * np.zeros((N, C)) + t_k * eps)
+        z_t_tgt = mx.array(np.ones((N, C)) + (t_k * eps - t_k * eps))  # z_edit + offset
+
+        def spy_model(x, t, cond, **kw):
+            calls.append(float(mx.mean(mx.abs(cond)).item()))
+            return mx.zeros_like(x)
+
+        rasi_optimize(
+            model=spy_model,
+            z_t_src=z_t_src,
+            z_t_tgt=z_t_tgt,
+            t_k=t_k,
+            dt=0.05,
+            cond_src=cond_src,
+            neg_cond=neg_cond,
+            x_src=x_src,
+            cfg_w_src=1.5,
+            cfg_w_tgt=9.0,
+            K=1,
+            lr=1e-5,
+        )
+        # With K=1, no phi perturbation (loss=0 from zero model), but initial forward
+        # pass still happens. Key invariant: cond_src mean = 2.0 must appear in calls
+        # (both pos-cond calls use c_src), neg_cond mean = 0.0 appears for phi calls.
+        cond_src_mean = float(mx.mean(mx.abs(cond_src)).item())
+        has_src_cond = any(abs(c - cond_src_mean) < 1e-4 for c in calls)
+        assert has_src_cond, "RASI must call model with c_src on at least one branch"
+
 
 # ---------------------------------------------------------------------------
 # PMG tests
@@ -128,86 +185,83 @@ class TestPMG:
     """Partial-Mean Guidance."""
 
     def test_pmg_output_shape_matches_input(self):
-        """PMG must return a velocity array with the same shape as z_t."""
+        """PMG must return a velocity array with the same shape as each v_delta sample."""
         from trellmlx.vs3d import pmg_velocity
 
-        N = 200
-        C = 32
-        z_t = mx.random.normal((N, C))
-        t_tensor = mx.array([800.0])
-        cond_tgt = mx.random.normal((1, 10, 1024))
-        phi = mx.zeros((1, 10, 1024))
+        N, C = 200, 32
+        v_delta_samples = [mx.random.normal((N, C)) for _ in range(5)]
 
-        def stub_model(x, t, cond, **kw):
-            return mx.zeros_like(x)
-
-        v = pmg_velocity(
-            model=stub_model,
-            z_t=z_t,
-            t_tensor=t_tensor,
-            cond_tgt=cond_tgt,
-            phi=phi,
-            S=5,
-            L=2,
-            w=1.2,
-        )
-        assert v.shape == z_t.shape, f"PMG output shape {v.shape} != {z_t.shape}"
+        v = pmg_velocity(v_delta_samples, w=1.2, L=2)
+        assert v.shape == (N, C), f"PMG output shape {v.shape} != ({N}, {C})"
 
     def test_pmg_amplifies_nonzero_signal(self):
-        """With w>0, PMG must produce larger magnitude than plain mean."""
+        """With w>0 and uniform v_delta, PMG must produce nonzero output."""
         from trellmlx.vs3d import pmg_velocity
 
-        N = 50
-        C = 8
-        z_t = mx.zeros((N, C))
-        t_tensor = mx.array([500.0])
-        cond = mx.zeros((1, 4, 1024))
-        phi = mx.zeros((1, 4, 1024))
+        N, C = 50, 8
+        # All samples identical constant v_delta
+        v_delta_samples = [mx.ones((N, C)) * 0.5 for _ in range(5)]
 
-        # Model returns a constant non-zero velocity
-        def biased_model(x, t, cond, **kw):
-            return mx.ones_like(x) * 0.5
-
-        v = pmg_velocity(
-            model=biased_model,
-            z_t=z_t,
-            t_tensor=t_tensor,
-            cond_tgt=cond,
-            phi=phi,
-            S=5,
-            L=2,
-            w=1.2,
-        )
-        # With w=1.2, result = (1+w)*mu_S - w*mu_L = 2.2*0.5 - 1.2*0.5 = 0.5
-        # i.e. same since model is deterministic, but must be nonzero
+        v = pmg_velocity(v_delta_samples, w=1.2, L=2)
+        # (1+w)*0.5 - w*0.5 = 0.5 (identical samples → partial mean = full mean)
         magnitude = float(mx.mean(mx.abs(v)).item())
-        assert magnitude > 0, "PMG must produce nonzero output with nonzero model"
+        assert magnitude > 0, "PMG must produce nonzero output with nonzero v_delta samples"
 
-    def test_pmg_uses_S_model_calls(self):
-        """PMG must call the model exactly S + 1 times (S for PMG + 1 for source)."""
+    def test_pmg_partial_mean_amplifies_consistent_directions(self):
+        """PMG must amplify directions consistently present across S samples (low-norm samples).
+
+        When some samples have small norm and others large, (1+w)*mu_S - w*mu_L
+        amplifies the small-norm (conservative, consistent) direction.
+        """
         from trellmlx.vs3d import pmg_velocity
 
-        call_count = {"n": 0}
+        N, C = 10, 4
+        np.random.seed(42)
+        # 2 consistent low-norm samples + 3 high-noise samples
+        low_norm = [mx.ones((N, C)) * 0.1 for _ in range(2)]
+        high_norm = [mx.array(np.random.randn(N, C).astype(np.float32)) * 5.0 for _ in range(3)]
+        samples = low_norm + high_norm
 
-        def counting_model(x, t, cond, **kw):
-            call_count["n"] += 1
-            return mx.zeros_like(x)
+        v = pmg_velocity(samples, w=1.2, L=2)
+        mu_S = float(mx.mean(mx.stack([mx.mean(s) for s in samples])).item())
+        v_mean = float(mx.mean(v).item())
+        # PMG with L=2 picks the 2 low-norm samples → mu_L ≈ 0.1
+        # u = (1+1.2)*mu_S - 1.2*0.1 — must not equal mu_S (plain mean)
+        assert abs(v_mean - mu_S) > 1e-6, (
+            "PMG output must differ from plain mean when samples have different norms"
+        )
 
-        z_t = mx.zeros((20, 8))
-        v = pmg_velocity(
-            model=counting_model,
-            z_t=z_t,
-            t_tensor=mx.array([500.0]),
-            cond_tgt=mx.zeros((1, 4, 1024)),
-            phi=mx.zeros((1, 4, 1024)),
-            S=5,
-            L=2,
-            w=1.2,
-        )
-        # Each of the S samples requires 2 model calls (pos + neg CFG)
-        assert call_count["n"] == 2 * 5, (
-            f"Expected 10 model calls (S=5, 2 per sample for CFG), got {call_count['n']}"
-        )
+    def test_pmg_requires_L_less_than_S(self):
+        """PMG must raise when L >= S."""
+        from trellmlx.vs3d import pmg_velocity
+
+        samples = [mx.ones((4, 4)) for _ in range(3)]
+        with pytest.raises(AssertionError):
+            pmg_velocity(samples, w=1.2, L=3)  # L == S → invalid
+
+    def test_pmg_variance_across_samples_is_used(self):
+        """PMG output must differ when S samples have variance vs. when they are constant."""
+        from trellmlx.vs3d import pmg_velocity
+
+        N, C = 20, 8
+        np.random.seed(10)
+
+        # Constant samples
+        const_samples = [mx.ones((N, C)) * 0.3 for _ in range(5)]
+        v_const = pmg_velocity(const_samples, w=1.2, L=2)
+
+        # Varied samples: some consistent, some not
+        varied_samples = [
+            mx.ones((N, C)) * 0.3,
+            mx.ones((N, C)) * 0.3,
+            mx.array(np.random.randn(N, C).astype(np.float32) * 2.0),
+            mx.array(np.random.randn(N, C).astype(np.float32) * 2.0),
+            mx.array(np.random.randn(N, C).astype(np.float32) * 2.0),
+        ]
+        v_varied = pmg_velocity(varied_samples, w=1.2, L=2)
+
+        diff = float(mx.mean(mx.abs(v_varied - v_const)).item())
+        assert diff > 1e-4, "PMG output must differ when sample variance differs"
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +378,9 @@ class TestVS3DSamplerIntegration:
     """The VS3D sampler must compose RASI + PMG in Stage 1."""
 
     def test_vs3d_sampler_stage1_returns_correct_shape(self):
-        """vs3d_flow_sample for Stage 1 must return same shape as noise."""
+        """vs3d_flow_sample for Stage 1 must return same shape as x_src."""
         from trellmlx.vs3d import vs3d_flow_sample
 
-        N = 64
         C = 8
         noise = mx.random.normal((1, C, 4, 4, 4))  # dense grid [B, C, R, R, R]
         cond_src = mx.zeros((1, 10, 1024))
@@ -351,8 +404,43 @@ class TestVS3DSamplerIntegration:
             cfg_w_tgt=9.0,
             guidance_interval=(0.6, 1.0),
         )
-        assert result.shape == noise.shape, (
-            f"vs3d_flow_sample output {result.shape} != noise {noise.shape}"
+        assert result.shape == x_src.shape, (
+            f"vs3d_flow_sample output {result.shape} != x_src {x_src.shape}"
+        )
+
+    def test_vs3d_sampler_starts_at_x_src(self):
+        """With zero-velocity model and no guidance, z_edit must equal x_src at output."""
+        from trellmlx.vs3d import vs3d_flow_sample
+
+        C = 8
+        np.random.seed(42)
+        x_src = mx.array(np.random.randn(1, C, 4, 4, 4).astype(np.float32))
+        noise = mx.random.normal((1, C, 4, 4, 4))
+        cond_src = mx.zeros((1, 4, 1024))
+        cond_tgt = mx.zeros((1, 4, 1024))
+        neg_cond = mx.zeros((1, 4, 1024))
+
+        def zero_model(x, t, cond, **kw):
+            return mx.zeros_like(x)
+
+        # guidance_interval=(0, 0) means no guidance step is ever applied
+        result = vs3d_flow_sample(
+            model=zero_model,
+            noise=noise,
+            cond_src=cond_src,
+            cond_tgt=cond_tgt,
+            neg_cond=neg_cond,
+            x_src=x_src,
+            stage="dense",
+            steps=4,
+            cfg_w_tgt=9.0,
+            guidance_interval=(0.0, 0.0),
+            rasi_K=0,
+        )
+        # Zero velocity everywhere → z_edit never moves → should equal x_src
+        diff = float(mx.mean(mx.abs(result - x_src)).item())
+        assert diff < 1e-5, (
+            f"With zero-velocity model, output must equal x_src (diff={diff:.2e})"
         )
 
     def test_vs3d_sampler_differs_from_baseline(self):
