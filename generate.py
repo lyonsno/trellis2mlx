@@ -392,6 +392,7 @@ def main():
             print(f"  No usable checkpoints in {args.resume}, running full pipeline", flush=True)
 
     mx.random.seed(args.seed)
+    n_steps = args.steps
     t_total = time.perf_counter()
 
     HF_4B = os.path.expanduser(
@@ -539,7 +540,6 @@ def main():
     from trellmlx.models.slat_flow import SLatFlowModel
 
     # Sampler params from pipeline.json
-    n_steps = args.steps
     SHAPE_SAMPLER = dict(steps=n_steps, guidance_strength=7.5, guidance_rescale=0.5,
                          guidance_interval=(0.6, 1.0), rescale_t=3.0)
     TEX_SAMPLER = dict(steps=n_steps, guidance_strength=1.0, guidance_rescale=0.0,
