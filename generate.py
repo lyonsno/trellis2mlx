@@ -403,6 +403,9 @@ def main():
     from trellmlx.cleanup import cleanup_model, cleanup
 
     vs3d_mode = bool(args.edit_target)
+    if vs3d_mode and not os.path.exists(args.edit_target):
+        raise FileNotFoundError(f"--edit-target path does not exist: {args.edit_target!r}. "
+                                f"Did you forget to pass edit_target as a greenroom param?")
 
     if args.quantize:
         from trellmlx.quantize import quantize_model
