@@ -48,6 +48,16 @@ def flow_euler_sample(
     if concat_cond is not None:
         model_kwargs['concat_cond'] = concat_cond
 
+    # Build cross-attention KV caches if the model supports it.
+    # The image conditioning doesn't change between steps, so KV projections
+    # can be computed once and reused for all 12 steps × 30 blocks.
+    pos_kv_cache = None
+    neg_kv_cache = None
+    if hasattr(model, 'build_cross_kv_cache'):
+        pos_kv_cache = model.build_cross_kv_cache(cond)
+        if guidance_strength != 1.0:
+            neg_kv_cache = model.build_cross_kv_cache(neg_cond)
+
     # Build timestep schedule
     t_seq = np.linspace(1, 0, steps + 1)
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
@@ -67,8 +77,14 @@ def flow_euler_sample(
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
-            pred_pos = model(sample, t_tensor, cond, **model_kwargs)
-            pred_neg = model(sample, t_tensor, neg_cond, **model_kwargs)
+            kw = dict(**model_kwargs)
+            if pos_kv_cache is not None:
+                kw['cross_kv_cache'] = pos_kv_cache
+            pred_pos = model(sample, t_tensor, cond, **kw)
+            kw_neg = dict(**model_kwargs)
+            if neg_kv_cache is not None:
+                kw_neg['cross_kv_cache'] = neg_kv_cache
+            pred_neg = model(sample, t_tensor, neg_cond, **kw_neg)
             mx.eval(pred_pos, pred_neg)
 
             # CFG combination
@@ -88,7 +104,10 @@ def flow_euler_sample(
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
         else:
             # Single forward pass with positive conditioning
-            pred = model(sample, t_tensor, cond, **model_kwargs)
+            kw = dict(**model_kwargs)
+            if pos_kv_cache is not None:
+                kw['cross_kv_cache'] = pos_kv_cache
+            pred = model(sample, t_tensor, cond, **kw)
             mx.eval(pred)
 
         # Euler step

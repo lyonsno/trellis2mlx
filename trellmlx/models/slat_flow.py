@@ -86,6 +86,21 @@ class SLatFlowModel(nn.Module):
         self._compiled = False
         self._run_blocks = self._run_blocks_impl
 
+    def build_cross_kv_cache(self, cond: mx.array) -> list[tuple]:
+        """Precompute cross-attention K, V for all blocks.
+
+        Call once per conditioning input. The cache is valid for all timesteps
+        since image conditioning doesn't change between ODE steps.
+
+        Returns list of (K, V) tuples, one per block.
+        """
+        cache = []
+        for block in self.blocks:
+            k, v = block.cross_attn.project_kv(cond)
+            cache.append((k, v))
+        mx.eval(*[t for pair in cache for t in pair])
+        return cache
+
     def __call__(
         self,
         x: mx.array,           # [N, in_channels] sparse token features
@@ -93,6 +108,7 @@ class SLatFlowModel(nn.Module):
         cond: mx.array,        # [B, L, context_channels]
         coords: mx.array = None,  # [N, 3] voxel coordinates for RoPE
         concat_cond: mx.array = None,  # [N, C'] features to concatenate with x
+        cross_kv_cache: list = None,  # precomputed cross-attention KV per block
     ) -> mx.array:
         N = x.shape[0]
         B = t.shape[0] if len(t.shape) else 1
@@ -119,15 +135,12 @@ class SLatFlowModel(nn.Module):
 
         # Run through blocks (B=1 assumed)
         if self._compiled:
-            # Compiled path: single fused graph, no internal evals.
-            # mx.compile handles buffer reuse; the sampler evals between steps.
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
-            # Eager path: periodic eval to yield memory bus back to CPU/display.
-            # Without this, 30 blocks on 171K tokens queues a single
-            # GPU burst that beachballs the entire machine.
             for i, block in enumerate(self.blocks):
-                x = block(x, mod[0], cond, rope_phases=rope_phases)
+                block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+                x = block(x, mod[0], cond, rope_phases=rope_phases,
+                          cross_kv_cache=block_kv)
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 
