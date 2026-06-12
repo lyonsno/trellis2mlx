@@ -258,6 +258,11 @@ def main():
                         help="Max tokens for HR SLat pass (reduces resolution if exceeded)")
     parser.add_argument("--target-faces", type=int, default=200_000,
                         help="Simplify mesh to this face count (0 to disable, default: 200K)")
+    parser.add_argument("--steps", type=int, default=12,
+                        help="Number of ODE sampler steps (default: 12, try 6 for 2x speed)")
+    parser.add_argument("--no-cascade", action="store_true",
+                        help="Skip two-pass cascade (LR→upsample→HR). Uses single 512 SLat pass. "
+                             "Much faster (~4x) but lower mesh quality and more holes.")
     parser.add_argument("--compile", action="store_true",
                         help="Use mx.compile for flow model forward passes (experimental, not faster)")
     parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8],
@@ -510,7 +515,7 @@ def main():
         mx.eval(z_s)
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
-        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=12, verbose=False)
+        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
@@ -534,9 +539,10 @@ def main():
     from trellmlx.models.slat_flow import SLatFlowModel
 
     # Sampler params from pipeline.json
-    SHAPE_SAMPLER = dict(steps=12, guidance_strength=7.5, guidance_rescale=0.5,
+    n_steps = args.steps
+    SHAPE_SAMPLER = dict(steps=n_steps, guidance_strength=7.5, guidance_rescale=0.5,
                          guidance_interval=(0.6, 1.0), rescale_t=3.0)
-    TEX_SAMPLER = dict(steps=12, guidance_strength=1.0, guidance_rescale=0.0,
+    TEX_SAMPLER = dict(steps=n_steps, guidance_strength=1.0, guidance_rescale=0.0,
                        guidance_interval=(0.6, 0.9), rescale_t=3.0)
 
     lr_slat_flow = SLatFlowModel()
@@ -567,71 +573,76 @@ def main():
     del lr_slat_flow
     gc.collect()
 
-    # === Stage 2b: Upsample to get HR coordinates ===
-    print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
-    from trellmlx.models.shape_slat_decoder import SLatDecoder
+    if args.no_cascade:
+        # No-cascade mode: use LR SLat directly for decoding.
+        # Skips upsample + HR SLat pass. Much faster but lower quality.
+        hr_slat = lr_slat
+        quant_coords = lr_coords_4d
+        num_tokens = N_lr
+        hr_resolution = lr_resolution * 16  # 512 mesh grid for 32 LR coords
+        print(f"  No-cascade: using LR SLat directly ({num_tokens:,} tokens, "
+              f"grid_size={hr_resolution})", flush=True)
+    else:
+        # === Stage 2b: Upsample to get HR coordinates ===
+        print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
+        from trellmlx.models.shape_slat_decoder import SLatDecoder
 
-    decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
-    load_weights(decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
+        decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
+        load_weights(decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
 
-    t0 = time.perf_counter()
-    hr_coords_raw = decoder.upsample(lr_slat, mx.array(lr_coords_4d), upsample_times=4)
-    mx.eval(hr_coords_raw)
-    print(f"  Upsampled: {time.perf_counter()-t0:.1f}s ({hr_coords_raw.shape[0]:,} voxels)", flush=True)
+        t0 = time.perf_counter()
+        hr_coords_raw = decoder.upsample(lr_slat, mx.array(lr_coords_4d), upsample_times=4)
+        mx.eval(hr_coords_raw)
+        print(f"  Upsampled: {time.perf_counter()-t0:.1f}s ({hr_coords_raw.shape[0]:,} voxels)", flush=True)
 
-    # Requantize: decoder output coords are at lr_resolution * 16 (= 512).
-    # The HR model (1024 variant, resolution=64) expects coords in [0, 63].
-    # Formula: ((coord + 0.5) / decoder_output_res * (hr_resolution // 16)).int()
-    # With decoder_output_res=512, hr_resolution=1024: coords → [0, 63] ✓
-    decoder_output_res = lr_resolution * 16  # 32 * 16 = 512
-    hr_resolution = args.resolution
-    hr_coords_np = np.array(hr_coords_raw)
-    while True:
-        quant_coords = _requantize_coords(hr_coords_np, decoder_output_res, hr_resolution)
-        num_tokens = len(quant_coords)
-        if num_tokens < args.max_tokens or hr_resolution == 1024:
-            if hr_resolution != args.resolution:
-                print(f"  Resolution reduced to {hr_resolution} ({num_tokens:,} tokens)", flush=True)
-            break
-        hr_resolution -= 128
+        decoder_output_res = lr_resolution * 16  # 32 * 16 = 512
+        hr_resolution = args.resolution
+        hr_coords_np = np.array(hr_coords_raw)
+        while True:
+            quant_coords = _requantize_coords(hr_coords_np, decoder_output_res, hr_resolution)
+            num_tokens = len(quant_coords)
+            if num_tokens < args.max_tokens or hr_resolution == 1024:
+                if hr_resolution != args.resolution:
+                    print(f"  Resolution reduced to {hr_resolution} ({num_tokens:,} tokens)", flush=True)
+                break
+            hr_resolution -= 128
 
-    hr_coords_3d = quant_coords[:, 1:4]
-    print(f"  HR coords: {num_tokens:,} tokens at res {hr_resolution}, "
-          f"coord range [{hr_coords_3d.min()}, {hr_coords_3d.max()}]", flush=True)
+        hr_coords_3d = quant_coords[:, 1:4]
+        print(f"  HR coords: {num_tokens:,} tokens at res {hr_resolution}, "
+              f"coord range [{hr_coords_3d.min()}, {hr_coords_3d.max()}]", flush=True)
 
-    cleanup_model(decoder)
-    del decoder
-    gc.collect()
+        cleanup_model(decoder)
+        del decoder
+        gc.collect()
 
-    # === Stage 2c: HR Shape Latent (second SLat pass) ===
-    print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
+        # === Stage 2c: HR Shape Latent (second SLat pass) ===
+        print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
 
-    # Load 1024 model for HR pass (resolution=64, trained for larger coord range)
-    hr_slat_flow = SLatFlowModel()
-    load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
-    if args.quantize:
-        quantize_model(hr_slat_flow, bits=args.quantize)
-    if args.compile:
-        hr_slat_flow.compile()
+        hr_slat_flow = SLatFlowModel()
+        load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
+        if args.quantize:
+            quantize_model(hr_slat_flow, bits=args.quantize)
+        if args.compile:
+            hr_slat_flow.compile()
 
-    hr_noise = mx.random.normal((num_tokens, 32))
+        hr_noise = mx.random.normal((num_tokens, 32))
 
-    t0 = time.perf_counter()
-    hr_slat = flow_euler_sample(
-        hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
-        verbose=False,
-        coords=mx.array(hr_coords_3d),
-        **SHAPE_SAMPLER,
-    )
-    mx.eval(hr_slat)
-    print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
+        t0 = time.perf_counter()
+        hr_slat = flow_euler_sample(
+            hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+            verbose=False,
+            coords=mx.array(hr_coords_3d),
+            **SHAPE_SAMPLER,
+        )
+        mx.eval(hr_slat)
+        print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
 
-    hr_slat = _denormalize_slat(hr_slat)
-    mx.eval(hr_slat)
+        hr_slat = _denormalize_slat(hr_slat)
+        mx.eval(hr_slat)
 
-    cleanup_model(hr_slat_flow)
-    del hr_slat_flow
-    gc.collect()
+        cleanup_model(hr_slat_flow)
+        del hr_slat_flow
+        gc.collect()
 
     # Keep hr_slat — needed for texture conditioning
 
