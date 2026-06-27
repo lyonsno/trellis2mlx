@@ -153,6 +153,22 @@ def write_probe_report(path, report):
     print(f"  Probe report: {out}", flush=True)
 
 
+def build_stage1_probe_report(args, lr_coords, lr_resolution, stage1_source, n_steps):
+    return {
+        "schema": "trellis2mlx.stage1-compat-probe.v0",
+        "phase": "stage1",
+        "status": "ok",
+        "stage1_source": stage1_source,
+        "stage1_coords": args.stage1_coords,
+        "stage1_coords_resolution": int(args.stage1_coords_resolution) if args.stage1_coords else None,
+        "lr_resolution": int(lr_resolution),
+        "lr_coords": coord_stats(lr_coords),
+        "seed": int(args.seed),
+        "steps": int(n_steps),
+        "no_cascade": bool(args.no_cascade),
+    }
+
+
 def _select_uv_method(method, vertices, faces):
     """Select UV unwrap function based on method and mesh geometry.
 
@@ -467,8 +483,36 @@ def main():
         else:
             print(f"  No usable checkpoints in {args.resume}, running full pipeline", flush=True)
 
-    mx.random.seed(args.seed)
     n_steps = args.steps
+    lr_resolution = 32
+    if args.stage1_coords and args.probe_stop_after == "stage1":
+        print("=== Stage 1: External Sparse Coordinates ===", flush=True)
+        lr_coords = load_stage1_coords(
+            args.stage1_coords,
+            source_resolution=args.stage1_coords_resolution,
+            target_resolution=lr_resolution,
+        )
+        if len(lr_coords) == 0:
+            raise ValueError("--stage1-coords produced 0 sparse voxels after quantization")
+        print(
+            f"  Loaded {len(lr_coords)} sparse voxels at {lr_resolution}³ "
+            f"from {args.stage1_coords} (source res {args.stage1_coords_resolution})",
+            flush=True,
+        )
+        if args.probe_report:
+            write_probe_report(
+                args.probe_report,
+                build_stage1_probe_report(
+                    args,
+                    lr_coords,
+                    lr_resolution,
+                    "external-stage1-coords",
+                    n_steps,
+                ),
+            )
+        return
+
+    mx.random.seed(args.seed)
     t_total = time.perf_counter()
 
     HF_4B = os.path.expanduser(
@@ -541,7 +585,6 @@ def main():
         cond_tgt = _extract_image_features(tgt_image_path)
         print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
 
-    lr_resolution = 32
     if args.stage1_coords:
         # === Stage 1: External Sparse Coordinates ===
         print("=== Stage 1: External Sparse Coordinates ===", flush=True)
@@ -629,19 +672,7 @@ def main():
 
         cleanup_model(ss_flow, ss_dec)
 
-    stage1_probe = {
-        "schema": "trellis2mlx.stage1-compat-probe.v0",
-        "phase": "stage1",
-        "status": "ok",
-        "stage1_source": stage1_source,
-        "stage1_coords": args.stage1_coords,
-        "stage1_coords_resolution": int(args.stage1_coords_resolution) if args.stage1_coords else None,
-        "lr_resolution": int(lr_resolution),
-        "lr_coords": coord_stats(lr_coords),
-        "seed": int(args.seed),
-        "steps": int(n_steps),
-        "no_cascade": bool(args.no_cascade),
-    }
+    stage1_probe = build_stage1_probe_report(args, lr_coords, lr_resolution, stage1_source, n_steps)
     if args.probe_stop_after == "stage1":
         if args.probe_report:
             write_probe_report(args.probe_report, stage1_probe)

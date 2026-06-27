@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 import generate
@@ -61,3 +63,27 @@ def test_write_probe_report_creates_parent_and_json(tmp_path):
 
     assert path.exists()
     assert '"phase": "stage1"' in path.read_text(encoding="utf-8")
+
+
+def test_build_stage1_probe_report_records_fast_external_probe_contract():
+    args = SimpleNamespace(
+        stage1_coords="/tmp/coords.npy",
+        stage1_coords_resolution=32,
+        seed=42,
+        no_cascade=True,
+    )
+    coords = np.array([[3, 4, 5], [7, 8, 9]], dtype=np.int32)
+
+    report = generate.build_stage1_probe_report(
+        args,
+        coords,
+        lr_resolution=32,
+        stage1_source="external-stage1-coords",
+        n_steps=0,
+    )
+
+    assert report["schema"] == "trellis2mlx.stage1-compat-probe.v0"
+    assert report["stage1_source"] == "external-stage1-coords"
+    assert report["stage1_coords"] == "/tmp/coords.npy"
+    assert report["steps"] == 0
+    assert report["lr_coords"]["count"] == 2
