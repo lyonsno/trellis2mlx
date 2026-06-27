@@ -90,6 +90,41 @@ def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     return unique_coords
 
 
+def load_stage1_coords(path, source_resolution, target_resolution=32):
+    """Load external sparse coords and quantize them to generate.py's LR grid.
+
+    World Tracing exports coords as ``[N, 3]`` x-y-z grid indices, plus an
+    optional ``[N, 4]`` variant with a leading zero batch column. This local
+    TRELLIS MLX path consumes the Stage-1 result as spatial LR coordinates, so
+    the external grid is downsampled and deduped before Stage 2a.
+    """
+    coords = np.load(path)
+    coords = np.asarray(coords)
+    if coords.ndim != 2 or coords.shape[1] not in (3, 4):
+        raise ValueError(
+            f"--stage1-coords must be a [N,3] or [N,4] .npy array; got {coords.shape}"
+        )
+    if coords.shape[1] == 4:
+        coords = coords[:, 1:4]
+    if source_resolution <= 0 or target_resolution <= 0:
+        raise ValueError("source_resolution and target_resolution must be positive")
+    if coords.size == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    if not np.isfinite(coords).all():
+        raise ValueError("--stage1-coords contains non-finite values")
+
+    coords = np.rint(coords).astype(np.int64)
+    if coords.min() < 0 or coords.max() >= int(source_resolution):
+        raise ValueError(
+            f"--stage1-coords values must be in [0, {int(source_resolution) - 1}] "
+            f"for source resolution {source_resolution}; got range [{coords.min()}, {coords.max()}]"
+        )
+    if int(source_resolution) != int(target_resolution):
+        coords = np.floor(coords.astype(np.float64) * int(target_resolution) / int(source_resolution))
+    coords = np.clip(coords, 0, int(target_resolution) - 1).astype(np.int32)
+    return np.unique(coords, axis=0)
+
+
 def _select_uv_method(method, vertices, faces):
     """Select UV unwrap function based on method and mesh geometry.
 
@@ -288,6 +323,12 @@ def main():
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
+    parser.add_argument("--stage1-coords", metavar="NPY",
+                        help="External sparse-structure coords .npy from a route such as World Tracing. "
+                             "Skips Stage 1 sparse-structure flow/decoder and feeds the coords into Stage 2a.")
+    parser.add_argument("--stage1-coords-resolution", type=int, default=64,
+                        help="Grid resolution of --stage1-coords before downsampling to generate.py's 32^3 LR stage "
+                             "(default: 64 for World Tracing/TRELLIS.2 1024 packets).")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -465,75 +506,91 @@ def main():
         cond_tgt = _extract_image_features(tgt_image_path)
         print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
 
-    # === Stage 1: Sparse Structure ===
-    print("=== Stage 1: Sparse Structure ===", flush=True)
-    from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
-    from trellmlx.models.sparse_structure_decoder import SparseStructureDecoder
-
-    ss_flow = SparseStructureFlowModel()
-    load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
-    if args.quantize:
-        quantize_model(ss_flow, bits=args.quantize)
-    if args.compile:
-        ss_flow.compile()
-    ss_dec = SparseStructureDecoder()
-    load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
-
-    noise = mx.random.normal((1, 8, 16, 16, 16))
-    t0 = time.perf_counter()
-
-    if vs3d_mode:
-        from trellmlx.vs3d import vs3d_flow_sample
-        # Step 1: run source generation to get x_src anchor
-        print(f"  VS3D: source pass ({args.vs3d_steps_src} steps) to get x_src...", flush=True)
-        mx.random.seed(args.seed)
-        src_noise = mx.random.normal((1, 8, 16, 16, 16))
-        x_src = flow_euler_sample(
-            ss_flow, src_noise, cond_src, neg_cond,
-            steps=args.vs3d_steps_src, verbose=False,
-        )
-        mx.eval(x_src)
-        print(f"  VS3D: source pass done ({time.perf_counter()-t0:.1f}s)", flush=True)
-        # Step 2: VS3D editing pass
-        t1 = time.perf_counter()
-        mx.random.seed(args.seed)
-        noise = mx.random.normal((1, 8, 16, 16, 16))
-        z_s = vs3d_flow_sample(
-            model=ss_flow,
-            noise=noise,
-            cond_src=cond_src,
-            cond_tgt=cond_tgt,
-            neg_cond=neg_cond,
-            x_src=x_src,
-            stage="dense",
-            steps=n_steps,
-            cfg_w_src=args.vs3d_cfg_src,
-            cfg_w_tgt=args.vs3d_cfg_tgt,
-            guidance_interval=(args.vs3d_guidance_low, args.vs3d_guidance_high),
-            rasi_K=args.vs3d_rasi_k,
-            verbose=True,
-        )
-        mx.eval(z_s)
-        print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
-    else:
-        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False)
-        mx.eval(z_s)
-
-    print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
-
-    logits = ss_dec(z_s.astype(mx.float32))
-    mx.eval(logits)
-    decoded = np.array(logits[0, 0] > 0)
-
     lr_resolution = 32
-    ratio = decoded.shape[0] // lr_resolution
-    decoded_ds = decoded.reshape(
-        lr_resolution, ratio, lr_resolution, ratio, lr_resolution, ratio
-    ).any(axis=(1, 3, 5))
-    lr_coords = np.argwhere(decoded_ds)
-    print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
+    if args.stage1_coords:
+        # === Stage 1: External Sparse Coordinates ===
+        print("=== Stage 1: External Sparse Coordinates ===", flush=True)
+        lr_coords = load_stage1_coords(
+            args.stage1_coords,
+            source_resolution=args.stage1_coords_resolution,
+            target_resolution=lr_resolution,
+        )
+        if len(lr_coords) == 0:
+            raise ValueError("--stage1-coords produced 0 sparse voxels after quantization")
+        print(
+            f"  Loaded {len(lr_coords)} sparse voxels at {lr_resolution}³ "
+            f"from {args.stage1_coords} (source res {args.stage1_coords_resolution})",
+            flush=True,
+        )
+    else:
+        # === Stage 1: Sparse Structure ===
+        print("=== Stage 1: Sparse Structure ===", flush=True)
+        from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
+        from trellmlx.models.sparse_structure_decoder import SparseStructureDecoder
 
-    cleanup_model(ss_flow, ss_dec)
+        ss_flow = SparseStructureFlowModel()
+        load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
+        if args.quantize:
+            quantize_model(ss_flow, bits=args.quantize)
+        if args.compile:
+            ss_flow.compile()
+        ss_dec = SparseStructureDecoder()
+        load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
+
+        noise = mx.random.normal((1, 8, 16, 16, 16))
+        t0 = time.perf_counter()
+
+        if vs3d_mode:
+            from trellmlx.vs3d import vs3d_flow_sample
+            # Step 1: run source generation to get x_src anchor
+            print(f"  VS3D: source pass ({args.vs3d_steps_src} steps) to get x_src...", flush=True)
+            mx.random.seed(args.seed)
+            src_noise = mx.random.normal((1, 8, 16, 16, 16))
+            x_src = flow_euler_sample(
+                ss_flow, src_noise, cond_src, neg_cond,
+                steps=args.vs3d_steps_src, verbose=False,
+            )
+            mx.eval(x_src)
+            print(f"  VS3D: source pass done ({time.perf_counter()-t0:.1f}s)", flush=True)
+            # Step 2: VS3D editing pass
+            t1 = time.perf_counter()
+            mx.random.seed(args.seed)
+            noise = mx.random.normal((1, 8, 16, 16, 16))
+            z_s = vs3d_flow_sample(
+                model=ss_flow,
+                noise=noise,
+                cond_src=cond_src,
+                cond_tgt=cond_tgt,
+                neg_cond=neg_cond,
+                x_src=x_src,
+                stage="dense",
+                steps=n_steps,
+                cfg_w_src=args.vs3d_cfg_src,
+                cfg_w_tgt=args.vs3d_cfg_tgt,
+                guidance_interval=(args.vs3d_guidance_low, args.vs3d_guidance_high),
+                rasi_K=args.vs3d_rasi_k,
+                verbose=True,
+            )
+            mx.eval(z_s)
+            print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
+        else:
+            z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False)
+            mx.eval(z_s)
+
+        print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
+
+        logits = ss_dec(z_s.astype(mx.float32))
+        mx.eval(logits)
+        decoded = np.array(logits[0, 0] > 0)
+
+        ratio = decoded.shape[0] // lr_resolution
+        decoded_ds = decoded.reshape(
+            lr_resolution, ratio, lr_resolution, ratio, lr_resolution, ratio
+        ).any(axis=(1, 3, 5))
+        lr_coords = np.argwhere(decoded_ds)
+        print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
+
+        cleanup_model(ss_flow, ss_dec)
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
