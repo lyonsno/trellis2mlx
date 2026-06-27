@@ -12,8 +12,10 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 import time
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
@@ -123,6 +125,32 @@ def load_stage1_coords(path, source_resolution, target_resolution=32):
         coords = np.floor(coords.astype(np.float64) * int(target_resolution) / int(source_resolution))
     coords = np.clip(coords, 0, int(target_resolution) - 1).astype(np.int32)
     return np.unique(coords, axis=0)
+
+
+def coord_stats(coords):
+    coords = np.asarray(coords)
+    stats = {
+        "count": int(coords.shape[0]),
+        "shape": list(coords.shape),
+    }
+    if coords.size:
+        stats.update(
+            {
+                "min": coords.min(axis=0).astype(int).tolist(),
+                "max": coords.max(axis=0).astype(int).tolist(),
+                "span": (coords.max(axis=0) - coords.min(axis=0)).astype(int).tolist(),
+            }
+        )
+    else:
+        stats.update({"min": None, "max": None, "span": None})
+    return stats
+
+
+def write_probe_report(path, report):
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"  Probe report: {out}", flush=True)
 
 
 def _select_uv_method(method, vertices, faces):
@@ -329,6 +357,13 @@ def main():
     parser.add_argument("--stage1-coords-resolution", type=int, default=64,
                         help="Grid resolution of --stage1-coords before downsampling to generate.py's 32^3 LR stage "
                              "(default: 64 for World Tracing/TRELLIS.2 1024 packets).")
+    parser.add_argument("--probe-stop-after", choices=("stage1", "shape-decode"),
+                        default=None,
+                        help="Compatibility probe mode: stop after the named stage and write --probe-report if set.")
+    parser.add_argument("--probe-report", metavar="JSON",
+                        help="Write a JSON compatibility probe report before a probe stop or decode guard failure.")
+    parser.add_argument("--max-decode-voxels", type=int, default=0,
+                        help="If >0, stop after shape decode with exit code 7 when decoded voxel count exceeds this cap.")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -510,6 +545,7 @@ def main():
     if args.stage1_coords:
         # === Stage 1: External Sparse Coordinates ===
         print("=== Stage 1: External Sparse Coordinates ===", flush=True)
+        stage1_source = "external-stage1-coords"
         lr_coords = load_stage1_coords(
             args.stage1_coords,
             source_resolution=args.stage1_coords_resolution,
@@ -525,6 +561,7 @@ def main():
     else:
         # === Stage 1: Sparse Structure ===
         print("=== Stage 1: Sparse Structure ===", flush=True)
+        stage1_source = "trellis-sparse-structure"
         from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
         from trellmlx.models.sparse_structure_decoder import SparseStructureDecoder
 
@@ -591,6 +628,25 @@ def main():
         print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
 
         cleanup_model(ss_flow, ss_dec)
+
+    stage1_probe = {
+        "schema": "trellis2mlx.stage1-compat-probe.v0",
+        "phase": "stage1",
+        "status": "ok",
+        "stage1_source": stage1_source,
+        "stage1_coords": args.stage1_coords,
+        "stage1_coords_resolution": int(args.stage1_coords_resolution) if args.stage1_coords else None,
+        "lr_resolution": int(lr_resolution),
+        "lr_coords": coord_stats(lr_coords),
+        "seed": int(args.seed),
+        "steps": int(n_steps),
+        "no_cascade": bool(args.no_cascade),
+    }
+    if args.probe_stop_after == "stage1":
+        if args.probe_report:
+            write_probe_report(args.probe_report, stage1_probe)
+        cleanup()
+        return
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
@@ -723,11 +779,41 @@ def main():
     del shape_decoder
     gc.collect()
 
+    dec_coords_np = np.array(dec_coords)
+    dec_coord_stats = coord_stats(dec_coords_np[:, 1:4] if dec_coords_np.shape[1] == 4 else dec_coords_np)
+    shape_decode_probe = {
+        **stage1_probe,
+        "schema": "trellis2mlx.shape-decode-compat-probe.v0",
+        "phase": "shape-decode",
+        "decoded_voxels": int(dec_out.shape[0]),
+        "decoded_coords": dec_coord_stats,
+        "subdivision_levels": int(len(shape_subs)),
+        "hr_resolution": int(hr_resolution),
+        "num_tokens": int(num_tokens),
+        "max_decode_voxels": int(args.max_decode_voxels),
+    }
+    if args.max_decode_voxels and int(dec_out.shape[0]) > int(args.max_decode_voxels):
+        shape_decode_probe["status"] = "decode-voxel-cap-exceeded"
+        shape_decode_probe["exit_code"] = 7
+        if args.probe_report:
+            write_probe_report(args.probe_report, shape_decode_probe)
+        print(
+            f"  Decode voxel cap exceeded: {int(dec_out.shape[0]):,} > {int(args.max_decode_voxels):,}",
+            flush=True,
+        )
+        cleanup()
+        raise SystemExit(7)
+    if args.probe_stop_after == "shape-decode":
+        shape_decode_probe["status"] = "ok"
+        if args.probe_report:
+            write_probe_report(args.probe_report, shape_decode_probe)
+        cleanup()
+        return
+
     # === Mesh Extraction ===
     print("\n=== Mesh Extraction ===", flush=True)
     from trellmlx.mesh_extract import decoder_output_to_mesh
 
-    dec_coords_np = np.array(dec_coords)
     dec_feats_np = np.array(dec_out)
 
     # The decoder output coords span [0, hr_resolution). The decoder input
