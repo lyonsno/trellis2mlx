@@ -52,8 +52,11 @@ Full pipeline: image → textured GLB with PBR materials.
 # Full pipeline (two-pass cascade, high quality):
 PYTHONPATH=. python generate.py --image photo.png --output mesh.glb
 
-# Fast preview (single-pass, 6 steps — ~4-6x faster):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 6 --no-cascade
+# Visual preview (single-pass, 8 steps; preserves objectness much better than 4-step plumbing checks):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --no-cascade --target-faces 100000 --texture-size 512
+
+# Premium preview texture (same geometry setting, nicer shaded inspection):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --no-cascade --target-faces 100000 --texture-size 4096
 
 # Higher quality mesh topology (Metal-accelerated QEM simplification):
 PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --qem-simplify
@@ -71,6 +74,30 @@ The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
 6. **Shape decode + mesh extraction** — sparse UNet decoder -> `flexible_dual_grid_to_mesh`
 7. **Texture SLat + decode** — per-voxel PBR attributes
 8. **UV unwrap + bake** — xatlas unwrap (`max_iterations=0`), MLX Metal rasterizer, trilinear voxel sampling, seam inpaint, GLB export
+
+### Preview vs final-quality modes
+
+The cheapest route that exits successfully is not necessarily a useful visual
+preview. In a 2026-06-27 M4 Max matrix on an isolated mechanical object, 4-step
+no-cascade output finished quickly but produced a shredded false baseline, while
+8-step no-cascade preserved the object envelope well enough for candidate triage.
+Treat these numbers as a starting heuristic rather than a machine-independent
+benchmark; Apple Silicon timing is sensitive to thermal state and other GPU work.
+
+| Mode | Command shape | Measured total | Use |
+|---|---|---:|---|
+| Plumbing check | `--steps 4 --no-cascade --target-faces 100000 --texture-size 512` | ~62s | Route smoke only; do not judge visual quality from this. |
+| Recommended preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 512` | ~187s | Default search/triage mode; good objectness/cost balance in the measured matrix. |
+| Premium preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 4096` | texture bake +~22-24s measured; wall-clock noisy | Same geometry as preview, better shaded viewport/readback. Use after shape passes. |
+| No-cascade higher step | `--steps 10/12 --no-cascade --target-faces 100000 --texture-size 512` | ~296-347s in matrix | More expensive; not clearly better than 8-step for preview on the measured input. |
+| Full/final | default cascade, `--target-faces 200000 --texture-size 4096` | ~6-9 min on M4 Max-class runs | Final-quality smoke; best objectness and texture read, not a cheap search mode. |
+
+Texture-size note: in the 8-step no-cascade comparison, `texture-size=512` and
+`texture-size=4096` produced identical geometry (120,947 vertices / 107,216
+faces). The 4k texture raised GLB size from ~5.9 MB to ~34.8 MB and improved
+surface sampling, but did not materially change the yes/no coherence decision in
+the deterministic witness. Use 512 during search and reserve 4096 for premium
+preview or final presentation.
 
 ### Performance: M2 Pro validation run
 
@@ -202,7 +229,7 @@ failure phase if the run stops early.
 - [x] xatlas chart optimization bypass: 56x faster UV unwrap, <1% quality difference ([docs/uv-unwrap.md](docs/uv-unwrap.md))
 - [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
 - [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
-- [x] `--no-cascade` + `--steps` flags for speed/quality control (6-step no-cascade for fast previews)
+- [x] `--no-cascade` + `--steps` flags for speed/quality control (4-step route smoke, 8-step visual preview)
 - [x] Cross-attention KV cache (eliminates redundant KV projection across ODE steps)
 - [x] Sparse conv neighbor map caching (313x cache hit speedup)
 - [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
