@@ -284,6 +284,17 @@ def main():
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")
+    parser.add_argument("--remesh", action="store_true",
+                        help="Run narrow-band SDF remesh before cleanup (CPU, experimental). "
+                             "Rebuilds mesh topology to reduce holes. Mirrors official "
+                             "TRELLIS.2 remesh=True path.")
+    parser.add_argument("--remesh-resolution", type=int, default=256,
+                        help="SDF grid resolution for remesh (default: 256)")
+    parser.add_argument("--remesh-band", type=float, default=3.0,
+                        help="Narrow band width in voxels for remesh (default: 3.0)")
+    parser.add_argument("--remesh-project-back", type=float, default=0.9,
+                        help="Projection factor for remesh vertices (default: 0.9, "
+                             "0=no projection, 1=snap to original)")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
@@ -327,6 +338,18 @@ def main():
             print(f"  Loaded texture: {tex_np.shape[0]:,} voxels, {tex_np.shape[1]} channels", flush=True)
 
             t_total = time.perf_counter()
+
+            # Optional: remesh reconstruction before cleanup
+            if args.remesh:
+                from trellmlx.remesh_reconstruct import remesh_narrow_band
+                print("  Remesh reconstruction (CPU)...", flush=True)
+                vertices, faces = remesh_narrow_band(
+                    vertices, faces,
+                    resolution=args.remesh_resolution,
+                    band=args.remesh_band,
+                    project_back=args.remesh_project_back,
+                    verbose=True,
+                )
 
             # Re-run cleanup + simplification with current settings
             vertices, faces = _cleanup_and_simplify_mesh(
@@ -697,6 +720,18 @@ def main():
         save_checkpoint(args.save_checkpoints, "mesh_raw",
                         vertices=vertices, faces=faces,
                         mesh_grid_size=mesh_grid_size)
+
+    # Optional: remesh reconstruction before cleanup
+    if args.remesh:
+        from trellmlx.remesh_reconstruct import remesh_narrow_band
+        print("  Remesh reconstruction (CPU)...", flush=True)
+        vertices, faces = remesh_narrow_band(
+            vertices, faces,
+            resolution=args.remesh_resolution,
+            band=args.remesh_band,
+            project_back=args.remesh_project_back,
+            verbose=True,
+        )
 
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
