@@ -18,6 +18,8 @@ import time
 import mlx.core as mx
 import numpy as np
 
+from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+
 # SLat normalization from pipeline.json
 SHAPE_SLAT_MEAN = np.array([
     0.781296, 0.018091, -0.495192, -0.558457, 1.06053, 0.093252,
@@ -286,6 +288,9 @@ def main():
                              "prevents holes from simplification). Slower but preserves mesh quality.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
+    parser.add_argument("--checkpoint-stop-file", metavar="PATH",
+                        help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
+                             "after a durable checkpoint boundary. Requires --save-checkpoints.")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
     parser.add_argument("--edit-target", metavar="IMAGE",
@@ -306,6 +311,9 @@ def main():
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
+
+    if args.checkpoint_stop_file and not args.save_checkpoints:
+        parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
 
     # === Resume from checkpoints ===
     if args.resume:
@@ -697,6 +705,15 @@ def main():
         save_checkpoint(args.save_checkpoints, "mesh_raw",
                         vertices=vertices, faces=faces,
                         mesh_grid_size=mesh_grid_size)
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="mesh_raw",
+            next_stage="texture",
+            output_path=args.output,
+            resume_supported=False,
+            resume_blocker="mesh_raw checkpoint exists, but mesh-only resume is not implemented",
+        )
 
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
@@ -776,6 +793,13 @@ def main():
                         tex_np=tex_np,
                         tex_coords_spatial=np.array(tex_coords)[:, 1:4],
                         mesh_grid_size=mesh_grid_size)
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="texture",
+            next_stage="texture_bake",
+            output_path=args.output,
+        )
 
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
