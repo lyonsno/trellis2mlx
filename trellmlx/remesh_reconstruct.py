@@ -34,6 +34,10 @@ def remesh_narrow_band(
     - `project_back`: fraction to project new vertices back toward original surface
       (0 = no projection, 1 = snap to original surface)
 
+    For large meshes (>500K faces), pre-simplifies to ~200K faces for SDF
+    computation to keep memory and time manageable. The original full-resolution
+    mesh is used for final vertex projection.
+
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
@@ -56,39 +60,48 @@ def remesh_narrow_band(
     if len(vertices) == 0 or len(faces) == 0:
         return vertices.copy(), faces.copy()
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # For SDF computation, use a simplified mesh if the input is very large.
+    # This keeps memory usage bounded while preserving the surface shape.
+    SDF_FACE_LIMIT = 200_000
+    if len(faces) > SDF_FACE_LIMIT:
+        if verbose:
+            print(f"  Pre-simplifying for SDF: {len(faces):,}F → ~{SDF_FACE_LIMIT:,}F...",
+                  flush=True)
+        import fast_simplification
+        t_simp = time.perf_counter()
+        sdf_verts, sdf_faces = fast_simplification.simplify(
+            vertices, faces, target_reduction=1.0 - SDF_FACE_LIMIT / len(faces),
+        )
+        if verbose:
+            print(f"  Pre-simplified: {len(sdf_verts):,}V {len(sdf_faces):,}F "
+                  f"({time.perf_counter() - t_simp:.1f}s)", flush=True)
+    else:
+        sdf_verts, sdf_faces = vertices, faces
 
-    # Compute bounding box
+    sdf_mesh = trimesh.Trimesh(vertices=sdf_verts, faces=sdf_faces, process=False)
+    orig_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    # Compute bounding box from original
     if center is None:
-        center = mesh.bounds.mean(axis=0)
+        center = orig_mesh.bounds.mean(axis=0)
     if scale is None:
-        extent = mesh.bounds[1] - mesh.bounds[0]
+        extent = orig_mesh.bounds[1] - orig_mesh.bounds[0]
         scale = extent.max() * 1.1  # 10% padding
 
-    # Build the voxel grid
     half = scale / 2.0
     voxel_size = scale / resolution
-
-    # Grid coordinates
-    lin = np.linspace(-half, half, resolution) + center[0]  # shift doesn't matter, we use per-axis
-    grid_x = np.linspace(center[0] - half, center[0] + half, resolution)
-    grid_y = np.linspace(center[1] - half, center[1] + half, resolution)
-    grid_z = np.linspace(center[2] - half, center[2] + half, resolution)
+    band_dist = band * voxel_size
 
     if verbose:
         print(f"  Remesh: resolution={resolution}, band={band}, "
               f"project_back={project_back}", flush=True)
-        print(f"  Grid: [{center[0]-half:.3f}, {center[0]+half:.3f}] x "
-              f"[{center[1]-half:.3f}, {center[1]+half:.3f}] x "
-              f"[{center[2]-half:.3f}, {center[2]+half:.3f}]", flush=True)
-        print(f"  Voxel size: {voxel_size:.6f}", flush=True)
+        print(f"  Voxel size: {voxel_size:.6f}, band_dist: {band_dist:.6f}", flush=True)
 
-    # Compute signed distance in narrow band using trimesh's proximity
-    # Build a regular grid of query points within the narrow band
-    # For efficiency, only query points near the surface
-    band_dist = band * voxel_size
+    # Grid coordinates
+    grid_x = np.linspace(center[0] - half, center[0] + half, resolution)
+    grid_y = np.linspace(center[1] - half, center[1] + half, resolution)
+    grid_z = np.linspace(center[2] - half, center[2] + half, resolution)
 
-    # Sample query points on a regular grid
     xx, yy, zz = np.meshgrid(grid_x, grid_y, grid_z, indexing='ij')
     query_points = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
 
@@ -96,18 +109,10 @@ def remesh_narrow_band(
         print(f"  Computing SDF for {len(query_points):,} points...", flush=True)
         t1 = time.perf_counter()
 
-    # Use trimesh's proximity for unsigned distance + sign from winding number
-    # For large grids, compute in chunks
-    chunk_size = 500_000
-    sdf = np.full(len(query_points), band_dist * 2, dtype=np.float32)
-
-    for i in range(0, len(query_points), chunk_size):
-        chunk = query_points[i:i + chunk_size]
-        # Unsigned distance
-        closest, dist, face_id = trimesh.proximity.closest_point(mesh, chunk)
-        # Sign via winding number (inside = negative)
-        signs = 1.0 - 2.0 * mesh.contains(chunk).astype(np.float32)
-        sdf[i:i + chunk_size] = dist * signs
+    # Try libigl's fast winding number for signed distance (much faster)
+    sdf = _compute_sdf_igl(sdf_verts, sdf_faces, query_points, verbose)
+    if sdf is None:
+        sdf = _compute_sdf_trimesh(sdf_mesh, query_points, band_dist, verbose)
 
     sdf = sdf.reshape(resolution, resolution, resolution)
 
@@ -137,13 +142,21 @@ def remesh_narrow_band(
     if len(new_verts) == 0:
         return vertices.copy(), faces.copy()
 
-    # Project back to original surface
+    # Project back to original surface (use original full-res mesh for accuracy)
     if project_back > 0:
-        closest, dist, face_id = trimesh.proximity.closest_point(mesh, new_verts)
-        new_verts = new_verts * (1 - project_back) + closest * project_back
         if verbose:
-            print(f"  Projected back (factor={project_back}): "
-                  f"mean dist {dist.mean():.6f}", flush=True)
+            print(f"  Projecting {len(new_verts):,} vertices back...", flush=True)
+        # Use simplified mesh for projection if original is huge
+        proj_mesh = sdf_mesh if len(faces) > SDF_FACE_LIMIT else orig_mesh
+        chunk_size = 100_000
+        all_closest = np.empty_like(new_verts)
+        for i in range(0, len(new_verts), chunk_size):
+            chunk = new_verts[i:i + chunk_size]
+            closest, dist, face_id = trimesh.proximity.closest_point(proj_mesh, chunk)
+            all_closest[i:i + chunk_size] = closest
+        new_verts = new_verts * (1 - project_back) + all_closest * project_back
+        if verbose:
+            print(f"  Projected back (factor={project_back})", flush=True)
 
     new_faces = new_faces.astype(np.int64)
 
@@ -151,3 +164,56 @@ def remesh_narrow_band(
         print(f"  Remesh total: {time.perf_counter() - t0:.1f}s", flush=True)
 
     return new_verts.astype(np.float32), new_faces
+
+
+def _compute_sdf_igl(vertices, faces, query_points, verbose=False):
+    """Compute SDF using libigl's signed_distance with fast winding number."""
+    try:
+        import igl
+    except ImportError:
+        if verbose:
+            print("  libigl not available, falling back to trimesh", flush=True)
+        return None
+
+    try:
+        v = np.ascontiguousarray(vertices, dtype=np.float64)
+        f = np.ascontiguousarray(faces, dtype=np.int64)
+        q = np.ascontiguousarray(query_points, dtype=np.float64)
+
+        # Process in chunks to limit memory
+        chunk_size = 500_000
+        sdf = np.empty(len(query_points), dtype=np.float64)
+        for i in range(0, len(query_points), chunk_size):
+            chunk = q[i:i + chunk_size]
+            S, I, C, N = igl.signed_distance(
+                chunk, v, f,
+                sign_type=igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER,
+            )
+            sdf[i:i + chunk_size] = S
+
+        if verbose:
+            n_inside = (sdf < 0).sum()
+            print(f"  igl SDF: {n_inside:,} inside, "
+                  f"dist range [{sdf.min():.6f}, {sdf.max():.6f}]", flush=True)
+
+        return sdf.astype(np.float32)
+    except Exception as e:
+        if verbose:
+            print(f"  igl SDF failed ({e}), falling back to trimesh", flush=True)
+        return None
+
+
+def _compute_sdf_trimesh(mesh, query_points, band_dist, verbose=False):
+    """Compute SDF using trimesh (slower fallback)."""
+    import trimesh
+
+    chunk_size = 100_000
+    sdf = np.full(len(query_points), band_dist * 2, dtype=np.float32)
+
+    for i in range(0, len(query_points), chunk_size):
+        chunk = query_points[i:i + chunk_size]
+        closest, dist, face_id = trimesh.proximity.closest_point(mesh, chunk)
+        signs = 1.0 - 2.0 * mesh.contains(chunk).astype(np.float32)
+        sdf[i:i + chunk_size] = dist * signs
+
+    return sdf
