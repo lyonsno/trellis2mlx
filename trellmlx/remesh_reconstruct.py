@@ -143,18 +143,33 @@ def remesh_narrow_band(
         n_near = (np.abs(sdf) < band_dist).sum()
         print(f"  Inside: {n_inside:,}, near surface: {n_near:,}", flush=True)
 
-    # Marching cubes to extract the zero-level set
+    # Extract surface from SDF — dual contouring (preserves sharp features)
+    # with marching cubes as fallback
+    grid_origin = np.array([center[0] - half, center[1] - half, center[2] - half])
     try:
-        new_verts, new_faces, normals, values = measure.marching_cubes(
-            sdf, level=0.0, spacing=(voxel_size, voxel_size, voxel_size),
-        )
-    except ValueError as e:
+        from trellmlx.dual_contouring import dual_contour_grid
         if verbose:
-            print(f"  Marching cubes failed: {e}", flush=True)
-        return vertices.copy(), faces.copy()
-
-    # Shift vertices to world coordinates
-    new_verts = new_verts + np.array([center[0] - half, center[1] - half, center[2] - half])
+            print(f"  Dual contouring...", flush=True)
+            t_dc = time.perf_counter()
+        new_verts, new_faces = dual_contour_grid(
+            sdf, voxel_size, grid_origin,
+        )
+        if verbose:
+            print(f"  Dual contouring: {len(new_verts):,}V {len(new_faces):,}F "
+                  f"({time.perf_counter() - t_dc:.1f}s)", flush=True)
+    except Exception as e:
+        if verbose:
+            print(f"  Dual contouring failed ({e}), falling back to marching cubes",
+                  flush=True)
+        try:
+            new_verts, new_faces, _, _ = measure.marching_cubes(
+                sdf, level=0.0, spacing=(voxel_size, voxel_size, voxel_size),
+            )
+            new_verts = new_verts + grid_origin
+        except ValueError as e2:
+            if verbose:
+                print(f"  Marching cubes also failed: {e2}", flush=True)
+            return vertices.copy(), faces.copy()
 
     if verbose:
         print(f"  Marching cubes: {len(new_verts):,}V {len(new_faces):,}F", flush=True)
