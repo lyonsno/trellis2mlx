@@ -288,13 +288,16 @@ def main():
                         help="Run narrow-band SDF remesh before cleanup (CPU, experimental). "
                              "Rebuilds mesh topology to reduce holes. Mirrors official "
                              "TRELLIS.2 remesh=True path.")
-    parser.add_argument("--remesh-resolution", type=int, default=256,
-                        help="SDF grid resolution for remesh (default: 256)")
-    parser.add_argument("--remesh-band", type=float, default=3.0,
-                        help="Narrow band width in voxels for remesh (default: 3.0)")
-    parser.add_argument("--remesh-project-back", type=float, default=0.9,
-                        help="Projection factor for remesh vertices (default: 0.9, "
-                             "0=no projection, 1=snap to original)")
+    parser.add_argument("--remesh-resolution", type=int, default=0,
+                        help="SDF grid resolution for remesh (default: match mesh_grid_size, "
+                             "typically 512 or 768)")
+    parser.add_argument("--remesh-band", type=float, default=1.0,
+                        help="Narrow band width in voxels for remesh (default: 1.0, "
+                             "matching official TRELLIS.2)")
+    parser.add_argument("--remesh-project-back", type=float, default=0.0,
+                        help="Projection factor for remesh vertices (default: 0.0, "
+                             "matching official TRELLIS.2 callers. Non-zero can cause "
+                             "asymmetric deformation on pre-simplified meshes.)")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
@@ -342,10 +345,11 @@ def main():
             # Optional: remesh reconstruction before cleanup
             if args.remesh:
                 from trellmlx.remesh_reconstruct import remesh_narrow_band
-                print("  Remesh reconstruction (CPU)...", flush=True)
+                remesh_res = args.remesh_resolution if args.remesh_resolution > 0 else mesh_grid_size
+                print(f"  Remesh reconstruction (CPU, resolution={remesh_res})...", flush=True)
                 vertices, faces = remesh_narrow_band(
                     vertices, faces,
-                    resolution=args.remesh_resolution,
+                    resolution=remesh_res,
                     band=args.remesh_band,
                     project_back=args.remesh_project_back,
                     verbose=True,
@@ -724,10 +728,11 @@ def main():
     # Optional: remesh reconstruction before cleanup
     if args.remesh:
         from trellmlx.remesh_reconstruct import remesh_narrow_band
-        print("  Remesh reconstruction (CPU)...", flush=True)
+        remesh_res = args.remesh_resolution if args.remesh_resolution > 0 else mesh_grid_size
+        print(f"  Remesh reconstruction (CPU, resolution={remesh_res})...", flush=True)
         vertices, faces = remesh_narrow_band(
             vertices, faces,
-            resolution=args.remesh_resolution,
+            resolution=remesh_res,
             band=args.remesh_band,
             project_back=args.remesh_project_back,
             verbose=True,

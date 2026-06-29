@@ -2,12 +2,15 @@
 
 Approximates the official TRELLIS.2 `cumesh.remeshing.remesh_narrow_band_dc`
 pipeline:
-1. Compute a narrow-band signed distance field from the input mesh
-2. Re-extract the surface via marching cubes
-3. Project vertices back to the original surface
+1. Pre-clean the input mesh (fill holes, remove non-manifold edges)
+2. Compute a signed distance field from the cleaned mesh
+3. Re-extract the surface via marching cubes
+4. Optionally project vertices back to the original surface
 
-This is a CPU reference implementation for testing whether topology
-reconstruction reduces holes. Not final Metal/MLX parity.
+The official path uses GPU dual contouring (which preserves sharp edges);
+this CPU version uses marching cubes (which rounds features to grid
+resolution). At matched resolution the topology improvement is comparable
+but geometric fidelity is lower on sharp features.
 """
 
 import numpy as np
@@ -19,31 +22,31 @@ def remesh_narrow_band(
     vertices: np.ndarray,
     faces: np.ndarray,
     *,
-    resolution: int = 256,
-    band: float = 3.0,
-    project_back: float = 0.9,
+    resolution: int = 512,
+    band: float = 1.0,
+    project_back: float = 0.0,
     center: Optional[np.ndarray] = None,
     scale: Optional[float] = None,
     verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Remesh via narrow-band SDF + marching cubes.
 
-    Mirrors the official `cumesh.remeshing.remesh_narrow_band_dc` interface:
-    - `resolution`: grid resolution for SDF computation
-    - `band`: narrow band width in voxels
-    - `project_back`: fraction to project new vertices back toward original surface
-      (0 = no projection, 1 = snap to original surface)
+    Mirrors the official `cumesh.remeshing.remesh_narrow_band_dc` interface.
+    Defaults match the official callers (example.py, app.py):
+    - `resolution`: should match mesh grid_size (default 512)
+    - `band`: 1 (official default)
+    - `project_back`: 0 (official callers all use 0)
 
-    For large meshes (>500K faces), pre-simplifies to ~200K faces for SDF
-    computation to keep memory and time manageable. The original full-resolution
-    mesh is used for final vertex projection.
+    For large meshes (>500K faces), pre-simplifies for SDF computation.
 
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
-        resolution: voxel grid resolution
+        resolution: voxel grid resolution (should match mesh_grid_size)
         band: narrow band width in voxels
-        project_back: projection factor (0-1)
+        project_back: projection factor (0=no projection, 1=snap to surface).
+            Official callers use 0. Non-zero projects onto pre-simplified
+            mesh which can introduce asymmetric deformation.
         center: center of the remesh volume (auto-computed if None)
         scale: scale of the remesh volume (auto-computed if None)
         verbose: print progress
@@ -60,41 +63,57 @@ def remesh_narrow_band(
     if len(vertices) == 0 or len(faces) == 0:
         return vertices.copy(), faces.copy()
 
+    # Pre-clean the input mesh before SDF computation (F9: official does this)
+    # Fill holes and remove non-manifold edges to improve winding number accuracy
+    if verbose:
+        print(f"  Pre-cleaning for SDF ({len(faces):,}F)...", flush=True)
+    from trellmlx.mesh_cleanup import fill_small_holes, repair_non_manifold_edges, remove_duplicate_faces
+    clean_verts, clean_faces = remove_duplicate_faces(vertices, faces, verbose=False)
+    clean_verts, clean_faces = repair_non_manifold_edges(clean_verts, clean_faces, verbose=False)
+    clean_verts, clean_faces = fill_small_holes(
+        clean_verts, clean_faces, max_hole_perimeter=3e-2, verbose=False,
+    )
+    if verbose:
+        print(f"  Pre-cleaned: {len(clean_verts):,}V {len(clean_faces):,}F", flush=True)
+
     # For SDF computation, use a simplified mesh if the input is very large.
-    # This keeps memory usage bounded while preserving the surface shape.
-    SDF_FACE_LIMIT = 200_000
-    if len(faces) > SDF_FACE_LIMIT:
+    SDF_FACE_LIMIT = 500_000
+    if len(clean_faces) > SDF_FACE_LIMIT:
         if verbose:
-            print(f"  Pre-simplifying for SDF: {len(faces):,}F → ~{SDF_FACE_LIMIT:,}F...",
+            print(f"  Pre-simplifying for SDF: {len(clean_faces):,}F → ~{SDF_FACE_LIMIT:,}F...",
                   flush=True)
         import fast_simplification
         t_simp = time.perf_counter()
         sdf_verts, sdf_faces = fast_simplification.simplify(
-            vertices, faces, target_reduction=1.0 - SDF_FACE_LIMIT / len(faces),
+            clean_verts, clean_faces, target_reduction=1.0 - SDF_FACE_LIMIT / len(clean_faces),
         )
         if verbose:
             print(f"  Pre-simplified: {len(sdf_verts):,}V {len(sdf_faces):,}F "
                   f"({time.perf_counter() - t_simp:.1f}s)", flush=True)
     else:
-        sdf_verts, sdf_faces = vertices, faces
+        sdf_verts, sdf_faces = clean_verts, clean_faces
 
-    sdf_mesh = trimesh.Trimesh(vertices=sdf_verts, faces=sdf_faces, process=False)
     orig_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    # Compute bounding box from original
+    # Compute bounding box from original mesh
     if center is None:
         center = orig_mesh.bounds.mean(axis=0)
     if scale is None:
         extent = orig_mesh.bounds[1] - orig_mesh.bounds[0]
-        scale = extent.max() * 1.1  # 10% padding
+        scale = extent.max()
 
-    half = scale / 2.0
-    voxel_size = scale / resolution
+    # F1: Use official band-expansion formula for grid scale
+    # Official: scale = (resolution + 3 * band) / resolution * scale
+    expanded_scale = (resolution + 3 * band) / resolution * scale
+    half = expanded_scale / 2.0
+    voxel_size = expanded_scale / resolution
     band_dist = band * voxel_size
 
     if verbose:
         print(f"  Remesh: resolution={resolution}, band={band}, "
               f"project_back={project_back}", flush=True)
+        print(f"  Scale: {scale:.6f} → {expanded_scale:.6f} "
+              f"(expansion factor {(resolution + 3*band)/resolution:.4f})", flush=True)
         print(f"  Voxel size: {voxel_size:.6f}, band_dist: {band_dist:.6f}", flush=True)
 
     # Grid coordinates
@@ -112,6 +131,7 @@ def remesh_narrow_band(
     # Try libigl's fast winding number for signed distance (much faster)
     sdf = _compute_sdf_igl(sdf_verts, sdf_faces, query_points, verbose)
     if sdf is None:
+        sdf_mesh = trimesh.Trimesh(vertices=sdf_verts, faces=sdf_faces, process=False)
         sdf = _compute_sdf_trimesh(sdf_mesh, query_points, band_dist, verbose)
 
     sdf = sdf.reshape(resolution, resolution, resolution)
@@ -142,12 +162,14 @@ def remesh_narrow_band(
     if len(new_verts) == 0:
         return vertices.copy(), faces.copy()
 
-    # Project back to original surface (use original full-res mesh for accuracy)
+    # Project back to original surface
+    # NOTE: Official callers use project_back=0. Non-zero projection onto
+    # a pre-simplified mesh causes asymmetric deformation (review F4/F5).
     if project_back > 0:
         if verbose:
-            print(f"  Projecting {len(new_verts):,} vertices back...", flush=True)
-        # Use simplified mesh for projection if original is huge
-        proj_mesh = sdf_mesh if len(faces) > SDF_FACE_LIMIT else orig_mesh
+            print(f"  Projecting {len(new_verts):,} vertices back "
+                  f"(factor={project_back})...", flush=True)
+        proj_mesh = trimesh.Trimesh(vertices=sdf_verts, faces=sdf_faces, process=False)
         chunk_size = 100_000
         all_closest = np.empty_like(new_verts)
         for i in range(0, len(new_verts), chunk_size):
@@ -156,7 +178,7 @@ def remesh_narrow_band(
             all_closest[i:i + chunk_size] = closest
         new_verts = new_verts * (1 - project_back) + all_closest * project_back
         if verbose:
-            print(f"  Projected back (factor={project_back})", flush=True)
+            print(f"  Projected back", flush=True)
 
     new_faces = new_faces.astype(np.int64)
 

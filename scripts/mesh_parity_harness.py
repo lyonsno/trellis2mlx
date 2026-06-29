@@ -99,10 +99,10 @@ def main():
     parser.add_argument("--label", default="",
                         help="Label for this run")
     parser.add_argument("--target-faces", type=int, default=350_000)
-    parser.add_argument("--remesh-resolution", type=int, default=256,
-                        help="Resolution for SDF remesh grid")
-    parser.add_argument("--remesh-band", type=float, default=3.0)
-    parser.add_argument("--remesh-project-back", type=float, default=0.9)
+    parser.add_argument("--remesh-resolution", type=int, default=0,
+                        help="Resolution for SDF remesh grid (0=match mesh_grid_size)")
+    parser.add_argument("--remesh-band", type=float, default=1.0)
+    parser.add_argument("--remesh-project-back", type=float, default=0.0)
     parser.add_argument("--output-dir", default="/tmp/parity-results")
     parser.add_argument("--skip-remesh", action="store_true",
                         help="Skip remesh candidate (faster, metrics-only)")
@@ -119,9 +119,13 @@ def main():
 
     # Load raw mesh
     vertices, faces, metadata = load_mesh_from_checkpoint(args.checkpoint)
-    grid_size = metadata.get("mesh_grid_size", "unknown")
+    grid_size = metadata.get("mesh_grid_size", 512)
     print(f"Raw mesh: {len(vertices):,}V {len(faces):,}F (grid_size={grid_size})",
           flush=True)
+
+    # Resolve remesh resolution: 0 means match mesh_grid_size
+    if args.remesh_resolution <= 0:
+        args.remesh_resolution = int(grid_size)
 
     config_base = {
         "checkpoint": args.checkpoint,
