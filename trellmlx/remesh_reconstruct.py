@@ -76,22 +76,12 @@ def remesh_narrow_band(
     if verbose:
         print(f"  Pre-cleaned: {len(clean_verts):,}V {len(clean_faces):,}F", flush=True)
 
-    # For SDF computation, use a simplified mesh if the input is very large.
-    SDF_FACE_LIMIT = 500_000
-    if len(clean_faces) > SDF_FACE_LIMIT:
-        if verbose:
-            print(f"  Pre-simplifying for SDF: {len(clean_faces):,}F → ~{SDF_FACE_LIMIT:,}F...",
-                  flush=True)
-        import fast_simplification
-        t_simp = time.perf_counter()
-        sdf_verts, sdf_faces = fast_simplification.simplify(
-            clean_verts, clean_faces, target_reduction=1.0 - SDF_FACE_LIMIT / len(clean_faces),
-        )
-        if verbose:
-            print(f"  Pre-simplified: {len(sdf_verts):,}V {len(sdf_faces):,}F "
-                  f"({time.perf_counter() - t_simp:.1f}s)", flush=True)
-    else:
-        sdf_verts, sdf_faces = clean_verts, clean_faces
+    # Use the full pre-cleaned mesh for SDF computation.
+    # Pre-simplification causes 16% sign errors near the surface (diagnostic
+    # showed 72K false-exterior + 7.8K false-interior points at 128^3),
+    # producing asymmetric blob artifacts. The full cleaned mesh takes ~23s
+    # for igl signed_distance vs ~3s simplified, but eliminates the divergence.
+    sdf_verts, sdf_faces = clean_verts, clean_faces
 
     orig_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
