@@ -700,6 +700,16 @@ def main():
     dec_coords_np = np.array(dec_coords)
     dec_feats_np = np.array(dec_out)
 
+    # Save raw decoder output for parity comparison
+    if args.save_checkpoints:
+        decoder_out_path = os.path.join(args.save_checkpoints, "decoder_output.npz")
+        np.savez(decoder_out_path,
+                 feats=dec_feats_np,
+                 coords=dec_coords_np)
+        print(f"  Saved decoder output: {decoder_out_path} "
+              f"({dec_feats_np.shape[0]:,} voxels, {dec_feats_np.shape[1]} channels)",
+              flush=True)
+
     # The decoder output coords span [0, hr_resolution). The decoder input
     # coords are at hr_resolution//16 (from requantization), and 4 upsamples
     # (2^4=16x) bring them back to hr_resolution scale.

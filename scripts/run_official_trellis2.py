@@ -1,7 +1,8 @@
-"""Run the official TRELLIS.2 pipeline end-to-end and save raw mesh at each stage.
+"""Run the Trellis-Mac pipeline end-to-end and save raw mesh + decoder output.
 
-This runs the Microsoft TRELLIS.2 pipeline (PyTorch MPS) to produce ground-truth
-mesh topology for comparison against our trellis2mlx reimplementation.
+Runs Microsoft's TRELLIS.2 pipeline via Trellis-Mac (PyTorch MPS) to produce
+ground-truth mesh topology and decoder features for comparison against
+trellis2mlx (MLX reimplementation).
 
 Usage (via Greenroom):
     /Users/noahlyons/dev/trellis-mac/.venv/bin/python -u \
@@ -21,11 +22,11 @@ import numpy as np
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run official TRELLIS.2 pipeline")
+    parser = argparse.ArgumentParser(description="Run Trellis-Mac pipeline")
     parser.add_argument("--image", required=True, help="Input image path")
     parser.add_argument("--output-dir", required=True, help="Output directory")
     parser.add_argument("--save-raw-mesh", action="store_true",
-                        help="Save raw mesh before any cleanup/remesh")
+                        help="Save raw mesh and decoder output before cleanup")
     parser.add_argument("--remesh", action="store_true",
                         help="Run with remesh=True in to_glb")
     parser.add_argument("--target-faces", type=int, default=350000)
@@ -49,9 +50,33 @@ def main():
     print("Loading pipeline...", flush=True)
     t0 = time.perf_counter()
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-    # Use MPS (Metal) instead of CUDA
     pipeline.to("mps")
     print(f"Pipeline loaded: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    # Hook the shape decoder to capture raw 7-channel features before extraction
+    _captured = {}
+
+    if args.save_raw_mesh:
+        decoder = pipeline.models['shape_slat_decoder']
+        _orig_forward = decoder.forward
+
+        @torch.no_grad()
+        def _hooked_forward(x, **kwargs):
+            # Run the parent decoder (NeXtDecoderSC.forward) to get raw output
+            decoded = decoder.__class__.__bases__[0].forward(decoder, x, **kwargs)
+            out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
+            h = out_list[0]
+
+            # Capture raw 7-channel features before sigmoid/threshold/softplus
+            _captured['feats'] = h.feats.detach().cpu().numpy()
+            _captured['coords'] = h.coords.detach().cpu().numpy()
+            print(f"  [hook] Captured decoder output: {h.feats.shape[0]:,} voxels, "
+                  f"{h.feats.shape[1]} channels", flush=True)
+
+            # Continue with normal forward (extraction happens here)
+            return _orig_forward(x, **kwargs)
+
+        decoder.forward = _hooked_forward
 
     # Load image
     image = Image.open(args.image)
@@ -70,11 +95,20 @@ def main():
     print(f"Raw mesh: {len(verts):,}V {len(faces):,}F", flush=True)
 
     if args.save_raw_mesh:
+        # Save raw mesh
         raw_path = os.path.join(args.output_dir, "raw_mesh.npz")
         np.savez(raw_path, vertices=verts, faces=faces)
         print(f"Saved raw mesh: {raw_path}", flush=True)
 
-        # Compute topology metrics inline
+        # Save captured decoder output
+        if _captured:
+            decoder_path = os.path.join(args.output_dir, "decoder_output.npz")
+            np.savez(decoder_path, **_captured)
+            print(f"Saved decoder output: {decoder_path} "
+                  f"(feats: {_captured['feats'].shape}, coords: {_captured['coords'].shape})",
+                  flush=True)
+
+        # Compute topology metrics
         from collections import Counter
         edge_count = Counter()
         for face in faces:
@@ -86,43 +120,22 @@ def main():
         print(f"Raw topology: {boundary_edges:,} boundary edges, "
               f"{non_manifold:,} non-manifold edges", flush=True)
 
-        # Save metrics
         metrics = {
             "vertices": len(verts),
             "faces": len(faces),
             "boundary_edges": boundary_edges,
             "non_manifold_edges": non_manifold,
         }
+        if _captured:
+            metrics["decoder_feats_shape"] = list(_captured['feats'].shape)
+            metrics["decoder_coords_shape"] = list(_captured['coords'].shape)
+
         with open(os.path.join(args.output_dir, "raw_mesh_metrics.json"), "w") as f:
             json.dump(metrics, f, indent=2)
 
-    # Simplify (nvdiffrast limit)
-    mesh.simplify(16777216)
-
-    # Export GLB via official to_glb
-    import o_voxel
-    print(f"Running to_glb (remesh={args.remesh})...", flush=True)
-    t0 = time.perf_counter()
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=mesh.layout,
-        voxel_size=mesh.voxel_size,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=args.target_faces,
-        texture_size=args.texture_size,
-        remesh=args.remesh,
-        remesh_band=1,
-        remesh_project=0,
-        verbose=True,
-    )
-    print(f"to_glb done: {time.perf_counter()-t0:.1f}s", flush=True)
-
-    output_path = os.path.join(args.output_dir, "output.glb")
-    glb.export(output_path)
-    print(f"Saved: {output_path} ({os.path.getsize(output_path)/1e6:.1f}MB)", flush=True)
+    # Skip to_glb for now — it crashes on MPS device mismatch in texture baking
+    print("Skipping to_glb (known MPS device mismatch in texture baking)", flush=True)
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
