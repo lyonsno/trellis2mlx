@@ -29,6 +29,9 @@ def main():
                         help="Save raw mesh and decoder output before cleanup")
     parser.add_argument("--remesh", action="store_true",
                         help="Run with remesh=True in to_glb")
+    parser.add_argument("--pipeline-type", default=None,
+                        help="Pipeline type: '512', '1024', '1024_cascade'. "
+                             "Default: auto (usually 1024_cascade for 4B model)")
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=1024)
     args = parser.parse_args()
@@ -83,9 +86,12 @@ def main():
     print(f"Image: {args.image} ({image.size})", flush=True)
 
     # Run pipeline
-    print("Running pipeline...", flush=True)
+    run_kwargs = {}
+    if args.pipeline_type:
+        run_kwargs['pipeline_type'] = args.pipeline_type
+    print(f"Running pipeline (type={args.pipeline_type or 'default'})...", flush=True)
     t0 = time.perf_counter()
-    meshes = pipeline.run(image)
+    meshes = pipeline.run(image, **run_kwargs)
     mesh = meshes[0]
     print(f"Pipeline done: {time.perf_counter()-t0:.1f}s", flush=True)
 
