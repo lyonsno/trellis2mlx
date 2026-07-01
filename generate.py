@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 import time
 
@@ -62,6 +63,30 @@ def _denormalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) 
 
 def _normalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) -> mx.array:
     return (slat - mx.array(mean)) / mx.array(std)
+
+
+def _save_sparse_coords_checkpoint(checkpoint_dir, lr_coords, lr_coords_4d, lr_resolution):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    lr_coords_np = np.asarray(lr_coords, dtype=np.int32)
+    coords_np = np.asarray(lr_coords_4d, dtype=np.int32)
+    np.savez(
+        os.path.join(checkpoint_dir, "sparse_coords.npz"),
+        lr_coords=lr_coords_np,
+        coords=coords_np,
+    )
+    with open(os.path.join(checkpoint_dir, "sparse_coords.json"), "w") as f:
+        json.dump(
+            {
+                "lr_resolution": int(lr_resolution),
+                "num_coords": int(len(lr_coords_np)),
+            },
+            f,
+        )
+    print(
+        f"  Saved sparse coords: {checkpoint_dir}/sparse_coords.npz "
+        f"({coords_np.shape})",
+        flush=True,
+    )
 
 
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
@@ -302,6 +327,8 @@ def main():
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
+    parser.add_argument("--stop-after-sparse", action="store_true",
+                        help="Exit successfully after saving sparse-structure coordinates")
     parser.add_argument("--shared-noise", metavar="PATH",
                         help="Load shared noise tensors from .npz for matched comparison. "
                              "Generate with scripts/generate_shared_noise.py")
@@ -584,7 +611,16 @@ def main():
     lr_coords = np.argwhere(decoded_ds)
     print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
 
+    N_lr = len(lr_coords)
+    lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
+    if args.save_checkpoints:
+        _save_sparse_coords_checkpoint(args.save_checkpoints, lr_coords, lr_coords_4d, lr_resolution)
+
     cleanup_model(ss_flow, ss_dec)
+    if args.stop_after_sparse:
+        print("Stop after sparse requested; exiting before SLat stages.", flush=True)
+        print(f"\nTotal: {time.perf_counter()-t_total:.1f}s", flush=True)
+        return
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
@@ -603,12 +639,10 @@ def main():
     if args.compile:
         lr_slat_flow.compile()
 
-    N_lr = len(lr_coords)
     if _shared_noise is not None:
         lr_noise = mx.array(_shared_noise["slat_noise_pool"][:N_lr])
     else:
         lr_noise = mx.random.normal((N_lr, 32))
-    lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
 
     t0 = time.perf_counter()
     lr_slat = flow_euler_sample(

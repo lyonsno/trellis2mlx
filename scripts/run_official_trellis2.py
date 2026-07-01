@@ -21,6 +21,10 @@ import time
 import numpy as np
 
 
+class _StopAfterSparse(Exception):
+    """Internal control-flow sentinel for sparse-only diagnostic runs."""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Trellis-Mac pipeline")
     parser.add_argument("--image", required=True, help="Input image path")
@@ -40,6 +44,10 @@ def main():
                              "Default: auto (usually 1024_cascade for 4B model)")
     parser.add_argument("--no-preprocess", action="store_true",
                         help="Pass preprocess_image=False to the Trellis-Mac pipeline")
+    parser.add_argument("--save-sparse-coords", action="store_true",
+                        help="Save sparse structure coordinates to sparse_coords.npz")
+    parser.add_argument("--stop-after-sparse", action="store_true",
+                        help="Exit successfully after saving sparse structure coordinates")
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=1024)
     args = parser.parse_args()
@@ -88,6 +96,13 @@ def main():
             return _orig_forward(x, **kwargs)
 
         decoder.forward = _hooked_forward
+
+    if args.save_sparse_coords or args.stop_after_sparse:
+        _install_sparse_capture_hook(
+            pipeline,
+            args.output_dir,
+            stop_after_sparse=args.stop_after_sparse,
+        )
 
     # Load image
     image = Image.open(args.image)
@@ -145,7 +160,12 @@ def main():
           f"steps={args.steps or 'default'}, seed={args.seed}, "
           f"preprocess={not args.no_preprocess})...", flush=True)
     t0 = time.perf_counter()
-    meshes = pipeline.run(image, **run_kwargs)
+    try:
+        meshes = pipeline.run(image, **run_kwargs)
+    except _StopAfterSparse:
+        print(f"Sparse-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
+        print("Done.", flush=True)
+        return
     mesh = meshes[0]
     print(f"Pipeline done: {time.perf_counter()-t0:.1f}s", flush=True)
 
@@ -212,6 +232,33 @@ def _build_run_kwargs(args):
         run_kwargs['shape_slat_sampler_params'] = step_override
         run_kwargs['tex_slat_sampler_params'] = step_override
     return run_kwargs
+
+
+def _install_sparse_capture_hook(pipeline, output_dir, *, stop_after_sparse=False):
+    original = pipeline.sample_sparse_structure
+
+    def _hooked_sample_sparse_structure(*args, **kwargs):
+        coords = original(*args, **kwargs)
+        coords_np = _to_numpy(coords).astype(np.int32, copy=False)
+        os.makedirs(output_dir, exist_ok=True)
+        sparse_path = os.path.join(output_dir, "sparse_coords.npz")
+        np.savez(sparse_path, coords=coords_np)
+        print(f"Saved sparse coords: {sparse_path} ({coords_np.shape})", flush=True)
+        if stop_after_sparse:
+            raise _StopAfterSparse()
+        return coords
+
+    pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _to_numpy(value):
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
 
 
 if __name__ == "__main__":
