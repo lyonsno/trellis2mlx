@@ -702,6 +702,7 @@ def main():
 
     # Save raw decoder output for parity comparison
     if args.save_checkpoints:
+        os.makedirs(args.save_checkpoints, exist_ok=True)
         decoder_out_path = os.path.join(args.save_checkpoints, "decoder_output.npz")
         np.savez(decoder_out_path,
                  feats=dec_feats_np,
