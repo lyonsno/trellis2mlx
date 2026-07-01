@@ -99,10 +99,16 @@ def flow_euler_sample(
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
                 reduce_dims = list(range(1, x_0_pos.ndim))
-                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) + 1e-8)
-                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) + 1e-8)
+                # Match PyTorch's torch.std() which uses Bessel correction (ddof=1)
+                # and no epsilon. The std ratio is numerically sensitive in CFG rescale.
+                n = 1
+                for d in reduce_dims:
+                    n *= x_0_pos.shape[d]
+                bessel = n / (n - 1)
+                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) * bessel)
+                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) * bessel)
 
-                x_0_rescaled = x_0_cfg * (std_pos / (std_cfg + 1e-8))
+                x_0_rescaled = x_0_cfg * (std_pos / std_cfg)
                 x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
         else:
