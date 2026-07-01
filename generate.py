@@ -474,12 +474,17 @@ def main():
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(ss_flow, bits=args.quantize)
+    # Upcast sparse structure flow to fp32 for CFG rescale stability.
+    # bf16 precision noise gets amplified ~5x per Euler step through the
+    # std ratio in CFG rescale, producing catastrophic divergence after
+    # 4 steps. fp32 reduces this. Cost: ~2.4GB extra for ~20s.
+    ss_flow.apply(lambda x: x.astype(mx.float32))
     if args.compile:
         ss_flow.compile()
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
-    noise = mx.random.normal((1, 8, 16, 16, 16))
+    noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
     t0 = time.perf_counter()
 
     if vs3d_mode:
@@ -516,7 +521,10 @@ def main():
         mx.eval(z_s)
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
-        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False)
+        # Cast conditioning to fp32 to match the fp32 sparse structure model
+        z_s = flow_euler_sample(ss_flow, noise,
+                                cond.astype(mx.float32), neg_cond.astype(mx.float32),
+                                steps=n_steps, verbose=False)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)

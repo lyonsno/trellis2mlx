@@ -96,10 +96,23 @@ def flow_euler_sample(
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
                 reduce_dims = list(range(1, x_0_pos.ndim))
-                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) + 1e-8)
-                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) + 1e-8)
+                # Match PyTorch torch.std() Bessel correction (ddof=1).
+                # Clamp the ratio to [0.5, 2.0] to prevent bf16 precision
+                # noise from cascading through Euler steps — the std ratio
+                # amplifies ~5x per step, producing catastrophic divergence
+                # after 4 steps without clamping.
+                n = 1
+                for d in reduce_dims:
+                    n *= x_0_pos.shape[d]
+                bessel = n / (n - 1)
+                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) * bessel)
+                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) * bessel)
 
-                x_0_rescaled = x_0_cfg * (std_pos / (std_cfg + 1e-8))
+                safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
+                ratio = std_pos / safe_std_cfg
+                ratio = mx.where(std_cfg > 0, ratio, mx.ones_like(ratio))
+                ratio = mx.clip(ratio, 0.5, 2.0)
+                x_0_rescaled = x_0_cfg * ratio
                 x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
         else:
