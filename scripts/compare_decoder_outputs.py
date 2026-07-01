@@ -387,6 +387,8 @@ def _infer_unmatched_variables(routes):
         unmatched.append("execution_backend")
     if "run_official_trellis2.py" in mac_route and "generate.py" in mlx_route:
         unmatched.append("implementation_route")
+        unmatched.append("image_feature_extraction")
+        unmatched.append("flow_sampler_semantics")
     unmatched.append("image_preprocessing")
     unmatched.append("model_weight_identity")
 

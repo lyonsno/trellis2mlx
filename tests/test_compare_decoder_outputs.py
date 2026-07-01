@@ -198,6 +198,8 @@ def test_compare_decoder_outputs_keeps_route_proof_candidate_when_variables_unma
 
     report = json.loads((output_dir / "comparison_report.json").read_text())
     assert report["unmatched_variables"]
+    assert "image_feature_extraction" in report["unmatched_variables"]
+    assert "flow_sampler_semantics" in report["unmatched_variables"]
     assert report["route_proof_status"] == "candidate"
 
 
