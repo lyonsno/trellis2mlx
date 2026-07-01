@@ -20,9 +20,10 @@ CHECKPOINT_STAGES = ("mesh_raw", "mesh_clean", "mesh_uv")
 
 
 class WitnessError(RuntimeError):
-    def __init__(self, phase: str, message: str):
+    def __init__(self, phase: str, message: str, *, loaded_stages: list[str] | None = None):
         super().__init__(message)
         self.phase = phase
+        self.loaded_stages = loaded_stages
 
 
 def _jsonable(value: Any) -> Any:
@@ -256,20 +257,24 @@ def build_report(*, checkpoint_dir: Path | None, glb: Path | None, report_path: 
     stages: dict[str, dict[str, Any]] = {}
     stage_arrays: dict[str, dict[str, np.ndarray]] = {}
 
-    if checkpoint_dir is not None:
-        for stage in CHECKPOINT_STAGES:
-            path = checkpoint_dir / f"{stage}.npz"
-            if not path.exists():
-                continue
-            arrays = _load_checkpoint_mesh(path)
-            stage_arrays[stage] = arrays
-            stages[stage] = analyze_mesh(stage, arrays["vertices"], arrays["faces"])
-            stages[stage]["path"] = str(path)
+    try:
+        if checkpoint_dir is not None:
+            for stage in CHECKPOINT_STAGES:
+                path = checkpoint_dir / f"{stage}.npz"
+                if not path.exists():
+                    continue
+                arrays = _load_checkpoint_mesh(path)
+                stage_arrays[stage] = arrays
+                stages[stage] = analyze_mesh(stage, arrays["vertices"], arrays["faces"])
+                stages[stage]["path"] = str(path)
 
-    if glb is not None:
-        vertices, faces = _load_glb_mesh(glb)
-        stages["export_glb"] = analyze_mesh("export_glb", vertices, faces)
-        stages["export_glb"]["path"] = str(glb)
+        if glb is not None:
+            vertices, faces = _load_glb_mesh(glb)
+            stages["export_glb"] = analyze_mesh("export_glb", vertices, faces)
+            stages["export_glb"]["path"] = str(glb)
+    except WitnessError as exc:
+        exc.loaded_stages = list(stages.keys())
+        raise
 
     if "mesh_uv" in stage_arrays and "vmapping" in stage_arrays["mesh_uv"]:
         source_stage = "mesh_clean" if "mesh_clean" in stage_arrays else "mesh_raw"
@@ -341,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         loaded = list(report["stages"].keys())
         _write_json(args.report, report)
     except WitnessError as exc:
+        loaded = exc.loaded_stages or loaded
         _write_json(
             args.report,
             _failure_report(

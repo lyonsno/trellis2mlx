@@ -121,3 +121,40 @@ def test_witness_writes_failure_report_when_no_mesh_inputs_exist(tmp_path):
     assert report["status"] == "error"
     assert report["phase"] == "load_inputs"
     assert report["last_trustworthy_evidence"]["loaded_stages"] == []
+
+
+def test_failure_report_preserves_stages_loaded_before_later_checkpoint_failure(tmp_path):
+    checkpoint_dir = tmp_path / "ckpt"
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    _write_mesh_npz(
+        checkpoint_dir / "mesh_raw.npz",
+        np.asarray(box.vertices, dtype=np.float32),
+        np.asarray(box.faces, dtype=np.int64),
+    )
+    checkpoint_dir.mkdir(exist_ok=True)
+    np.savez_compressed(
+        checkpoint_dir / "mesh_clean.npz",
+        vertices=np.asarray(box.vertices, dtype=np.float32),
+    )
+
+    report_path = tmp_path / "winding.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--report",
+            str(report_path),
+        ],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "error"
+    assert report["phase"] == "load_inputs"
+    assert report["last_trustworthy_evidence"]["loaded_stages"] == ["mesh_raw"]

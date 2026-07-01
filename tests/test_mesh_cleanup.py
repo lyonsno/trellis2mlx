@@ -53,7 +53,7 @@ def _make_open_box():
     ], dtype=np.float32) * scale
     faces = np.array([
         # bottom
-        [0, 1, 2], [0, 2, 3],
+        [0, 2, 1], [0, 3, 2],
         # front
         [0, 1, 5], [0, 5, 4],
         # right
@@ -65,6 +65,58 @@ def _make_open_box():
         # top is MISSING — this is the hole
     ], dtype=np.int64)
     return verts, faces
+
+
+def _assert_manifold_edges_oppositely_oriented(faces):
+    """Every two-face shared edge must be traversed in opposite directions."""
+    edge_dirs = {}
+    for face in faces:
+        for i in range(3):
+            edge = (int(face[i]), int(face[(i + 1) % 3]))
+            key = tuple(sorted(edge))
+            edge_dirs.setdefault(key, []).append(edge)
+
+    conflicts = []
+    for key, dirs in edge_dirs.items():
+        if len(dirs) == 2 and dirs[0] == dirs[1]:
+            conflicts.append((key, dirs))
+    assert conflicts == []
+
+
+def _component_signed_volumes(vertices, faces):
+    """Return signed volume for each face-connected component."""
+    edge_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            edge = tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+            edge_faces.setdefault(edge, []).append(fi)
+
+    adjacency = [[] for _ in range(len(faces))]
+    for incident in edge_faces.values():
+        for a in incident:
+            for b in incident:
+                if a != b:
+                    adjacency[a].append(b)
+
+    volumes = []
+    seen = set()
+    for start in range(len(faces)):
+        if start in seen:
+            continue
+        stack = [start]
+        component = []
+        seen.add(start)
+        while stack:
+            cur = stack.pop()
+            component.append(cur)
+            for nxt in adjacency[cur]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        tri = vertices[faces[component]]
+        volume = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0
+        volumes.append(volume)
+    return volumes
 
 
 class TestRemoveDuplicateFaces:
@@ -214,6 +266,13 @@ class TestFillSmallHolesPerimeter:
         assert len(f_out) == len(faces) + 4
         assert len(v_out) == len(verts) + 1
 
+    def test_filled_hole_preserves_boundary_winding_consistency(self):
+        """Cap triangles must oppose the existing directed boundary edges."""
+        verts, faces = _make_open_box()
+        v_out, f_out = fill_small_holes(verts, faces, max_hole_perimeter=3e-2, verbose=False)
+        assert len(f_out) == len(faces) + 4
+        _assert_manifold_edges_oppositely_oriented(f_out)
+
 
 class TestCleanupMeshIntegration:
     def test_cleanup_tuning_arguments_are_keyword_only(self):
@@ -249,6 +308,28 @@ class TestCleanupMeshIntegration:
         cleaned_v, cleaned_f = cleanup_mesh(verts, faces, verbose=False)
         # Tetrahedron is watertight, no floaters, no duplicates
         assert len(cleaned_f) == len(faces)
+
+    def test_cleanup_orients_disconnected_closed_components_outward(self):
+        """Default cleanup preserves islands, so each closed body needs orientation repair."""
+        box = np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+        ], dtype=np.float32)
+        box_faces = np.array([
+            [0, 2, 1], [0, 3, 2],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [1, 2, 6], [1, 6, 5],
+            [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7],
+        ], dtype=np.int64)
+        vertices = np.vstack([box, box + np.array([2.0, 0.0, 0.0], dtype=np.float32)])
+        faces = np.vstack([box_faces, box_faces[:, ::-1] + len(box)])
+
+        cleaned_v, cleaned_f = cleanup_mesh(vertices, faces, verbose=False)
+
+        assert len(cleaned_f) == len(faces)
+        assert all(volume > 0 for volume in _component_signed_volumes(cleaned_v, cleaned_f))
 
 
 class TestKeepLargestIsOptIn:

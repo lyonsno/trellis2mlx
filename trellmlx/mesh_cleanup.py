@@ -195,22 +195,26 @@ def fill_small_holes(
     if len(faces) == 0:
         return vertices, faces
 
-    # Find boundary edges (edges that appear in only one face)
+    # Find boundary edges (edges that appear in only one face). Keep their
+    # original directed traversal so filled caps oppose the adjacent face.
     edge_count = {}
+    directed_edges = []
     for face in faces:
         for i in range(3):
-            e = tuple(sorted((face[i], face[(i + 1) % 3])))
+            v0 = int(face[i])
+            v1 = int(face[(i + 1) % 3])
+            e = tuple(sorted((v0, v1)))
             edge_count[e] = edge_count.get(e, 0) + 1
+            directed_edges.append((v0, v1, e))
 
-    boundary_edges = {e for e, c in edge_count.items() if c == 1}
+    boundary_edges = [(v0, v1) for v0, v1, e in directed_edges if edge_count[e] == 1]
     if not boundary_edges:
         return vertices, faces
 
-    # Build adjacency for boundary vertices
+    # Build directed adjacency for boundary vertices.
     boundary_adj = {}
     for v0, v1 in boundary_edges:
         boundary_adj.setdefault(v0, []).append(v1)
-        boundary_adj.setdefault(v1, []).append(v0)
 
     # Trace boundary loops
     visited_edges = set()
@@ -218,27 +222,29 @@ def fill_small_holes(
     for start_edge in boundary_edges:
         if start_edge in visited_edges:
             continue
-        # Trace from start_edge[0]
         loop = [start_edge[0], start_edge[1]]
         visited_edges.add(start_edge)
+        closed = False
         while True:
             current = loop[-1]
             neighbors = boundary_adj.get(current, [])
-            found_next = False
+            next_vertex = None
             for n in neighbors:
-                e = tuple(sorted((current, n)))
-                if e not in visited_edges and n != loop[-2] if len(loop) > 1 else True:
+                e = (current, n)
+                if e not in visited_edges:
+                    next_vertex = n
                     visited_edges.add(e)
-                    if n == loop[0] and len(loop) >= 3:
-                        # Closed loop
-                        loops.append(loop)
-                        found_next = True
-                        break
-                    loop.append(n)
-                    found_next = True
                     break
-            if not found_next:
+            if next_vertex is None:
                 break
+            if next_vertex == loop[0] and len(loop) >= 3:
+                closed = True
+                break
+            if next_vertex in loop:
+                break
+            loop.append(next_vertex)
+        if closed:
+            loops.append(loop)
 
     if not loops:
         return vertices, faces
@@ -264,7 +270,7 @@ def fill_small_holes(
         for i in range(len(loop)):
             v0 = loop[i]
             v1 = loop[(i + 1) % len(loop)]
-            new_faces.append([v0, v1, centroid_idx])
+            new_faces.append([v1, v0, centroid_idx])
         filled += 1
 
     if verbose and filled > 0:
@@ -399,7 +405,7 @@ def fix_normals(
 
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    trimesh.repair.fix_normals(mesh)
+    trimesh.repair.fix_normals(mesh, multibody=True)
     # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)
     return np.array(mesh.vertices, dtype=vertices.dtype), np.array(mesh.faces, dtype=faces.dtype)
 
