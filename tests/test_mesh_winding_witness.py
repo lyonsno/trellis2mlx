@@ -1,0 +1,123 @@
+"""Contracts for the mesh winding/export witness."""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import trimesh
+
+
+SCRIPT = Path("scripts/mesh_winding_witness.py")
+
+
+def _write_mesh_npz(path: Path, vertices, faces, **extra):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        vertices=np.asarray(vertices, dtype=np.float32),
+        faces=np.asarray(faces, dtype=np.int64),
+        **extra,
+    )
+
+
+def test_analyze_mesh_detects_reversed_face_and_fix_counterfactual():
+    from scripts.mesh_winding_witness import analyze_mesh
+
+    mesh = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    faces[0] = faces[0][::-1]
+
+    report = analyze_mesh("flipped_box", vertices, faces)
+
+    assert report["orientation"]["inward_faces"] >= 1
+    assert report["edge_consistency"]["same_direction_conflict_edges"] >= 1
+    assert report["fix_normals_counterfactual"]["changed_faces"] >= 1
+    assert (
+        report["fix_normals_counterfactual"]["after_orientation"]["inward_faces"]
+        < report["orientation"]["inward_faces"]
+    )
+
+
+def test_checkpoint_report_catches_uv_stage_reversed_source_mapping(tmp_path):
+    clean_vertices = np.array(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [0, 1, 0],
+        ],
+        dtype=np.float32,
+    )
+    clean_faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+    checkpoint_dir = tmp_path / "ckpt"
+    _write_mesh_npz(checkpoint_dir / "mesh_clean.npz", clean_vertices, clean_faces)
+
+    uv_vertices = clean_vertices[[0, 1, 2, 0, 3, 2]]
+    uv_faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    vmapping = np.array([0, 1, 2, 0, 3, 2], dtype=np.int64)
+    _write_mesh_npz(
+        checkpoint_dir / "mesh_uv.npz",
+        uv_vertices,
+        uv_faces,
+        vmapping=vmapping,
+        uvs=np.zeros((6, 2), dtype=np.float32),
+    )
+
+    report_path = tmp_path / "winding.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--report",
+            str(report_path),
+        ],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "ok"
+    assert report["schema"] == "trellis2mlx.mesh_winding_witness.v1"
+    assert report["stages"]["mesh_clean"]["faces"] == 2
+    assert report["stages"]["mesh_uv"]["edge_consistency"]["boundary_edges"] == 6
+    assert report["stages"]["mesh_uv"]["source_face_mapping"] == {
+        "source_stage": "mesh_clean",
+        "mapped_faces": 2,
+        "same_orientation_faces": 1,
+        "reversed_orientation_faces": 1,
+        "unmatched_faces": 0,
+        "ambiguous_faces": 0,
+    }
+
+
+def test_witness_writes_failure_report_when_no_mesh_inputs_exist(tmp_path):
+    report_path = tmp_path / "winding.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--checkpoint-dir",
+            str(tmp_path / "missing"),
+            "--report",
+            str(report_path),
+        ],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "error"
+    assert report["phase"] == "load_inputs"
+    assert report["last_trustworthy_evidence"]["loaded_stages"] == []
