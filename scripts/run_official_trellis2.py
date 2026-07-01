@@ -31,6 +31,8 @@ def main():
                         help="Run with remesh=True in to_glb")
     parser.add_argument("--shared-noise", metavar="PATH",
                         help="Load shared noise tensors from .npz for matched comparison")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="Override sampler steps for all stages (0=use pipeline defaults)")
     parser.add_argument("--pipeline-type", default=None,
                         help="Pipeline type: '512', '1024', '1024_cascade'. "
                              "Default: auto (usually 1024_cascade for 4B model)")
@@ -137,7 +139,13 @@ def main():
     run_kwargs = {}
     if args.pipeline_type:
         run_kwargs['pipeline_type'] = args.pipeline_type
-    print(f"Running pipeline (type={args.pipeline_type or 'default'})...", flush=True)
+    if args.steps > 0:
+        step_override = {'steps': args.steps}
+        run_kwargs['sparse_structure_sampler_params'] = step_override
+        run_kwargs['shape_slat_sampler_params'] = step_override
+        run_kwargs['tex_slat_sampler_params'] = step_override
+    print(f"Running pipeline (type={args.pipeline_type or 'default'}, "
+          f"steps={args.steps or 'default'})...", flush=True)
     t0 = time.perf_counter()
     meshes = pipeline.run(image, **run_kwargs)
     mesh = meshes[0]
