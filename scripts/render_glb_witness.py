@@ -15,7 +15,9 @@ import trimesh
 
 
 PANELS = ("front_xz", "side_yz", "top_xy")
+CULLING_MODES = ("double_sided", "front_faces", "back_faces")
 ROUTE = "software_projected_mesh_witness"
+CULLING_ROUTE = "software_projected_winding_cull"
 BACKGROUND = (248, 248, 246)
 LINE = (72, 76, 82)
 LABEL = (30, 34, 40)
@@ -73,6 +75,28 @@ def _failure_report(
     return payload
 
 
+def _culling_output_paths(output_path: Path, culling_dir: Path | None = None) -> dict[str, Path]:
+    directory = culling_dir or output_path.with_suffix("")
+    return {mode: directory / f"{mode}.png" for mode in CULLING_MODES}
+
+
+def _source_artifacts(
+    *,
+    input_path: Path,
+    output_path: Path,
+    report_path: Path,
+    culling_outputs: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "input_glb": str(input_path),
+        "control_output_png": str(output_path),
+        "report_json": str(report_path),
+    }
+    if culling_outputs is not None:
+        payload["culling_output_pngs"] = {mode: str(path) for mode, path in culling_outputs.items()}
+    return payload
+
+
 def _write_failure_report_and_cleanup(
     *,
     phase: str,
@@ -81,6 +105,7 @@ def _write_failure_report_and_cleanup(
     output_path: Path,
     report_path: Path,
     status_code: int,
+    culling_outputs: dict[str, Path] | None = None,
 ) -> int:
     report = _failure_report(
         phase=phase,
@@ -91,6 +116,18 @@ def _write_failure_report_and_cleanup(
     )
     if output_path.exists():
         output_path.unlink()
+    if culling_outputs is not None:
+        report["source_artifacts"] = _source_artifacts(
+            input_path=input_path,
+            output_path=output_path,
+            report_path=report_path,
+            culling_outputs=culling_outputs,
+        )
+        report["stale_culling_outputs_removed"] = []
+        for mode, path in culling_outputs.items():
+            if path.exists():
+                report["stale_culling_outputs_removed"].append({"mode": mode, "path": str(path)})
+                path.unlink()
     _write_json(report_path, report)
     if phase != "parse_args":
         print(f"{phase}: {error}", file=sys.stderr)
@@ -217,6 +254,8 @@ def _project_panel(
     face_colors: np.ndarray,
     panel: str,
     size: int,
+    culling_mode: str,
+    front_face: str,
 ) -> tuple[Image.Image, dict[str, Any]]:
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -252,14 +291,29 @@ def _project_panel(
     light /= np.linalg.norm(light)
     faces_drawn = 0
     faces_skipped = 0
+    front_faces_seen = 0
+    back_faces_seen = 0
+    faces_culled = 0
 
     for face_index in order:
         pts = projected[faces[face_index]]
         if not np.isfinite(pts).all():
             faces_skipped += 1
             continue
-        if abs(_polygon_area(pts)) < 0.02:
+        signed_area = _signed_polygon_area(pts)
+        if abs(signed_area) < 0.02:
             faces_skipped += 1
+            continue
+        is_front = signed_area > 0 if front_face == "ccw" else signed_area < 0
+        if is_front:
+            front_faces_seen += 1
+        else:
+            back_faces_seen += 1
+        if culling_mode == "front_faces" and not is_front:
+            faces_culled += 1
+            continue
+        if culling_mode == "back_faces" and is_front:
+            faces_culled += 1
             continue
 
         base = face_colors[face_index].astype(np.float64)
@@ -269,30 +323,48 @@ def _project_panel(
         draw.polygon([tuple(p) for p in pts], fill=color, outline=outline)
         faces_drawn += 1
 
-    draw.text((18, 16), panel, fill=LABEL)
+    draw.text((18, 16), f"{panel} {culling_mode}", fill=LABEL)
     return image, {
         "panel": panel,
+        "culling_mode": culling_mode,
         "faces_rendered": int(faces.shape[0]),
         "faces_drawn": faces_drawn,
         "faces_skipped": faces_skipped,
+        "faces_culled": faces_culled,
+        "front_faces_seen": front_faces_seen,
+        "back_faces_seen": back_faces_seen,
         "scale": float(scale),
         "axes": [axis_a, axis_b],
         "depth_axis": depth_axis,
     }
 
 
-def _polygon_area(points: np.ndarray) -> float:
+def _signed_polygon_area(points: np.ndarray) -> float:
     x = points[:, 0]
     y = points[:, 1]
-    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+    return float(0.5 * (np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
 
 
-def _render_witness(mesh: trimesh.Trimesh, output_path: Path, size: int) -> dict[str, Any]:
-    face_colors, color_route = _face_colors(mesh)
+def _render_mode(
+    *,
+    mesh: trimesh.Trimesh,
+    face_colors: np.ndarray,
+    color_route: str,
+    culling_mode: str,
+    front_face: str,
+    size: int,
+) -> tuple[Image.Image, dict[str, Any]]:
     panel_images = []
     panel_reports = []
     for panel in PANELS:
-        image, report = _project_panel(mesh=mesh, face_colors=face_colors, panel=panel, size=size)
+        image, report = _project_panel(
+            mesh=mesh,
+            face_colors=face_colors,
+            panel=panel,
+            size=size,
+            culling_mode=culling_mode,
+            front_face=front_face,
+        )
         panel_images.append(image)
         panel_reports.append(report)
 
@@ -308,22 +380,87 @@ def _render_witness(mesh: trimesh.Trimesh, output_path: Path, size: int) -> dict
         and pixel_std > 1.0
         and np.unique(pixels.reshape(-1, 3), axis=0).shape[0] > 8
     )
-    if not nonblank:
-        raise WitnessError(
-            "validate_witness",
-            f"rendered witness is blank or near-blank; faces_drawn={faces_drawn}, pixel_std={pixel_std:.4f}",
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.save(output_path)
-    return {
+    return output, {
         "nonblank": nonblank,
         "pixel_std": pixel_std,
         "size": [output.width, output.height],
         "panels": list(PANELS),
         "panel_reports": panel_reports,
         "faces_drawn": faces_drawn,
+        "front_faces_seen": sum(panel["front_faces_seen"] for panel in panel_reports),
+        "back_faces_seen": sum(panel["back_faces_seen"] for panel in panel_reports),
+        "faces_culled": sum(panel["faces_culled"] for panel in panel_reports),
         "color_route": color_route,
+    }
+
+
+def _render_witness(
+    mesh: trimesh.Trimesh,
+    output_path: Path,
+    size: int,
+    *,
+    culling_outputs: dict[str, Path],
+    front_face: str,
+) -> dict[str, Any]:
+    face_colors, color_route = _face_colors(mesh)
+    mode_reports = {}
+    for mode in CULLING_MODES:
+        output, mode_report = _render_mode(
+            mesh=mesh,
+            face_colors=face_colors,
+            color_route=color_route,
+            culling_mode=mode,
+            front_face=front_face,
+            size=size,
+        )
+        if mode == "double_sided" and not mode_report["nonblank"]:
+            faces_drawn = mode_report["faces_drawn"]
+            pixel_std = mode_report["pixel_std"]
+            raise WitnessError(
+                "validate_witness",
+                f"rendered witness is blank or near-blank; faces_drawn={faces_drawn}, pixel_std={pixel_std:.4f}",
+            )
+
+        path = culling_outputs[mode]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output.save(path)
+        if mode == "double_sided":
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output.save(output_path)
+        mode_reports[mode] = {
+            **mode_report,
+            "output_png": str(path),
+        }
+
+    double_sided = mode_reports["double_sided"]
+    front = mode_reports["front_faces"]
+    back = mode_reports["back_faces"]
+    culling_summary = {
+        "route": CULLING_ROUTE,
+        "front_face": front_face,
+        "orientation_basis": "projected_triangle_signed_area_after_panel_projection",
+        "control_mode": "double_sided",
+        "front_faces_mode": "draw projected triangles matching --front-face",
+        "back_faces_mode": "draw projected triangles opposite --front-face",
+        "mode_outputs": {mode: str(path) for mode, path in culling_outputs.items()},
+        "front_drawn_ratio": float(front["faces_drawn"] / double_sided["faces_drawn"])
+        if double_sided["faces_drawn"]
+        else None,
+        "back_drawn_ratio": float(back["faces_drawn"] / double_sided["faces_drawn"])
+        if double_sided["faces_drawn"]
+        else None,
+    }
+    return {
+        "nonblank": double_sided["nonblank"],
+        "pixel_std": double_sided["pixel_std"],
+        "size": double_sided["size"],
+        "panels": list(PANELS),
+        "panel_reports": double_sided["panel_reports"],
+        "faces_drawn": double_sided["faces_drawn"],
+        "color_route": color_route,
+        "culling_modes": list(CULLING_MODES),
+        "culling_summary": culling_summary,
+        "culling_reports": mode_reports,
     }
 
 
@@ -334,6 +471,7 @@ def _success_report(
     input_path: Path,
     output_path: Path,
     report_path: Path,
+    culling_outputs: dict[str, Path],
 ) -> dict[str, Any]:
     bounds = np.asarray(mesh.bounds, dtype=np.float64)
     extents = np.asarray(mesh.extents, dtype=np.float64)
@@ -344,6 +482,12 @@ def _success_report(
         "input_glb": str(input_path),
         "output_png": str(output_path),
         "report_json": str(report_path),
+        "source_artifacts": _source_artifacts(
+            input_path=input_path,
+            output_path=output_path,
+            report_path=report_path,
+            culling_outputs=culling_outputs,
+        ),
         "mesh": {
             "vertices": int(len(mesh.vertices)),
             "faces": int(len(mesh.faces)),
@@ -362,11 +506,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path, help="Output PNG witness path.")
     parser.add_argument("--report", required=True, type=Path, help="Output JSON report path.")
     parser.add_argument("--size", type=int, default=720, help="Per-panel square size in pixels.")
+    parser.add_argument(
+        "--culling-dir",
+        type=Path,
+        default=None,
+        help="Directory for culling-mode PNGs. Defaults to the output path without its suffix.",
+    )
+    parser.add_argument(
+        "--front-face",
+        choices=("ccw", "cw"),
+        default="ccw",
+        help="Projected winding treated as front-facing for culling-mode views.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    culling_outputs = _culling_output_paths(args.output, args.culling_dir)
     if args.size < 128:
         return _write_failure_report_and_cleanup(
             phase="parse_args",
@@ -375,12 +532,19 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             report_path=args.report,
             status_code=2,
+            culling_outputs=culling_outputs,
         )
 
     try:
         mesh = _load_mesh(args.input)
         _validate_mesh(mesh)
-        witness = _render_witness(mesh, args.output, args.size)
+        witness = _render_witness(
+            mesh,
+            args.output,
+            args.size,
+            culling_outputs=culling_outputs,
+            front_face=args.front_face,
+        )
         _write_json(
             args.report,
             _success_report(
@@ -389,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
                 input_path=args.input,
                 output_path=args.output,
                 report_path=args.report,
+                culling_outputs=culling_outputs,
             ),
         )
     except WitnessError as exc:
@@ -399,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             report_path=args.report,
             status_code=1,
+            culling_outputs=culling_outputs,
         )
     except Exception as exc:  # pragma: no cover - defensive durable failure report
         phase = "unexpected"
@@ -409,9 +575,12 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             report_path=args.report,
             status_code=1,
+            culling_outputs=culling_outputs,
         )
 
     print(f"wrote witness: {args.output}")
+    for mode, path in culling_outputs.items():
+        print(f"wrote {mode}: {path}")
     print(f"wrote report: {args.report}")
     return 0
 
