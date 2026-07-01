@@ -605,15 +605,21 @@ def main():
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(ss_flow, bits=args.quantize)
+    # Upcast sparse structure flow to fp32 for CFG rescale numerical stability.
+    # The CFG rescale std ratio amplifies bf16 noise ~5x per Euler step,
+    # producing catastrophic divergence after 4 steps. fp32 eliminates this.
+    # Cost: ~2.4GB extra for ~20s, freed after sparse structure stage.
+    ss_flow.apply(lambda x: x.astype(mx.float32))
+    print("  Sparse structure flow upcast to fp32", flush=True)
     if args.compile:
         ss_flow.compile()
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
     if _shared_noise is not None:
-        noise = mx.array(_shared_noise["ss_noise"])
+        noise = mx.array(_shared_noise["ss_noise"], dtype=mx.float32)
     else:
-        noise = mx.random.normal((1, 8, 16, 16, 16))
+        noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
     t0 = time.perf_counter()
 
     if vs3d_mode:
