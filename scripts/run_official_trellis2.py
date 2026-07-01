@@ -25,6 +25,10 @@ class _StopAfterSparse(Exception):
     """Internal control-flow sentinel for sparse-only diagnostic runs."""
 
 
+class _StopAfterShapeSLat(Exception):
+    """Internal control-flow sentinel for shape-SLat-only diagnostic runs."""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Trellis-Mac pipeline")
     parser.add_argument("--image", required=True, help="Input image path")
@@ -48,6 +52,10 @@ def main():
                         help="Save sparse structure coordinates to sparse_coords.npz")
     parser.add_argument("--stop-after-sparse", action="store_true",
                         help="Exit successfully after saving sparse structure coordinates")
+    parser.add_argument("--save-shape-slat", action="store_true",
+                        help="Save shape structured latent to shape_slat.npz")
+    parser.add_argument("--stop-after-shape-slat", action="store_true",
+                        help="Exit successfully after saving shape structured latent")
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=1024)
     args = parser.parse_args()
@@ -102,6 +110,12 @@ def main():
             pipeline,
             args.output_dir,
             stop_after_sparse=args.stop_after_sparse,
+        )
+    if args.save_shape_slat or args.stop_after_shape_slat:
+        _install_shape_slat_capture_hook(
+            pipeline,
+            args.output_dir,
+            stop_after_shape_slat=args.stop_after_shape_slat,
         )
 
     # Load image
@@ -164,6 +178,10 @@ def main():
         meshes = pipeline.run(image, **run_kwargs)
     except _StopAfterSparse:
         print(f"Sparse-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
+        print("Done.", flush=True)
+        return
+    except _StopAfterShapeSLat:
+        print(f"Shape-SLat-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
         print("Done.", flush=True)
         return
     mesh = meshes[0]
@@ -249,6 +267,28 @@ def _install_sparse_capture_hook(pipeline, output_dir, *, stop_after_sparse=Fals
         return coords
 
     pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_shape_slat_capture_hook(pipeline, output_dir, *, stop_after_shape_slat=False):
+    original = pipeline.sample_shape_slat
+
+    def _hooked_sample_shape_slat(*args, **kwargs):
+        shape_slat = original(*args, **kwargs)
+        feats_np = _to_numpy(shape_slat.feats).astype(np.float32, copy=False)
+        coords_np = _to_numpy(shape_slat.coords).astype(np.int32, copy=False)
+        os.makedirs(output_dir, exist_ok=True)
+        slat_path = os.path.join(output_dir, "shape_slat.npz")
+        np.savez(slat_path, feats=feats_np, coords=coords_np)
+        print(
+            f"Saved shape SLat: {slat_path} "
+            f"(feats: {feats_np.shape}, coords: {coords_np.shape})",
+            flush=True,
+        )
+        if stop_after_shape_slat:
+            raise _StopAfterShapeSLat()
+        return shape_slat
+
+    pipeline.sample_shape_slat = _hooked_sample_shape_slat
 
 
 def _to_numpy(value):

@@ -47,3 +47,30 @@ def test_sparse_capture_hook_saves_coords_and_can_stop(tmp_path):
         np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
     )
     assert pipeline.calls == 1
+
+
+def test_shape_slat_capture_hook_saves_feats_coords_and_can_stop(tmp_path):
+    from scripts.run_official_trellis2 import _StopAfterShapeSLat, _install_shape_slat_capture_hook
+
+    class FakeSLat:
+        feats = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32)
+        coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+
+    class FakePipeline:
+        def __init__(self):
+            self.calls = 0
+
+        def sample_shape_slat(self, *args, **kwargs):
+            self.calls += 1
+            return FakeSLat()
+
+    pipeline = FakePipeline()
+    _install_shape_slat_capture_hook(pipeline, str(tmp_path), stop_after_shape_slat=True)
+
+    with pytest.raises(_StopAfterShapeSLat):
+        pipeline.sample_shape_slat("cond", "flow", np.array([[0, 1, 2, 3]], dtype=np.int32))
+
+    saved = np.load(tmp_path / "shape_slat.npz")
+    np.testing.assert_allclose(saved["feats"], FakeSLat.feats)
+    np.testing.assert_array_equal(saved["coords"], FakeSLat.coords)
+    assert pipeline.calls == 1

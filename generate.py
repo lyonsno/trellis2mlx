@@ -89,6 +89,31 @@ def _save_sparse_coords_checkpoint(checkpoint_dir, lr_coords, lr_coords_4d, lr_r
     )
 
 
+def _save_shape_slat_checkpoint(checkpoint_dir, feats, coords, stage):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    feats_np = np.asarray(feats, dtype=np.float32)
+    coords_np = np.asarray(coords, dtype=np.int32)
+    np.savez(
+        os.path.join(checkpoint_dir, "shape_slat.npz"),
+        feats=feats_np,
+        coords=coords_np,
+    )
+    with open(os.path.join(checkpoint_dir, "shape_slat.json"), "w") as f:
+        json.dump(
+            {
+                "stage": stage,
+                "num_tokens": int(feats_np.shape[0]),
+                "channels": int(feats_np.shape[1]) if feats_np.ndim == 2 else None,
+            },
+            f,
+        )
+    print(
+        f"  Saved shape SLat: {checkpoint_dir}/shape_slat.npz "
+        f"(feats: {feats_np.shape}, coords: {coords_np.shape})",
+        flush=True,
+    )
+
+
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
@@ -329,6 +354,8 @@ def main():
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
     parser.add_argument("--stop-after-sparse", action="store_true",
                         help="Exit successfully after saving sparse-structure coordinates")
+    parser.add_argument("--stop-after-shape-slat", action="store_true",
+                        help="Exit successfully after saving shape structured latent")
     parser.add_argument("--shared-noise", metavar="PATH",
                         help="Load shared noise tensors from .npz for matched comparison. "
                              "Generate with scripts/generate_shared_noise.py")
@@ -735,6 +762,17 @@ def main():
         gc.collect()
 
     # Keep hr_slat — needed for texture conditioning
+    if args.save_checkpoints:
+        _save_shape_slat_checkpoint(
+            args.save_checkpoints,
+            np.array(hr_slat),
+            quant_coords,
+            "no_cascade_lr_slat" if args.no_cascade else "hr_slat",
+        )
+    if args.stop_after_shape_slat:
+        print("Stop after shape SLat requested; exiting before decode/texture stages.", flush=True)
+        print(f"\nTotal: {time.perf_counter()-t_total:.1f}s", flush=True)
+        return
 
     # === Stage 3: Shape Decode ===
     print("\n=== Stage 3: Decode Shape ===", flush=True)
