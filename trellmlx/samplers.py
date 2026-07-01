@@ -63,6 +63,9 @@ def flow_euler_sample(
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
     t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
 
+    # Optional: save per-step state for debugging
+    _debug_states = model_kwargs.pop('_debug_states', None)
+
     for step_idx, (t, t_prev) in enumerate(t_pairs):
         if verbose:
             print(f"  Step {step_idx + 1}/{steps} (t={t:.4f}→{t_prev:.4f})", end="", flush=True)
@@ -113,6 +116,18 @@ def flow_euler_sample(
         # Euler step
         sample = sample - (t - t_prev) * pred
         mx.eval(sample)
+
+        if _debug_states is not None:
+            _debug_states.append({
+                'step': step_idx,
+                't': float(t),
+                'sample_mean': float(mx.mean(sample)),
+                'sample_std': float(mx.sqrt(mx.var(sample))),
+                'sample_min': float(mx.min(sample)),
+                'sample_max': float(mx.max(sample)),
+                'pred_mean': float(mx.mean(pred)),
+                'pred_std': float(mx.sqrt(mx.var(pred))),
+            })
 
         if verbose:
             print(f" done", flush=True)

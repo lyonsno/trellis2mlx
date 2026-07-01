@@ -555,10 +555,22 @@ def main():
         mx.eval(z_s)
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
-        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False)
+        _ss_debug = []
+        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False,
+                                _debug_states=_ss_debug)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    # Save sparse structure debug states
+    if args.save_checkpoints and _ss_debug:
+        import json as _json
+        os.makedirs(args.save_checkpoints, exist_ok=True)
+        with open(os.path.join(args.save_checkpoints, "ss_flow_debug.json"), "w") as f:
+            _json.dump(_ss_debug, f, indent=2)
+        # Also save the raw z_s tensor
+        np.save(os.path.join(args.save_checkpoints, "z_s.npy"), np.array(z_s))
+        print(f"  Saved SS flow debug ({len(_ss_debug)} steps) + z_s tensor", flush=True)
 
     logits = ss_dec(z_s.astype(mx.float32))
     mx.eval(logits)
