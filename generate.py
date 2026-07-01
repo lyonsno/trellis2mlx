@@ -302,6 +302,9 @@ def main():
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
+    parser.add_argument("--shared-noise", metavar="PATH",
+                        help="Load shared noise tensors from .npz for matched comparison. "
+                             "Generate with scripts/generate_shared_noise.py")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -422,6 +425,12 @@ def main():
     n_steps = args.steps
     t_total = time.perf_counter()
 
+    # Load shared noise for matched comparison
+    _shared_noise = None
+    if args.shared_noise:
+        _shared_noise = np.load(args.shared_noise)
+        print(f"  Loaded shared noise from {args.shared_noise}", flush=True)
+
     HF_4B = os.path.expanduser(
         "~/.cache/huggingface/hub/models--microsoft--TRELLIS.2-4B/"
         "snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/"
@@ -506,7 +515,10 @@ def main():
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
-    noise = mx.random.normal((1, 8, 16, 16, 16))
+    if _shared_noise is not None:
+        noise = mx.array(_shared_noise["ss_noise"])
+    else:
+        noise = mx.random.normal((1, 8, 16, 16, 16))
     t0 = time.perf_counter()
 
     if vs3d_mode:
@@ -580,7 +592,10 @@ def main():
         lr_slat_flow.compile()
 
     N_lr = len(lr_coords)
-    lr_noise = mx.random.normal((N_lr, 32))
+    if _shared_noise is not None:
+        lr_noise = mx.array(_shared_noise["slat_noise_pool"][:N_lr])
+    else:
+        lr_noise = mx.random.normal((N_lr, 32))
     lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
 
     t0 = time.perf_counter()
@@ -776,7 +791,10 @@ def main():
 
     # Sample texture latent: noise (32ch) conditioned on shape SLat (32ch)
     # Texture uses guidance_strength=1.0 (no CFG — single forward pass per step)
-    tex_noise = mx.random.normal((num_tokens, 32))
+    if _shared_noise is not None:
+        tex_noise = mx.array(_shared_noise["tex_noise_pool"][:num_tokens])
+    else:
+        tex_noise = mx.random.normal((num_tokens, 32))
     t0 = time.perf_counter()
     tex_slat = flow_euler_sample(
         tex_flow, tex_noise, cond_tgt if vs3d_mode else cond, neg_cond,

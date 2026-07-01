@@ -29,6 +29,8 @@ def main():
                         help="Save raw mesh and decoder output before cleanup")
     parser.add_argument("--remesh", action="store_true",
                         help="Run with remesh=True in to_glb")
+    parser.add_argument("--shared-noise", metavar="PATH",
+                        help="Load shared noise tensors from .npz for matched comparison")
     parser.add_argument("--pipeline-type", default=None,
                         help="Pipeline type: '512', '1024', '1024_cascade'. "
                              "Default: auto (usually 1024_cascade for 4B model)")
@@ -84,6 +86,52 @@ def main():
     # Load image
     image = Image.open(args.image)
     print(f"Image: {args.image} ({image.size})", flush=True)
+
+    # Inject shared noise by monkey-patching torch.randn
+    if args.shared_noise:
+        _shared = np.load(args.shared_noise)
+        _noise_calls = [0]
+        _noise_map = {
+            (1, 8, 16, 16, 16): torch.tensor(_shared["ss_noise"]),
+        }
+        _slat_pool = torch.tensor(_shared["slat_noise_pool"])
+        _tex_pool = torch.tensor(_shared["tex_noise_pool"])
+        _original_randn = torch.randn
+
+        def _patched_randn(*args_t, **kwargs):
+            shape = args_t if len(args_t) > 1 else args_t[0] if args_t else None
+            if isinstance(shape, (list, tuple)):
+                shape = tuple(shape)
+            elif hasattr(shape, 'shape'):
+                shape = tuple(shape.shape)
+
+            # Match by shape
+            if shape in _noise_map:
+                result = _noise_map[shape].clone()
+                if 'device' in kwargs:
+                    result = result.to(kwargs['device'])
+                print(f"  [shared noise] Injected {shape}", flush=True)
+                return result
+
+            # For SLat-sized noise (N, 32), use pool
+            if len(shape) == 2 and shape[1] == 32:
+                n = shape[0]
+                _noise_calls[0] += 1
+                if _noise_calls[0] <= 1:
+                    pool = _slat_pool[:n]
+                else:
+                    pool = _tex_pool[:n]
+                result = pool.clone()
+                if 'device' in kwargs:
+                    result = result.to(kwargs['device'])
+                print(f"  [shared noise] Injected SLat {shape} (call #{_noise_calls[0]})",
+                      flush=True)
+                return result
+
+            return _original_randn(*args_t, **kwargs)
+
+        torch.randn = _patched_randn
+        print(f"Shared noise loaded from {args.shared_noise}", flush=True)
 
     # Run pipeline
     run_kwargs = {}
