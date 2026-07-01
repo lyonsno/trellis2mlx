@@ -31,11 +31,15 @@ def main():
                         help="Run with remesh=True in to_glb")
     parser.add_argument("--shared-noise", metavar="PATH",
                         help="Load shared noise tensors from .npz for matched comparison")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed passed to Trellis2ImageTo3DPipeline.run")
     parser.add_argument("--steps", type=int, default=0,
                         help="Override sampler steps for all stages (0=use pipeline defaults)")
     parser.add_argument("--pipeline-type", default=None,
                         help="Pipeline type: '512', '1024', '1024_cascade'. "
                              "Default: auto (usually 1024_cascade for 4B model)")
+    parser.add_argument("--no-preprocess", action="store_true",
+                        help="Pass preprocess_image=False to the Trellis-Mac pipeline")
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=1024)
     args = parser.parse_args()
@@ -136,16 +140,10 @@ def main():
         print(f"Shared noise loaded from {args.shared_noise}", flush=True)
 
     # Run pipeline
-    run_kwargs = {}
-    if args.pipeline_type:
-        run_kwargs['pipeline_type'] = args.pipeline_type
-    if args.steps > 0:
-        step_override = {'steps': args.steps}
-        run_kwargs['sparse_structure_sampler_params'] = step_override
-        run_kwargs['shape_slat_sampler_params'] = step_override
-        run_kwargs['tex_slat_sampler_params'] = step_override
+    run_kwargs = _build_run_kwargs(args)
     print(f"Running pipeline (type={args.pipeline_type or 'default'}, "
-          f"steps={args.steps or 'default'})...", flush=True)
+          f"steps={args.steps or 'default'}, seed={args.seed}, "
+          f"preprocess={not args.no_preprocess})...", flush=True)
     t0 = time.perf_counter()
     meshes = pipeline.run(image, **run_kwargs)
     mesh = meshes[0]
@@ -198,6 +196,22 @@ def main():
     # Skip to_glb for now — it crashes on MPS device mismatch in texture baking
     print("Skipping to_glb (known MPS device mismatch in texture baking)", flush=True)
     print("Done.", flush=True)
+
+
+def _build_run_kwargs(args):
+    run_kwargs = {
+        'seed': args.seed,
+    }
+    if args.pipeline_type:
+        run_kwargs['pipeline_type'] = args.pipeline_type
+    if args.no_preprocess:
+        run_kwargs['preprocess_image'] = False
+    if args.steps > 0:
+        step_override = {'steps': args.steps}
+        run_kwargs['sparse_structure_sampler_params'] = step_override
+        run_kwargs['shape_slat_sampler_params'] = step_override
+        run_kwargs['tex_slat_sampler_params'] = step_override
+    return run_kwargs
 
 
 if __name__ == "__main__":
