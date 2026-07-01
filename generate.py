@@ -337,6 +337,10 @@ def main():
                 simplify_first=args.simplify_first,
                 qem_simplify=args.qem_simplify,
             )
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(args.save_checkpoints, "mesh_clean",
+                                vertices=vertices, faces=faces)
 
             # Jump straight to texture baking
             from trellmlx.texture_bake import bake_texture
@@ -345,6 +349,11 @@ def main():
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(args.save_checkpoints, "mesh_uv",
+                                vertices=uv_verts, faces=uv_faces,
+                                uvs=uvs, vmapping=vmapping)
 
             base_color, metallic_roughness, alpha_mode = bake_texture(
                 uv_verts, uv_faces, uvs, vmapping,
@@ -715,6 +724,10 @@ def main():
         simplify_first=args.simplify_first,
         qem_simplify=args.qem_simplify,
     )
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_clean",
+                        vertices=vertices, faces=faces)
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
@@ -797,6 +810,11 @@ def main():
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_uv",
+                        vertices=uv_verts, faces=uv_faces,
+                        uvs=uvs, vmapping=vmapping)
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(
