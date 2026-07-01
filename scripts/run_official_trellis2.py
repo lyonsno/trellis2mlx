@@ -33,6 +33,10 @@ class _StopAfterShapeSLat(Exception):
     """Internal control-flow sentinel for shape-SLat-only diagnostic runs."""
 
 
+class _StopAfterShapeFlowStep(Exception):
+    """Internal control-flow sentinel for first-step shape-flow diagnostic runs."""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Trellis-Mac pipeline")
     parser.add_argument("--image", required=True, help="Input image path")
@@ -64,6 +68,10 @@ def main():
                         help="Save shape structured latent to shape_slat.npz")
     parser.add_argument("--stop-after-shape-slat", action="store_true",
                         help="Exit successfully after saving shape structured latent")
+    parser.add_argument("--save-shape-flow-step", action="store_true",
+                        help="Save first shape-flow prediction to shape_flow_step0.npz")
+    parser.add_argument("--stop-after-shape-flow-step", action="store_true",
+                        help="Exit successfully after saving first shape-flow prediction")
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=1024)
     args = parser.parse_args()
@@ -130,6 +138,12 @@ def main():
             pipeline,
             args.output_dir,
             stop_after_shape_slat=args.stop_after_shape_slat,
+        )
+    if args.save_shape_flow_step or args.stop_after_shape_flow_step:
+        _install_shape_flow_step_capture_hook(
+            pipeline,
+            args.output_dir,
+            stop_after_shape_flow_step=args.stop_after_shape_flow_step,
         )
 
     # Load image
@@ -200,6 +214,10 @@ def main():
         return
     except _StopAfterShapeSLat:
         print(f"Shape-SLat-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
+        print("Done.", flush=True)
+        return
+    except _StopAfterShapeFlowStep:
+        print(f"Shape-flow-step-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
         print("Done.", flush=True)
         return
     mesh = meshes[0]
@@ -338,6 +356,34 @@ def _install_shape_slat_capture_hook(pipeline, output_dir, *, stop_after_shape_s
         return shape_slat
 
     pipeline.sample_shape_slat = _hooked_sample_shape_slat
+
+
+def _install_shape_flow_step_capture_hook(pipeline, output_dir, *, stop_after_shape_flow_step=False):
+    sampler = pipeline.shape_slat_sampler
+    original = sampler._get_model_prediction
+    captured = {"done": False}
+
+    def _hooked_get_model_prediction(model, x_t, t, cond=None, **kwargs):
+        pred_x0, pred_eps, pred_v = original(model, x_t, t, cond, **kwargs)
+        if not captured["done"]:
+            captured["done"] = True
+            os.makedirs(output_dir, exist_ok=True)
+            step_path = os.path.join(output_dir, "shape_flow_step0.npz")
+            np.savez(
+                step_path,
+                sample_feats=_to_numpy(x_t.feats).astype(np.float32, copy=False),
+                coords=_to_numpy(x_t.coords).astype(np.int32, copy=False),
+                pred_x0_feats=_to_numpy(pred_x0.feats).astype(np.float32, copy=False),
+                pred_eps_feats=_to_numpy(pred_eps.feats).astype(np.float32, copy=False),
+                pred_v_feats=_to_numpy(pred_v.feats).astype(np.float32, copy=False),
+                t=np.array(t, dtype=np.float32),
+            )
+            print(f"Saved first shape-flow step: {step_path}", flush=True)
+            if stop_after_shape_flow_step:
+                raise _StopAfterShapeFlowStep()
+        return pred_x0, pred_eps, pred_v
+
+    sampler._get_model_prediction = _hooked_get_model_prediction
 
 
 def _to_numpy(value):

@@ -10,6 +10,10 @@ import mlx.core as mx
 import numpy as np
 
 
+class StopAfterFirstFlowStep(Exception):
+    """Raised after writing an explicitly requested first-step flow witness."""
+
+
 def flow_euler_sample(
     model,
     noise: mx.array,
@@ -65,6 +69,9 @@ def flow_euler_sample(
 
     # Optional: save per-step state for debugging
     _debug_states = model_kwargs.pop('_debug_states', None)
+    _capture_first_step_path = model_kwargs.pop('_capture_first_step_path', None)
+    _capture_first_step_coords = model_kwargs.pop('_capture_first_step_coords', None)
+    _stop_after_first_step = model_kwargs.pop('_stop_after_first_step', False)
 
     for step_idx, (t, t_prev) in enumerate(t_pairs):
         if verbose:
@@ -118,6 +125,24 @@ def flow_euler_sample(
                 kw['cross_kv_cache'] = pos_kv_cache
             pred = model(sample, t_tensor, cond, **kw)
             mx.eval(pred)
+
+        if step_idx == 0 and _capture_first_step_path:
+            import os
+            os.makedirs(os.path.dirname(_capture_first_step_path), exist_ok=True)
+            pred_x0 = _pred_to_xstart(sample, t, pred, sigma_min)
+            mx.eval(sample, pred, pred_x0)
+            payload = {
+                "sample_feats": np.array(sample, dtype=np.float32),
+                "pred_v_feats": np.array(pred, dtype=np.float32),
+                "pred_x0_feats": np.array(pred_x0, dtype=np.float32),
+                "t": np.array(t, dtype=np.float32),
+                "t_prev": np.array(t_prev, dtype=np.float32),
+            }
+            if _capture_first_step_coords is not None:
+                payload["coords"] = np.asarray(_capture_first_step_coords, dtype=np.int32)
+            np.savez(_capture_first_step_path, **payload)
+            if _stop_after_first_step:
+                raise StopAfterFirstFlowStep(_capture_first_step_path)
 
         # Euler step
         sample = sample - (t - t_prev) * pred

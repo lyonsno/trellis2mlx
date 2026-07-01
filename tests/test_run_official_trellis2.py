@@ -113,3 +113,43 @@ def test_conditioning_capture_hook_saves_cond_neg_cond_and_can_stop(tmp_path):
     np.testing.assert_allclose(saved["cond"], np.array([[[1.0, 2.0]]], dtype=np.float32))
     np.testing.assert_allclose(saved["neg_cond"], np.array([[[0.0, 0.0]]], dtype=np.float32))
     assert pipeline.calls == 1
+
+
+def test_shape_flow_step_capture_hook_saves_first_prediction_and_can_stop(tmp_path):
+    from scripts.run_official_trellis2 import _StopAfterShapeFlowStep, _install_shape_flow_step_capture_hook
+
+    class FakeSparse:
+        def __init__(self, feats, coords):
+            self.feats = feats
+            self.coords = coords
+
+    class FakeSampler:
+        def __init__(self):
+            self.calls = 0
+
+        def _get_model_prediction(self, model, x_t, t, cond=None, **kwargs):
+            self.calls += 1
+            coords = np.array([[0, 1, 2, 3]], dtype=np.int32)
+            return (
+                FakeSparse(np.array([[1.0, 2.0]], dtype=np.float32), coords),
+                FakeSparse(np.array([[3.0, 4.0]], dtype=np.float32), coords),
+                FakeSparse(np.array([[5.0, 6.0]], dtype=np.float32), coords),
+            )
+
+    class FakePipeline:
+        shape_slat_sampler = FakeSampler()
+
+    coords = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    x_t = FakeSparse(np.array([[0.1, 0.2]], dtype=np.float32), coords)
+    pipeline = FakePipeline()
+    _install_shape_flow_step_capture_hook(pipeline, str(tmp_path), stop_after_shape_flow_step=True)
+
+    with pytest.raises(_StopAfterShapeFlowStep):
+        pipeline.shape_slat_sampler._get_model_prediction("model", x_t, 1.0, cond="cond")
+
+    saved = np.load(tmp_path / "shape_flow_step0.npz")
+    np.testing.assert_allclose(saved["sample_feats"], x_t.feats)
+    np.testing.assert_allclose(saved["pred_v_feats"], np.array([[5.0, 6.0]], dtype=np.float32))
+    np.testing.assert_allclose(saved["pred_x0_feats"], np.array([[1.0, 2.0]], dtype=np.float32))
+    np.testing.assert_array_equal(saved["coords"], coords)
+    assert pipeline.shape_slat_sampler.calls == 1

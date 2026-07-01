@@ -384,6 +384,8 @@ def main():
                         help="Exit successfully after saving image conditioning tensors")
     parser.add_argument("--stop-after-shape-slat", action="store_true",
                         help="Exit successfully after saving shape structured latent")
+    parser.add_argument("--stop-after-shape-flow-step", action="store_true",
+                        help="Exit successfully after saving first shape-flow prediction")
     parser.add_argument("--shared-noise", metavar="PATH",
                         help="Load shared noise tensors from .npz for matched comparison. "
                              "Generate with scripts/generate_shared_noise.py")
@@ -523,7 +525,7 @@ def main():
     )
 
     from trellmlx.weight_loader import load_weights
-    from trellmlx.samplers import flow_euler_sample
+    from trellmlx.samplers import StopAfterFirstFlowStep, flow_euler_sample
     from trellmlx.cleanup import cleanup_model, cleanup
 
     vs3d_mode = bool(args.edit_target)
@@ -711,12 +713,24 @@ def main():
         lr_noise = mx.random.normal((N_lr, 32))
 
     t0 = time.perf_counter()
-    lr_slat = flow_euler_sample(
-        lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
-        verbose=False,
-        coords=mx.array(lr_coords),
-        **SHAPE_SAMPLER,
+    shape_flow_step_path = (
+        os.path.join(args.save_checkpoints, "shape_flow_step0.npz")
+        if args.save_checkpoints else None
     )
+    try:
+        lr_slat = flow_euler_sample(
+            lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+            verbose=False,
+            coords=mx.array(lr_coords),
+            _capture_first_step_path=shape_flow_step_path if args.stop_after_shape_flow_step else None,
+            _capture_first_step_coords=lr_coords_4d,
+            _stop_after_first_step=args.stop_after_shape_flow_step,
+            **SHAPE_SAMPLER,
+        )
+    except StopAfterFirstFlowStep:
+        print("Stop after first shape-flow step requested; exiting before SLat integration.", flush=True)
+        print(f"\nTotal: {time.perf_counter()-t_total:.1f}s", flush=True)
+        return
     mx.eval(lr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N_lr} tokens)", flush=True)
 
