@@ -74,3 +74,42 @@ def test_shape_slat_capture_hook_saves_feats_coords_and_can_stop(tmp_path):
     np.testing.assert_allclose(saved["feats"], FakeSLat.feats)
     np.testing.assert_array_equal(saved["coords"], FakeSLat.coords)
     assert pipeline.calls == 1
+
+
+def test_conditioning_capture_hook_saves_cond_neg_cond_and_can_stop(tmp_path):
+    from scripts.run_official_trellis2 import _StopAfterConditioning, _install_conditioning_capture_hook
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    class FakePipeline:
+        def __init__(self):
+            self.calls = 0
+
+        def get_cond(self, *args, **kwargs):
+            self.calls += 1
+            return {
+                "cond": FakeTensor(np.array([[[1.0, 2.0]]], dtype=np.float32)),
+                "neg_cond": FakeTensor(np.array([[[0.0, 0.0]]], dtype=np.float32)),
+            }
+
+    pipeline = FakePipeline()
+    _install_conditioning_capture_hook(pipeline, str(tmp_path), stop_after_conditioning=True)
+
+    with pytest.raises(_StopAfterConditioning):
+        pipeline.get_cond(["image"], 512)
+
+    saved = np.load(tmp_path / "conditioning.npz")
+    np.testing.assert_allclose(saved["cond"], np.array([[[1.0, 2.0]]], dtype=np.float32))
+    np.testing.assert_allclose(saved["neg_cond"], np.array([[[0.0, 0.0]]], dtype=np.float32))
+    assert pipeline.calls == 1

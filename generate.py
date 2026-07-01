@@ -114,6 +114,32 @@ def _save_shape_slat_checkpoint(checkpoint_dir, feats, coords, stage):
     )
 
 
+def _save_conditioning_checkpoint(checkpoint_dir, cond, neg_cond, source):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    cond_np = np.asarray(cond, dtype=np.float32)
+    neg_cond_np = np.asarray(neg_cond, dtype=np.float32)
+    np.savez(
+        os.path.join(checkpoint_dir, "conditioning.npz"),
+        cond=cond_np,
+        neg_cond=neg_cond_np,
+    )
+    with open(os.path.join(checkpoint_dir, "conditioning.json"), "w") as f:
+        json.dump(
+            {
+                "source": source,
+                "shape": list(cond_np.shape),
+                "tokens": int(cond_np.shape[1]) if cond_np.ndim == 3 else None,
+                "channels": int(cond_np.shape[2]) if cond_np.ndim == 3 else None,
+            },
+            f,
+        )
+    print(
+        f"  Saved conditioning: {checkpoint_dir}/conditioning.npz "
+        f"(cond: {cond_np.shape}, neg_cond: {neg_cond_np.shape})",
+        flush=True,
+    )
+
+
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
@@ -354,6 +380,8 @@ def main():
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
     parser.add_argument("--stop-after-sparse", action="store_true",
                         help="Exit successfully after saving sparse-structure coordinates")
+    parser.add_argument("--stop-after-conditioning", action="store_true",
+                        help="Exit successfully after saving image conditioning tensors")
     parser.add_argument("--stop-after-shape-slat", action="store_true",
                         help="Exit successfully after saving shape structured latent")
     parser.add_argument("--shared-noise", metavar="PATH",
@@ -536,6 +564,17 @@ def main():
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
     neg_cond = mx.zeros_like(cond)
+    if args.save_checkpoints:
+        _save_conditioning_checkpoint(
+            args.save_checkpoints,
+            np.array(cond),
+            np.array(neg_cond),
+            "image_dinov3" if args.image else "random_conditioning",
+        )
+    if args.stop_after_conditioning:
+        print("Stop after conditioning requested; exiting before sparse structure stage.", flush=True)
+        print(f"\nTotal: {time.perf_counter()-t_total:.1f}s", flush=True)
+        return
 
     # VS3D: extract target conditioning and relabel source cond
     if vs3d_mode:

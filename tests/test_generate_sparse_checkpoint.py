@@ -40,3 +40,24 @@ def test_save_shape_slat_checkpoint_writes_feats_coords_and_metadata(tmp_path):
         "num_tokens": 2,
         "channels": 2,
     }
+
+
+def test_save_conditioning_checkpoint_writes_cond_neg_cond_and_metadata(tmp_path):
+    from generate import _save_conditioning_checkpoint
+
+    cond = np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float64)
+    neg_cond = np.zeros_like(cond)
+
+    _save_conditioning_checkpoint(str(tmp_path), cond, neg_cond, "mlx_dinov3")
+
+    saved = np.load(tmp_path / "conditioning.npz")
+    np.testing.assert_allclose(saved["cond"], cond.astype(np.float32))
+    np.testing.assert_allclose(saved["neg_cond"], neg_cond.astype(np.float32))
+
+    metadata = json.loads((tmp_path / "conditioning.json").read_text())
+    assert metadata == {
+        "source": "mlx_dinov3",
+        "shape": [1, 2, 2],
+        "tokens": 2,
+        "channels": 2,
+    }

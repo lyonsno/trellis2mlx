@@ -25,6 +25,10 @@ class _StopAfterSparse(Exception):
     """Internal control-flow sentinel for sparse-only diagnostic runs."""
 
 
+class _StopAfterConditioning(Exception):
+    """Internal control-flow sentinel for conditioning-only diagnostic runs."""
+
+
 class _StopAfterShapeSLat(Exception):
     """Internal control-flow sentinel for shape-SLat-only diagnostic runs."""
 
@@ -48,6 +52,10 @@ def main():
                              "Default: auto (usually 1024_cascade for 4B model)")
     parser.add_argument("--no-preprocess", action="store_true",
                         help="Pass preprocess_image=False to the Trellis-Mac pipeline")
+    parser.add_argument("--save-conditioning", action="store_true",
+                        help="Save image conditioning tensors to conditioning.npz")
+    parser.add_argument("--stop-after-conditioning", action="store_true",
+                        help="Exit successfully after saving image conditioning tensors")
     parser.add_argument("--save-sparse-coords", action="store_true",
                         help="Save sparse structure coordinates to sparse_coords.npz")
     parser.add_argument("--stop-after-sparse", action="store_true",
@@ -110,6 +118,12 @@ def main():
             pipeline,
             args.output_dir,
             stop_after_sparse=args.stop_after_sparse,
+        )
+    if args.save_conditioning or args.stop_after_conditioning:
+        _install_conditioning_capture_hook(
+            pipeline,
+            args.output_dir,
+            stop_after_conditioning=args.stop_after_conditioning,
         )
     if args.save_shape_slat or args.stop_after_shape_slat:
         _install_shape_slat_capture_hook(
@@ -176,6 +190,10 @@ def main():
     t0 = time.perf_counter()
     try:
         meshes = pipeline.run(image, **run_kwargs)
+    except _StopAfterConditioning:
+        print(f"Conditioning-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
+        print("Done.", flush=True)
+        return
     except _StopAfterSparse:
         print(f"Sparse-only run done: {time.perf_counter()-t0:.1f}s", flush=True)
         print("Done.", flush=True)
@@ -267,6 +285,37 @@ def _install_sparse_capture_hook(pipeline, output_dir, *, stop_after_sparse=Fals
         return coords
 
     pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_conditioning_capture_hook(pipeline, output_dir, *, stop_after_conditioning=False):
+    original = pipeline.get_cond
+
+    def _hooked_get_cond(*args, **kwargs):
+        cond = original(*args, **kwargs)
+        cond_np = _to_numpy(cond["cond"]).astype(np.float32, copy=False)
+        neg_cond_np = _to_numpy(cond["neg_cond"]).astype(np.float32, copy=False)
+        resolution = args[1] if len(args) > 1 else kwargs.get("resolution")
+        os.makedirs(output_dir, exist_ok=True)
+        conditioning_path = os.path.join(output_dir, "conditioning.npz")
+        np.savez(conditioning_path, cond=cond_np, neg_cond=neg_cond_np)
+        metadata = {
+            "resolution": int(resolution) if resolution is not None else None,
+            "shape": list(cond_np.shape),
+            "tokens": int(cond_np.shape[1]) if cond_np.ndim == 3 else None,
+            "channels": int(cond_np.shape[2]) if cond_np.ndim == 3 else None,
+        }
+        with open(os.path.join(output_dir, "conditioning.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(
+            f"Saved conditioning: {conditioning_path} "
+            f"(cond: {cond_np.shape}, neg_cond: {neg_cond_np.shape})",
+            flush=True,
+        )
+        if stop_after_conditioning:
+            raise _StopAfterConditioning()
+        return cond
+
+    pipeline.get_cond = _hooked_get_cond
 
 
 def _install_shape_slat_capture_hook(pipeline, output_dir, *, stop_after_shape_slat=False):
