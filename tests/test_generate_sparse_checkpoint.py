@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 
 import numpy as np
 
@@ -61,3 +63,28 @@ def test_save_conditioning_checkpoint_writes_cond_neg_cond_and_metadata(tmp_path
         "tokens": 2,
         "channels": 2,
     }
+
+
+def test_generate_initializes_sparse_debug_before_vs3d_stage1_branch():
+    source = Path("generate.py").read_text()
+    module = ast.parse(source)
+    main_fn = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+    stage1_vs3d_line = None
+    ss_debug_assign_line = None
+    for node in ast.walk(main_fn):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "vs3d_mode"
+            and 620 <= node.lineno <= 660
+        ):
+            stage1_vs3d_line = node.lineno
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_ss_debug":
+                    ss_debug_assign_line = node.lineno
+
+    assert stage1_vs3d_line is not None
+    assert ss_debug_assign_line is not None
+    assert ss_debug_assign_line < stage1_vs3d_line

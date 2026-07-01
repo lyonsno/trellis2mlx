@@ -621,6 +621,7 @@ def main():
     else:
         noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
     t0 = time.perf_counter()
+    _ss_debug = []
 
     if vs3d_mode:
         from trellmlx.vs3d import vs3d_flow_sample
@@ -656,7 +657,6 @@ def main():
         mx.eval(z_s)
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
-        _ss_debug = []
         # Ensure all inputs are fp32 for the fp32 sparse structure model
         ss_cond = cond.astype(mx.float32)
         ss_neg_cond = neg_cond.astype(mx.float32)

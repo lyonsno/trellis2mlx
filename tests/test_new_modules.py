@@ -199,6 +199,30 @@ class TestSampler:
                          steps=4, guidance_strength=1.0, verbose=False)
         assert call_count["pos"] == 4  # one call per step, no neg
 
+    def test_cfg_rescale_constant_prediction_stays_finite(self):
+        """Constant x0 predictions have zero std and must not poison sampling."""
+        from trellmlx.samplers import flow_euler_sample
+
+        class ConstantModel:
+            def __call__(self, x, t, cond):
+                return mx.zeros_like(x)
+
+        sample = flow_euler_sample(
+            ConstantModel(),
+            mx.zeros((1, 1, 2), dtype=mx.float32),
+            mx.ones((1, 1, 1), dtype=mx.float32),
+            mx.zeros((1, 1, 1), dtype=mx.float32),
+            steps=1,
+            guidance_strength=7.5,
+            guidance_rescale=0.7,
+            guidance_interval=(0.0, 1.0),
+            verbose=False,
+        )
+        mx.eval(sample)
+        sample_np = np.array(sample)
+        assert np.isfinite(sample_np).all()
+        np.testing.assert_allclose(sample_np, np.zeros((1, 1, 2), dtype=np.float32))
+
 
 class TestWeightLoader:
     def test_remap_adaln(self):
