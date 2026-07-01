@@ -1114,11 +1114,9 @@ def bake_texture(vertices, faces, uvs, vmapping,
     mr = inpaint_texture(mr, mask, radius=1)
     print(f"    Inpainted seams ({time.perf_counter()-t0:.1f}s)", flush=True)
 
-    # Step 6: Auto-detect alpha transparency
-    alpha_valid = base_color[mask, 3]
-    if len(alpha_valid) > 0 and alpha_valid.min() < 250:
-        alpha_mode = "BLEND"
-    else:
-        alpha_mode = "OPAQUE"
+    # Alpha mode: always OPAQUE, matching the reference pipeline.
+    # The alpha channel is baked as a material property but the GLB
+    # export uses OPAQUE mode (reference postprocess.py line 285).
+    alpha_mode = "OPAQUE"
 
     return base_color, mr, alpha_mode
