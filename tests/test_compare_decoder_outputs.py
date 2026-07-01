@@ -169,6 +169,73 @@ def test_compare_decoder_outputs_rejects_artifact_outside_receipt_output_dir(tmp
     assert "artifact_outside_receipt_output_dir" in report["route_validation"]["trellis_mac"]["reasons"]
 
 
+def test_compare_decoder_outputs_keeps_route_proof_candidate_when_variables_unmatched(tmp_path):
+    mac_path = _write_decoder(tmp_path / "mac-out" / "decoder_output.npz")
+    mlx_path = _write_decoder(tmp_path / "mlx-out" / "checkpoints" / "decoder_output.npz")
+    mac_receipt = _write_receipt(
+        tmp_path,
+        "mac",
+        mac_path,
+        route=(
+            "python run_official_trellis2.py --output-dir "
+            f"{mac_path.parent} --pipeline-type 512 --seed 42 --steps 12"
+        ),
+        env={"PYTHONPATH": ".", "ATTN_BACKEND": "sdpa"},
+    )
+    mlx_receipt = _write_receipt(
+        tmp_path,
+        "mlx",
+        mlx_path,
+        route=(
+            "python generate.py --save-checkpoints "
+            f"{mlx_path.parent} --resolution 512 --no-cascade --seed 42 --steps 12"
+        ),
+        env={"PYTHONPATH": "."},
+    )
+    output_dir = tmp_path / "comparison"
+
+    _run_compare(mac_path, mlx_path, mac_receipt, mlx_receipt, output_dir, check=True)
+
+    report = json.loads((output_dir / "comparison_report.json").read_text())
+    assert report["unmatched_variables"]
+    assert report["route_proof_status"] == "candidate"
+
+
+def test_compare_decoder_outputs_rejects_artifact_not_implied_by_effective_route(tmp_path):
+    mac_output = tmp_path / "mac-out"
+    mlx_checkpoints = tmp_path / "mlx-out" / "checkpoints"
+    implied_mac = mac_output / "decoder_output.npz"
+    implied_mlx = mlx_checkpoints / "decoder_output.npz"
+    _write_decoder(implied_mac)
+    _write_decoder(implied_mlx)
+    mac_path = _write_decoder(mac_output / "unbound_decoder_output.npz")
+    mlx_path = _write_decoder(tmp_path / "mlx-out" / "not-checkpoints" / "decoder_output.npz")
+    mac_receipt = _write_receipt(
+        tmp_path,
+        "mac",
+        mac_path,
+        output_dir=mac_output,
+        route=f"python run_official_trellis2.py --output-dir {mac_output} --seed 42 --steps 12",
+    )
+    mlx_receipt = _write_receipt(
+        tmp_path,
+        "mlx",
+        mlx_path,
+        output_dir=tmp_path / "mlx-out",
+        route=f"python generate.py --save-checkpoints {mlx_checkpoints} --seed 42 --steps 12",
+    )
+    output_dir = tmp_path / "comparison"
+
+    result = _run_compare(mac_path, mlx_path, mac_receipt, mlx_receipt, output_dir)
+
+    assert result.returncode != 0
+    report = json.loads((output_dir / "comparison_report.json").read_text())
+    assert report["comparison_status"] == "failed"
+    assert report["failure_phase"] == "validate_routes"
+    assert "artifact_not_implied_by_effective_route" in report["route_validation"]["trellis_mac"]["reasons"]
+    assert "artifact_not_implied_by_effective_route" in report["route_validation"]["trellis_mlx"]["reasons"]
+
+
 def _write_decoder(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -179,7 +246,17 @@ def _write_decoder(path):
     return path
 
 
-def _write_receipt(tmp_path, name, artifact_path, *, status="done", exit_code=0, output_dir=None):
+def _write_receipt(
+    tmp_path,
+    name,
+    artifact_path,
+    *,
+    status="done",
+    exit_code=0,
+    output_dir=None,
+    route=None,
+    env=None,
+):
     output_dir = output_dir or artifact_path.parent
     receipt_path = tmp_path / f"{name}_receipt.json"
     receipt_path.write_text(
@@ -194,8 +271,9 @@ def _write_receipt(tmp_path, name, artifact_path, *, status="done", exit_code=0,
                 "failure_phase": None if status == "done" else "execution",
                 "error_message": None if status == "done" else "boom",
                 "ignored_params": None,
-                "effective_route": f"python {name}.py --seed 42 --steps 12",
+                "effective_route": route or f"python {name}.py --seed 42 --steps 12",
                 "effective_cwd": f"/{name}",
+                "effective_env": env,
             }
         )
     )

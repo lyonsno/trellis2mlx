@@ -61,8 +61,11 @@ def main():
         "trellis_mac": _validate_route(report["routes"]["trellis_mac"], report["artifacts"]["trellis_mac"]),
         "trellis_mlx": _validate_route(report["routes"]["trellis_mlx"], report["artifacts"]["trellis_mlx"]),
     }
-    report["route_proof_status"] = _route_proof_status(report["route_validation"])
     report["unmatched_variables"] = _infer_unmatched_variables(report["routes"])
+    report["route_proof_status"] = _route_proof_status(
+        report["route_validation"],
+        report["unmatched_variables"],
+    )
 
     if report["route_proof_status"] == "rejected":
         report["evidence_use_class"] = "negative_evidence"
@@ -318,6 +321,14 @@ def _validate_route(route, artifact):
     else:
         warnings.append("receipt_output_dir_missing")
 
+    implied_artifact = _route_implied_decoder_artifact(route)
+    if implied_artifact and artifact.get("path"):
+        artifact_path = os.path.abspath(artifact["path"])
+        if artifact_path != os.path.abspath(implied_artifact):
+            reasons.append("artifact_not_implied_by_effective_route")
+    elif route.get("effective_route"):
+        warnings.append("route_implied_artifact_unknown")
+
     if not route.get("input_path"):
         warnings.append("receipt_input_path_missing")
 
@@ -339,10 +350,23 @@ def _validate_route(route, artifact):
     }
 
 
-def _route_proof_status(route_validation):
+def _route_implied_decoder_artifact(route):
+    effective_route = route.get("effective_route") or ""
+    output_dir = _flag_value(effective_route, "--output-dir")
+    if output_dir:
+        return os.path.join(output_dir, "decoder_output.npz")
+    save_checkpoints = _flag_value(effective_route, "--save-checkpoints")
+    if save_checkpoints:
+        return os.path.join(save_checkpoints, "decoder_output.npz")
+    return None
+
+
+def _route_proof_status(route_validation, unmatched_variables):
     statuses = {v["status"] for v in route_validation.values()}
     if "rejected" in statuses:
         return "rejected"
+    if unmatched_variables:
+        return "candidate"
     if "missing" in statuses or "accepted_with_warnings" in statuses:
         return "candidate"
     return "accepted"
