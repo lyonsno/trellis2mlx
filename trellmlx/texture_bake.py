@@ -1039,7 +1039,7 @@ def inpaint_texture(image, mask, radius=3):
 
 def bake_texture(vertices, faces, uvs, vmapping,
                  voxel_coords, voxel_attrs, grid_size,
-                 texture_size=1024, backend="cpu"):
+                 texture_size=1024, backend="gpu"):
     """Full texture baking pipeline.
 
     Args:
@@ -1051,8 +1051,8 @@ def bake_texture(vertices, faces, uvs, vmapping,
         voxel_attrs: [M, 6] float32 PBR attrs (RGB, metallic, roughness, alpha)
         grid_size: int — decoder output coord space extent
         texture_size: output texture resolution
-        backend: "cpu" for numpy reference, "gpu" for MLX Metal rasterizer +
-                 vectorized sampler
+        backend: "gpu" for MLX Metal rasterizer + vectorized sampler, "cpu"
+                 for numpy reference
 
     Returns:
         base_color: [H, W, 4] uint8 RGBA

@@ -383,18 +383,60 @@ class TestBakeTextureBackend:
             f"GPU/CPU base color mean diff {bc_diff.mean():.1f} too large"
         )
 
-    def test_bake_texture_default_backend_is_cpu(self):
-        """Default backend (no parameter) should still work = backwards compat."""
+    def test_bake_texture_default_backend_produces_texture(self):
+        """Default backend (no parameter) should keep API callers working."""
         from trellmlx.texture_bake import bake_texture
         mesh = self._make_textured_mesh()
         vertices, faces, uvs, vmapping, vc, va, gs = mesh
 
-        # No backend param — should work as before (cpu)
+        # No backend param should still produce a texture.
         bc, mr, _ = bake_texture(
             vertices, faces, uvs, vmapping, vc, va, gs,
             texture_size=8,
         )
         assert bc.shape == (8, 8, 4)
+
+    def test_bake_texture_default_backend_uses_gpu_path(self, monkeypatch):
+        """The API default should preserve the previous GPU-accelerated route."""
+        import trellmlx.texture_bake as texture_bake
+
+        mesh = self._make_textured_mesh()
+        vertices, faces, uvs, vmapping, vc, va, gs = mesh
+        calls = []
+
+        def fake_rasterize_uv_mlx(got_uvs, got_faces, texture_size):
+            calls.append(("gpu_raster", texture_size))
+            mask = np.zeros((texture_size, texture_size), dtype=bool)
+            mask[0, 0] = True
+            face_idx = np.zeros((texture_size, texture_size), dtype=np.int64)
+            bary = np.zeros((texture_size, texture_size, 3), dtype=np.float32)
+            bary[0, 0] = [1.0, 0.0, 0.0]
+            return mask, face_idx, bary
+
+        def fake_sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size):
+            calls.append(("gpu_sample", len(positions)))
+            return np.array([[0.2, 0.4, 0.6, 0.8, 0.5, 1.0]], dtype=np.float32)
+
+        def forbidden_cpu_raster(*args, **kwargs):
+            raise AssertionError("default bake_texture() unexpectedly used CPU rasterizer")
+
+        def forbidden_cpu_sample(*args, **kwargs):
+            raise AssertionError("default bake_texture() unexpectedly used CPU sampler")
+
+        monkeypatch.setattr(texture_bake, "rasterize_uv_mlx", fake_rasterize_uv_mlx)
+        monkeypatch.setattr(texture_bake, "sample_voxel_attrs_fast", fake_sample_voxel_attrs_fast)
+        monkeypatch.setattr(texture_bake, "rasterize_uv", forbidden_cpu_raster)
+        monkeypatch.setattr(texture_bake, "sample_voxel_attrs", forbidden_cpu_sample)
+        monkeypatch.setattr(texture_bake, "inpaint_texture", lambda image, mask, radius=3: image)
+
+        bc, mr, _ = texture_bake.bake_texture(
+            vertices, faces, uvs, vmapping, vc, va, gs,
+            texture_size=4,
+        )
+
+        assert calls == [("gpu_raster", 4), ("gpu_sample", 1)]
+        assert bc.shape == (4, 4, 4)
+        assert mr.shape == (4, 4, 3)
 
     def test_bake_texture_rejects_invalid_backend(self):
         """Invalid backend values should raise ValueError, not silently fallback."""
