@@ -115,7 +115,8 @@ def flow_euler_sample(
                 std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) * bessel)
                 std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) * bessel)
 
-                x_0_rescaled = x_0_cfg * (std_pos / std_cfg)
+                ratio = mx.clip(std_pos / std_cfg, 0.5, 2.0)
+                x_0_rescaled = x_0_cfg * ratio
                 x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
         else:
