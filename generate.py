@@ -657,7 +657,11 @@ def main():
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
         _ss_debug = []
-        z_s = flow_euler_sample(ss_flow, noise, cond, neg_cond, steps=n_steps, verbose=False,
+        # Ensure all inputs are fp32 for the fp32 sparse structure model
+        ss_cond = cond.astype(mx.float32)
+        ss_neg_cond = neg_cond.astype(mx.float32)
+        ss_noise = noise.astype(mx.float32)
+        z_s = flow_euler_sample(ss_flow, ss_noise, ss_cond, ss_neg_cond, steps=n_steps, verbose=False,
                                 _debug_states=_ss_debug)
         mx.eval(z_s)
 
