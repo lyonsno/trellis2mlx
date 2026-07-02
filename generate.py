@@ -292,6 +292,8 @@ def main():
                         choices=["conditioning", "sparse_coords", "shape_slat", "decoder_output", "mesh_raw"],
                         default=None,
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
+    parser.add_argument("--shared-noise", metavar="NPZ",
+                        help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -320,6 +322,7 @@ def main():
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
     if args.stop_after_stage and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --stop-after-stage is set")
+    shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
     if args.resume:
@@ -518,7 +521,11 @@ def main():
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
-    noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
+    if shared_noise is not None:
+        noise = mx.array(shared_noise["ss_noise"]).astype(mx.float32)
+        print(f"  Shared sparse noise: {args.shared_noise} {noise.shape}", flush=True)
+    else:
+        noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
     t0 = time.perf_counter()
 
     if vs3d_mode:

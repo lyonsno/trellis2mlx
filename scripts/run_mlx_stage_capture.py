@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-faces", type=int, default=350000)
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
+    parser.add_argument("--shared-noise")
     return parser
 
 
@@ -58,6 +59,8 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "target_faces": args.target_faces,
             "texture_size": args.texture_size,
             "preprocess_rembg": not args.no_rembg,
+            "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
+            "shared_noise_sha256": _sha256_file(args.shared_noise) if args.shared_noise else None,
         },
         "source": {
             "image_path": image_path,
@@ -186,6 +189,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--no-cascade")
     if args.no_rembg:
         command.append("--no-rembg")
+    if args.shared_noise:
+        command.extend(["--shared-noise", str(Path(args.shared_noise))])
     return command
 
 

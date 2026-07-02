@@ -58,6 +58,44 @@ def test_mlx_stage_capture_runner_writes_failed_report_when_child_fails(monkeypa
     assert report["primary_output_status"] == "missing"
 
 
+def test_mlx_stage_capture_runner_records_and_passes_shared_noise(monkeypatch, tmp_path):
+    runner = importlib.import_module("scripts.run_mlx_stage_capture")
+
+    image = tmp_path / "source.png"
+    image.write_bytes(b"parser identity only")
+    shared_noise = tmp_path / "shared_noise.npz"
+    shared_noise.write_bytes(b"stable shared noise fixture")
+    output_dir = tmp_path / "out"
+
+    def fake_run(command, cwd=None, env=None, text=None, capture_output=None):
+        assert "--shared-noise" in command
+        assert str(shared_noise) in command
+        checkpoint_dir = Path(command[command.index("--save-checkpoints") + 1])
+        checkpoint_dir.mkdir(parents=True)
+        (checkpoint_dir / "sparse_coords.npz").write_bytes(b"artifact")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc = runner.main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "sparse_coords",
+            "--shared-noise",
+            str(shared_noise),
+        ]
+    )
+
+    assert rc == 0
+    route = json.loads((output_dir / "route_identity.json").read_text())
+    assert route["route"]["shared_noise_path"] == str(shared_noise)
+    assert route["route"]["shared_noise_sha256"] is not None
+    assert "--shared-noise" in route["command"]
+
+
 def test_generate_exposes_stage_stop_checkpoints():
     text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
 
@@ -66,3 +104,10 @@ def test_generate_exposes_stage_stop_checkpoints():
     for stage in ("conditioning", "sparse_coords", "shape_slat", "decoder_output"):
         assert f'"{stage}"' in text
     assert text.count("save_checkpoint(") >= 8
+
+
+def test_generate_exposes_shared_noise_for_sparse_witness():
+    text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
+
+    assert "--shared-noise" in text
+    assert 'shared_noise["ss_noise"]' in text
