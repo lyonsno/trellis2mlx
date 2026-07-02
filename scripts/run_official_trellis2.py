@@ -354,27 +354,104 @@ def _sampler_param_overrides(args: argparse.Namespace) -> tuple[dict[str, Any], 
     return override, override
 
 
-def _install_decoder_capture_hook(pipeline: Any, captured: dict[str, np.ndarray]) -> None:
+def _install_decoder_capture_hook(pipeline_or_decoder: Any, captured: dict[str, np.ndarray]) -> None:
     import torch
 
-    decoder = pipeline.models["shape_slat_decoder"]
-    original_forward = decoder.forward
+    decoder = (
+        pipeline_or_decoder.models["shape_slat_decoder"]
+        if hasattr(pipeline_or_decoder, "models")
+        else pipeline_or_decoder
+    )
+    base_forward = decoder.__class__.__bases__[0].forward
 
     @torch.no_grad()
     def _hooked_forward(x, **kwargs):
-        decoded = decoder.__class__.__bases__[0].forward(decoder, x, **kwargs)
-        out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
-        h = out_list[0]
-        captured["feats"] = h.feats.detach().cpu().numpy()
-        captured["coords"] = h.coords.detach().cpu().numpy()
-        print(
-            f"  [hook] Captured decoder output: {h.feats.shape[0]:,} voxels, "
-            f"{h.feats.shape[1]} channels",
-            flush=True,
-        )
-        return original_forward(x, **kwargs)
+        decoded = base_forward(decoder, x, **kwargs)
+        return _convert_captured_decoder_output(decoder, decoded, captured, kwargs)
 
     decoder.forward = _hooked_forward
+
+
+def _convert_captured_decoder_output(
+    decoder: Any,
+    decoded: Any,
+    captured: dict[str, np.ndarray],
+    kwargs: dict[str, Any],
+) -> Any:
+    out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
+    h = out_list[0]
+    captured["feats"] = h.feats.detach().cpu().numpy()
+    captured["coords"] = h.coords.detach().cpu().numpy()
+    print(
+        f"  [hook] Captured decoder output: {h.feats.shape[0]:,} voxels, "
+        f"{h.feats.shape[1]} channels",
+        flush=True,
+    )
+
+    vertices = h.replace(
+        (1 + 2 * decoder.voxel_margin) * _sigmoid(h.feats[..., 0:3]) - decoder.voxel_margin
+    )
+    quad_lerp = h.replace(_softplus(h.feats[..., 6:7]))
+    if getattr(decoder, "training", False):
+        intersected_src = kwargs.get("gt_intersected")
+        if intersected_src is None:
+            raise ValueError("gt_intersected is required for training decoder capture")
+        intersected_logits = h.replace(h.feats[..., 3:6])
+        mesh = [
+            _flexible_dual_grid_to_mesh(
+                v.coords[:, 1:],
+                v.feats,
+                i.feats,
+                q.feats,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                grid_size=decoder.resolution,
+                train=True,
+                decoder=decoder,
+            )
+            for v, i, q in zip(vertices, intersected_src, quad_lerp)
+        ]
+        _subs_gt = out_list[1] if len(out_list) > 1 else None
+        _subs = out_list[2] if len(out_list) > 2 else None
+        return mesh, vertices, intersected_logits, _subs_gt, _subs
+
+    intersected = h.replace(h.feats[..., 3:6] > 0)
+    mesh = [
+        _flexible_dual_grid_to_mesh(
+            v.coords[:, 1:],
+            v.feats,
+            i.feats,
+            q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=decoder.resolution,
+            train=False,
+            decoder=decoder,
+        )
+        for v, i, q in zip(vertices, intersected, quad_lerp)
+    ]
+    out_list[0] = mesh
+    return out_list[0] if len(out_list) == 1 else tuple(out_list)
+
+
+def _sigmoid(value: Any) -> Any:
+    import torch
+
+    return torch.sigmoid(value)
+
+
+def _softplus(value: Any) -> Any:
+    import torch.nn.functional as F
+
+    return F.softplus(value)
+
+
+def _flexible_dual_grid_to_mesh(*args: Any, decoder: Any, **kwargs: Any) -> Any:
+    forward_globals = decoder.__class__.forward.__globals__
+    extractor = forward_globals.get("flexible_dual_grid_to_mesh")
+    if extractor is None:
+        raise RuntimeError("decoder class does not expose flexible_dual_grid_to_mesh")
+    result = extractor(*args, **kwargs)
+    mesh_type = forward_globals.get("Mesh")
+    return mesh_type(*result) if mesh_type is not None else result
 
 
 def _install_sparse_capture_hook(

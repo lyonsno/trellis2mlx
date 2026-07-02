@@ -1,4 +1,8 @@
 import importlib
+import sys
+import types
+
+import numpy as np
 
 
 def test_official_runner_records_raw_512_contract(tmp_path):
@@ -81,3 +85,97 @@ def test_stop_after_raw_mesh_uses_shape_only_cut(monkeypatch, tmp_path):
 
     assert runner._run_mesh_pipeline(Pipeline(), object(), args) == ["raw-mesh"]
     assert calls and calls[0][2] is args
+
+
+def test_decoder_capture_hook_runs_base_decoder_once(monkeypatch):
+    runner = importlib.import_module("scripts.run_official_trellis2")
+
+    fake_torch = types.SimpleNamespace(no_grad=lambda: (lambda fn: fn))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    calls = {"base": 0}
+
+    class Tensor:
+        def __init__(self, array):
+            self.array = np.asarray(array)
+            self.shape = self.array.shape
+
+        def __getitem__(self, key):
+            return Tensor(self.array[key])
+
+        def __mul__(self, other):
+            return Tensor(self.array * other)
+
+        __rmul__ = __mul__
+
+        def __add__(self, other):
+            return Tensor(self.array + other)
+
+        __radd__ = __add__
+
+        def __sub__(self, other):
+            return Tensor(self.array - other)
+
+        def __rsub__(self, other):
+            return Tensor(other - self.array)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.array
+
+        def __gt__(self, other):
+            return Tensor(self.array > other)
+
+    class Sparse:
+        def __init__(self, feats, coords):
+            self.feats = Tensor(feats)
+            self.coords = Tensor(coords)
+
+        def replace(self, feats):
+            return Sparse(feats.array if isinstance(feats, Tensor) else feats, self.coords.array)
+
+        def __iter__(self):
+            yield self
+
+    class BaseDecoder:
+        def forward(self, x, **kwargs):
+            calls["base"] += 1
+            return Sparse(
+                np.array([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.25]], dtype=np.float32),
+                np.array([[0, 0, 0, 0]], dtype=np.int32),
+            )
+
+    class Decoder(BaseDecoder):
+        training = False
+        voxel_margin = 0.5
+        resolution = 512
+
+        def forward(self, x, **kwargs):  # pragma: no cover - pre-patch hook calls this
+            calls["original"] = calls.get("original", 0) + 1
+            return super().forward(x, **kwargs)
+
+    def fake_flexible_dual_grid_to_mesh(coords, vertices, intersected, quad_lerp, **kwargs):
+        assert coords.shape == (1, 3)
+        assert vertices.shape == (1, 3)
+        assert intersected.shape == (1, 3)
+        assert quad_lerp.shape == (1, 1)
+        return "vertices", "faces"
+
+    monkeypatch.setattr(runner, "_sigmoid", lambda value: value)
+    monkeypatch.setattr(runner, "_softplus", lambda value: value)
+    monkeypatch.setattr(runner, "_flexible_dual_grid_to_mesh", fake_flexible_dual_grid_to_mesh)
+
+    captured = {}
+    decoder = Decoder()
+    runner._install_decoder_capture_hook(decoder, captured)
+    result = decoder.forward(object())
+
+    assert calls == {"base": 1}
+    assert captured["feats"].shape == (1, 7)
+    assert captured["coords"].shape == (1, 4)
+    assert result == [("vertices", "faces")]
