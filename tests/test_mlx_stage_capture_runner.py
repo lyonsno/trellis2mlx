@@ -105,10 +105,18 @@ def test_generate_exposes_stage_stop_checkpoints():
 
     assert "--stop-after-stage" in text
     assert (
-        'choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", '
-        '"shape_slat", "decoder_output", "mesh_raw"]'
+        'choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_flow_block_trace", '
+        '"sparse_internals", "shape_slat", "decoder_output", "mesh_raw"]'
     ) in text
-    for stage in ("conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output"):
+    for stage in (
+        "conditioning",
+        "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_block_trace",
+        "sparse_internals",
+        "shape_slat",
+        "decoder_output",
+    ):
         assert f'"{stage}"' in text
     assert text.count("save_checkpoint(") >= 8
 
@@ -142,5 +150,21 @@ def test_generate_exposes_sparse_flow_step_checkpoint():
         "std_ratio=np.array(step_capture[\"std_ratio\"])",
         "pred_final=np.array(step_capture[\"pred_final\"])",
         "sample_next=np.array(step_capture[\"sample_next\"])",
+    ):
+        assert key in text
+
+
+def test_generate_exposes_sparse_flow_block_trace_checkpoint():
+    text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
+
+    assert '"sparse_flow_block_trace"' in text
+    assert "trace_first_block" in text
+    for key in (
+        "pos_input_projected",
+        "pos_block0_self_attn",
+        "pos_block0_cross_attn",
+        "pos_block0_mlp",
+        "neg_input_projected",
+        "neg_block0_after_mlp",
     ):
         assert key in text

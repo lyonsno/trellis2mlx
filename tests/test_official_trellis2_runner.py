@@ -229,3 +229,21 @@ def test_official_runner_exposes_sparse_flow_step_stage():
         "sample_next=",
     ):
         assert key in text
+
+
+def test_official_runner_exposes_sparse_flow_block_trace_stage():
+    runner_path = importlib.import_module("scripts.run_official_trellis2").__file__
+    text = open(runner_path).read()
+
+    assert "--save-sparse-flow-block-trace" in text
+    assert "--stop-after-sparse-flow-block-trace" in text
+    assert "sparse_flow_block_trace.npz" in text
+    for key in (
+        "pos_input_projected=",
+        "pos_block0_self_attn=",
+        "pos_block0_cross_attn=",
+        "pos_block0_mlp=",
+        "neg_input_projected=",
+        "neg_block0_after_mlp=",
+    ):
+        assert key in text

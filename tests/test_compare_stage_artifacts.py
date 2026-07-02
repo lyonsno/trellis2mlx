@@ -203,3 +203,55 @@ def test_compare_sparse_flow_step_reports_sampler_tensor_deltas(tmp_path):
     assert report["stage"] == "sparse_flow_step"
     assert report["arrays"]["pred_pos"]["mean_abs_diff"] == 0.25
     assert report["arrays"]["pred_final"]["mean_abs_diff"] == 1.0
+
+
+def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path):
+    ref = tmp_path / "ref.npz"
+    mlx = tmp_path / "mlx.npz"
+    out = tmp_path / "comparison.json"
+    base = np.zeros((1, 4, 3), dtype=np.float32)
+    ref_payload = {
+        "pos_input_projected": base + 1,
+        "pos_block0_self_attn": base + 2,
+        "pos_block0_after_self": base + 3,
+        "pos_block0_cross_attn": base + 4,
+        "pos_block0_after_cross": base + 5,
+        "pos_block0_mlp": base + 6,
+        "pos_block0_after_mlp": base + 7,
+        "neg_input_projected": base + 8,
+        "neg_block0_self_attn": base + 9,
+        "neg_block0_after_self": base + 10,
+        "neg_block0_cross_attn": base + 11,
+        "neg_block0_after_cross": base + 12,
+        "neg_block0_mlp": base + 13,
+        "neg_block0_after_mlp": base + 14,
+    }
+    cand_payload = dict(ref_payload)
+    cand_payload["pos_block0_self_attn"] = base + 2.5
+    cand_payload["neg_block0_after_mlp"] = base + 16
+    np.savez(ref, **ref_payload)
+    np.savez(mlx, **cand_payload)
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/compare_stage_artifacts.py",
+            "--stage",
+            "sparse_flow_block_trace",
+            "--reference",
+            str(ref),
+            "--candidate",
+            str(mlx),
+            "--output",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    assert report["stage"] == "sparse_flow_block_trace"
+    assert report["arrays"]["pos_block0_self_attn"]["mean_abs_diff"] == 0.5
+    assert report["arrays"]["neg_block0_after_mlp"]["mean_abs_diff"] == 2.0

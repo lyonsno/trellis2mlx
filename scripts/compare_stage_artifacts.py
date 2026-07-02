@@ -11,12 +11,38 @@ from typing import Any
 import numpy as np
 
 
+_SPARSE_FLOW_BLOCK_TRACE_KEYS = (
+    "pos_input_projected",
+    "pos_block0_self_attn",
+    "pos_block0_after_self",
+    "pos_block0_cross_attn",
+    "pos_block0_after_cross",
+    "pos_block0_mlp",
+    "pos_block0_after_mlp",
+    "neg_input_projected",
+    "neg_block0_self_attn",
+    "neg_block0_after_self",
+    "neg_block0_cross_attn",
+    "neg_block0_after_cross",
+    "neg_block0_mlp",
+    "neg_block0_after_mlp",
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare TRELLIS stage artifacts")
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output"],
+        choices=[
+            "conditioning",
+            "sparse_coords",
+            "sparse_flow_step",
+            "sparse_flow_block_trace",
+            "sparse_internals",
+            "shape_slat",
+            "decoder_output",
+        ],
     )
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
@@ -68,6 +94,13 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
                     "t",
                     "t_prev",
                 )
+                if name in ref and name in cand
+            }
+            return report
+        if stage == "sparse_flow_block_trace":
+            report["arrays"] = {
+                name: _array_delta(ref[name], cand[name])
+                for name in _SPARSE_FLOW_BLOCK_TRACE_KEYS
                 if name in ref and name in cand
             }
             return report

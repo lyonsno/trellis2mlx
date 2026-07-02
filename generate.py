@@ -289,7 +289,7 @@ def main():
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--stop-after-stage",
-                        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
+                        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_flow_block_trace", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
                         default=None,
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--shared-noise", metavar="NPZ",
@@ -565,6 +565,45 @@ def main():
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
         # Cast conditioning to fp32 to match the fp32 sparse structure model
+        if args.stop_after_stage == "sparse_flow_block_trace":
+            t_tensor = mx.array([1000.0], dtype=mx.float32)
+            pos_cond = cond.astype(mx.float32)
+            neg_cond_fp32 = neg_cond.astype(mx.float32)
+            pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond)
+            neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32)
+            pos_trace = ss_flow.trace_first_block(
+                noise, t_tensor, pos_cond, cross_kv_cache=pos_kv_cache
+            )
+            neg_trace = ss_flow.trace_first_block(
+                noise, t_tensor, neg_cond_fp32, cross_kv_cache=neg_kv_cache
+            )
+            mx.eval(*pos_trace.values(), *neg_trace.values())
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(
+                    args.save_checkpoints,
+                    "sparse_flow_block_trace",
+                    pos_input_projected=np.array(pos_trace["input_projected"])[None].astype(np.float32, copy=False),
+                    pos_block0_self_attn=np.array(pos_trace["block0_self_attn"])[None].astype(np.float32, copy=False),
+                    pos_block0_after_self=np.array(pos_trace["block0_after_self"])[None].astype(np.float32, copy=False),
+                    pos_block0_cross_attn=np.array(pos_trace["block0_cross_attn"])[None].astype(np.float32, copy=False),
+                    pos_block0_after_cross=np.array(pos_trace["block0_after_cross"])[None].astype(np.float32, copy=False),
+                    pos_block0_mlp=np.array(pos_trace["block0_mlp"])[None].astype(np.float32, copy=False),
+                    pos_block0_after_mlp=np.array(pos_trace["block0_after_mlp"])[None].astype(np.float32, copy=False),
+                    neg_input_projected=np.array(neg_trace["input_projected"])[None].astype(np.float32, copy=False),
+                    neg_block0_self_attn=np.array(neg_trace["block0_self_attn"])[None].astype(np.float32, copy=False),
+                    neg_block0_after_self=np.array(neg_trace["block0_after_self"])[None].astype(np.float32, copy=False),
+                    neg_block0_cross_attn=np.array(neg_trace["block0_cross_attn"])[None].astype(np.float32, copy=False),
+                    neg_block0_after_cross=np.array(neg_trace["block0_after_cross"])[None].astype(np.float32, copy=False),
+                    neg_block0_mlp=np.array(neg_trace["block0_mlp"])[None].astype(np.float32, copy=False),
+                    neg_block0_after_mlp=np.array(neg_trace["block0_after_mlp"])[None].astype(np.float32, copy=False),
+                    t=np.array(1000.0, dtype=np.float32),
+                    steps=np.array(n_steps, dtype=np.int32),
+                    cfg_rescale_clamp=np.array(not args.no_cfg_rescale_clamp, dtype=np.bool_),
+                )
+            print("  Stop after stage: sparse_flow_block_trace", flush=True)
+            return
+
         step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),

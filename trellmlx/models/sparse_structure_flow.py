@@ -226,6 +226,54 @@ class ModulatedBlock(nn.Module):
 
         return x
 
+    def trace(
+        self,
+        x: mx.array,
+        mod: mx.array,
+        context: mx.array,
+        rope_phases: mx.array = None,
+        cross_kv_cache: tuple = None,
+    ) -> tuple[mx.array, dict[str, mx.array]]:
+        """Run this block once and return its internal boundary tensors."""
+        mod = mod + self.modulation
+
+        C = self.channels
+        shift_msa = mod[0*C:1*C]
+        scale_msa = mod[1*C:2*C]
+        gate_msa  = mod[2*C:3*C]
+        shift_mlp = mod[3*C:4*C]
+        scale_mlp = mod[4*C:5*C]
+        gate_mlp  = mod[5*C:6*C]
+
+        trace: dict[str, mx.array] = {}
+
+        h = _layernorm_noaffine(x)
+        h = h * (1 + scale_msa) + shift_msa
+        h = self.self_attn(h, rope_phases=rope_phases)
+        trace["block0_self_attn"] = h
+        h = h * gate_msa
+        x = x + h
+        trace["block0_after_self"] = x
+
+        h = self.norm2(x)
+        if cross_kv_cache is not None:
+            h = self.cross_attn(h, cached_kv=cross_kv_cache)
+        else:
+            h = self.cross_attn(h, context)
+        trace["block0_cross_attn"] = h
+        x = x + h
+        trace["block0_after_cross"] = x
+
+        h = _layernorm_noaffine(x)
+        h = h * (1 + scale_mlp) + shift_mlp
+        h = self.mlp(h)
+        trace["block0_mlp"] = h
+        h = h * gate_mlp
+        x = x + h
+        trace["block0_after_mlp"] = x
+
+        return x, trace
+
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     """LayerNorm without learnable affine (controlled by adaLN)."""
@@ -320,6 +368,37 @@ class SparseStructureFlowModel(nn.Module):
             cache.append((k, v))
         mx.eval(*[t for pair in cache for t in pair])
         return cache
+
+    def trace_first_block(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        """Capture first-block sparse-flow internals for parity witnesses."""
+        B = x.shape[0]
+        R = x.shape[2]
+
+        t_emb = self.t_embedder(t)
+        mod = self.adaLN_modulation(t_emb)
+
+        x = x.reshape(B, self.in_channels, -1)
+        x = x.transpose(0, 2, 1)
+        x = x.reshape(B * R * R * R, self.in_channels)
+        x = self.input_layer(x)
+
+        head_dim = self.model_channels // self.num_heads
+        rope_phases = build_rope_phases(R, head_dim)
+
+        assert B == 1, f"Only B=1 supported for inference, got B={B}"
+        block_kv = cross_kv_cache[0] if cross_kv_cache is not None else None
+        _x_after, trace = self.blocks[0].trace(
+            x, mod[0], cond, rope_phases=rope_phases, cross_kv_cache=block_kv
+        )
+        trace["input_projected"] = x
+        mx.eval(*trace.values())
+        return trace
 
     def __call__(
         self,

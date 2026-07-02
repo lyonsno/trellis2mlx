@@ -35,6 +35,10 @@ class _StopAfterSparseFlowStep(Exception):
     """Internal control-flow sentinel for first-step sparse-flow diagnostic runs."""
 
 
+class _StopAfterSparseFlowBlockTrace(Exception):
+    """Internal control-flow sentinel for first-block sparse-flow diagnostic runs."""
+
+
 class _StopAfterConditioning(Exception):
     """Internal control-flow sentinel for conditioning-only diagnostic runs."""
 
@@ -85,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-sparse", action="store_true")
     parser.add_argument("--save-sparse-flow-step", action="store_true")
     parser.add_argument("--stop-after-sparse-flow-step", action="store_true")
+    parser.add_argument("--save-sparse-flow-block-trace", action="store_true")
+    parser.add_argument("--stop-after-sparse-flow-block-trace", action="store_true")
     parser.add_argument("--save-sparse-internals", action="store_true")
     parser.add_argument("--stop-after-sparse-internals", action="store_true")
     parser.add_argument("--save-shape-slat", action="store_true")
@@ -111,6 +117,7 @@ def build_route_identity(
         "conditioning": bool(args.stop_after_conditioning),
         "sparse": bool(args.stop_after_sparse),
         "sparse_flow_step": bool(args.stop_after_sparse_flow_step),
+        "sparse_flow_block_trace": bool(args.stop_after_sparse_flow_block_trace),
         "sparse_internals": bool(args.stop_after_sparse_internals),
         "shape_slat": bool(args.stop_after_shape_slat),
         "shape_flow_step": bool(args.stop_after_shape_flow_step),
@@ -139,6 +146,9 @@ def build_route_identity(
             "conditioning": bool(args.save_conditioning or args.stop_after_conditioning),
             "sparse_coords": bool(args.save_sparse_coords or args.stop_after_sparse),
             "sparse_flow_step": bool(args.save_sparse_flow_step or args.stop_after_sparse_flow_step),
+            "sparse_flow_block_trace": bool(
+                args.save_sparse_flow_block_trace or args.stop_after_sparse_flow_block_trace
+            ),
             "sparse_internals": bool(args.save_sparse_internals or args.stop_after_sparse_internals),
             "shape_slat": bool(args.save_shape_slat or args.stop_after_shape_slat),
             "shape_flow_step": bool(args.save_shape_flow_step or args.stop_after_shape_flow_step),
@@ -212,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         _install_sparse_flow_step_capture_hook(
             pipeline, output_dir, stop_after_sparse_flow_step=args.stop_after_sparse_flow_step
         )
+    if args.save_sparse_flow_block_trace or args.stop_after_sparse_flow_block_trace:
+        _install_sparse_flow_block_trace_hook(
+            pipeline, output_dir, stop_after_sparse_flow_block_trace=args.stop_after_sparse_flow_block_trace
+        )
     if args.save_sparse_internals or args.stop_after_sparse_internals:
         _install_sparse_internals_capture_hook(
             pipeline, output_dir, stop_after_sparse_internals=args.stop_after_sparse_internals
@@ -251,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         return _finish_stage_only(output_dir, route_identity, "sparse", run_start)
     except _StopAfterSparseFlowStep:
         return _finish_stage_only(output_dir, route_identity, "sparse_flow_step", run_start)
+    except _StopAfterSparseFlowBlockTrace:
+        return _finish_stage_only(output_dir, route_identity, "sparse_flow_block_trace", run_start)
     except _StopAfterSparseInternals:
         return _finish_stage_only(output_dir, route_identity, "sparse_internals", run_start)
     except _StopAfterShapeSLat:
@@ -595,6 +611,117 @@ def _install_sparse_flow_step_capture_hook(
             flow_model.cpu()
         if stop_after_sparse_flow_step:
             raise _StopAfterSparseFlowStep()
+        torch.random.set_rng_state(rng_state)
+        return original(cond, resolution, num_samples, sampler_params)
+
+    pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_sparse_flow_block_trace_hook(
+    pipeline: Any, output_dir: Path, *, stop_after_sparse_flow_block_trace: bool = False
+) -> None:
+    import torch
+    from trellis2.modules.utils import manual_cast
+
+    original = pipeline.sample_sparse_structure
+
+    def _trace_first_block(flow_model, sample_in, t_tensor, context):
+        assert sample_in.shape[0] == 1, f"Only B=1 trace supported, got {sample_in.shape[0]}"
+        h = sample_in.view(*sample_in.shape[:2], -1).permute(0, 2, 1).contiguous()
+        h = flow_model.input_layer(h)
+        if flow_model.pe_mode == "ape":
+            h = h + flow_model.pos_emb[None]
+        t_emb = flow_model.t_embedder(t_tensor)
+        if flow_model.share_mod:
+            t_emb = flow_model.adaLN_modulation(t_emb)
+        t_emb = manual_cast(t_emb, flow_model.dtype)
+        h = manual_cast(h, flow_model.dtype)
+        context = manual_cast(context, flow_model.dtype)
+
+        block = flow_model.blocks[0]
+        if block.share_mod:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                block.modulation + t_emb
+            ).type(t_emb.dtype).chunk(6, dim=1)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                block.adaLN_modulation(t_emb).chunk(6, dim=1)
+            )
+
+        trace = {"input_projected": h}
+
+        block_h = block.norm1(h)
+        block_h = block_h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        block_h = block.self_attn(block_h, phases=flow_model.rope_phases)
+        trace["block0_self_attn"] = block_h
+        block_h = block_h * gate_msa.unsqueeze(1)
+        h = h + block_h
+        trace["block0_after_self"] = h
+
+        block_h = block.norm2(h)
+        block_h = block.cross_attn(block_h, context)
+        trace["block0_cross_attn"] = block_h
+        h = h + block_h
+        trace["block0_after_cross"] = h
+
+        block_h = block.norm3(h)
+        block_h = block_h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        block_h = block.mlp(block_h)
+        trace["block0_mlp"] = block_h
+        block_h = block_h * gate_mlp.unsqueeze(1)
+        h = h + block_h
+        trace["block0_after_mlp"] = h
+
+        return trace
+
+    def _hooked_sample_sparse_structure(cond, resolution, num_samples=1, sampler_params=None):
+        sampler_params = sampler_params or {}
+        flow_model = pipeline.models["sparse_structure_flow_model"]
+        reso = flow_model.resolution
+        in_channels = flow_model.in_channels
+        rng_state = torch.random.get_rng_state()
+        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(pipeline.device)
+        sampler_params_merged = {**pipeline.sparse_structure_sampler_params, **sampler_params}
+        if pipeline.low_vram:
+            flow_model.to(pipeline.device)
+
+        steps = sampler_params_merged.get("steps", 50)
+        t_seq = np.linspace(1, 0, steps + 1)
+        rescale_t = sampler_params_merged.get("rescale_t", 1.0)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t = float(t_seq[0])
+        t_tensor = torch.tensor([1000 * t] * noise.shape[0], device=noise.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            pos_trace = _trace_first_block(flow_model, noise, t_tensor, cond["cond"])
+            neg_trace = _trace_first_block(flow_model, noise, t_tensor, cond["neg_cond"])
+
+        trace_path = output_dir / "sparse_flow_block_trace.npz"
+        np.savez(
+            trace_path,
+            pos_input_projected=_to_numpy(pos_trace["input_projected"]).astype(np.float32, copy=False),
+            pos_block0_self_attn=_to_numpy(pos_trace["block0_self_attn"]).astype(np.float32, copy=False),
+            pos_block0_after_self=_to_numpy(pos_trace["block0_after_self"]).astype(np.float32, copy=False),
+            pos_block0_cross_attn=_to_numpy(pos_trace["block0_cross_attn"]).astype(np.float32, copy=False),
+            pos_block0_after_cross=_to_numpy(pos_trace["block0_after_cross"]).astype(np.float32, copy=False),
+            pos_block0_mlp=_to_numpy(pos_trace["block0_mlp"]).astype(np.float32, copy=False),
+            pos_block0_after_mlp=_to_numpy(pos_trace["block0_after_mlp"]).astype(np.float32, copy=False),
+            neg_input_projected=_to_numpy(neg_trace["input_projected"]).astype(np.float32, copy=False),
+            neg_block0_self_attn=_to_numpy(neg_trace["block0_self_attn"]).astype(np.float32, copy=False),
+            neg_block0_after_self=_to_numpy(neg_trace["block0_after_self"]).astype(np.float32, copy=False),
+            neg_block0_cross_attn=_to_numpy(neg_trace["block0_cross_attn"]).astype(np.float32, copy=False),
+            neg_block0_after_cross=_to_numpy(neg_trace["block0_after_cross"]).astype(np.float32, copy=False),
+            neg_block0_mlp=_to_numpy(neg_trace["block0_mlp"]).astype(np.float32, copy=False),
+            neg_block0_after_mlp=_to_numpy(neg_trace["block0_after_mlp"]).astype(np.float32, copy=False),
+            t=np.array(1000 * t, dtype=np.float32),
+            steps=np.array(steps, dtype=np.int32),
+            rescale_t=np.array(rescale_t, dtype=np.float32),
+        )
+        print(f"Saved sparse-flow first-block trace: {trace_path}", flush=True)
+        if pipeline.low_vram:
+            flow_model.cpu()
+        if stop_after_sparse_flow_block_trace:
+            raise _StopAfterSparseFlowBlockTrace()
         torch.random.set_rng_state(rng_state)
         return original(cond, resolution, num_samples, sampler_params)
 
