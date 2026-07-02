@@ -699,20 +699,20 @@ def _install_sparse_flow_block_trace_hook(
         trace_path = output_dir / "sparse_flow_block_trace.npz"
         np.savez(
             trace_path,
-            pos_input_projected=_to_numpy(pos_trace["input_projected"]).astype(np.float32, copy=False),
-            pos_block0_self_attn=_to_numpy(pos_trace["block0_self_attn"]).astype(np.float32, copy=False),
-            pos_block0_after_self=_to_numpy(pos_trace["block0_after_self"]).astype(np.float32, copy=False),
-            pos_block0_cross_attn=_to_numpy(pos_trace["block0_cross_attn"]).astype(np.float32, copy=False),
-            pos_block0_after_cross=_to_numpy(pos_trace["block0_after_cross"]).astype(np.float32, copy=False),
-            pos_block0_mlp=_to_numpy(pos_trace["block0_mlp"]).astype(np.float32, copy=False),
-            pos_block0_after_mlp=_to_numpy(pos_trace["block0_after_mlp"]).astype(np.float32, copy=False),
-            neg_input_projected=_to_numpy(neg_trace["input_projected"]).astype(np.float32, copy=False),
-            neg_block0_self_attn=_to_numpy(neg_trace["block0_self_attn"]).astype(np.float32, copy=False),
-            neg_block0_after_self=_to_numpy(neg_trace["block0_after_self"]).astype(np.float32, copy=False),
-            neg_block0_cross_attn=_to_numpy(neg_trace["block0_cross_attn"]).astype(np.float32, copy=False),
-            neg_block0_after_cross=_to_numpy(neg_trace["block0_after_cross"]).astype(np.float32, copy=False),
-            neg_block0_mlp=_to_numpy(neg_trace["block0_mlp"]).astype(np.float32, copy=False),
-            neg_block0_after_mlp=_to_numpy(neg_trace["block0_after_mlp"]).astype(np.float32, copy=False),
+            pos_input_projected=_to_numpy_float32(pos_trace["input_projected"]),
+            pos_block0_self_attn=_to_numpy_float32(pos_trace["block0_self_attn"]),
+            pos_block0_after_self=_to_numpy_float32(pos_trace["block0_after_self"]),
+            pos_block0_cross_attn=_to_numpy_float32(pos_trace["block0_cross_attn"]),
+            pos_block0_after_cross=_to_numpy_float32(pos_trace["block0_after_cross"]),
+            pos_block0_mlp=_to_numpy_float32(pos_trace["block0_mlp"]),
+            pos_block0_after_mlp=_to_numpy_float32(pos_trace["block0_after_mlp"]),
+            neg_input_projected=_to_numpy_float32(neg_trace["input_projected"]),
+            neg_block0_self_attn=_to_numpy_float32(neg_trace["block0_self_attn"]),
+            neg_block0_after_self=_to_numpy_float32(neg_trace["block0_after_self"]),
+            neg_block0_cross_attn=_to_numpy_float32(neg_trace["block0_cross_attn"]),
+            neg_block0_after_cross=_to_numpy_float32(neg_trace["block0_after_cross"]),
+            neg_block0_mlp=_to_numpy_float32(neg_trace["block0_mlp"]),
+            neg_block0_after_mlp=_to_numpy_float32(neg_trace["block0_after_mlp"]),
             t=np.array(1000 * t, dtype=np.float32),
             steps=np.array(steps, dtype=np.int32),
             rescale_t=np.array(rescale_t, dtype=np.float32),
@@ -1001,6 +1001,18 @@ def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "numpy"):
         return value.numpy()
     return np.asarray(value)
+
+
+def _to_numpy_float32(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "float"):
+        value = value.float()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        return value.numpy().astype(np.float32, copy=False)
+    return np.asarray(value, dtype=np.float32)
 
 
 def _sha256_file(path: str | os.PathLike[str]) -> str | None:

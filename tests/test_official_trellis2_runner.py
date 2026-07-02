@@ -247,3 +247,31 @@ def test_official_runner_exposes_sparse_flow_block_trace_stage():
         "neg_block0_after_mlp=",
     ):
         assert key in text
+
+
+def test_sparse_flow_block_trace_numpy_helper_casts_before_numpy():
+    runner = importlib.import_module("scripts.run_official_trellis2")
+
+    class BFloat16Like:
+        def __init__(self):
+            self.cast = False
+
+        def detach(self):
+            return self
+
+        def float(self):
+            self.cast = True
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            if not self.cast:
+                raise TypeError("Got unsupported ScalarType BFloat16")
+            return np.array([1.25], dtype=np.float32)
+
+    out = runner._to_numpy_float32(BFloat16Like())
+
+    assert out.dtype == np.float32
+    assert out.tolist() == [1.25]
