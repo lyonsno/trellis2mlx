@@ -177,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     from PIL import Image
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
+    _record_effective_backend_identity(route_identity, output_dir)
     print(f"PyTorch {torch.__version__}, MPS: {torch.backends.mps.is_available()}", flush=True)
 
     print("Loading pipeline...", flush=True)
@@ -595,6 +596,33 @@ def _install_shared_noise(torch: Any, shared_noise_path: str) -> None:
 
     torch.randn = _patched_randn
     print(f"Shared noise loaded from {shared_noise_path}", flush=True)
+
+
+def _record_effective_backend_identity(route_identity: dict[str, Any], output_dir: Path) -> None:
+    import importlib
+
+    attention_config = importlib.import_module("trellis2.modules.attention.config")
+    sparse_config = importlib.import_module("trellis2.modules.sparse.config")
+
+    route_identity["effective_backend"] = {
+        "attention_backend": getattr(attention_config, "BACKEND", None),
+        "sparse_attention_backend": getattr(
+            sparse_config,
+            "ATTN",
+            getattr(sparse_config, "BACKEND", None),
+        ),
+    }
+    _write_json(output_dir / "route_identity.json", route_identity)
+    _write_json(
+        output_dir / "run_report.json",
+        {
+            "schema": "trellis2mlx.official_trellis2_run_report.v1",
+            "status": "starting",
+            "route_identity": route_identity,
+            "last_trustworthy_phase": "effective_backend_identity_written",
+            "primary_output_status": "not_started",
+        },
+    )
 
 
 def _finish_stage_only(

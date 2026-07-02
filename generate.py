@@ -288,9 +288,13 @@ def main():
                              "prevents holes from simplification). Slower but preserves mesh quality.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
+    parser.add_argument("--stop-after-stage",
+                        choices=["conditioning", "sparse_coords", "shape_slat", "decoder_output", "mesh_raw"],
+                        default=None,
+                        help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
-                             "after a durable checkpoint boundary. Requires --save-checkpoints.")
+                        "after a durable checkpoint boundary. Requires --save-checkpoints.")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
     parser.add_argument("--edit-target", metavar="IMAGE",
@@ -314,6 +318,8 @@ def main():
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
+    if args.stop_after_stage and not args.save_checkpoints:
+        parser.error("--save-checkpoints is required when --stop-after-stage is set")
 
     # === Resume from checkpoints ===
     if args.resume:
@@ -463,6 +469,17 @@ def main():
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
     neg_cond = mx.zeros_like(cond)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "conditioning",
+            cond=np.array(cond),
+            neg_cond=np.array(neg_cond),
+        )
+        if args.stop_after_stage == "conditioning":
+            print("  Stop after stage: conditioning", flush=True)
+            return
 
     # VS3D: extract target conditioning and relabel source cond
     if vs3d_mode:
@@ -580,6 +597,18 @@ def main():
     N_lr = len(lr_coords)
     lr_noise = mx.random.normal((N_lr, 32))
     lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_coords",
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            coords_3d=lr_coords.astype(np.int32, copy=False),
+            lr_resolution=lr_resolution,
+        )
+        if args.stop_after_stage == "sparse_coords":
+            print("  Stop after stage: sparse_coords", flush=True)
+            return
 
     t0 = time.perf_counter()
     lr_slat = flow_euler_sample(
@@ -672,6 +701,20 @@ def main():
         gc.collect()
 
     # Keep hr_slat — needed for texture conditioning
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "shape_slat",
+            feats=np.array(hr_slat).astype(np.float32, copy=False),
+            coords=quant_coords.astype(np.int32, copy=False),
+            coords_3d=hr_coords_3d.astype(np.int32, copy=False),
+            mesh_grid_size=hr_resolution,
+            cascade=not args.no_cascade,
+        )
+        if args.stop_after_stage == "shape_slat":
+            print("  Stop after stage: shape_slat", flush=True)
+            return
 
     # === Stage 3: Shape Decode ===
     print("\n=== Stage 3: Decode Shape ===", flush=True)
@@ -697,12 +740,25 @@ def main():
 
     dec_coords_np = np.array(dec_coords)
     dec_feats_np = np.array(dec_out)
-
     # The decoder output coords span [0, hr_resolution). The decoder input
     # coords are at hr_resolution//16 (from requantization), and 4 upsamples
     # (2^4=16x) bring them back to hr_resolution scale.
     # grid_size = hr_resolution gives correct [-0.5, 0.5] world-space scaling.
     mesh_grid_size = hr_resolution
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "decoder_output",
+            feats=dec_feats_np.astype(np.float32, copy=False),
+            coords=dec_coords_np.astype(np.int32, copy=False),
+            shape_subs=[np.array(mask) for mask in shape_subs],
+            mesh_grid_size=mesh_grid_size,
+        )
+        if args.stop_after_stage == "decoder_output":
+            print("  Stop after stage: decoder_output", flush=True)
+            return
+
     print(f"  {dec_coords_np.shape[0]:,} voxels, coord range "
           f"[{dec_coords_np[:,1:].min()}, {dec_coords_np[:,1:].max()}], "
           f"grid_size={mesh_grid_size}", flush=True)
@@ -731,6 +787,9 @@ def main():
             resume_supported=False,
             resume_blocker="mesh_raw checkpoint exists, but mesh-only resume is not implemented",
         )
+        if args.stop_after_stage == "mesh_raw":
+            print("  Stop after stage: mesh_raw", flush=True)
+            return
 
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,

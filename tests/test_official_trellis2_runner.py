@@ -179,3 +179,23 @@ def test_decoder_capture_hook_runs_base_decoder_once(monkeypatch):
     assert captured["feats"].shape == (1, 7)
     assert captured["coords"].shape == (1, 4)
     assert result == [("vertices", "faces")]
+
+
+def test_records_effective_trellis_backend_identity(monkeypatch, tmp_path):
+    runner = importlib.import_module("scripts.run_official_trellis2")
+
+    attention_config = types.ModuleType("trellis2.modules.attention.config")
+    attention_config.BACKEND = "sdpa"
+    sparse_config = types.ModuleType("trellis2.modules.sparse.config")
+    sparse_config.ATTN = "sdpa"
+    monkeypatch.setitem(sys.modules, "trellis2.modules.attention.config", attention_config)
+    monkeypatch.setitem(sys.modules, "trellis2.modules.sparse.config", sparse_config)
+
+    route_identity = {"route": {}}
+    runner._record_effective_backend_identity(route_identity, tmp_path)
+
+    assert route_identity["effective_backend"] == {
+        "attention_backend": "sdpa",
+        "sparse_attention_backend": "sdpa",
+    }
+    assert (tmp_path / "route_identity.json").exists()
