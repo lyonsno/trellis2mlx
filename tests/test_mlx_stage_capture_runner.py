@@ -161,10 +161,14 @@ def test_generate_exposes_sparse_flow_block_trace_checkpoint():
     assert "trace_first_block" in text
     for key in (
         "pos_input_projected",
+        "pos_block0_q_pre_norm",
+        "pos_block0_q_post_rope",
+        "pos_block0_attention_raw",
         "pos_block0_self_attn",
         "pos_block0_cross_attn",
         "pos_block0_mlp",
         "neg_input_projected",
+        "neg_block0_k_post_norm",
         "neg_block0_after_mlp",
     ):
         assert key in text

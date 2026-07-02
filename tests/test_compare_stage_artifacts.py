@@ -212,23 +212,44 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
     base = np.zeros((1, 4, 3), dtype=np.float32)
     ref_payload = {
         "pos_input_projected": base + 1,
-        "pos_block0_self_attn": base + 2,
-        "pos_block0_after_self": base + 3,
-        "pos_block0_cross_attn": base + 4,
-        "pos_block0_after_cross": base + 5,
-        "pos_block0_mlp": base + 6,
-        "pos_block0_after_mlp": base + 7,
-        "neg_input_projected": base + 8,
-        "neg_block0_self_attn": base + 9,
-        "neg_block0_after_self": base + 10,
-        "neg_block0_cross_attn": base + 11,
-        "neg_block0_after_cross": base + 12,
-        "neg_block0_mlp": base + 13,
-        "neg_block0_after_mlp": base + 14,
+        "pos_block0_norm1": base + 2,
+        "pos_block0_modulated_self_input": base + 3,
+        "pos_block0_q_pre_norm": base + 4,
+        "pos_block0_k_pre_norm": base + 5,
+        "pos_block0_v": base + 6,
+        "pos_block0_q_post_norm": base + 7,
+        "pos_block0_k_post_norm": base + 8,
+        "pos_block0_q_post_rope": base + 9,
+        "pos_block0_k_post_rope": base + 10,
+        "pos_block0_attention_raw": base + 11,
+        "pos_block0_self_attn": base + 12,
+        "pos_block0_after_self": base + 13,
+        "pos_block0_cross_attn": base + 14,
+        "pos_block0_after_cross": base + 15,
+        "pos_block0_mlp": base + 16,
+        "pos_block0_after_mlp": base + 17,
+        "neg_input_projected": base + 18,
+        "neg_block0_norm1": base + 19,
+        "neg_block0_modulated_self_input": base + 20,
+        "neg_block0_q_pre_norm": base + 21,
+        "neg_block0_k_pre_norm": base + 22,
+        "neg_block0_v": base + 23,
+        "neg_block0_q_post_norm": base + 24,
+        "neg_block0_k_post_norm": base + 25,
+        "neg_block0_q_post_rope": base + 26,
+        "neg_block0_k_post_rope": base + 27,
+        "neg_block0_attention_raw": base + 28,
+        "neg_block0_self_attn": base + 29,
+        "neg_block0_after_self": base + 30,
+        "neg_block0_cross_attn": base + 31,
+        "neg_block0_after_cross": base + 32,
+        "neg_block0_mlp": base + 33,
+        "neg_block0_after_mlp": base + 34,
     }
     cand_payload = dict(ref_payload)
-    cand_payload["pos_block0_self_attn"] = base + 2.5
-    cand_payload["neg_block0_after_mlp"] = base + 16
+    cand_payload["pos_block0_q_post_rope"] = base + 9.75
+    cand_payload["pos_block0_self_attn"] = base + 12.5
+    cand_payload["neg_block0_after_mlp"] = base + 36
     np.savez(ref, **ref_payload)
     np.savez(mlx, **cand_payload)
 
@@ -253,5 +274,6 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
     assert result.returncode == 0, result.stderr
     report = json.loads(out.read_text())
     assert report["stage"] == "sparse_flow_block_trace"
+    assert report["arrays"]["pos_block0_q_post_rope"]["mean_abs_diff"] == 0.75
     assert report["arrays"]["pos_block0_self_attn"]["mean_abs_diff"] == 0.5
     assert report["arrays"]["neg_block0_after_mlp"]["mean_abs_diff"] == 2.0

@@ -621,6 +621,7 @@ def _install_sparse_flow_block_trace_hook(
     pipeline: Any, output_dir: Path, *, stop_after_sparse_flow_block_trace: bool = False
 ) -> None:
     import torch
+    from trellis2.modules.attention import RotaryPositionEmbedder, scaled_dot_product_attention
     from trellis2.modules.utils import manual_cast
 
     original = pipeline.sample_sparse_structure
@@ -651,8 +652,30 @@ def _install_sparse_flow_block_trace_hook(
         trace = {"input_projected": h}
 
         block_h = block.norm1(h)
+        trace["block0_norm1"] = block_h
         block_h = block_h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        block_h = block.self_attn(block_h, phases=flow_model.rope_phases)
+        trace["block0_modulated_self_input"] = block_h
+
+        qkv = block.self_attn.to_qkv(block_h)
+        qkv = qkv.reshape(block_h.shape[0], block_h.shape[1], 3, block.self_attn.num_heads, -1)
+        q, k, v = qkv.unbind(dim=2)
+        trace["block0_q_pre_norm"] = q
+        trace["block0_k_pre_norm"] = k
+        trace["block0_v"] = v
+        if block.self_attn.qk_rms_norm:
+            q = block.self_attn.q_rms_norm(q)
+            k = block.self_attn.k_rms_norm(k)
+        trace["block0_q_post_norm"] = q
+        trace["block0_k_post_norm"] = k
+        if block.self_attn.use_rope:
+            q = RotaryPositionEmbedder.apply_rotary_embedding(q, flow_model.rope_phases)
+            k = RotaryPositionEmbedder.apply_rotary_embedding(k, flow_model.rope_phases)
+        trace["block0_q_post_rope"] = q
+        trace["block0_k_post_rope"] = k
+        block_h = scaled_dot_product_attention(q, k, v)
+        block_h = block_h.reshape(block_h.shape[0], block_h.shape[1], -1)
+        trace["block0_attention_raw"] = block_h
+        block_h = block.self_attn.to_out(block_h)
         trace["block0_self_attn"] = block_h
         block_h = block_h * gate_msa.unsqueeze(1)
         h = h + block_h
@@ -700,6 +723,16 @@ def _install_sparse_flow_block_trace_hook(
         np.savez(
             trace_path,
             pos_input_projected=_to_numpy_float32(pos_trace["input_projected"]),
+            pos_block0_norm1=_to_numpy_float32(pos_trace["block0_norm1"]),
+            pos_block0_modulated_self_input=_to_numpy_float32(pos_trace["block0_modulated_self_input"]),
+            pos_block0_q_pre_norm=_to_numpy_float32(pos_trace["block0_q_pre_norm"]),
+            pos_block0_k_pre_norm=_to_numpy_float32(pos_trace["block0_k_pre_norm"]),
+            pos_block0_v=_to_numpy_float32(pos_trace["block0_v"]),
+            pos_block0_q_post_norm=_to_numpy_float32(pos_trace["block0_q_post_norm"]),
+            pos_block0_k_post_norm=_to_numpy_float32(pos_trace["block0_k_post_norm"]),
+            pos_block0_q_post_rope=_to_numpy_float32(pos_trace["block0_q_post_rope"]),
+            pos_block0_k_post_rope=_to_numpy_float32(pos_trace["block0_k_post_rope"]),
+            pos_block0_attention_raw=_to_numpy_float32(pos_trace["block0_attention_raw"]),
             pos_block0_self_attn=_to_numpy_float32(pos_trace["block0_self_attn"]),
             pos_block0_after_self=_to_numpy_float32(pos_trace["block0_after_self"]),
             pos_block0_cross_attn=_to_numpy_float32(pos_trace["block0_cross_attn"]),
@@ -707,6 +740,16 @@ def _install_sparse_flow_block_trace_hook(
             pos_block0_mlp=_to_numpy_float32(pos_trace["block0_mlp"]),
             pos_block0_after_mlp=_to_numpy_float32(pos_trace["block0_after_mlp"]),
             neg_input_projected=_to_numpy_float32(neg_trace["input_projected"]),
+            neg_block0_norm1=_to_numpy_float32(neg_trace["block0_norm1"]),
+            neg_block0_modulated_self_input=_to_numpy_float32(neg_trace["block0_modulated_self_input"]),
+            neg_block0_q_pre_norm=_to_numpy_float32(neg_trace["block0_q_pre_norm"]),
+            neg_block0_k_pre_norm=_to_numpy_float32(neg_trace["block0_k_pre_norm"]),
+            neg_block0_v=_to_numpy_float32(neg_trace["block0_v"]),
+            neg_block0_q_post_norm=_to_numpy_float32(neg_trace["block0_q_post_norm"]),
+            neg_block0_k_post_norm=_to_numpy_float32(neg_trace["block0_k_post_norm"]),
+            neg_block0_q_post_rope=_to_numpy_float32(neg_trace["block0_q_post_rope"]),
+            neg_block0_k_post_rope=_to_numpy_float32(neg_trace["block0_k_post_rope"]),
+            neg_block0_attention_raw=_to_numpy_float32(neg_trace["block0_attention_raw"]),
             neg_block0_self_attn=_to_numpy_float32(neg_trace["block0_self_attn"]),
             neg_block0_after_self=_to_numpy_float32(neg_trace["block0_after_self"]),
             neg_block0_cross_attn=_to_numpy_float32(neg_trace["block0_cross_attn"]),

@@ -129,6 +129,43 @@ class MultiHeadAttention(nn.Module):
 
         return self.to_out(out)
 
+    def trace_self_attention(
+        self,
+        x: mx.array,
+        rope_phases: mx.array = None,
+    ) -> tuple[mx.array, dict[str, mx.array]]:
+        """Run dense self-attention and expose q/k/v internal tensors."""
+        B_T = x.shape[0]
+        qkv = self.to_qkv(x)
+        qkv = qkv.reshape(B_T, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        trace = {
+            "block0_q_pre_norm": q,
+            "block0_k_pre_norm": k,
+            "block0_v": v,
+        }
+
+        q = self.q_rms_norm(q)
+        k = self.k_rms_norm(k)
+        trace["block0_q_post_norm"] = q
+        trace["block0_k_post_norm"] = k
+
+        if rope_phases is not None:
+            q = apply_rope(q, rope_phases)
+            k = apply_rope(k, rope_phases)
+        trace["block0_q_post_rope"] = q
+        trace["block0_k_post_rope"] = k
+
+        q_b = q[None].transpose(0, 2, 1, 3)
+        k_b = k[None].transpose(0, 2, 1, 3)
+        v_b = v[None].transpose(0, 2, 1, 3)
+        out = scaled_dot_product_attention(q_b, k_b, v_b)
+        out = out.transpose(0, 2, 1, 3).reshape(B_T, self.channels)
+        trace["block0_attention_raw"] = out
+
+        return self.to_out(out), trace
+
 
 class FeedForward(nn.Module):
     """MLP with GELU. Matches TRELLIS weight layout: mlp.0 and mlp.2."""
@@ -248,8 +285,11 @@ class ModulatedBlock(nn.Module):
         trace: dict[str, mx.array] = {}
 
         h = _layernorm_noaffine(x)
+        trace["block0_norm1"] = h
         h = h * (1 + scale_msa) + shift_msa
-        h = self.self_attn(h, rope_phases=rope_phases)
+        trace["block0_modulated_self_input"] = h
+        h, attn_trace = self.self_attn.trace_self_attention(h, rope_phases=rope_phases)
+        trace.update(attn_trace)
         trace["block0_self_attn"] = h
         h = h * gate_msa
         x = x + h
