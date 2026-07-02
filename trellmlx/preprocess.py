@@ -55,20 +55,22 @@ def preprocess_image(image_path: str, max_size: int = 1024) -> Image.Image:
         print("  WARNING: rembg found no foreground, using original image", flush=True)
         return img.convert("RGB")
 
-    y_min, x_min = foreground.min(axis=0)
-    y_max, x_max = foreground.max(axis=0)
-
-    # Square crop centered on object
-    center_x = (x_min + x_max) / 2
-    center_y = (y_min + y_max) / 2
-    size = max(x_max - x_min, y_max - y_min)
-    half = size // 2
-
     bbox = (
-        int(center_x - half),
-        int(center_y - half),
-        int(center_x + half),
-        int(center_y + half),
+        np.min(foreground[:, 1]),
+        np.min(foreground[:, 0]),
+        np.max(foreground[:, 1]),
+        np.max(foreground[:, 0]),
+    )
+
+    # Keep the half-pixel crop semantics of the Trellis-Mac reference route.
+    center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+    size = int(size * 1)
+    bbox = (
+        center[0] - size // 2,
+        center[1] - size // 2,
+        center[0] + size // 2,
+        center[1] + size // 2,
     )
     output = output.crop(bbox)
 
