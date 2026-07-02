@@ -185,6 +185,31 @@ class TestSparseStructureFlowModel:
         out = model(x, t, cond)
         assert out.shape == (1, 8, 4, 4, 4)
 
+    def test_final_layernorm_uses_reference_epsilon(self, monkeypatch):
+        import trellmlx.models.sparse_structure_flow as sparse_flow
+
+        seen_eps = []
+        original_layernorm = sparse_flow._layernorm_noaffine
+
+        def capture_layernorm(x, eps=1e-6):
+            seen_eps.append(eps)
+            return original_layernorm(x, eps=eps)
+
+        monkeypatch.setattr(sparse_flow, "_layernorm_noaffine", capture_layernorm)
+        model = sparse_flow.SparseStructureFlowModel(
+            in_channels=8, out_channels=8, model_channels=16,
+            num_heads=4, num_blocks=0, mlp_hidden=32,
+            context_channels=8, resolution=2,
+        )
+
+        x = mx.random.normal((1, 8, 2, 2, 2))
+        t = mx.array([1000.0])
+        cond = mx.random.normal((1, 5, 8))
+        out = model(x, t, cond)
+        mx.eval(out)
+
+        assert seen_eps == [1e-5]
+
     def test_parameter_count_small(self):
         """Small model parameter count should be predictable."""
         import mlx.utils

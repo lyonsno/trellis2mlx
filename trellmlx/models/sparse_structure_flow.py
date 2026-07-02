@@ -360,7 +360,8 @@ class SparseStructureFlowModel(nn.Module):
                     mx.eval(x)
 
         # Output projection
-        x = _layernorm_noaffine(x)
+        # Match reference F.layer_norm default eps on the final output norm.
+        x = _layernorm_noaffine(x, eps=1e-5)
         x = self.out_layer(x)                          # [B*R³, out_C]
 
         # Reshape back to 3D
