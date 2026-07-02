@@ -100,8 +100,11 @@ def test_generate_exposes_stage_stop_checkpoints():
     text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
 
     assert "--stop-after-stage" in text
-    assert 'choices=["conditioning", "sparse_coords", "shape_slat", "decoder_output", "mesh_raw"]' in text
-    for stage in ("conditioning", "sparse_coords", "shape_slat", "decoder_output"):
+    assert (
+        'choices=["conditioning", "sparse_coords", "sparse_internals", '
+        '"shape_slat", "decoder_output", "mesh_raw"]'
+    ) in text
+    for stage in ("conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output"):
         assert f'"{stage}"' in text
     assert text.count("save_checkpoint(") >= 8
 
@@ -111,3 +114,12 @@ def test_generate_exposes_shared_noise_for_sparse_witness():
 
     assert "--shared-noise" in text
     assert 'shared_noise["ss_noise"]' in text
+
+
+def test_generate_exposes_sparse_internals_checkpoint():
+    text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
+
+    assert '"sparse_internals"' in text
+    assert "z_s=np.array(z_s)" in text
+    assert "logits=np.array(logits)" in text
+    assert "decoded.astype(np.bool_)" in text

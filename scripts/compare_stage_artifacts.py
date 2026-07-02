@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["conditioning", "sparse_coords", "shape_slat", "decoder_output"],
+        choices=["conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output"],
     )
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
@@ -45,6 +45,14 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
                 name: _array_delta(ref[name], cand[name])
                 for name in ("cond", "neg_cond")
             }
+            return report
+        if stage == "sparse_internals":
+            report["arrays"] = {
+                name: _array_delta(ref[name], cand[name])
+                for name in ("z_s", "logits", "decoded", "decoded_ds")
+            }
+            coords_report, _ref_order, _cand_order = _coord_overlap(ref["coords"], cand["coords"])
+            report["coords"] = coords_report
             return report
 
         coords_report, ref_order, cand_order = _coord_overlap(ref["coords"], cand["coords"])

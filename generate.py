@@ -289,7 +289,7 @@ def main():
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--stop-after-stage",
-                        choices=["conditioning", "sparse_coords", "shape_slat", "decoder_output", "mesh_raw"],
+                        choices=["conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
                         default=None,
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--shared-noise", metavar="NPZ",
@@ -581,6 +581,23 @@ def main():
     ).any(axis=(1, 3, 5))
     lr_coords = np.argwhere(decoded_ds)
     print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
+
+    if args.save_checkpoints and args.stop_after_stage == "sparse_internals":
+        from trellmlx.checkpoint import save_checkpoint
+        lr_coords_4d = np.column_stack([np.zeros(len(lr_coords), dtype=np.int32), lr_coords])
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_internals",
+            z_s=np.array(z_s).astype(np.float32, copy=False),
+            logits=np.array(logits).astype(np.float32, copy=False),
+            decoded=decoded.astype(np.bool_),
+            decoded_ds=decoded_ds.astype(np.bool_),
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            lr_resolution=lr_resolution,
+            sparse_decoder_resolution=int(decoded.shape[0]),
+        )
+        print("  Stop after stage: sparse_internals", flush=True)
+        return
 
     cleanup_model(ss_flow, ss_dec)
 

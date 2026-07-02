@@ -110,3 +110,49 @@ def test_compare_shape_slat_aligns_feature_deltas_by_common_coords(tmp_path):
     assert report["features"]["common_shape"] == [1, 2]
     assert report["features"]["max_abs_diff"] == 2.0
     assert report["features"]["mean_abs_diff"] == 1.5
+
+
+def test_compare_sparse_internals_reports_array_and_coordinate_deltas(tmp_path):
+    ref = tmp_path / "ref.npz"
+    mlx = tmp_path / "mlx.npz"
+    out = tmp_path / "comparison.json"
+    np.savez(
+        ref,
+        z_s=np.zeros((1, 2, 2, 2, 2), dtype=np.float32),
+        logits=np.ones((1, 1, 4, 4, 4), dtype=np.float32),
+        decoded=np.zeros((4, 4, 4), dtype=bool),
+        decoded_ds=np.zeros((2, 2, 2), dtype=bool),
+        coords=np.array([[0, 0, 0, 0]], dtype=np.int32),
+    )
+    np.savez(
+        mlx,
+        z_s=np.ones((1, 2, 2, 2, 2), dtype=np.float32),
+        logits=np.ones((1, 1, 4, 4, 4), dtype=np.float32) * 3,
+        decoded=np.zeros((4, 4, 4), dtype=bool),
+        decoded_ds=np.zeros((2, 2, 2), dtype=bool),
+        coords=np.array([[0, 0, 0, 0]], dtype=np.int32),
+    )
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/compare_stage_artifacts.py",
+            "--stage",
+            "sparse_internals",
+            "--reference",
+            str(ref),
+            "--candidate",
+            str(mlx),
+            "--output",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    assert report["arrays"]["z_s"]["mean_abs_diff"] == 1.0
+    assert report["arrays"]["logits"]["mean_abs_diff"] == 2.0
+    assert report["coords"]["jaccard"] == 1.0

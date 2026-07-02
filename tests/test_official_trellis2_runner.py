@@ -199,3 +199,14 @@ def test_records_effective_trellis_backend_identity(monkeypatch, tmp_path):
         "sparse_attention_backend": "sdpa",
     }
     assert (tmp_path / "route_identity.json").exists()
+
+
+def test_official_runner_exposes_sparse_internals_stage():
+    runner_path = importlib.import_module("scripts.run_official_trellis2").__file__
+    text = open(runner_path).read()
+
+    assert "--save-sparse-internals" in text
+    assert "--stop-after-sparse-internals" in text
+    assert "sparse_internals.npz" in text
+    assert "z_s=" in text
+    assert "logits=" in text

@@ -27,6 +27,10 @@ class _StopAfterSparse(Exception):
     """Internal control-flow sentinel for sparse-only diagnostic runs."""
 
 
+class _StopAfterSparseInternals(Exception):
+    """Internal control-flow sentinel for sparse-internals diagnostic runs."""
+
+
 class _StopAfterConditioning(Exception):
     """Internal control-flow sentinel for conditioning-only diagnostic runs."""
 
@@ -75,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-conditioning", action="store_true")
     parser.add_argument("--save-sparse-coords", action="store_true")
     parser.add_argument("--stop-after-sparse", action="store_true")
+    parser.add_argument("--save-sparse-internals", action="store_true")
+    parser.add_argument("--stop-after-sparse-internals", action="store_true")
     parser.add_argument("--save-shape-slat", action="store_true")
     parser.add_argument("--stop-after-shape-slat", action="store_true")
     parser.add_argument("--save-shape-flow-step", action="store_true")
@@ -98,6 +104,7 @@ def build_route_identity(
     requested_stops = {
         "conditioning": bool(args.stop_after_conditioning),
         "sparse": bool(args.stop_after_sparse),
+        "sparse_internals": bool(args.stop_after_sparse_internals),
         "shape_slat": bool(args.stop_after_shape_slat),
         "shape_flow_step": bool(args.stop_after_shape_flow_step),
         "raw_mesh": bool(args.stop_after_raw_mesh),
@@ -124,6 +131,7 @@ def build_route_identity(
         "requested_outputs": {
             "conditioning": bool(args.save_conditioning or args.stop_after_conditioning),
             "sparse_coords": bool(args.save_sparse_coords or args.stop_after_sparse),
+            "sparse_internals": bool(args.save_sparse_internals or args.stop_after_sparse_internals),
             "shape_slat": bool(args.save_shape_slat or args.stop_after_shape_slat),
             "shape_flow_step": bool(args.save_shape_flow_step or args.stop_after_shape_flow_step),
             "raw_mesh": bool(args.save_raw_mesh),
@@ -192,6 +200,10 @@ def main(argv: list[str] | None = None) -> int:
         _install_decoder_capture_hook(pipeline, captured)
     if args.save_sparse_coords or args.stop_after_sparse:
         _install_sparse_capture_hook(pipeline, output_dir, stop_after_sparse=args.stop_after_sparse)
+    if args.save_sparse_internals or args.stop_after_sparse_internals:
+        _install_sparse_internals_capture_hook(
+            pipeline, output_dir, stop_after_sparse_internals=args.stop_after_sparse_internals
+        )
     if args.save_conditioning or args.stop_after_conditioning:
         _install_conditioning_capture_hook(
             pipeline, output_dir, stop_after_conditioning=args.stop_after_conditioning
@@ -225,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         return _finish_stage_only(output_dir, route_identity, "conditioning", run_start)
     except _StopAfterSparse:
         return _finish_stage_only(output_dir, route_identity, "sparse", run_start)
+    except _StopAfterSparseInternals:
+        return _finish_stage_only(output_dir, route_identity, "sparse_internals", run_start)
     except _StopAfterShapeSLat:
         return _finish_stage_only(output_dir, route_identity, "shape_slat", run_start)
     except _StopAfterShapeFlowStep:
@@ -468,6 +482,67 @@ def _install_sparse_capture_hook(
         print(f"Saved sparse coords: {sparse_path} ({coords_np.shape})", flush=True)
         if stop_after_sparse:
             raise _StopAfterSparse()
+        return coords
+
+    pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_sparse_internals_capture_hook(
+    pipeline: Any, output_dir: Path, *, stop_after_sparse_internals: bool = False
+) -> None:
+    import torch
+    import torch.nn.functional as F
+
+    def _hooked_sample_sparse_structure(cond, resolution, num_samples=1, sampler_params=None):
+        sampler_params = sampler_params or {}
+        flow_model = pipeline.models["sparse_structure_flow_model"]
+        reso = flow_model.resolution
+        in_channels = flow_model.in_channels
+        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(pipeline.device)
+        sampler_params_merged = {**pipeline.sparse_structure_sampler_params, **sampler_params}
+        if pipeline.low_vram:
+            flow_model.to(pipeline.device)
+        z_s = pipeline.sparse_structure_sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **sampler_params_merged,
+            verbose=True,
+            tqdm_desc="Sampling sparse structure",
+        ).samples
+        if pipeline.low_vram:
+            flow_model.cpu()
+
+        decoder = pipeline.models["sparse_structure_decoder"]
+        if pipeline.low_vram:
+            decoder.to(pipeline.device)
+        logits = decoder(z_s)
+        decoded = logits > 0
+        if pipeline.low_vram:
+            decoder.cpu()
+        if resolution != decoded.shape[2]:
+            ratio = decoded.shape[2] // resolution
+            decoded_ds = F.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+        else:
+            decoded_ds = decoded
+        coords = torch.argwhere(decoded_ds)[:, [0, 2, 3, 4]].int()
+
+        internals_path = output_dir / "sparse_internals.npz"
+        np.savez(
+            internals_path,
+            z_s=_to_numpy(z_s).astype(np.float32, copy=False),
+            logits=_to_numpy(logits).astype(np.float32, copy=False),
+            decoded=_to_numpy(decoded).astype(np.bool_, copy=False)[0, 0],
+            decoded_ds=_to_numpy(decoded_ds).astype(np.bool_, copy=False)[0, 0],
+            coords=_to_numpy(coords).astype(np.int32, copy=False),
+        )
+        print(
+            f"Saved sparse internals: {internals_path} "
+            f"(z_s: {tuple(z_s.shape)}, logits: {tuple(logits.shape)}, coords: {tuple(coords.shape)})",
+            flush=True,
+        )
+        if stop_after_sparse_internals:
+            raise _StopAfterSparseInternals()
         return coords
 
     pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
