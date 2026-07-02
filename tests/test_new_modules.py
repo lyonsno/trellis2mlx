@@ -199,6 +199,53 @@ class TestSampler:
                          steps=4, guidance_strength=1.0, verbose=False)
         assert call_count["pos"] == 4  # one call per step, no neg
 
+    def test_cfg_rescale_clamp_can_be_disabled_for_parity_witness(self):
+        """Diagnostic route can preserve the reference raw CFG-rescale ratio."""
+        from trellmlx.samplers import flow_euler_sample
+
+        class MockModel:
+            def __call__(self, x, t, cond):
+                pred_pos = mx.array([[[[[0.0, 1.0]]]]])
+                pred_neg = mx.array([[[[[0.0, -1.0]]]]])
+                return mx.where(mx.sum(cond) > 0, pred_pos, pred_neg)
+
+        noise = mx.zeros((1, 1, 1, 1, 2))
+        cond = mx.ones((1, 1, 1))
+        neg_cond = mx.zeros_like(cond)
+
+        clamped = {}
+        flow_euler_sample(
+            MockModel(),
+            noise,
+            cond,
+            neg_cond,
+            steps=8,
+            guidance_strength=7.5,
+            guidance_rescale=0.7,
+            verbose=False,
+            capture_first_step=clamped,
+            stop_after_first_step=True,
+        )
+
+        unclamped = {}
+        flow_euler_sample(
+            MockModel(),
+            noise,
+            cond,
+            neg_cond,
+            steps=8,
+            guidance_strength=7.5,
+            guidance_rescale=0.7,
+            verbose=False,
+            cfg_rescale_clamp=False,
+            capture_first_step=unclamped,
+            stop_after_first_step=True,
+        )
+
+        assert np.array(clamped["ratio_raw"])[0, 0, 0, 0, 0] < 0.5
+        assert np.array(clamped["ratio_effective"])[0, 0, 0, 0, 0] == 0.5
+        assert np.array(unclamped["ratio_effective"])[0, 0, 0, 0, 0] == np.array(unclamped["ratio_raw"])[0, 0, 0, 0, 0]
+
 
 class TestWeightLoader:
     def test_remap_adaln(self):

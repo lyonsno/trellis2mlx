@@ -70,6 +70,7 @@ def test_mlx_stage_capture_runner_records_and_passes_shared_noise(monkeypatch, t
     def fake_run(command, cwd=None, env=None, text=None, capture_output=None):
         assert "--shared-noise" in command
         assert str(shared_noise) in command
+        assert "--no-cfg-rescale-clamp" in command
         checkpoint_dir = Path(command[command.index("--save-checkpoints") + 1])
         checkpoint_dir.mkdir(parents=True)
         (checkpoint_dir / "sparse_coords.npz").write_bytes(b"artifact")
@@ -86,6 +87,7 @@ def test_mlx_stage_capture_runner_records_and_passes_shared_noise(monkeypatch, t
             "sparse_coords",
             "--shared-noise",
             str(shared_noise),
+            "--no-cfg-rescale-clamp",
         ]
     )
 
@@ -93,7 +95,9 @@ def test_mlx_stage_capture_runner_records_and_passes_shared_noise(monkeypatch, t
     route = json.loads((output_dir / "route_identity.json").read_text())
     assert route["route"]["shared_noise_path"] == str(shared_noise)
     assert route["route"]["shared_noise_sha256"] is not None
+    assert route["route"]["cfg_rescale_clamp"] is False
     assert "--shared-noise" in route["command"]
+    assert "--no-cfg-rescale-clamp" in route["command"]
 
 
 def test_generate_exposes_stage_stop_checkpoints():
@@ -129,6 +133,7 @@ def test_generate_exposes_sparse_flow_step_checkpoint():
     text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
 
     assert '"sparse_flow_step"' in text
+    assert "--no-cfg-rescale-clamp" in text
     for key in (
         "noise=np.array(noise)",
         "pred_pos=np.array(step_capture[\"pred_pos\"])",

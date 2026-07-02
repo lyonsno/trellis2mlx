@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--shared-noise")
+    parser.add_argument("--no-cfg-rescale-clamp", action="store_true")
     return parser
 
 
@@ -59,6 +60,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "target_faces": args.target_faces,
             "texture_size": args.texture_size,
             "preprocess_rembg": not args.no_rembg,
+            "cfg_rescale_clamp": not args.no_cfg_rescale_clamp,
             "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
             "shared_noise_sha256": _sha256_file(args.shared_noise) if args.shared_noise else None,
         },
@@ -193,6 +195,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--no-rembg")
     if args.shared_noise:
         command.extend(["--shared-noise", str(Path(args.shared_noise))])
+    if args.no_cfg_rescale_clamp:
+        command.append("--no-cfg-rescale-clamp")
     return command
 
 

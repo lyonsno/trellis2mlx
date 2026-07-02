@@ -294,6 +294,8 @@ def main():
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--shared-noise", metavar="NPZ",
                         help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
+    parser.add_argument("--no-cfg-rescale-clamp", action="store_true",
+                        help="Diagnostic: disable MLX CFG-rescale ratio clamp for reference-parity witnesses.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -567,6 +569,7 @@ def main():
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
                                 steps=n_steps, verbose=False,
+                                cfg_rescale_clamp=not args.no_cfg_rescale_clamp,
                                 capture_first_step=step_capture,
                                 stop_after_first_step=args.stop_after_stage == "sparse_flow_step")
         mx.eval(z_s)
@@ -601,6 +604,7 @@ def main():
             guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
             rescale_t=np.array(5.0, dtype=np.float32),
             sigma_min=np.array(1e-5, dtype=np.float32),
+            cfg_rescale_clamp=np.array(not args.no_cfg_rescale_clamp, dtype=np.bool_),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
         return

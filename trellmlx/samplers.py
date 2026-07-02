@@ -23,6 +23,7 @@ def flow_euler_sample(
     sigma_min: float = 1e-5,
     verbose: bool = True,
     concat_cond: mx.array = None,
+    cfg_rescale_clamp: bool = True,
     capture_first_step: dict | None = None,
     stop_after_first_step: bool = False,
     **model_kwargs,
@@ -122,7 +123,7 @@ def flow_euler_sample(
                 safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
                 ratio_raw = std_pos / safe_std_cfg
                 ratio_raw = mx.where(std_cfg > 0, ratio_raw, mx.ones_like(ratio_raw))
-                std_ratio = mx.clip(ratio_raw, 0.5, 2.0)
+                std_ratio = mx.clip(ratio_raw, 0.5, 2.0) if cfg_rescale_clamp else ratio_raw
                 x_0_rescaled = x_0_cfg * std_ratio
                 x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
                 pred = _xstart_to_pred(sample, t, x_0, sigma_min)
