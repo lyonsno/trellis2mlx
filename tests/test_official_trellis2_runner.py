@@ -210,3 +210,22 @@ def test_official_runner_exposes_sparse_internals_stage():
     assert "sparse_internals.npz" in text
     assert "z_s=" in text
     assert "logits=" in text
+
+
+def test_official_runner_exposes_sparse_flow_step_stage():
+    runner_path = importlib.import_module("scripts.run_official_trellis2").__file__
+    text = open(runner_path).read()
+
+    assert "--save-sparse-flow-step" in text
+    assert "--stop-after-sparse-flow-step" in text
+    assert "sparse_flow_step0.npz" in text
+    for key in (
+        "noise=",
+        "pred_pos=",
+        "pred_neg=",
+        "pred_cfg=",
+        "std_ratio=",
+        "pred_final=",
+        "sample_next=",
+    ):
+        assert key in text

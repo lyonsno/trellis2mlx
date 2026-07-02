@@ -289,7 +289,7 @@ def main():
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--stop-after-stage",
-                        choices=["conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
+                        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
                         default=None,
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--shared-noise", metavar="NPZ",
@@ -563,12 +563,47 @@ def main():
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
         # Cast conditioning to fp32 to match the fp32 sparse structure model
+        step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
-                                steps=n_steps, verbose=False)
+                                steps=n_steps, verbose=False,
+                                capture_first_step=step_capture,
+                                stop_after_first_step=args.stop_after_stage == "sparse_flow_step")
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if args.save_checkpoints and args.stop_after_stage == "sparse_flow_step":
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_flow_step",
+            noise=np.array(noise).astype(np.float32, copy=False),
+            pred_pos=np.array(step_capture["pred_pos"]).astype(np.float32, copy=False),
+            pred_neg=np.array(step_capture["pred_neg"]).astype(np.float32, copy=False),
+            pred_cfg=np.array(step_capture["pred_cfg"]).astype(np.float32, copy=False),
+            x0_pos=np.array(step_capture["x0_pos"]).astype(np.float32, copy=False),
+            x0_cfg=np.array(step_capture["x0_cfg"]).astype(np.float32, copy=False),
+            std_pos=np.array(step_capture["std_pos"]).astype(np.float32, copy=False),
+            std_cfg=np.array(step_capture["std_cfg"]).astype(np.float32, copy=False),
+            ratio_raw=np.array(step_capture["ratio_raw"]).astype(np.float32, copy=False),
+            std_ratio=np.array(step_capture["std_ratio"]).astype(np.float32, copy=False),
+            ratio_effective=np.array(step_capture["ratio_effective"]).astype(np.float32, copy=False),
+            x0_rescaled=np.array(step_capture["x0_rescaled"]).astype(np.float32, copy=False),
+            x0_after_rescale=np.array(step_capture["x0_after_rescale"]).astype(np.float32, copy=False),
+            pred_final=np.array(step_capture["pred_final"]).astype(np.float32, copy=False),
+            sample_next=np.array(step_capture["sample_next"]).astype(np.float32, copy=False),
+            t=np.array(step_capture["t"]).astype(np.float32, copy=False),
+            t_prev=np.array(step_capture["t_prev"]).astype(np.float32, copy=False),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(7.5, dtype=np.float32),
+            guidance_rescale=np.array(0.7, dtype=np.float32),
+            guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
+            rescale_t=np.array(5.0, dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
+        )
+        print("  Stop after stage: sparse_flow_step", flush=True)
+        return
 
     logits = ss_dec(z_s.astype(mx.float32))
     mx.eval(logits)

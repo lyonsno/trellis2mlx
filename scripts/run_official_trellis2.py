@@ -31,6 +31,10 @@ class _StopAfterSparseInternals(Exception):
     """Internal control-flow sentinel for sparse-internals diagnostic runs."""
 
 
+class _StopAfterSparseFlowStep(Exception):
+    """Internal control-flow sentinel for first-step sparse-flow diagnostic runs."""
+
+
 class _StopAfterConditioning(Exception):
     """Internal control-flow sentinel for conditioning-only diagnostic runs."""
 
@@ -79,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-conditioning", action="store_true")
     parser.add_argument("--save-sparse-coords", action="store_true")
     parser.add_argument("--stop-after-sparse", action="store_true")
+    parser.add_argument("--save-sparse-flow-step", action="store_true")
+    parser.add_argument("--stop-after-sparse-flow-step", action="store_true")
     parser.add_argument("--save-sparse-internals", action="store_true")
     parser.add_argument("--stop-after-sparse-internals", action="store_true")
     parser.add_argument("--save-shape-slat", action="store_true")
@@ -104,6 +110,7 @@ def build_route_identity(
     requested_stops = {
         "conditioning": bool(args.stop_after_conditioning),
         "sparse": bool(args.stop_after_sparse),
+        "sparse_flow_step": bool(args.stop_after_sparse_flow_step),
         "sparse_internals": bool(args.stop_after_sparse_internals),
         "shape_slat": bool(args.stop_after_shape_slat),
         "shape_flow_step": bool(args.stop_after_shape_flow_step),
@@ -131,6 +138,7 @@ def build_route_identity(
         "requested_outputs": {
             "conditioning": bool(args.save_conditioning or args.stop_after_conditioning),
             "sparse_coords": bool(args.save_sparse_coords or args.stop_after_sparse),
+            "sparse_flow_step": bool(args.save_sparse_flow_step or args.stop_after_sparse_flow_step),
             "sparse_internals": bool(args.save_sparse_internals or args.stop_after_sparse_internals),
             "shape_slat": bool(args.save_shape_slat or args.stop_after_shape_slat),
             "shape_flow_step": bool(args.save_shape_flow_step or args.stop_after_shape_flow_step),
@@ -200,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         _install_decoder_capture_hook(pipeline, captured)
     if args.save_sparse_coords or args.stop_after_sparse:
         _install_sparse_capture_hook(pipeline, output_dir, stop_after_sparse=args.stop_after_sparse)
+    if args.save_sparse_flow_step or args.stop_after_sparse_flow_step:
+        _install_sparse_flow_step_capture_hook(
+            pipeline, output_dir, stop_after_sparse_flow_step=args.stop_after_sparse_flow_step
+        )
     if args.save_sparse_internals or args.stop_after_sparse_internals:
         _install_sparse_internals_capture_hook(
             pipeline, output_dir, stop_after_sparse_internals=args.stop_after_sparse_internals
@@ -237,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         return _finish_stage_only(output_dir, route_identity, "conditioning", run_start)
     except _StopAfterSparse:
         return _finish_stage_only(output_dir, route_identity, "sparse", run_start)
+    except _StopAfterSparseFlowStep:
+        return _finish_stage_only(output_dir, route_identity, "sparse_flow_step", run_start)
     except _StopAfterSparseInternals:
         return _finish_stage_only(output_dir, route_identity, "sparse_internals", run_start)
     except _StopAfterShapeSLat:
@@ -483,6 +497,106 @@ def _install_sparse_capture_hook(
         if stop_after_sparse:
             raise _StopAfterSparse()
         return coords
+
+    pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_sparse_flow_step_capture_hook(
+    pipeline: Any, output_dir: Path, *, stop_after_sparse_flow_step: bool = False
+) -> None:
+    import torch
+
+    original = pipeline.sample_sparse_structure
+
+    def _hooked_sample_sparse_structure(cond, resolution, num_samples=1, sampler_params=None):
+        sampler_params = sampler_params or {}
+        flow_model = pipeline.models["sparse_structure_flow_model"]
+        reso = flow_model.resolution
+        in_channels = flow_model.in_channels
+        rng_state = torch.random.get_rng_state()
+        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(pipeline.device)
+        sampler_params_merged = {**pipeline.sparse_structure_sampler_params, **sampler_params}
+        if pipeline.low_vram:
+            flow_model.to(pipeline.device)
+
+        steps = sampler_params_merged.get("steps", 50)
+        rescale_t = sampler_params_merged.get("rescale_t", 1.0)
+        guidance_strength = sampler_params_merged.get("guidance_strength", 3.0)
+        guidance_rescale = sampler_params_merged.get("guidance_rescale", 0.0)
+        guidance_interval = sampler_params_merged.get("guidance_interval", (0.0, 1.0))
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t = float(t_seq[0])
+        t_prev = float(t_seq[1])
+        t_tensor = torch.tensor([1000 * t] * noise.shape[0], device=noise.device, dtype=torch.float32)
+
+        sample_in = noise
+        apply_guidance = guidance_strength != 1 and guidance_interval[0] <= t <= guidance_interval[1]
+        if apply_guidance:
+            pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+            pred_neg = flow_model(sample_in, t_tensor, cond["neg_cond"])
+            pred_cfg = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+            x0_pos = pipeline.sparse_structure_sampler._pred_to_xstart(sample_in, t, pred_pos)
+            x0_cfg = pipeline.sparse_structure_sampler._pred_to_xstart(sample_in, t, pred_cfg)
+            reduce_dims = list(range(1, x0_pos.ndim))
+            std_pos = x0_pos.std(dim=reduce_dims, keepdim=True)
+            std_cfg = x0_cfg.std(dim=reduce_dims, keepdim=True)
+            ratio_raw = std_pos / std_cfg
+            std_ratio = ratio_raw
+            x0_rescaled = x0_cfg * std_ratio
+            x0_after_rescale = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+            pred_final = pipeline.sparse_structure_sampler._xstart_to_pred(sample_in, t, x0_after_rescale)
+        else:
+            pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+            pred_neg = pred_pos
+            pred_cfg = pred_pos
+            x0_pos = pipeline.sparse_structure_sampler._pred_to_xstart(sample_in, t, pred_pos)
+            x0_cfg = x0_pos
+            std_pos = torch.ones((1, 1, 1, 1, 1), device=sample_in.device, dtype=sample_in.dtype)
+            std_cfg = std_pos
+            ratio_raw = std_pos
+            std_ratio = std_pos
+            x0_rescaled = x0_pos
+            x0_after_rescale = x0_pos
+            pred_final = pred_pos
+        sample_next = sample_in - (t - t_prev) * pred_final
+
+        step_path = output_dir / "sparse_flow_step0.npz"
+        np.savez(
+            step_path,
+            noise=_to_numpy(sample_in).astype(np.float32, copy=False),
+            pred_pos=_to_numpy(pred_pos).astype(np.float32, copy=False),
+            pred_neg=_to_numpy(pred_neg).astype(np.float32, copy=False),
+            pred_cfg=_to_numpy(pred_cfg).astype(np.float32, copy=False),
+            x0_pos=_to_numpy(x0_pos).astype(np.float32, copy=False),
+            x0_cfg=_to_numpy(x0_cfg).astype(np.float32, copy=False),
+            std_pos=_to_numpy(std_pos).astype(np.float32, copy=False),
+            std_cfg=_to_numpy(std_cfg).astype(np.float32, copy=False),
+            ratio_raw=_to_numpy(ratio_raw).astype(np.float32, copy=False),
+            std_ratio=_to_numpy(std_ratio).astype(np.float32, copy=False),
+            ratio_effective=_to_numpy(std_ratio).astype(np.float32, copy=False),
+            x0_rescaled=_to_numpy(x0_rescaled).astype(np.float32, copy=False),
+            x0_after_rescale=_to_numpy(x0_after_rescale).astype(np.float32, copy=False),
+            pred_final=_to_numpy(pred_final).astype(np.float32, copy=False),
+            sample_next=_to_numpy(sample_next).astype(np.float32, copy=False),
+            t=np.array(t, dtype=np.float32),
+            t_prev=np.array(t_prev, dtype=np.float32),
+            t_tensor=_to_numpy(t_tensor).astype(np.float32, copy=False),
+            steps=np.array(steps, dtype=np.int32),
+            guidance_strength=np.array(guidance_strength, dtype=np.float32),
+            guidance_rescale=np.array(guidance_rescale, dtype=np.float32),
+            guidance_interval=np.array(guidance_interval, dtype=np.float32),
+            rescale_t=np.array(rescale_t, dtype=np.float32),
+            sigma_min=np.array(pipeline.sparse_structure_sampler.sigma_min, dtype=np.float32),
+            apply_guidance=np.array(apply_guidance, dtype=np.bool_),
+        )
+        print(f"Saved first sparse-flow step: {step_path}", flush=True)
+        if pipeline.low_vram:
+            flow_model.cpu()
+        if stop_after_sparse_flow_step:
+            raise _StopAfterSparseFlowStep()
+        torch.random.set_rng_state(rng_state)
+        return original(cond, resolution, num_samples, sampler_params)
 
     pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
 

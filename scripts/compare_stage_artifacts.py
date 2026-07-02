@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output"],
+        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output"],
     )
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
@@ -44,6 +44,31 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
             report["arrays"] = {
                 name: _array_delta(ref[name], cand[name])
                 for name in ("cond", "neg_cond")
+            }
+            return report
+        if stage == "sparse_flow_step":
+            report["arrays"] = {
+                name: _array_delta(ref[name], cand[name])
+                for name in (
+                    "noise",
+                    "pred_pos",
+                    "pred_neg",
+                    "pred_cfg",
+                    "x0_pos",
+                    "x0_cfg",
+                    "std_pos",
+                    "std_cfg",
+                    "ratio_raw",
+                    "std_ratio",
+                    "ratio_effective",
+                    "x0_rescaled",
+                    "x0_after_rescale",
+                    "pred_final",
+                    "sample_next",
+                    "t",
+                    "t_prev",
+                )
+                if name in ref and name in cand
             }
             return report
         if stage == "sparse_internals":
@@ -164,8 +189,14 @@ def _compact_console_summary(report: dict[str, Any]) -> dict[str, Any]:
         return summary
     return {
         "stage": report["stage"],
-        "cond_max_abs_diff": report["arrays"]["cond"]["max_abs_diff"],
-        "cond_mean_abs_diff": report["arrays"]["cond"]["mean_abs_diff"],
+        "array_max_abs_diff": {
+            name: values.get("max_abs_diff")
+            for name, values in report.get("arrays", {}).items()
+        },
+        "array_mean_abs_diff": {
+            name: values.get("mean_abs_diff")
+            for name, values in report.get("arrays", {}).items()
+        },
     }
 
 

@@ -101,10 +101,10 @@ def test_generate_exposes_stage_stop_checkpoints():
 
     assert "--stop-after-stage" in text
     assert (
-        'choices=["conditioning", "sparse_coords", "sparse_internals", '
+        'choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", '
         '"shape_slat", "decoder_output", "mesh_raw"]'
     ) in text
-    for stage in ("conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output"):
+    for stage in ("conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output"):
         assert f'"{stage}"' in text
     assert text.count("save_checkpoint(") >= 8
 
@@ -123,3 +123,19 @@ def test_generate_exposes_sparse_internals_checkpoint():
     assert "z_s=np.array(z_s)" in text
     assert "logits=np.array(logits)" in text
     assert "decoded.astype(np.bool_)" in text
+
+
+def test_generate_exposes_sparse_flow_step_checkpoint():
+    text = (Path(__file__).resolve().parents[1] / "generate.py").read_text()
+
+    assert '"sparse_flow_step"' in text
+    for key in (
+        "noise=np.array(noise)",
+        "pred_pos=np.array(step_capture[\"pred_pos\"])",
+        "pred_neg=np.array(step_capture[\"pred_neg\"])",
+        "pred_cfg=np.array(step_capture[\"pred_cfg\"])",
+        "std_ratio=np.array(step_capture[\"std_ratio\"])",
+        "pred_final=np.array(step_capture[\"pred_final\"])",
+        "sample_next=np.array(step_capture[\"sample_next\"])",
+    ):
+        assert key in text

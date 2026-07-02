@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stop-after-stage",
         required=True,
-        choices=["conditioning", "sparse_coords", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
+        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=8)
@@ -70,6 +70,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
         "requested_outputs": {
             "conditioning": args.stop_after_stage == "conditioning",
             "sparse_coords": args.stop_after_stage == "sparse_coords",
+            "sparse_flow_step": args.stop_after_stage == "sparse_flow_step",
             "sparse_internals": args.stop_after_stage == "sparse_internals",
             "shape_slat": args.stop_after_stage == "shape_slat",
             "decoder_output": args.stop_after_stage == "decoder_output",
