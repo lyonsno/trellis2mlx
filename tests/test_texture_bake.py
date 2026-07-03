@@ -246,6 +246,49 @@ class TestSampleVoxelAttrs:
 
 
 class TestBakeTexture:
+    def test_bake_texture_rejects_out_of_domain_mesh_positions_before_sampling(self, monkeypatch):
+        import trellmlx.texture_bake as texture_bake
+
+        vertices = np.array(
+            [
+                [10.0, 0.0, 0.0],
+                [11.0, 0.0, 0.0],
+                [10.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 1, 2]], dtype=np.uint32)
+        uvs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+        vmapping = np.arange(3, dtype=np.uint32)
+        voxel_coords = np.array([[0, 0, 0]], dtype=np.int32)
+        voxel_attrs = np.ones((1, 6), dtype=np.float32)
+
+        def fake_rasterize_uv_mlx(got_uvs, got_faces, texture_size):
+            mask = np.zeros((texture_size, texture_size), dtype=bool)
+            mask[0, 0] = True
+            face_idx = np.zeros((texture_size, texture_size), dtype=np.int64)
+            bary = np.zeros((texture_size, texture_size, 3), dtype=np.float32)
+            bary[0, 0] = [1.0, 0.0, 0.0]
+            return mask, face_idx, bary
+
+        def forbidden_sampler(*args, **kwargs):
+            raise AssertionError("out-of-domain mesh positions reached texture sampler")
+
+        monkeypatch.setattr(texture_bake, "rasterize_uv_mlx", fake_rasterize_uv_mlx)
+        monkeypatch.setattr(texture_bake, "sample_voxel_attrs_fast", forbidden_sampler)
+
+        with pytest.raises(ValueError, match="outside TRELLIS world coordinate domain"):
+            texture_bake.bake_texture(
+                vertices,
+                faces,
+                uvs,
+                vmapping,
+                voxel_coords,
+                voxel_attrs,
+                grid_size=512,
+                texture_size=4,
+            )
+
     def test_bake_texture_uses_fast_raster_and_sampler(self, monkeypatch):
         """The main bake route should exercise the optimized helpers."""
         import trellmlx.texture_bake as texture_bake

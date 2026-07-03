@@ -111,6 +111,70 @@ def _select_uv_method(method, vertices, faces):
     return uv_unwrap, "xatlas"
 
 
+def _mesh_coord_space():
+    from trellmlx.texture_bake import TRELLIS_WORLD_COORD_SPACE
+
+    return TRELLIS_WORLD_COORD_SPACE
+
+
+def _validate_mesh_checkpoint_vertices(vertices, *, mesh_grid_size, coord_space=None, stage="mesh"):
+    expected = _mesh_coord_space()
+    if coord_space is not None and coord_space != expected:
+        raise ValueError(
+            f"{stage} checkpoint has unsupported mesh_coord_space={coord_space!r}; "
+            f"expected {expected!r}"
+        )
+
+    from trellmlx.texture_bake import validate_trellis_world_positions
+
+    return validate_trellis_world_positions(
+        vertices,
+        mesh_grid_size,
+        context=f"{stage} checkpoint vertices",
+    )
+
+
+def _apply_voxel_remesh_if_requested(
+    vertices,
+    faces,
+    *,
+    pitch,
+    no_cleanup,
+    keep_largest=False,
+    cleanup_mesh=None,
+    voxel_remesh=None,
+    log=print,
+):
+    if not pitch:
+        return vertices, faces
+
+    if voxel_remesh is None:
+        from trellmlx.mesh_remesh import voxel_remesh
+
+    t0 = time.perf_counter()
+    remesh_vertices, remesh_faces = voxel_remesh(vertices, faces, pitch=pitch)
+    log(
+        f"  Voxel remesh (pitch={pitch:g}): "
+        f"{len(vertices):,}V {len(faces):,}F → "
+        f"{len(remesh_vertices):,}V {len(remesh_faces):,}F "
+        f"({time.perf_counter()-t0:.1f}s)",
+        flush=True,
+    )
+    if not no_cleanup:
+        if cleanup_mesh is None:
+            from trellmlx.mesh_cleanup import cleanup_mesh
+        t0 = time.perf_counter()
+        remesh_vertices, remesh_faces = cleanup_mesh(
+            remesh_vertices,
+            remesh_faces,
+            keep_largest=keep_largest,
+            do_fix_normals=True,
+            verbose=False,
+        )
+        log(f"  Voxel remesh cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
+    return remesh_vertices, remesh_faces
+
+
 def _cleanup_and_simplify_mesh(
     vertices,
     faces,
@@ -286,6 +350,9 @@ def main():
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")
+    parser.add_argument("--voxel-remesh-pitch", type=float, default=0.0,
+                        help="Opt-in topology rebuild via filled voxel grid before UV/texture bake. "
+                             "0 disables (default). A pitch near 1/128 is useful for 512 no-cascade witnesses.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--stop-after-stage",
@@ -339,6 +406,12 @@ def main():
             vertices = mesh_data["vertices"]
             faces = mesh_data["faces"]
             mesh_grid_size = int(mesh_data["mesh_grid_size"])
+            _validate_mesh_checkpoint_vertices(
+                vertices,
+                mesh_grid_size=mesh_grid_size,
+                coord_space=mesh_data.get("mesh_coord_space"),
+                stage="mesh_raw",
+            )
             tex_np = tex_data["tex_np"]
             tex_coords_spatial = tex_data["tex_coords_spatial"]
 
@@ -356,10 +429,19 @@ def main():
                 simplify_first=args.simplify_first,
                 qem_simplify=args.qem_simplify,
             )
+            vertices, faces = _apply_voxel_remesh_if_requested(
+                vertices,
+                faces,
+                pitch=args.voxel_remesh_pitch,
+                no_cleanup=args.no_cleanup,
+                keep_largest=args.keep_largest,
+            )
             if args.save_checkpoints:
                 from trellmlx.checkpoint import save_checkpoint
                 save_checkpoint(args.save_checkpoints, "mesh_clean",
-                                vertices=vertices, faces=faces)
+                                vertices=vertices, faces=faces,
+                                mesh_grid_size=mesh_grid_size,
+                                mesh_coord_space=_mesh_coord_space())
 
             # Jump straight to texture baking
             from trellmlx.texture_bake import bake_texture
@@ -372,7 +454,9 @@ def main():
                 from trellmlx.checkpoint import save_checkpoint
                 save_checkpoint(args.save_checkpoints, "mesh_uv",
                                 vertices=uv_verts, faces=uv_faces,
-                                uvs=uvs, vmapping=vmapping)
+                                uvs=uvs, vmapping=vmapping,
+                                mesh_grid_size=mesh_grid_size,
+                                mesh_coord_space=_mesh_coord_space())
 
             base_color, metallic_roughness, alpha_mode = bake_texture(
                 uv_verts, uv_faces, uvs, vmapping,
@@ -899,7 +983,8 @@ def main():
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_raw",
                         vertices=vertices, faces=faces,
-                        mesh_grid_size=mesh_grid_size)
+                        mesh_grid_size=mesh_grid_size,
+                        mesh_coord_space=_mesh_coord_space())
         maybe_checkpoint_yield(
             stop_file=args.checkpoint_stop_file,
             checkpoint_dir=args.save_checkpoints,
@@ -922,10 +1007,19 @@ def main():
         simplify_first=args.simplify_first,
         qem_simplify=args.qem_simplify,
     )
+    vertices, faces = _apply_voxel_remesh_if_requested(
+        vertices,
+        faces,
+        pitch=args.voxel_remesh_pitch,
+        no_cleanup=args.no_cleanup,
+        keep_largest=args.keep_largest,
+    )
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_clean",
-                        vertices=vertices, faces=faces)
+                        vertices=vertices, faces=faces,
+                        mesh_grid_size=mesh_grid_size,
+                        mesh_coord_space=_mesh_coord_space())
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
@@ -1019,7 +1113,9 @@ def main():
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_uv",
                         vertices=uv_verts, faces=uv_faces,
-                        uvs=uvs, vmapping=vmapping)
+                        uvs=uvs, vmapping=vmapping,
+                        mesh_grid_size=mesh_grid_size,
+                        mesh_coord_space=_mesh_coord_space())
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(

@@ -179,4 +179,4 @@ def _sigmoid(x):
 
 
 def _softplus(x):
-    return np.log1p(np.exp(np.clip(x, -20, 20)))
+    return np.logaddexp(0, x)

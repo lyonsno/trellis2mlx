@@ -1,5 +1,6 @@
 """Generate.py mesh postprocess sequencing contracts."""
 
+import numpy as np
 import pytest
 
 
@@ -106,3 +107,66 @@ def test_postprocess_no_cleanup_still_simplifies_without_cleanup_import():
     assert out_vertices is vertices
     assert len(out_faces) == 200_000
     assert simplify_calls == [pytest.approx(0.4), pytest.approx(2 / 3)]
+
+
+def test_voxel_remesh_runs_final_cleanup_when_cleanup_enabled():
+    from generate import _apply_voxel_remesh_if_requested
+
+    vertices = FaceBag(10)
+    input_faces = FaceBag(100)
+    remesh_faces = FaceBag(80)
+    cleaned_faces = FaceBag(75)
+    cleanup_calls = []
+
+    def voxel_remesh(v, faces, *, pitch):
+        assert v is vertices
+        assert faces is input_faces
+        assert pitch == pytest.approx(1.0 / 128.0)
+        return v, remesh_faces
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        cleanup_calls.append((faces, keep_largest, do_fix_normals, verbose))
+        return v, cleaned_faces
+
+    out_vertices, out_faces = _apply_voxel_remesh_if_requested(
+        vertices,
+        input_faces,
+        pitch=1.0 / 128.0,
+        no_cleanup=False,
+        keep_largest=True,
+        cleanup_mesh=cleanup_mesh,
+        voxel_remesh=voxel_remesh,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert out_vertices is vertices
+    assert out_faces is cleaned_faces
+    assert cleanup_calls == [(remesh_faces, True, True, False)]
+
+
+def test_mesh_checkpoint_validator_rejects_wrong_coord_space_metadata():
+    from generate import _validate_mesh_checkpoint_vertices
+
+    vertices = np.zeros((1, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="unsupported mesh_coord_space"):
+        _validate_mesh_checkpoint_vertices(
+            vertices,
+            mesh_grid_size=512,
+            coord_space="voxel_index_space",
+            stage="mesh_raw",
+        )
+
+
+def test_mesh_checkpoint_validator_rejects_legacy_out_of_domain_vertices():
+    from generate import _validate_mesh_checkpoint_vertices
+
+    vertices = np.array([[121.5, 0.0, 0.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="outside TRELLIS world coordinate domain"):
+        _validate_mesh_checkpoint_vertices(
+            vertices,
+            mesh_grid_size=512,
+            coord_space=None,
+            stage="mesh_raw",
+        )

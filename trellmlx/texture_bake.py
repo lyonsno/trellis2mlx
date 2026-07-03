@@ -14,6 +14,43 @@ Pipeline:
 import numpy as np
 
 
+TRELLIS_WORLD_COORD_SPACE = "normalized_world_aabb_-0.5_0.5"
+
+
+def validate_trellis_world_positions(positions, grid_size, *, voxel_coords=None, context="positions"):
+    """Reject non-finite or non-normalized-world positions before texture sampling."""
+    positions = np.asarray(positions, dtype=np.float32)
+    if len(positions) == 0:
+        return positions
+
+    G = int(grid_size)
+    tol = 0.5 / G + 1e-5
+    lo = -0.5 - tol
+    hi = 0.5 + tol
+
+    finite = np.isfinite(positions).all()
+    pos_min = positions.min(axis=0)
+    pos_max = positions.max(axis=0)
+    in_domain = bool(np.all(pos_min >= lo) and np.all(pos_max <= hi))
+    if finite and in_domain:
+        return positions
+
+    detail = (
+        f"{context} outside TRELLIS world coordinate domain "
+        f"(coord_space={TRELLIS_WORLD_COORD_SPACE}, grid_size={G}, "
+        f"allowed=[{lo:.6f}, {hi:.6f}], "
+        f"position_min={pos_min.tolist()}, position_max={pos_max.tolist()}"
+    )
+    if voxel_coords is not None and len(voxel_coords):
+        voxel_coords = np.asarray(voxel_coords)
+        detail += (
+            f", voxel_coord_min={voxel_coords.min(axis=0).tolist()}, "
+            f"voxel_coord_max={voxel_coords.max(axis=0).tolist()}"
+        )
+    detail += ")"
+    raise ValueError(detail)
+
+
 def uv_unwrap(vertices, faces):
     """UV unwrap a mesh using xatlas.
 
@@ -826,6 +863,12 @@ def sample_voxel_attrs(positions, voxel_coords, voxel_attrs, grid_size):
     Returns:
         sampled: [N, C] float32 interpolated attributes
     """
+    positions = validate_trellis_world_positions(
+        positions,
+        grid_size,
+        voxel_coords=voxel_coords,
+        context="sample_voxel_attrs positions",
+    )
     N = len(positions)
     C = voxel_attrs.shape[1]
 
@@ -916,7 +959,12 @@ def sample_voxel_attrs_fast(positions, voxel_coords, voxel_attrs, grid_size):
     Returns:
         sampled: [N, C] float32 interpolated attributes (numpy)
     """
-    positions = np.asarray(positions, dtype=np.float32)
+    positions = validate_trellis_world_positions(
+        positions,
+        grid_size,
+        voxel_coords=voxel_coords,
+        context="sample_voxel_attrs_fast positions",
+    )
     voxel_coords = np.asarray(voxel_coords, dtype=np.int32)
     voxel_attrs = np.asarray(voxel_attrs, dtype=np.float32)
 
@@ -1086,6 +1134,12 @@ def bake_texture(vertices, faces, uvs, vmapping,
                  b[:, 1:2] * tri_verts[fi, 1] +
                  b[:, 2:3] * tri_verts[fi, 2])  # [N, 3]
     print(f"    Interpolated {len(positions):,} positions ({time.perf_counter()-t0:.1f}s)", flush=True)
+    validate_trellis_world_positions(
+        positions,
+        grid_size,
+        voxel_coords=voxel_coords,
+        context="bake_texture interpolated mesh positions",
+    )
 
     # Step 3: Sample PBR attrs from voxel grid
     t0 = time.perf_counter()

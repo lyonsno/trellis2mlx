@@ -282,6 +282,16 @@ class TestWeightLoader:
 
 
 class TestMeshExtract:
+    def test_softplus_preserves_large_positive_split_logits(self):
+        """Split-weight softplus must not collapse large positive logits."""
+        from trellmlx.mesh_extract import _softplus
+
+        values = np.array([19.0, 25.0, 50.0], dtype=np.float32)
+        result = _softplus(values)
+
+        np.testing.assert_allclose(result, np.logaddexp(0, values), rtol=1e-6)
+        assert result[2] > result[1] > result[0]
+
     def test_dense_cube_connected(self):
         """A dense 2x2x2 cube must produce a single connected mesh."""
         from trellmlx.mesh_extract import flexible_dual_grid_to_mesh
