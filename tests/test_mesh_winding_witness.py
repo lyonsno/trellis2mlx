@@ -41,6 +41,57 @@ def test_analyze_mesh_detects_reversed_face_and_fix_counterfactual():
     )
 
 
+def test_visible_exterior_orientation_flags_backfacing_open_patch_with_zero_edge_conflicts():
+    from scripts.mesh_winding_witness import analyze_mesh
+
+    vertices = np.array(
+        [
+            [-1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+    report = analyze_mesh("backfacing_open_patch", vertices, faces)
+
+    assert report["is_winding_consistent"] is True
+    assert report["edge_consistency"]["same_direction_conflict_edges"] == 0
+    assert report["visible_exterior_orientation"]["views"]["+Y"]["visible_pixels"] > 0
+    assert (
+        report["visible_exterior_orientation"]["views"]["+Y"]["backfacing_visible_ratio"]
+        > 0.95
+    )
+    assert report["visible_exterior_orientation"]["worst_view"] == "+Y"
+
+
+def test_visible_exterior_orientation_accepts_frontfacing_open_patch():
+    from scripts.mesh_winding_witness import analyze_mesh
+
+    vertices = np.array(
+        [
+            [-1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int64)
+
+    report = analyze_mesh("frontfacing_open_patch", vertices, faces)
+
+    assert report["is_winding_consistent"] is True
+    assert report["edge_consistency"]["same_direction_conflict_edges"] == 0
+    assert report["visible_exterior_orientation"]["views"]["+Y"]["visible_pixels"] > 0
+    assert (
+        report["visible_exterior_orientation"]["views"]["+Y"]["backfacing_visible_ratio"]
+        < 0.05
+    )
+
+
 def test_checkpoint_report_catches_uv_stage_reversed_source_mapping(tmp_path):
     clean_vertices = np.array(
         [

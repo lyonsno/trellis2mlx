@@ -17,6 +17,14 @@ import trimesh
 SCHEMA = "trellis2mlx.mesh_winding_witness.v1"
 ROUTE = "cpu_mesh_winding_witness"
 CHECKPOINT_STAGES = ("mesh_raw", "mesh_clean", "mesh_uv")
+VISIBLE_EXTERIOR_VIEWS = {
+    "+X": (0, 1),
+    "-X": (0, -1),
+    "+Y": (1, 1),
+    "-Y": (1, -1),
+    "+Z": (2, 1),
+    "-Z": (2, -1),
+}
 
 
 class WitnessError(RuntimeError):
@@ -134,13 +142,174 @@ def _edge_consistency_summary(faces: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _edge_function(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> float:
+    return float((p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0]))
+
+
+def _visible_view_orientation_summary(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    normals: np.ndarray,
+    view_name: str,
+    image_size: int,
+) -> dict[str, Any]:
+    depth_axis, sign = VISIBLE_EXTERIOR_VIEWS[view_name]
+    axes = [axis for axis in range(3) if axis != depth_axis]
+    outward_axis = np.zeros(3, dtype=np.float64)
+    outward_axis[depth_axis] = float(sign)
+
+    coords = vertices[:, axes]
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0)
+    span = maxs - mins
+    span[span == 0.0] = 1.0
+
+    margin = max(2.0, image_size * 0.05)
+    scale = min((image_size - 2.0 * margin) / span[0], (image_size - 2.0 * margin) / span[1])
+    offset = np.array(
+        [
+            (image_size - span[0] * scale) / 2.0 - mins[0] * scale,
+            (image_size - span[1] * scale) / 2.0 - mins[1] * scale,
+        ],
+        dtype=np.float64,
+    )
+    projected = coords * scale + offset
+    depths = vertices[:, depth_axis] * float(sign)
+
+    z_buffer = np.full((image_size, image_size), -np.inf, dtype=np.float64)
+    face_buffer = np.full((image_size, image_size), -1, dtype=np.int64)
+
+    for face_index, face in enumerate(faces):
+        tri_2d = projected[face]
+        if not np.isfinite(tri_2d).all():
+            continue
+        area2 = _edge_function(tri_2d[0], tri_2d[1], tri_2d[2])
+        if abs(area2) < 1e-8:
+            continue
+
+        min_xy = np.floor(tri_2d.min(axis=0)).astype(int)
+        max_xy = np.ceil(tri_2d.max(axis=0)).astype(int)
+        x0 = max(0, int(min_xy[0]))
+        y0 = max(0, int(min_xy[1]))
+        x1 = min(image_size - 1, int(max_xy[0]))
+        y1 = min(image_size - 1, int(max_xy[1]))
+        if x0 > x1 or y0 > y1:
+            continue
+
+        tri_depths = depths[face]
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                sample = np.array([x + 0.5, y + 0.5], dtype=np.float64)
+                w0 = _edge_function(tri_2d[1], tri_2d[2], sample) / area2
+                w1 = _edge_function(tri_2d[2], tri_2d[0], sample) / area2
+                w2 = _edge_function(tri_2d[0], tri_2d[1], sample) / area2
+                if w0 < -1e-8 or w1 < -1e-8 or w2 < -1e-8:
+                    continue
+                depth = w0 * tri_depths[0] + w1 * tri_depths[1] + w2 * tri_depths[2]
+                if depth > z_buffer[y, x]:
+                    z_buffer[y, x] = depth
+                    face_buffer[y, x] = face_index
+
+    visible = face_buffer >= 0
+    visible_pixels = int(visible.sum())
+    if visible_pixels == 0:
+        return {
+            "visible_pixels": 0,
+            "frontfacing_visible_pixels": 0,
+            "backfacing_visible_pixels": 0,
+            "near_tangent_visible_pixels": 0,
+            "frontfacing_visible_ratio": 0.0,
+            "backfacing_visible_ratio": 0.0,
+            "near_tangent_visible_ratio": 0.0,
+            "unique_visible_faces": 0,
+            "unique_backfacing_visible_faces": 0,
+        }
+
+    visible_face_ids = face_buffer[visible]
+    dots = normals[visible_face_ids] @ outward_axis
+    front = dots > 1e-6
+    back = dots < -1e-6
+    near = ~(front | back)
+    unique_faces = np.unique(visible_face_ids)
+    unique_face_dots = normals[unique_faces] @ outward_axis
+    return {
+        "visible_pixels": visible_pixels,
+        "frontfacing_visible_pixels": int(front.sum()),
+        "backfacing_visible_pixels": int(back.sum()),
+        "near_tangent_visible_pixels": int(near.sum()),
+        "frontfacing_visible_ratio": float(front.sum() / visible_pixels),
+        "backfacing_visible_ratio": float(back.sum() / visible_pixels),
+        "near_tangent_visible_ratio": float(near.sum() / visible_pixels),
+        "unique_visible_faces": int(len(unique_faces)),
+        "unique_backfacing_visible_faces": int((unique_face_dots < -1e-6).sum()),
+    }
+
+
+def _visible_exterior_orientation_summary(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    image_size: int = 96,
+) -> dict[str, Any]:
+    normals, areas = _face_normals_and_areas(vertices, faces)
+    degenerate_faces = int((areas <= 1e-12).sum())
+    views = {
+        view_name: _visible_view_orientation_summary(
+            vertices=vertices,
+            faces=faces,
+            normals=normals,
+            view_name=view_name,
+            image_size=image_size,
+        )
+        for view_name in VISIBLE_EXTERIOR_VIEWS
+    }
+    worst_view = max(
+        views,
+        key=lambda name: (
+            views[name]["backfacing_visible_ratio"],
+            views[name]["backfacing_visible_pixels"],
+        ),
+    )
+    total_visible_pixels = sum(view["visible_pixels"] for view in views.values())
+    total_backfacing_pixels = sum(view["backfacing_visible_pixels"] for view in views.values())
+    return {
+        "route": "cpu_visible_exterior_normal_agreement",
+        "image_size": int(image_size),
+        "checked_views": list(VISIBLE_EXTERIOR_VIEWS.keys()),
+        "degenerate_faces": degenerate_faces,
+        "total_visible_pixels": int(total_visible_pixels),
+        "total_backfacing_visible_pixels": int(total_backfacing_pixels),
+        "total_backfacing_visible_ratio": (
+            float(total_backfacing_pixels / total_visible_pixels) if total_visible_pixels else 0.0
+        ),
+        "worst_view": worst_view,
+        "worst_backfacing_visible_ratio": float(views[worst_view]["backfacing_visible_ratio"]),
+        "views": views,
+    }
+
+
+def _skipped_visible_exterior_orientation(reason: str) -> dict[str, Any]:
+    return {
+        "route": "cpu_visible_exterior_normal_agreement",
+        "status": "skipped",
+        "reason": reason,
+    }
+
+
 def _changed_face_rows(before: np.ndarray, after: np.ndarray) -> int | None:
     if before.shape != after.shape:
         return None
     return int((before != after).any(axis=1).sum())
 
 
-def analyze_mesh(stage: str, vertices: np.ndarray, faces: np.ndarray) -> dict[str, Any]:
+def analyze_mesh(
+    stage: str,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    include_visible_exterior: bool = True,
+) -> dict[str, Any]:
     """Analyze winding/normal evidence for one mesh stage."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
@@ -157,6 +326,12 @@ def analyze_mesh(stage: str, vertices: np.ndarray, faces: np.ndarray) -> dict[st
 
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     orientation = _orientation_summary(vertices, faces)
+    if include_visible_exterior:
+        visible_exterior_orientation = _visible_exterior_orientation_summary(vertices, faces)
+    else:
+        visible_exterior_orientation = _skipped_visible_exterior_orientation(
+            "raw pre-cleanup mesh is not an exterior-visibility contract"
+        )
 
     fixed = mesh.copy()
     before_faces = np.asarray(fixed.faces).copy()
@@ -175,6 +350,7 @@ def analyze_mesh(stage: str, vertices: np.ndarray, faces: np.ndarray) -> dict[st
         "volume": float(mesh.volume) if np.isfinite(mesh.volume) else None,
         "orientation": orientation,
         "edge_consistency": _edge_consistency_summary(faces),
+        "visible_exterior_orientation": visible_exterior_orientation,
         "fix_normals_counterfactual": {
             "changed_faces": _changed_face_rows(before_faces, after_faces),
             "face_count_after": int(len(after_faces)),
@@ -265,7 +441,12 @@ def build_report(*, checkpoint_dir: Path | None, glb: Path | None, report_path: 
                     continue
                 arrays = _load_checkpoint_mesh(path)
                 stage_arrays[stage] = arrays
-                stages[stage] = analyze_mesh(stage, arrays["vertices"], arrays["faces"])
+                stages[stage] = analyze_mesh(
+                    stage,
+                    arrays["vertices"],
+                    arrays["faces"],
+                    include_visible_exterior=(stage != "mesh_raw"),
+                )
                 stages[stage]["path"] = str(path)
 
         if glb is not None:
