@@ -263,6 +263,37 @@ def _panel_axes(panel: str) -> tuple[int, int, int]:
     raise ValueError(panel)
 
 
+def _uv_vertices_to_glb_space(uv_vertices: np.ndarray) -> np.ndarray:
+    export_vertices = np.asarray(uv_vertices, dtype=np.float64).copy()
+    export_vertices[:, 1], export_vertices[:, 2] = (
+        export_vertices[:, 2].copy(),
+        -export_vertices[:, 1].copy(),
+    )
+    return export_vertices
+
+
+def export_space_identity(*, uv_vertices: np.ndarray, glb_vertices: np.ndarray) -> dict[str, Any]:
+    uv_vertices = np.asarray(uv_vertices, dtype=np.float64)
+    glb_vertices = np.asarray(glb_vertices, dtype=np.float64)
+    if uv_vertices.shape != glb_vertices.shape:
+        return {
+            "transform": "glb_xyz_from_uv_x_z_neg_y",
+            "vertices_match_export_transform": False,
+            "max_abs_error": None,
+            "shape_mismatch": {
+                "uv_vertices": list(uv_vertices.shape),
+                "glb_vertices": list(glb_vertices.shape),
+            },
+        }
+    expected = _uv_vertices_to_glb_space(uv_vertices)
+    max_abs_error = float(np.max(np.abs(expected - glb_vertices))) if expected.size else 0.0
+    return {
+        "transform": "glb_xyz_from_uv_x_z_neg_y",
+        "vertices_match_export_transform": bool(max_abs_error <= 1e-6),
+        "max_abs_error": max_abs_error,
+    }
+
+
 def default_front_face_for_panel(panel: str) -> str:
     try:
         return PANEL_FRONT_FACE[panel]
@@ -532,6 +563,7 @@ def build_report(
     clean_vertices = np.asarray(mesh_clean["vertices"], dtype=np.float64)
     clean_faces = np.asarray(mesh_clean["faces"], dtype=np.int64)
     uv_faces = np.asarray(mesh_uv["faces"], dtype=np.int64)
+    uv_vertices = np.asarray(mesh_uv["vertices"], dtype=np.float64)
     vmapping = np.asarray(mesh_uv["vmapping"], dtype=np.int64)
     mesh = _load_glb(glb)
     glb_vertices = np.asarray(mesh.vertices, dtype=np.float64)
@@ -652,6 +684,10 @@ def build_report(
             "mesh_clean_faces": int(len(clean_faces)),
             "glb_faces_equal_mesh_uv_faces": face_rows_equal,
             "uv_to_clean_summary": source_map["summary"],
+            "export_space_identity": export_space_identity(
+                uv_vertices=uv_vertices,
+                glb_vertices=glb_vertices,
+            ),
         },
         "visible_backface_summary": {
             "visible_faces": int(len(all_visible_pixels)),

@@ -75,3 +75,28 @@ def test_default_projected_front_face_convention_is_panel_specific():
     assert default_front_face_for_panel("front_xz") == "ccw"
     assert default_front_face_for_panel("side_yz") == "cw"
     assert default_front_face_for_panel("top_xy") == "cw"
+
+
+def test_export_space_identity_accounts_for_glb_axis_transform():
+    from scripts.mesh_culling_attribution import export_space_identity
+
+    uv_vertices = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [-4.0, 5.0, -6.0],
+        ],
+        dtype=np.float64,
+    )
+    glb_vertices = np.array(
+        [
+            [1.0, 3.0, -2.0],
+            [-4.0, -6.0, -5.0],
+        ],
+        dtype=np.float64,
+    )
+
+    assert export_space_identity(uv_vertices=uv_vertices, glb_vertices=glb_vertices) == {
+        "transform": "glb_xyz_from_uv_x_z_neg_y",
+        "vertices_match_export_transform": True,
+        "max_abs_error": 0.0,
+    }
