@@ -484,12 +484,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baseline-raw-mesh", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resolution", type=int)
-    parser.add_argument("--image-size", type=int, default=96)
+    parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--pixel-metric", choices=("none", "identity", "all"), default="none")
     parser.add_argument("--variants", help="Comma-separated variant names; defaults to all")
     args = parser.parse_args(argv)
-    if args.image_size < 8:
-        parser.error("--image-size must be at least 8")
+    if args.image_size < 128:
+        parser.error("--image-size must be at least 128; smaller raw-mesh projections can collapse to zero pixels")
     if args.resolution is not None and args.resolution <= 0:
         parser.error("--resolution must be positive")
     return args

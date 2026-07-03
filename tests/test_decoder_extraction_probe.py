@@ -22,7 +22,7 @@ def test_missing_decoder_output_writes_failure_report(tmp_path):
             "--output-dir",
             str(output_dir),
             "--image-size",
-            "32",
+            "128",
         ],
         cwd=Path.cwd(),
         text=True,
