@@ -390,6 +390,63 @@ def repair_non_manifold_edges(
     return _reindex_mesh(vertices, faces[keep_mask])
 
 
+def remove_same_direction_manifold_conflicts(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove the smaller face from residual same-directed manifold edges.
+
+    ``trimesh.repair.fix_normals`` can leave conflicts on complex open meshes:
+    an edge shared by exactly two faces is still traversed in the same direction
+    by both faces. That cannot render as a locally consistent oriented surface.
+    The reference cumesh route runs a final orientation unifier; this fallback
+    conservatively prunes the smaller adjacent triangle only for conflicts that
+    remain after the normal repair pass.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    faces_i64 = faces.astype(np.int64, copy=False)
+    tri = vertices[faces_i64]
+    face_areas = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]),
+        axis=1,
+    )
+
+    edge_dirs: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for face_index, face in enumerate(faces_i64):
+        for corner in range(3):
+            a = int(face[corner])
+            b = int(face[(corner + 1) % 3])
+            edge_dirs.setdefault(tuple(sorted((a, b))), []).append((face_index, a, b))
+
+    faces_to_remove: set[int] = set()
+    for incident in edge_dirs.values():
+        if len(incident) != 2:
+            continue
+        (face_a, a0, b0), (face_b, a1, b1) = incident
+        if a0 != a1 or b0 != b1:
+            continue
+        if face_areas[face_a] <= face_areas[face_b]:
+            faces_to_remove.add(face_a)
+        else:
+            faces_to_remove.add(face_b)
+
+    if not faces_to_remove:
+        return vertices, faces
+
+    if verbose:
+        print(
+            f"  Removed {len(faces_to_remove)} residual winding-conflict faces",
+            flush=True,
+        )
+
+    keep_mask = np.ones(len(faces), dtype=bool)
+    keep_mask[list(faces_to_remove)] = False
+    return _reindex_mesh(vertices, faces[keep_mask])
+
+
 def fix_normals(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -407,7 +464,13 @@ def fix_normals(
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     trimesh.repair.fix_normals(mesh, multibody=True)
     # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)
-    return np.array(mesh.vertices, dtype=vertices.dtype), np.array(mesh.faces, dtype=faces.dtype)
+    fixed_vertices = np.array(mesh.vertices, dtype=vertices.dtype)
+    fixed_faces = np.array(mesh.faces, dtype=faces.dtype)
+    return remove_same_direction_manifold_conflicts(
+        fixed_vertices,
+        fixed_faces,
+        verbose=verbose,
+    )
 
 
 def _reindex_mesh(vertices, faces):

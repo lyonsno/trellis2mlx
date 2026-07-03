@@ -17,6 +17,7 @@ from trellmlx.mesh_cleanup import (
     fill_small_holes,
     remove_duplicate_faces,
     repair_non_manifold_edges,
+    remove_same_direction_manifold_conflicts,
     fix_normals,
 )
 
@@ -209,6 +210,33 @@ class TestFixNormals:
         fixed_v, fixed_f = fix_normals(verts, faces)
         assert type(fixed_v) is np.ndarray
         assert type(fixed_f) is np.ndarray
+
+
+class TestRemoveSameDirectionManifoldConflicts:
+    def test_removes_smaller_face_from_same_direction_shared_edge(self):
+        """Fallback pruning must clear remaining two-face edge direction conflicts."""
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],  # area 0.5
+            [0, 1, 3],  # area 1.0, same directed edge (0, 1)
+        ], dtype=np.int64)
+
+        cleaned_v, cleaned_f = remove_same_direction_manifold_conflicts(
+            vertices,
+            faces,
+            verbose=False,
+        )
+
+        assert len(cleaned_f) == 1
+        assert cleaned_f.tolist() == [[0, 1, 2]]
+        _assert_manifold_edges_oppositely_oriented(cleaned_f)
+        assert cleaned_v.shape == (3, 3)
+        assert [1.0, 2.0, 0.0] in cleaned_v.tolist()
 
 
 class TestFillSmallHolesPerimeter:
