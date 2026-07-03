@@ -16,6 +16,11 @@ import trimesh
 
 PANELS = ("front_xz", "side_yz", "top_xy")
 CULLING_MODES = ("double_sided", "front_faces", "back_faces")
+PANEL_FRONT_FACE = {
+    "front_xz": "ccw",
+    "side_yz": "cw",
+    "top_xy": "cw",
+}
 ROUTE = "software_projected_mesh_witness"
 CULLING_ROUTE = "software_projected_winding_cull"
 BACKGROUND = (248, 248, 246)
@@ -248,6 +253,15 @@ def _panel_axes(panel: str) -> tuple[int, int, int]:
     raise ValueError(panel)
 
 
+def _effective_front_face(panel: str, front_face: str) -> str:
+    if front_face != "auto":
+        return front_face
+    try:
+        return PANEL_FRONT_FACE[panel]
+    except KeyError as exc:
+        raise ValueError(panel) from exc
+
+
 def _project_panel(
     *,
     mesh: trimesh.Trimesh,
@@ -294,6 +308,7 @@ def _project_panel(
     front_faces_seen = 0
     back_faces_seen = 0
     faces_culled = 0
+    effective_front_face = _effective_front_face(panel, front_face)
 
     for face_index in order:
         pts = projected[faces[face_index]]
@@ -304,7 +319,7 @@ def _project_panel(
         if abs(signed_area) < 0.02:
             faces_skipped += 1
             continue
-        is_front = signed_area > 0 if front_face == "ccw" else signed_area < 0
+        is_front = signed_area > 0 if effective_front_face == "ccw" else signed_area < 0
         if is_front:
             front_faces_seen += 1
         else:
@@ -333,6 +348,8 @@ def _project_panel(
         "faces_culled": faces_culled,
         "front_faces_seen": front_faces_seen,
         "back_faces_seen": back_faces_seen,
+        "front_face": front_face,
+        "effective_front_face": effective_front_face,
         "scale": float(scale),
         "axes": [axis_a, axis_b],
         "depth_axis": depth_axis,
@@ -514,8 +531,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--front-face",
-        choices=("ccw", "cw"),
-        default="ccw",
+        choices=("auto", "ccw", "cw"),
+        default="auto",
         help="Projected winding treated as front-facing for culling-mode views.",
     )
     return parser.parse_args(argv)

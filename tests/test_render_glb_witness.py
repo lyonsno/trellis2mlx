@@ -85,7 +85,7 @@ def test_witness_renderer_writes_nonblank_png_and_report(tmp_path):
     assert data["witness"]["panels"] == ["front_xz", "side_yz", "top_xy"]
     assert data["witness"]["culling_modes"] == ["double_sided", "front_faces", "back_faces"]
     assert data["witness"]["culling_summary"]["route"] == "software_projected_winding_cull"
-    assert data["witness"]["culling_summary"]["front_face"] == "ccw"
+    assert data["witness"]["culling_summary"]["front_face"] == "auto"
     assert data["witness"]["culling_summary"]["orientation_basis"] == (
         "projected_triangle_signed_area_after_panel_projection"
     )
@@ -124,6 +124,25 @@ def test_witness_renderer_culling_modes_split_projected_winding(tmp_path):
         "double_sided.png",
         "front_faces.png",
         "back_faces.png",
+    }
+
+
+def test_witness_renderer_default_auto_front_face_is_panel_specific(tmp_path):
+    glb = tmp_path / "box.glb"
+    output = tmp_path / "witness.png"
+    report = tmp_path / "witness.json"
+    _write_colored_box(glb)
+
+    result = _run_witness(glb, output, report)
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(report.read_text())
+    assert data["witness"]["culling_summary"]["front_face"] == "auto"
+    panels = data["witness"]["culling_reports"]["front_faces"]["panel_reports"]
+    assert {panel["panel"]: panel["effective_front_face"] for panel in panels} == {
+        "front_xz": "ccw",
+        "side_yz": "cw",
+        "top_xy": "cw",
     }
 
 
