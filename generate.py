@@ -183,8 +183,10 @@ def _cleanup_and_simplify_mesh(
     no_cleanup,
     keep_largest=False,
     simplify_first=False,
+    reference_cleanup=False,
     qem_simplify=False,
     cleanup_mesh=None,
+    fill_holes=None,
     simplify=None,
     log=print,
 ):
@@ -204,6 +206,66 @@ def _cleanup_and_simplify_mesh(
     if not no_cleanup:
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
+
+    if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
+        if fill_holes is None:
+            from trellmlx.mesh_cleanup import fill_small_holes as fill_holes
+        if simplify is None:
+            import fast_simplification
+            simplify = fast_simplification.simplify
+
+        t0 = time.perf_counter()
+        vertices, faces = fill_holes(
+            vertices,
+            faces,
+            max_hole_perimeter=3e-2,
+            verbose=True,
+        )
+        log(f"  Reference cleanup initial hole fill: {len(vertices):,}V {len(faces):,}F "
+            f"({time.perf_counter()-t0:.1f}s)", flush=True)
+
+        coarse_target = target_faces * 3
+        if len(faces) > coarse_target:
+            t0 = time.perf_counter()
+            ratio = coarse_target / len(faces)
+            vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
+            log(f"  Reference cleanup coarse simplify: {len(vertices):,}V {len(faces):,}F "
+                f"({time.perf_counter()-t0:.1f}s)", flush=True)
+
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(
+            vertices,
+            faces,
+            keep_largest=keep_largest,
+            do_fix_normals=False,
+        )
+        log(f"  Reference cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
+
+        if len(faces) > target_faces:
+            t0 = time.perf_counter()
+            if qem_simplify:
+                from trellmlx.simplify_qem_metal import simplify_qem
+                vertices, faces = simplify_qem(vertices, faces, target_faces, verbose=True)
+            else:
+                for _ in range(3):
+                    if len(faces) <= target_faces:
+                        break
+                    ratio = target_faces / len(faces)
+                    target_reduction = 1.0 - ratio
+                    if target_reduction <= 0:
+                        break
+                    vertices, faces = simplify(
+                        vertices,
+                        faces,
+                        target_reduction=target_reduction,
+                    )
+                    if len(faces) <= target_faces * 1.1:
+                        break
+            log(f"  Reference cleanup final simplify: {len(vertices):,}V {len(faces):,}F "
+                f"({time.perf_counter()-t0:.1f}s)", flush=True)
+
+        vertices, faces = final_cleanup(vertices, faces)
+        return vertices, faces
 
     # Simplify-first mode: reduce face count before expensive cleanup
     if simplify_first and target_faces and len(faces) > target_faces:
@@ -341,6 +403,9 @@ def main():
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
     parser.add_argument("--simplify-first", action="store_true",
                         help="Simplify before cleanup (much faster on large meshes, skips multi-pass)")
+    parser.add_argument("--reference-cleanup", action="store_true",
+                        help="Use reference-like mesh postprocess order: initial hole fill, coarse simplify, "
+                             "cleanup, final simplify, final cleanup.")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
@@ -427,6 +492,7 @@ def main():
                 no_cleanup=args.no_cleanup,
                 keep_largest=args.keep_largest,
                 simplify_first=args.simplify_first,
+                reference_cleanup=args.reference_cleanup,
                 qem_simplify=args.qem_simplify,
             )
             vertices, faces = _apply_voxel_remesh_if_requested(
@@ -1005,6 +1071,7 @@ def main():
         no_cleanup=args.no_cleanup,
         keep_largest=args.keep_largest,
         simplify_first=args.simplify_first,
+        reference_cleanup=args.reference_cleanup,
         qem_simplify=args.qem_simplify,
     )
     vertices, faces = _apply_voxel_remesh_if_requested(

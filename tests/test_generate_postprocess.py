@@ -109,6 +109,51 @@ def test_postprocess_no_cleanup_still_simplifies_without_cleanup_import():
     assert simplify_calls == [pytest.approx(0.4), pytest.approx(2 / 3)]
 
 
+def test_postprocess_reference_cleanup_fills_before_staged_simplification():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(190_000)]
+    fill_calls = []
+    cleanup_calls = []
+    simplify_calls = []
+
+    def fill_holes(v, faces, max_hole_perimeter=3e-2, verbose=True):
+        fill_calls.append((len(faces), max_hole_perimeter, verbose))
+        return v, faces
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        cleanup_calls.append((len(faces), do_fix_normals, verbose))
+        return v, cleanup_outputs.pop(0)
+
+    def simplify(v, faces, target_reduction):
+        simplify_calls.append(target_reduction)
+        if len(simplify_calls) == 1:
+            return v, FaceBag(600_000)
+        return v, FaceBag(200_000)
+
+    out_vertices, out_faces = _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        cleanup_mesh=cleanup_mesh,
+        fill_holes=fill_holes,
+        simplify=simplify,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert out_vertices is vertices
+    assert len(out_faces) == 190_000
+    assert fill_calls == [(1_000_000, pytest.approx(3e-2), True)]
+    assert simplify_calls == [pytest.approx(0.4), pytest.approx(0.6)]
+    assert cleanup_calls == [
+        (600_000, False, True),
+        (200_000, True, False),
+    ]
+
+
 def test_voxel_remesh_runs_final_cleanup_when_cleanup_enabled():
     from generate import _apply_voxel_remesh_if_requested
 
