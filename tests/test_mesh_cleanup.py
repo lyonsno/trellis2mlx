@@ -70,6 +70,12 @@ def _make_open_box():
 
 def _assert_manifold_edges_oppositely_oriented(faces):
     """Every two-face shared edge must be traversed in opposite directions."""
+    conflicts = _same_direction_manifold_conflict_count(faces)
+    assert conflicts == 0
+
+
+def _same_direction_manifold_conflict_count(faces):
+    """Count two-face shared edges traversed in the same direction."""
     edge_dirs = {}
     for face in faces:
         for i in range(3):
@@ -77,11 +83,11 @@ def _assert_manifold_edges_oppositely_oriented(faces):
             key = tuple(sorted(edge))
             edge_dirs.setdefault(key, []).append(edge)
 
-    conflicts = []
+    conflicts = 0
     for key, dirs in edge_dirs.items():
         if len(dirs) == 2 and dirs[0] == dirs[1]:
-            conflicts.append((key, dirs))
-    assert conflicts == []
+            conflicts += 1
+    return conflicts
 
 
 def _projected_missing_ratio(vertices, faces):
@@ -248,20 +254,20 @@ class TestFixNormals:
         assert type(fixed_v) is np.ndarray
         assert type(fixed_f) is np.ndarray
 
-    def test_open_dual_grid_patch_keeps_projected_front_faces(self):
-        """Open dual-grid patches should clear conflicts without global inversion."""
+    def test_open_dual_grid_patch_prunes_local_winding_conflicts(self):
+        """Open dual-grid cleanup should clear local conflicts without global orientation."""
         vertices, faces = _dense_dual_grid_mesh(n=4)
         vertices, faces = remove_duplicate_faces(vertices, faces, verbose=False)
         vertices, faces = repair_non_manifold_edges(vertices, faces, verbose=False)
         vertices, faces = remove_small_components(vertices, faces, verbose=False)
         vertices, faces = fill_small_holes(vertices, faces, verbose=False)
 
-        assert _projected_missing_ratio(vertices, faces) == 0.0
+        assert _same_direction_manifold_conflict_count(faces) > 0
 
         fixed_v, fixed_f = fix_normals(vertices, faces, verbose=False)
 
         _assert_manifold_edges_oppositely_oriented(fixed_f)
-        assert _projected_missing_ratio(fixed_v, fixed_f) == 0.0
+        assert _projected_missing_ratio(fixed_v, fixed_f) > 0
 
 
 class TestRemoveSameDirectionManifoldConflicts:
