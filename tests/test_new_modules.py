@@ -199,6 +199,59 @@ class TestSampler:
                          steps=4, guidance_strength=1.0, verbose=False)
         assert call_count["pos"] == 4  # one call per step, no neg
 
+    def test_first_step_capture_arrays_when_guidance_or_rescale_skipped(self):
+        """Checkpoint capture fields must stay array-serializable when CFG branches are skipped."""
+        from trellmlx.samplers import flow_euler_sample
+
+        class MockModel:
+            def __call__(self, x, t, cond):
+                pred_pos = mx.array([[[[[0.0, 1.0]]]]])
+                pred_neg = mx.array([[[[[0.0, -1.0]]]]])
+                return mx.where(mx.sum(cond) > 0, pred_pos, pred_neg)
+
+        noise = mx.zeros((1, 1, 1, 1, 2))
+        cond = mx.ones((1, 1, 1))
+        neg_cond = mx.zeros_like(cond)
+        array_capture_keys = (
+            "pred_pos",
+            "pred_neg",
+            "pred_cfg",
+            "x0_pos",
+            "x0_cfg",
+            "std_pos",
+            "std_cfg",
+            "ratio_raw",
+            "std_ratio",
+            "ratio_effective",
+            "x0_rescaled",
+            "x0_after_rescale",
+            "pred_final",
+            "sample_next",
+            "t",
+            "t_prev",
+        )
+
+        for kwargs in (
+            {"guidance_strength": 1.0, "guidance_rescale": 0.7},
+            {"guidance_strength": 7.5, "guidance_rescale": 0.0},
+        ):
+            capture = {}
+            flow_euler_sample(
+                MockModel(),
+                noise,
+                cond,
+                neg_cond,
+                steps=8,
+                verbose=False,
+                capture_first_step=capture,
+                stop_after_first_step=True,
+                **kwargs,
+            )
+
+            for key in array_capture_keys:
+                assert capture[key] is not None, key
+                np.array(capture[key]).astype(np.float32, copy=False)
+
     def test_cfg_rescale_clamp_can_be_disabled_for_parity_witness(self):
         """Diagnostic route can preserve the reference raw CFG-rescale ratio."""
         from trellmlx.samplers import flow_euler_sample

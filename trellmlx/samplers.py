@@ -77,6 +77,7 @@ def flow_euler_sample(
             guidance_strength != 1.0
             and guidance_interval[0] <= t <= guidance_interval[1]
         )
+        capture_this_step = capture_first_step is not None and step_idx == 0
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
@@ -103,7 +104,7 @@ def flow_euler_sample(
             x_0 = None
             std_pos = None
             std_cfg = None
-            if guidance_rescale > 0:
+            if guidance_rescale > 0 or capture_this_step:
                 x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
@@ -125,8 +126,11 @@ def flow_euler_sample(
                 ratio_raw = mx.where(std_cfg > 0, ratio_raw, mx.ones_like(ratio_raw))
                 std_ratio = mx.clip(ratio_raw, 0.5, 2.0) if cfg_rescale_clamp else ratio_raw
                 x_0_rescaled = x_0_cfg * std_ratio
-                x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
-                pred = _xstart_to_pred(sample, t, x_0, sigma_min)
+                if guidance_rescale > 0:
+                    x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
+                    pred = _xstart_to_pred(sample, t, x_0, sigma_min)
+                else:
+                    x_0 = x_0_cfg
         else:
             # Single forward pass with positive conditioning
             kw = dict(**model_kwargs)
@@ -135,7 +139,7 @@ def flow_euler_sample(
             pred = model(sample, t_tensor, cond, **kw)
             mx.eval(pred)
             pred_pos = pred
-            pred_neg = None
+            pred_neg = pred
             pred_cfg = pred
             std_ratio = None
             ratio_raw = None
@@ -145,6 +149,16 @@ def flow_euler_sample(
             x_0 = None
             std_pos = None
             std_cfg = None
+            if capture_this_step:
+                x_0 = _pred_to_xstart(sample, t, pred, sigma_min)
+                x_0_pos = x_0
+                x_0_cfg = x_0
+                reduce_dims = list(range(1, x_0.ndim))
+                std_pos = mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True))
+                std_cfg = std_pos
+                ratio_raw = mx.ones_like(std_pos)
+                std_ratio = ratio_raw
+                x_0_rescaled = x_0
 
         # Euler step
         sample_next = sample - (t - t_prev) * pred
