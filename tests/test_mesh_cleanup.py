@@ -84,6 +84,43 @@ def _assert_manifold_edges_oppositely_oriented(faces):
     assert conflicts == []
 
 
+def _projected_missing_ratio(vertices, faces):
+    from scripts.mesh_culling_attribution import (
+        PANELS,
+        default_front_face_for_panel,
+        projected_front_face_missing_attribution,
+    )
+
+    export_vertices = vertices.astype(np.float64).copy()
+    export_vertices[:, 1], export_vertices[:, 2] = vertices[:, 2].copy(), -vertices[:, 1].copy()
+    missing = 0
+    total = 0
+    for panel in PANELS:
+        report = projected_front_face_missing_attribution(
+            vertices=export_vertices,
+            faces=faces,
+            panel=panel,
+            image_size=128,
+            front_face=default_front_face_for_panel(panel),
+        )
+        missing += report["missing_pixels"]
+        total += report["double_sided_pixels"]
+    return missing / total if total else 0.0
+
+
+def _dense_dual_grid_mesh(n=4):
+    from trellmlx.mesh_extract import decoder_output_to_mesh
+
+    coords_3d = np.array(
+        [[z, y, x] for z in range(n) for y in range(n) for x in range(n)],
+        dtype=np.int64,
+    )
+    coords = np.column_stack([np.zeros(len(coords_3d), dtype=np.int64), coords_3d])
+    feats = np.zeros((len(coords), 7), dtype=np.float32)
+    feats[:, 3:6] = 1.0
+    return decoder_output_to_mesh(feats, coords, resolution=n)
+
+
 def _component_signed_volumes(vertices, faces):
     """Return signed volume for each face-connected component."""
     edge_faces = {}
@@ -210,6 +247,21 @@ class TestFixNormals:
         fixed_v, fixed_f = fix_normals(verts, faces)
         assert type(fixed_v) is np.ndarray
         assert type(fixed_f) is np.ndarray
+
+    def test_open_dual_grid_patch_keeps_projected_front_faces(self):
+        """Open dual-grid patches should clear conflicts without global inversion."""
+        vertices, faces = _dense_dual_grid_mesh(n=4)
+        vertices, faces = remove_duplicate_faces(vertices, faces, verbose=False)
+        vertices, faces = repair_non_manifold_edges(vertices, faces, verbose=False)
+        vertices, faces = remove_small_components(vertices, faces, verbose=False)
+        vertices, faces = fill_small_holes(vertices, faces, verbose=False)
+
+        assert _projected_missing_ratio(vertices, faces) == 0.0
+
+        fixed_v, fixed_f = fix_normals(vertices, faces, verbose=False)
+
+        _assert_manifold_edges_oppositely_oriented(fixed_f)
+        assert _projected_missing_ratio(fixed_v, fixed_f) == 0.0
 
 
 class TestRemoveSameDirectionManifoldConflicts:

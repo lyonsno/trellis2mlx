@@ -462,6 +462,15 @@ def fix_normals(
 
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # On open extracted meshes, Trimesh's global orientation repair can flip
+    # visible patches. Prune local conflicts without reorienting components.
+    if not mesh.is_watertight:
+        return remove_same_direction_manifold_conflicts(
+            vertices,
+            faces,
+            verbose=verbose,
+        )
+
     trimesh.repair.fix_normals(mesh, multibody=True)
     # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)
     fixed_vertices = np.array(mesh.vertices, dtype=vertices.dtype)
