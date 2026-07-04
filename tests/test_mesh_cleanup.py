@@ -20,6 +20,7 @@ from trellmlx.mesh_cleanup import (
     remove_same_direction_manifold_conflicts,
     orient_faces_by_adjacency,
     orient_components_outward_by_radial_heuristic,
+    orient_uv_islands_by_visible_exterior,
     fix_normals,
 )
 
@@ -68,6 +69,34 @@ def _make_open_box():
         # top is MISSING — this is the hole
     ], dtype=np.int64)
     return verts, faces
+
+
+def _make_split_cube_face_islands(inverted_face=None):
+    """Cube with each side using independent vertices, like UV-split islands."""
+    sides = [
+        # -X
+        [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]],
+        # +X
+        [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]],
+        # -Y
+        [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]],
+        # +Y
+        [[-1, 1, -1], [-1, 1, 1], [1, 1, 1], [1, 1, -1]],
+        # -Z
+        [[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1]],
+        # +Z
+        [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
+    ]
+    verts = []
+    faces = []
+    for side_index, side in enumerate(sides):
+        base = len(verts)
+        verts.extend(side)
+        side_faces = np.array([[base, base + 1, base + 2], [base, base + 2, base + 3]], dtype=np.int64)
+        if inverted_face == side_index:
+            side_faces = side_faces[:, ::-1]
+        faces.extend(side_faces.tolist())
+    return np.asarray(verts, dtype=np.float32), np.asarray(faces, dtype=np.int64)
 
 
 def _assert_manifold_edges_oppositely_oriented(faces):
@@ -351,6 +380,19 @@ class TestFixNormals:
         outward_after, inward_after = _radial_orientation_counts(fixed_v, fixed_f)
         assert len(fixed_f) == len(inverted)
         assert outward_after > inward_after
+
+    def test_visible_exterior_orients_inverted_uv_face_island(self):
+        """Post-UV islands need renderer-visible orientation, not only adjacency."""
+        vertices, expected = _make_split_cube_face_islands()
+        _, inverted = _make_split_cube_face_islands(inverted_face=1)
+
+        _, oriented = orient_uv_islands_by_visible_exterior(
+            vertices, inverted, image_size=64, verbose=False,
+        )
+
+        changed_rows = np.flatnonzero((oriented != inverted).any(axis=1))
+        np.testing.assert_array_equal(changed_rows, np.array([2, 3]))
+        np.testing.assert_array_equal(oriented, expected)
 
 
 class TestRemoveSameDirectionManifoldConflicts:

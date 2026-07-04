@@ -647,6 +647,149 @@ def orient_components_outward_by_radial_heuristic(
     return vertices, oriented.astype(faces.dtype, copy=False)
 
 
+_VISIBLE_EXTERIOR_VIEWS = {
+    "+X": (0, 1),
+    "-X": (0, -1),
+    "+Y": (1, 1),
+    "-Y": (1, -1),
+    "+Z": (2, 1),
+    "-Z": (2, -1),
+}
+
+
+def _edge_function_2d(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> float:
+    return float((p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0]))
+
+
+def orient_uv_islands_by_visible_exterior(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    image_size: int = 128,
+    min_visible_pixels: int = 1,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flip UV/export islands whose visible exterior pixels are mostly backfacing.
+
+    UV unwrap can split a still-problematic open mesh into many render islands.
+    At that point adjacency and simple radial cues no longer identify every
+    exterior-facing patch, but the export-facing culling contract is explicit:
+    across six orthographic exterior views, an island should not be mostly
+    visible only through its back side. This helper flips whole face-connected
+    islands only, preserving local winding consistency inside each island.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+    if min_visible_pixels < 0:
+        raise ValueError("min_visible_pixels must be non-negative")
+
+    vertices64 = np.asarray(vertices, dtype=np.float64)
+    faces_i64 = np.asarray(faces, dtype=np.int64)
+    n_faces = len(faces_i64)
+    n_components, labels = _face_connected_components(faces_i64, n_faces)
+
+    tri = vertices64[faces_i64]
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal_len = np.linalg.norm(normals, axis=1)
+    unit_normals = np.zeros_like(normals)
+    valid_normals = normal_len > 1e-12
+    unit_normals[valid_normals] = normals[valid_normals] / normal_len[valid_normals, None]
+
+    component_visible = np.zeros(n_components, dtype=np.int64)
+    component_backfacing = np.zeros(n_components, dtype=np.int64)
+
+    for depth_axis, sign in _VISIBLE_EXTERIOR_VIEWS.values():
+        axes = [axis for axis in range(3) if axis != depth_axis]
+        outward_axis = np.zeros(3, dtype=np.float64)
+        outward_axis[depth_axis] = float(sign)
+
+        coords = vertices64[:, axes]
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0)
+        span = maxs - mins
+        span[span == 0.0] = 1.0
+
+        margin = max(2.0, image_size * 0.05)
+        scale = min(
+            (image_size - 2.0 * margin) / span[0],
+            (image_size - 2.0 * margin) / span[1],
+        )
+        offset = np.array(
+            [
+                (image_size - span[0] * scale) / 2.0 - mins[0] * scale,
+                (image_size - span[1] * scale) / 2.0 - mins[1] * scale,
+            ],
+            dtype=np.float64,
+        )
+        projected = coords * scale + offset
+        depths = vertices64[:, depth_axis] * float(sign)
+
+        z_buffer = np.full((image_size, image_size), -np.inf, dtype=np.float64)
+        face_buffer = np.full((image_size, image_size), -1, dtype=np.int64)
+
+        for face_index, face in enumerate(faces_i64):
+            tri_2d = projected[face]
+            if not np.isfinite(tri_2d).all():
+                continue
+            area2 = _edge_function_2d(tri_2d[0], tri_2d[1], tri_2d[2])
+            if abs(area2) < 1e-8:
+                continue
+
+            min_xy = np.floor(tri_2d.min(axis=0)).astype(int)
+            max_xy = np.ceil(tri_2d.max(axis=0)).astype(int)
+            x0 = max(0, int(min_xy[0]))
+            y0 = max(0, int(min_xy[1]))
+            x1 = min(image_size - 1, int(max_xy[0]))
+            y1 = min(image_size - 1, int(max_xy[1]))
+            if x0 > x1 or y0 > y1:
+                continue
+
+            tri_depths = depths[face]
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    sample = np.array([x + 0.5, y + 0.5], dtype=np.float64)
+                    w0 = _edge_function_2d(tri_2d[1], tri_2d[2], sample) / area2
+                    w1 = _edge_function_2d(tri_2d[2], tri_2d[0], sample) / area2
+                    w2 = _edge_function_2d(tri_2d[0], tri_2d[1], sample) / area2
+                    if w0 < -1e-8 or w1 < -1e-8 or w2 < -1e-8:
+                        continue
+                    depth = w0 * tri_depths[0] + w1 * tri_depths[1] + w2 * tri_depths[2]
+                    if depth > z_buffer[y, x]:
+                        z_buffer[y, x] = depth
+                        face_buffer[y, x] = face_index
+
+        visible_faces = face_buffer[face_buffer >= 0]
+        if len(visible_faces) == 0:
+            continue
+        visible_components = labels[visible_faces]
+        np.add.at(component_visible, visible_components, 1)
+
+        backfacing = (unit_normals[visible_faces] @ outward_axis) < -1e-6
+        if backfacing.any():
+            np.add.at(component_backfacing, visible_components[backfacing], 1)
+
+    flip_components = (
+        (component_visible >= min_visible_pixels)
+        & (component_backfacing * 2 > component_visible)
+    )
+    if not flip_components.any():
+        return vertices, faces
+
+    flip_faces = flip_components[labels]
+    oriented = np.array(faces, copy=True)
+    oriented[flip_faces] = oriented[flip_faces][:, ::-1]
+
+    if verbose:
+        print(
+            f"  Flipped {int(flip_faces.sum()):,} faces across "
+            f"{int(flip_components.sum()):,} visible-backface UV islands",
+            flush=True,
+        )
+    return vertices, oriented.astype(faces.dtype, copy=False)
+
+
 def fix_normals(
     vertices: np.ndarray,
     faces: np.ndarray,

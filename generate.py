@@ -117,6 +117,36 @@ def _mesh_coord_space():
     return TRELLIS_WORLD_COORD_SPACE
 
 
+def _glb_export_vertices(vertices):
+    export_verts = vertices.copy()
+    export_verts[:, 1], export_verts[:, 2] = vertices[:, 2].copy(), -vertices[:, 1].copy()
+    return export_verts
+
+
+def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
+    if args.no_uv_visible_orient:
+        print("  UV visible island orientation: skipped (--no-uv-visible-orient)", flush=True)
+        return uv_faces
+
+    from trellmlx.mesh_cleanup import orient_uv_islands_by_visible_exterior
+
+    export_verts = _glb_export_vertices(uv_verts)
+    t0 = time.perf_counter()
+    _, oriented_faces = orient_uv_islands_by_visible_exterior(
+        export_verts,
+        uv_faces,
+        image_size=args.uv_visible_orient_size,
+        verbose=True,
+    )
+    changed = int((oriented_faces != uv_faces).any(axis=1).sum())
+    print(
+        f"  UV visible island orientation: checked at {args.uv_visible_orient_size}px, "
+        f"changed {changed:,} faces ({time.perf_counter()-t0:.1f}s)",
+        flush=True,
+    )
+    return oriented_faces
+
+
 def _validate_mesh_checkpoint_vertices(vertices, *, mesh_grid_size, coord_space=None, stage="mesh"):
     expected = _mesh_coord_space()
     if coord_space is not None and coord_space != expected:
@@ -412,6 +442,10 @@ def main():
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
     parser.add_argument("--uv-method", choices=["auto", "lscm", "xatlas", "cube"], default="auto",
                         help="UV unwrap method: auto (xatlas, default), lscm, xatlas, or cube")
+    parser.add_argument("--no-uv-visible-orient", action="store_true",
+                        help="Skip post-UV visible-exterior island orientation before texture bake/export")
+    parser.add_argument("--uv-visible-orient-size", type=int, default=192,
+                        help="Image size for post-UV visible-exterior island orientation (default: 192)")
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")
@@ -516,6 +550,7 @@ def main():
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            uv_faces = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
             if args.save_checkpoints:
                 from trellmlx.checkpoint import save_checkpoint
                 save_checkpoint(args.save_checkpoints, "mesh_uv",
@@ -537,8 +572,7 @@ def main():
             from PIL import Image
 
             if len(uv_verts) > 0 and len(uv_faces) > 0:
-                export_verts = uv_verts.copy()
-                export_verts[:, 1], export_verts[:, 2] = uv_verts[:, 2].copy(), -uv_verts[:, 1].copy()
+                export_verts = _glb_export_vertices(uv_verts)
                 export_uvs = uvs.copy()
                 export_uvs[:, 1] = 1 - export_uvs[:, 1]
                 mesh = trimesh.Trimesh(vertices=export_verts, faces=uv_faces, process=False)
@@ -1176,6 +1210,7 @@ def main():
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
+    uv_faces = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_uv",
@@ -1199,8 +1234,7 @@ def main():
 
     if len(uv_verts) > 0 and len(uv_faces) > 0:
         # Swap Y and Z axes, invert Y for GLB compatibility (matches reference)
-        export_verts = uv_verts.copy()
-        export_verts[:, 1], export_verts[:, 2] = uv_verts[:, 2].copy(), -uv_verts[:, 1].copy()
+        export_verts = _glb_export_vertices(uv_verts)
 
         # Flip UV V-coordinate for GLB
         export_uvs = uvs.copy()
