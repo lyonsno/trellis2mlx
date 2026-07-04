@@ -309,85 +309,97 @@ def repair_non_manifold_edges(
     faces: np.ndarray,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove faces that create non-manifold edges (edges shared by 3+ faces).
+    """Split face-corner vertices across non-manifold edges.
 
-    For each non-manifold edge, keeps the two largest adjacent faces and
-    removes the rest. Vectorized: uses packed int64 edge keys, np.unique
-    for grouping, and batch area computation.
+    This mirrors reference cumesh ``repair_non_manifold_edges``. It starts from
+    one logical vertex per face corner, unions only corners connected by edges
+    shared by exactly two faces, then rebuilds vertices/faces from those union
+    components. Faces are preserved; non-manifold sharing is repaired by vertex
+    splitting rather than by deleting incident faces.
     """
     if len(faces) == 0:
         return vertices, faces
 
     n_faces = len(faces)
-    faces_i64 = faces.astype(np.int64)
+    faces_i64 = np.asarray(faces, dtype=np.int64)
 
-    # Guard: packed int64 edge keys overflow at vertex index >= 2^31
-    max_vi = faces_i64.max()
-    if max_vi >= 2**31:
-        raise ValueError(
-            f"Vertex index {max_vi} exceeds 2^31-1; "
-            "packed int64 edge keys would overflow"
-        )
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    edge_order: list[tuple[int, int]] = []
+    for face_index, face in enumerate(faces_i64):
+        for corner in range(3):
+            edge = tuple(sorted((int(face[corner]), int(face[(corner + 1) % 3]))))
+            if edge not in edge_faces:
+                edge_order.append(edge)
+            edge_faces.setdefault(edge, []).append(face_index)
 
-    # Build all edges: 3 edges per face → [3F, 2] sorted pairs
-    e0 = np.stack([faces_i64[:, 0], faces_i64[:, 1]], axis=1)
-    e1 = np.stack([faces_i64[:, 1], faces_i64[:, 2]], axis=1)
-    e2 = np.stack([faces_i64[:, 2], faces_i64[:, 0]], axis=1)
-    all_edges = np.concatenate([e0, e1, e2], axis=0)  # [3F, 2]
-    all_edges.sort(axis=1)
+    manifold_adjacency: list[tuple[int, int]] = []
+    for edge in edge_order:
+        incident = edge_faces[edge]
+        if len(incident) == 2:
+            manifold_adjacency.append((incident[0], incident[1]))
 
-    # Face index for each edge
-    face_idx = np.tile(np.arange(n_faces, dtype=np.int64), 3)
-
-    # Pack edge pairs into single int64 for fast grouping
-    edge_keys = all_edges[:, 0] * (2**32) + all_edges[:, 1]
-
-    # Group by edge key
-    sort_order = np.argsort(edge_keys)
-    sorted_keys = edge_keys[sort_order]
-    sorted_face_idx = face_idx[sort_order]
-
-    # Find group boundaries
-    breaks = np.concatenate([
-        [0],
-        np.where(sorted_keys[1:] != sorted_keys[:-1])[0] + 1,
-        [len(sorted_keys)],
-    ])
-
-    # Find non-manifold edges (group size > 2)
-    group_sizes = np.diff(breaks)
-    non_manifold_mask = group_sizes > 2
-    if not non_manifold_mask.any():
+    if not manifold_adjacency:
         return vertices, faces
 
-    # Precompute all face areas
-    v0 = vertices[faces[:, 0]]
-    v1 = vertices[faces[:, 1]]
-    v2 = vertices[faces[:, 2]]
-    cross = np.cross(v1 - v0, v2 - v0)
-    face_areas = 0.5 * np.sqrt((cross ** 2).sum(axis=1))
+    parent = np.arange(3 * n_faces, dtype=np.int64)
 
-    # For each non-manifold edge group, keep the 2 largest-area faces
-    faces_to_remove = set()
-    nm_indices = np.where(non_manifold_mask)[0]
-    for gi in nm_indices:
-        start, end = breaks[gi], breaks[gi + 1]
-        group_faces = sorted_face_idx[start:end]
-        group_areas = face_areas[group_faces]
-        keep_idx = np.argsort(group_areas)[-2:]
-        for i in range(len(group_faces)):
-            if i not in keep_idx:
-                faces_to_remove.add(group_faces[i])
+    def find(idx: int) -> int:
+        root = idx
+        while int(parent[root]) != root:
+            root = int(parent[root])
+        while int(parent[idx]) != idx:
+            next_idx = int(parent[idx])
+            parent[idx] = root
+            idx = next_idx
+        return root
 
-    if not faces_to_remove:
-        return vertices, faces
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a == root_b:
+            return
+        if root_a < root_b:
+            parent[root_b] = root_a
+        else:
+            parent[root_a] = root_b
+
+    for face_a, face_b in manifold_adjacency:
+        shared_a: list[int] = []
+        shared_b: list[int] = []
+        face1 = faces_i64[face_a]
+        face2 = faces_i64[face_b]
+        for corner_a, vertex_a in enumerate(face1):
+            for corner_b, vertex_b in enumerate(face2):
+                if int(vertex_a) == int(vertex_b):
+                    shared_a.append(corner_a)
+                    shared_b.append(corner_b)
+                    break
+            if len(shared_a) == 2:
+                break
+        if len(shared_a) != 2:
+            continue
+        union(3 * face_a + shared_a[0], 3 * face_b + shared_b[0])
+        union(3 * face_a + shared_a[1], 3 * face_b + shared_b[1])
+
+    roots = np.array([find(i) for i in range(3 * n_faces)], dtype=np.int64)
+    unique_roots, inverse = np.unique(roots, return_inverse=True)
+    new_faces = inverse.reshape(n_faces, 3).astype(faces.dtype, copy=False)
 
     if verbose:
-        print(f"  Removed {len(faces_to_remove)} non-manifold faces", flush=True)
+        duplicated = len(unique_roots) - len(vertices)
+        if duplicated > 0:
+            print(
+                f"  Split non-manifold vertices into {len(unique_roots):,} face-corner components "
+                f"(+{duplicated:,})",
+                flush=True,
+            )
 
-    keep_mask = np.ones(n_faces, dtype=bool)
-    keep_mask[list(faces_to_remove)] = False
-    return _reindex_mesh(vertices, faces[keep_mask])
+    representative_corner = np.empty(len(unique_roots), dtype=np.int64)
+    representative_corner[inverse] = np.arange(3 * n_faces, dtype=np.int64)
+    representative_faces = representative_corner // 3
+    representative_local = representative_corner % 3
+    representative_vertices = faces_i64[representative_faces, representative_local]
+    return vertices[representative_vertices].copy(), new_faces
 
 
 def remove_same_direction_manifold_conflicts(
@@ -454,50 +466,90 @@ def orient_faces_by_adjacency(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Propagate face winding across manifold adjacency without deleting faces.
 
-    This mirrors the useful part of the reference cumesh
-    ``unify_face_orientations`` step for open meshes: when two faces share a
-    manifold edge, they should traverse that shared edge in opposite
-    directions. Unlike ``trimesh.repair.fix_normals``, this does not try to
-    decide global inside/outside for open components.
+    This mirrors reference cumesh ``unify_face_orientations``: compute whether
+    each manifold edge requires a flip, then solve face flips with an oriented
+    union-find that hooks higher roots to lower roots. On contradictory open
+    components, this preserves cumesh's spanning-choice behavior instead of
+    imposing a DFS traversal or deleting faces.
     """
     if len(faces) == 0:
         return vertices, faces
 
     faces_i64 = np.asarray(faces, dtype=np.int64)
-    edge_dirs: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    edge_order: list[tuple[int, int]] = []
     for face_index, face in enumerate(faces_i64):
         for corner in range(3):
             a = int(face[corner])
             b = int(face[(corner + 1) % 3])
-            edge_dirs.setdefault(tuple(sorted((a, b))), []).append((face_index, a, b))
+            edge = tuple(sorted((a, b)))
+            if edge not in edge_faces:
+                edge_order.append(edge)
+            edge_faces.setdefault(edge, []).append(face_index)
 
-    adjacency: list[list[tuple[int, bool]]] = [[] for _ in range(len(faces_i64))]
-    for incident in edge_dirs.values():
+    adjacency: list[tuple[int, int]] = []
+    flip_required: list[bool] = []
+    for edge in edge_order:
+        incident = edge_faces[edge]
         if len(incident) != 2:
             continue
-        (face_a, a0, b0), (face_b, a1, b1) = incident
-        same_direction = a0 == a1 and b0 == b1
-        adjacency[face_a].append((face_b, same_direction))
-        adjacency[face_b].append((face_a, same_direction))
-
-    flip = np.zeros(len(faces_i64), dtype=bool)
-    seen = np.zeros(len(faces_i64), dtype=bool)
-    contradictions = 0
-    for start in range(len(faces_i64)):
-        if seen[start]:
+        face_a, face_b = incident
+        face1 = faces_i64[face_a]
+        face2 = faces_i64[face_b]
+        shared_in_face1: list[int] = []
+        shared_in_face2: list[int] = []
+        for i, vertex_a in enumerate(face1):
+            for j, vertex_b in enumerate(face2):
+                if int(vertex_a) == int(vertex_b):
+                    shared_in_face1.append(i)
+                    shared_in_face2.append(j)
+                    break
+            if len(shared_in_face1) == 2:
+                break
+        if len(shared_in_face1) != 2:
             continue
-        seen[start] = True
-        stack = [start]
-        while stack:
-            current = stack.pop()
-            for neighbor, same_direction in adjacency[current]:
-                required = flip[current] ^ same_direction
-                if not seen[neighbor]:
-                    seen[neighbor] = True
-                    flip[neighbor] = required
-                    stack.append(neighbor)
-                elif flip[neighbor] != required:
-                    contradictions += 1
+        direction1 = (shared_in_face1[1] - shared_in_face1[0] + 3) % 3
+        direction2 = (shared_in_face2[1] - shared_in_face2[0] + 3) % 3
+        adjacency.append((face_a, face_b))
+        flip_required.append(direction1 == direction2)
+
+    component_with_flip = np.arange(len(faces_i64), dtype=np.int64) << 1
+
+    def root_with_flip(face_index: int) -> tuple[int, int]:
+        value = int(component_with_flip[face_index])
+        root = value >> 1
+        flip = value & 1
+        while True:
+            parent_value = int(component_with_flip[root])
+            parent_root = parent_value >> 1
+            if parent_root == root:
+                return root, flip
+            flip ^= parent_value & 1
+            root = parent_root
+
+    iterations = 0
+    for iterations in range(1, 65):
+        changed = False
+        for (face_a, face_b), edge_needs_flip in zip(adjacency, flip_required):
+            root_a, flip_a = root_with_flip(face_a)
+            root_b, flip_b = root_with_flip(face_b)
+            if root_a == root_b:
+                continue
+            high = max(root_a, root_b)
+            low = min(root_a, root_b)
+            component_with_flip[high] = (
+                low << 1
+            ) | (int(edge_needs_flip) ^ flip_a ^ flip_b)
+            changed = True
+
+        for face_index in range(len(faces_i64)):
+            root, flip = root_with_flip(face_index)
+            component_with_flip[face_index] = (root << 1) | flip
+
+        if not changed:
+            break
+
+    flip = (component_with_flip & 1).astype(bool)
 
     if not flip.any():
         return vertices, faces
@@ -506,8 +558,8 @@ def orient_faces_by_adjacency(
     oriented[flip] = oriented[flip][:, ::-1]
     if verbose:
         print(
-            f"  Oriented {int(flip.sum())} faces by adjacency"
-            + (f" ({contradictions} contradictory adjacency constraints)" if contradictions else ""),
+            f"  Oriented {int(flip.sum())} faces by cumesh-style adjacency union"
+            + (f" ({iterations} union iterations)" if iterations else ""),
             flush=True,
         )
     return vertices, oriented.astype(faces.dtype, copy=False)
@@ -611,15 +663,7 @@ def fix_normals(
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     if not mesh.is_watertight:
-        oriented_vertices, oriented_faces = orient_faces_by_adjacency(
-            vertices, faces, verbose=verbose,
-        )
-        oriented_vertices, oriented_faces = orient_components_outward_by_radial_heuristic(
-            oriented_vertices, oriented_faces, verbose=verbose,
-        )
-        return remove_same_direction_manifold_conflicts(
-            oriented_vertices, oriented_faces, verbose=verbose,
-        )
+        return orient_faces_by_adjacency(vertices, faces, verbose=verbose)
 
     trimesh.repair.fix_normals(mesh, multibody=True)
     # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)

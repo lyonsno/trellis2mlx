@@ -18,6 +18,8 @@ from trellmlx.mesh_cleanup import (
     remove_duplicate_faces,
     repair_non_manifold_edges,
     remove_same_direction_manifold_conflicts,
+    orient_faces_by_adjacency,
+    orient_components_outward_by_radial_heuristic,
     fix_normals,
 )
 
@@ -212,18 +214,28 @@ class TestRemoveDuplicateFaces:
 
 
 class TestRepairNonManifoldEdges:
-    def test_removes_non_manifold_faces(self):
-        """An edge shared by 3+ faces is non-manifold. Repair should reduce to 2."""
-        verts, faces = _make_tetrahedron()
-        # Add extra face sharing edge (0,1) — now edge (0,1) has 3 adjacent faces
-        extra_vert = np.array([[0.5, -1, 0.5]], dtype=np.float32)
-        verts = np.vstack([verts, extra_vert])
-        extra_face = np.array([[0, 1, 4]], dtype=np.int64)
-        faces = np.vstack([faces, extra_face])
+    def test_splits_non_manifold_edge_vertices_without_deleting_faces(self):
+        """Cumesh repair preserves faces and separates non-manifold edge corners."""
+        verts = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],
+            [1, 0, 3],
+            [0, 1, 4],
+            [2, 1, 5],
+        ], dtype=np.int64)
 
         cleaned_v, cleaned_f = repair_non_manifold_edges(verts, faces)
-        # The extra face (smallest area on edge 0,1) should be removed
-        assert len(cleaned_f) == 4
+
+        assert len(cleaned_f) == len(faces)
+        assert len(cleaned_v) == 10
+        assert cleaned_f.tolist() == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [2, 1, 9]]
 
     def test_noop_on_manifold_mesh(self):
         verts, faces = _make_tetrahedron()
@@ -308,14 +320,33 @@ class TestFixNormals:
             (0, 1, 3),
         }
 
-    def test_open_component_fix_normals_orients_globally_inverted_patch_outward(self):
-        """A consistent but inverted open component should be flipped as a body."""
+    def test_open_mesh_orientation_matches_cumesh_low_root_union_find(self):
+        """Contradictory open components should follow cumesh's union-find choice."""
+        vertices = np.zeros((7, 3), dtype=np.float32)
+        faces = np.array([
+            [6, 0, 4],
+            [6, 5, 4],
+            [0, 3, 6],
+            [3, 5, 0],
+            [3, 5, 4],
+        ], dtype=np.int64)
+
+        _, oriented = orient_faces_by_adjacency(vertices, faces, verbose=False)
+
+        expected = faces.copy()
+        expected[[1, 2]] = expected[[1, 2]][:, ::-1]
+        np.testing.assert_array_equal(oriented, expected)
+
+    def test_radial_heuristic_orients_globally_inverted_patch_outward(self):
+        """The optional radial heuristic can flip a consistent open component."""
         vertices, faces = _make_open_box()
         inverted = faces[:, ::-1].copy()
         outward_before, inward_before = _radial_orientation_counts(vertices, inverted)
         assert inward_before > outward_before
 
-        fixed_v, fixed_f = fix_normals(vertices, inverted, verbose=False)
+        fixed_v, fixed_f = orient_components_outward_by_radial_heuristic(
+            vertices, inverted, verbose=False,
+        )
 
         outward_after, inward_after = _radial_orientation_counts(fixed_v, fixed_f)
         assert len(fixed_f) == len(inverted)
