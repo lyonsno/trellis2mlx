@@ -254,8 +254,8 @@ class TestFixNormals:
         assert type(fixed_v) is np.ndarray
         assert type(fixed_f) is np.ndarray
 
-    def test_open_dual_grid_patch_prunes_local_winding_conflicts(self):
-        """Open dual-grid cleanup should clear local conflicts without global orientation."""
+    def test_open_dual_grid_patch_orients_local_winding_conflicts(self):
+        """Open dual-grid cleanup should orient local conflicts without deleting patches."""
         vertices, faces = _dense_dual_grid_mesh(n=4)
         vertices, faces = remove_duplicate_faces(vertices, faces, verbose=False)
         vertices, faces = repair_non_manifold_edges(vertices, faces, verbose=False)
@@ -267,7 +267,31 @@ class TestFixNormals:
         fixed_v, fixed_f = fix_normals(vertices, faces, verbose=False)
 
         _assert_manifold_edges_oppositely_oriented(fixed_f)
-        assert _projected_missing_ratio(fixed_v, fixed_f) > 0
+        assert len(fixed_f) == len(faces)
+
+    def test_open_mesh_fix_normals_flips_adjacent_face_instead_of_pruning(self):
+        """Open meshes need reference-like orientation propagation, not face deletion."""
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],
+            [0, 1, 3],
+        ], dtype=np.int64)
+
+        assert _same_direction_manifold_conflict_count(faces) == 1
+
+        fixed_v, fixed_f = fix_normals(vertices, faces, verbose=False)
+
+        assert len(fixed_f) == 2
+        assert _same_direction_manifold_conflict_count(fixed_f) == 0
+        assert {tuple(sorted(face)) for face in fixed_f.tolist()} == {
+            (0, 1, 2),
+            (0, 1, 3),
+        }
 
 
 class TestRemoveSameDirectionManifoldConflicts:

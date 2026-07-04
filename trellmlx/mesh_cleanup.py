@@ -447,6 +447,72 @@ def remove_same_direction_manifold_conflicts(
     return _reindex_mesh(vertices, faces[keep_mask])
 
 
+def orient_faces_by_adjacency(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Propagate face winding across manifold adjacency without deleting faces.
+
+    This mirrors the useful part of the reference cumesh
+    ``unify_face_orientations`` step for open meshes: when two faces share a
+    manifold edge, they should traverse that shared edge in opposite
+    directions. Unlike ``trimesh.repair.fix_normals``, this does not try to
+    decide global inside/outside for open components.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    faces_i64 = np.asarray(faces, dtype=np.int64)
+    edge_dirs: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for face_index, face in enumerate(faces_i64):
+        for corner in range(3):
+            a = int(face[corner])
+            b = int(face[(corner + 1) % 3])
+            edge_dirs.setdefault(tuple(sorted((a, b))), []).append((face_index, a, b))
+
+    adjacency: list[list[tuple[int, bool]]] = [[] for _ in range(len(faces_i64))]
+    for incident in edge_dirs.values():
+        if len(incident) != 2:
+            continue
+        (face_a, a0, b0), (face_b, a1, b1) = incident
+        same_direction = a0 == a1 and b0 == b1
+        adjacency[face_a].append((face_b, same_direction))
+        adjacency[face_b].append((face_a, same_direction))
+
+    flip = np.zeros(len(faces_i64), dtype=bool)
+    seen = np.zeros(len(faces_i64), dtype=bool)
+    contradictions = 0
+    for start in range(len(faces_i64)):
+        if seen[start]:
+            continue
+        seen[start] = True
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            for neighbor, same_direction in adjacency[current]:
+                required = flip[current] ^ same_direction
+                if not seen[neighbor]:
+                    seen[neighbor] = True
+                    flip[neighbor] = required
+                    stack.append(neighbor)
+                elif flip[neighbor] != required:
+                    contradictions += 1
+
+    if not flip.any():
+        return vertices, faces
+
+    oriented = np.array(faces, copy=True)
+    oriented[flip] = oriented[flip][:, ::-1]
+    if verbose:
+        print(
+            f"  Oriented {int(flip.sum())} faces by adjacency"
+            + (f" ({contradictions} contradictory adjacency constraints)" if contradictions else ""),
+            flush=True,
+        )
+    return vertices, oriented.astype(faces.dtype, copy=False)
+
+
 def fix_normals(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -462,13 +528,12 @@ def fix_normals(
 
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    # On open extracted meshes, Trimesh's global orientation repair can flip
-    # visible patches. Prune local conflicts without reorienting components.
     if not mesh.is_watertight:
+        oriented_vertices, oriented_faces = orient_faces_by_adjacency(
+            vertices, faces, verbose=verbose,
+        )
         return remove_same_direction_manifold_conflicts(
-            vertices,
-            faces,
-            verbose=verbose,
+            oriented_vertices, oriented_faces, verbose=verbose,
         )
 
     trimesh.repair.fix_normals(mesh, multibody=True)
