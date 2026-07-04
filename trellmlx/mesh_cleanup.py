@@ -513,6 +513,88 @@ def orient_faces_by_adjacency(
     return vertices, oriented.astype(faces.dtype, copy=False)
 
 
+def orient_components_outward_by_radial_heuristic(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flip consistently wound open components whose normals point inward.
+
+    Open decoder meshes do not have a reliable signed volume, but each connected
+    exterior patch still has a useful local radial cue. For each face-connected
+    component, compare area-weighted normals against vectors from the component
+    center to face centers. If the component's aggregate score is inward, flip
+    the whole component. Whole-component flips preserve adjacency consistency.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    faces_i64 = np.asarray(faces, dtype=np.int64)
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for face_index, face in enumerate(faces_i64):
+        for corner in range(3):
+            edge = tuple(sorted((int(face[corner]), int(face[(corner + 1) % 3]))))
+            edge_faces.setdefault(edge, []).append(face_index)
+
+    adjacency: list[list[int]] = [[] for _ in range(len(faces_i64))]
+    for incident in edge_faces.values():
+        if len(incident) < 2:
+            continue
+        for i, face_a in enumerate(incident):
+            for face_b in incident[i + 1:]:
+                adjacency[face_a].append(face_b)
+                adjacency[face_b].append(face_a)
+
+    tri = vertices[faces_i64]
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal_len = np.linalg.norm(normals, axis=1)
+    face_centers = tri.mean(axis=1)
+
+    oriented = np.array(faces, copy=True)
+    seen = np.zeros(len(faces_i64), dtype=bool)
+    components_flipped = 0
+    faces_flipped = 0
+    for start in range(len(faces_i64)):
+        if seen[start]:
+            continue
+        seen[start] = True
+        stack = [start]
+        component: list[int] = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if not seen[neighbor]:
+                    seen[neighbor] = True
+                    stack.append(neighbor)
+
+        comp_idx = np.asarray(component, dtype=np.int64)
+        used_vertices = np.unique(faces_i64[comp_idx].reshape(-1))
+        if len(used_vertices) == 0:
+            continue
+        component_center = vertices[used_vertices].mean(axis=0)
+        radial = face_centers[comp_idx] - component_center
+        radial_len = np.linalg.norm(radial, axis=1)
+        usable = (normal_len[comp_idx] > 1e-12) & (radial_len > 1e-12)
+        if not usable.any():
+            continue
+        score = np.sum(
+            np.sum(normals[comp_idx][usable] * radial[usable], axis=1)
+            / radial_len[usable]
+        )
+        if score < 0:
+            oriented[comp_idx] = oriented[comp_idx][:, ::-1]
+            components_flipped += 1
+            faces_flipped += int(len(comp_idx))
+
+    if verbose and faces_flipped:
+        print(
+            f"  Flipped {faces_flipped} faces across {components_flipped} inward components",
+            flush=True,
+        )
+    return vertices, oriented.astype(faces.dtype, copy=False)
+
+
 def fix_normals(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -531,6 +613,9 @@ def fix_normals(
     if not mesh.is_watertight:
         oriented_vertices, oriented_faces = orient_faces_by_adjacency(
             vertices, faces, verbose=verbose,
+        )
+        oriented_vertices, oriented_faces = orient_components_outward_by_radial_heuristic(
+            oriented_vertices, oriented_faces, verbose=verbose,
         )
         return remove_same_direction_manifold_conflicts(
             oriented_vertices, oriented_faces, verbose=verbose,

@@ -114,6 +114,21 @@ def _projected_missing_ratio(vertices, faces):
     return missing / total if total else 0.0
 
 
+def _radial_orientation_counts(vertices, faces):
+    tri = vertices[faces]
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal_len = np.linalg.norm(normals, axis=1)
+    centers = tri.mean(axis=1)
+    radial = centers - vertices.mean(axis=0)
+    radial_len = np.linalg.norm(radial, axis=1)
+    usable = (normal_len > 1e-12) & (radial_len > 1e-12)
+    dots = np.zeros(len(faces), dtype=np.float64)
+    dots[usable] = np.sum(normals[usable] * radial[usable], axis=1) / (
+        normal_len[usable] * radial_len[usable]
+    )
+    return int((dots > 1e-8).sum()), int((dots < -1e-8).sum())
+
+
 def _dense_dual_grid_mesh(n=4):
     from trellmlx.mesh_extract import decoder_output_to_mesh
 
@@ -292,6 +307,19 @@ class TestFixNormals:
             (0, 1, 2),
             (0, 1, 3),
         }
+
+    def test_open_component_fix_normals_orients_globally_inverted_patch_outward(self):
+        """A consistent but inverted open component should be flipped as a body."""
+        vertices, faces = _make_open_box()
+        inverted = faces[:, ::-1].copy()
+        outward_before, inward_before = _radial_orientation_counts(vertices, inverted)
+        assert inward_before > outward_before
+
+        fixed_v, fixed_f = fix_normals(vertices, inverted, verbose=False)
+
+        outward_after, inward_after = _radial_orientation_counts(fixed_v, fixed_f)
+        assert len(fixed_f) == len(inverted)
+        assert outward_after > inward_after
 
 
 class TestRemoveSameDirectionManifoldConflicts:
