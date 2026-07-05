@@ -16,7 +16,18 @@ import trimesh
 
 SCHEMA = "trellis2mlx.mesh_winding_witness.v1"
 ROUTE = "cpu_mesh_winding_witness"
-CHECKPOINT_STAGES = ("mesh_raw", "mesh_clean", "mesh_uv")
+CHECKPOINT_STAGES = (
+    "mesh_raw",
+    "mesh_after_initial_fill",
+    "mesh_after_coarse_simplify",
+    "mesh_after_cleanup_pass1",
+    "mesh_after_cleanup_pass2",
+    "mesh_after_final_simplify",
+    "mesh_after_cleanup_final",
+    "mesh_clean",
+    "mesh_uv_pre_visible_orient",
+    "mesh_uv",
+)
 VISIBLE_EXTERIOR_VIEWS = {
     "+X": (0, 1),
     "-X": (0, -1),
@@ -457,14 +468,14 @@ def build_report(*, checkpoint_dir: Path | None, glb: Path | None, report_path: 
         exc.loaded_stages = list(stages.keys())
         raise
 
-    if "mesh_uv" in stage_arrays and "vmapping" in stage_arrays["mesh_uv"]:
-        source_stage = "mesh_clean" if "mesh_clean" in stage_arrays else "mesh_raw"
-        if source_stage in stage_arrays:
-            stages["mesh_uv"]["source_face_mapping"] = _source_face_mapping(
+    source_stage = "mesh_clean" if "mesh_clean" in stage_arrays else "mesh_raw"
+    for uv_stage in ("mesh_uv_pre_visible_orient", "mesh_uv"):
+        if uv_stage in stage_arrays and "vmapping" in stage_arrays[uv_stage] and source_stage in stage_arrays:
+            stages[uv_stage]["source_face_mapping"] = _source_face_mapping(
                 source_stage=source_stage,
                 source_faces=stage_arrays[source_stage]["faces"],
-                uv_faces=stage_arrays["mesh_uv"]["faces"],
-                vmapping=stage_arrays["mesh_uv"]["vmapping"],
+                uv_faces=stage_arrays[uv_stage]["faces"],
+                vmapping=stage_arrays[uv_stage]["vmapping"],
             )
 
     if not stages:

@@ -150,6 +150,41 @@ def test_checkpoint_report_catches_uv_stage_reversed_source_mapping(tmp_path):
     }
 
 
+def test_checkpoint_report_loads_postprocess_boundary_stages(tmp_path):
+    from scripts.mesh_winding_witness import build_report
+
+    vertices = np.array(
+        [
+            [-1.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+    checkpoint_dir = tmp_path / "ckpt"
+    _write_mesh_npz(checkpoint_dir / "mesh_after_cleanup_pass1.npz", vertices, faces)
+    _write_mesh_npz(checkpoint_dir / "mesh_after_final_simplify.npz", vertices, faces)
+    _write_mesh_npz(checkpoint_dir / "mesh_after_cleanup_final.npz", vertices, faces)
+
+    report = build_report(
+        checkpoint_dir=checkpoint_dir,
+        glb=None,
+        report_path=tmp_path / "winding.json",
+    )
+
+    assert "mesh_after_cleanup_pass1" in report["stages"]
+    assert "mesh_after_final_simplify" in report["stages"]
+    assert "mesh_after_cleanup_final" in report["stages"]
+    assert (
+        report["stages"]["mesh_after_cleanup_final"]["visible_exterior_orientation"]
+        ["views"]["+Y"]["backfacing_visible_ratio"]
+        > 0.95
+    )
+
+
 def test_witness_writes_failure_report_when_no_mesh_inputs_exist(tmp_path):
     report_path = tmp_path / "winding.json"
     result = subprocess.run(
