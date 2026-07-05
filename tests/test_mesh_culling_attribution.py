@@ -100,3 +100,27 @@ def test_export_space_identity_accounts_for_glb_axis_transform():
         "vertices_match_export_transform": True,
         "max_abs_error": 0.0,
     }
+
+
+def test_face_table_arrays_include_uv_island_and_all_touched_faces():
+    from collections import Counter
+
+    from scripts.mesh_culling_attribution import build_face_table_arrays
+
+    table = build_face_table_arrays(
+        visible_pixels=Counter({0: 7, 2: 3}),
+        backface_pixels=Counter({2: 2}),
+        projected_missing_pixels=Counter({1: 5}),
+        source_face_index=np.array([10, 11, 12], dtype=np.int64),
+        source_orientation=np.array(["same", "reversed", "unmatched"], dtype=object),
+        uv_component_labels=np.array([4, 4, 9], dtype=np.int32),
+    )
+
+    assert table["glb_face"].tolist() == [0, 1, 2]
+    assert table["uv_face"].tolist() == [0, 1, 2]
+    assert table["clean_face"].tolist() == [10, 11, 12]
+    assert table["uv_island"].tolist() == [4, 4, 9]
+    assert table["source_orientation"].tolist() == ["same", "reversed", "unmatched"]
+    assert table["visible_pixels"].tolist() == [7, 0, 3]
+    assert table["backface_pixels"].tolist() == [0, 0, 2]
+    assert table["projected_missing_pixels"].tolist() == [0, 5, 0]

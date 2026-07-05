@@ -455,6 +455,56 @@ def _component_labels(faces: np.ndarray) -> np.ndarray:
     return labels.astype(np.int32)
 
 
+def build_face_table_arrays(
+    *,
+    visible_pixels: Counter[int],
+    backface_pixels: Counter[int],
+    projected_missing_pixels: Counter[int],
+    source_face_index: np.ndarray,
+    source_orientation: np.ndarray,
+    uv_component_labels: np.ndarray,
+) -> dict[str, np.ndarray]:
+    touched = sorted(
+        set(int(face) for face in visible_pixels)
+        | set(int(face) for face in backface_pixels)
+        | set(int(face) for face in projected_missing_pixels)
+    )
+    glb_face = np.asarray(touched, dtype=np.int64)
+    clean_source = np.asarray(source_face_index, dtype=np.int64)
+    uv_islands = np.asarray(uv_component_labels, dtype=np.int64)
+    orientation = np.asarray(source_orientation, dtype=object)
+
+    clean_face = np.full(len(glb_face), -1, dtype=np.int64)
+    uv_island = np.full(len(glb_face), -1, dtype=np.int64)
+    source_orientation_out = np.full(len(glb_face), "out_of_range", dtype=object)
+    visible_out = np.zeros(len(glb_face), dtype=np.int64)
+    backface_out = np.zeros(len(glb_face), dtype=np.int64)
+    projected_missing_out = np.zeros(len(glb_face), dtype=np.int64)
+
+    for index, face in enumerate(glb_face):
+        face_i = int(face)
+        if 0 <= face_i < len(clean_source):
+            clean_face[index] = int(clean_source[face_i])
+        if 0 <= face_i < len(uv_islands):
+            uv_island[index] = int(uv_islands[face_i])
+        if 0 <= face_i < len(orientation):
+            source_orientation_out[index] = str(orientation[face_i])
+        visible_out[index] = int(visible_pixels.get(face_i, 0))
+        backface_out[index] = int(backface_pixels.get(face_i, 0))
+        projected_missing_out[index] = int(projected_missing_pixels.get(face_i, 0))
+
+    return {
+        "glb_face": glb_face,
+        "uv_face": glb_face.copy(),
+        "clean_face": clean_face,
+        "uv_island": uv_island,
+        "source_orientation": source_orientation_out.astype("<U32"),
+        "visible_pixels": visible_out,
+        "backface_pixels": backface_out,
+        "projected_missing_pixels": projected_missing_out,
+    }
+
+
 def _boundary_face_mask(faces: np.ndarray) -> np.ndarray:
     edge_counts: Counter[tuple[int, int]] = Counter()
     face_edges = []
@@ -618,6 +668,7 @@ def build_report(
         )
 
     clean_component_labels = _component_labels(clean_faces)
+    uv_component_labels = _component_labels(uv_faces)
     clean_boundary_mask = _boundary_face_mask(clean_faces)
     mapped_backface_clean = np.array(
         [clean_source[int(face)] for face in all_backface_pixels if clean_source[int(face)] >= 0],
@@ -757,6 +808,34 @@ def build_report(
         },
         "top_backface_faces": top_backface_entries,
         "top_projected_missing_faces": top_projected_missing_entries,
+        "face_table_summary": {
+            "available": True,
+            "rows": int(
+                len(
+                    set(int(face) for face in all_visible_pixels)
+                    | set(int(face) for face in all_backface_pixels)
+                    | set(int(face) for face in projected_missing_pixels)
+                )
+            ),
+            "columns": [
+                "glb_face",
+                "uv_face",
+                "clean_face",
+                "uv_island",
+                "source_orientation",
+                "visible_pixels",
+                "backface_pixels",
+                "projected_missing_pixels",
+            ],
+        },
+        "_face_table_arrays": build_face_table_arrays(
+            visible_pixels=all_visible_pixels,
+            backface_pixels=all_backface_pixels,
+            projected_missing_pixels=projected_missing_pixels,
+            source_face_index=clean_source,
+            source_orientation=source_orientation,
+            uv_component_labels=uv_component_labels,
+        ),
         "forbidden_to_prove": [
             "not a renderer-ground-truth hardware culling proof",
             "not root-cause closure",
@@ -798,6 +877,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--top-n", type=int, default=50)
+    parser.add_argument("--face-table-npz", type=Path, default=None)
     return parser.parse_args(argv)
 
 
@@ -813,8 +893,15 @@ def main(argv: list[str] | None = None) -> int:
             image_size=args.image_size,
             top_n=args.top_n,
         )
+        face_table = report.pop("_face_table_arrays")
+        if args.face_table_npz is not None:
+            args.face_table_npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(args.face_table_npz, **face_table)
+            report["face_table_summary"]["npz"] = str(args.face_table_npz)
         _write_json(args.report, report)
         print(f"wrote report: {args.report}", flush=True)
+        if args.face_table_npz is not None:
+            print(f"wrote face table: {args.face_table_npz}", flush=True)
         return 0
     except AttributionError as exc:
         _write_json(
