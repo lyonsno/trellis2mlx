@@ -124,6 +124,18 @@ def _glb_export_vertices(vertices):
     return export_verts
 
 
+def _export_material_double_sided(args):
+    return not bool(getattr(args, "voxel_remesh_pitch", 0.0))
+
+
+def _raise_unusable_resume_checkpoint_dir(resume_dir, available_stages, *, reason):
+    stages = ", ".join(available_stages) if available_stages else "none"
+    raise ValueError(
+        f"Cannot resume from {resume_dir}: {reason}; available stages: {stages}. "
+        "Refusing to run full pipeline fallback. Remove --resume to run a fresh generation."
+    )
+
+
 @dataclass(frozen=True)
 class UvOrientationResult:
     faces: np.ndarray
@@ -611,7 +623,8 @@ def main():
                     baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
                     metallicRoughnessTexture=Image.fromarray(metallic_roughness),
                     metallicFactor=1.0, roughnessFactor=1.0,
-                    alphaMode=alpha_mode, doubleSided=True,
+                    alphaMode=alpha_mode,
+                    doubleSided=_export_material_double_sided(args),
                 )
                 textured_mesh = trimesh.Trimesh(
                     vertices=export_verts, faces=uv_faces,
@@ -626,10 +639,17 @@ def main():
             return
 
         elif has_checkpoint(args.resume, "mesh_raw"):
-            print("  Only mesh checkpoint found — will re-run texture stages", flush=True)
-            # Could add partial resume here later
+            _raise_unusable_resume_checkpoint_dir(
+                args.resume,
+                available,
+                reason="mesh_raw checkpoint exists, but mesh-only resume is not implemented",
+            )
         else:
-            print(f"  No usable checkpoints in {args.resume}, running full pipeline", flush=True)
+            _raise_unusable_resume_checkpoint_dir(
+                args.resume,
+                available,
+                reason="no texture and mesh_raw checkpoint pair",
+            )
 
     mx.random.seed(args.seed)
     n_steps = args.steps
@@ -1281,7 +1301,7 @@ def main():
             metallicFactor=1.0,
             roughnessFactor=1.0,
             alphaMode=alpha_mode,
-            doubleSided=True,
+            doubleSided=_export_material_double_sided(args),
         )
 
         textured_mesh = trimesh.Trimesh(

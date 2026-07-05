@@ -13,6 +13,25 @@ class FaceBag:
         return self.count
 
 
+def test_export_material_is_double_sided_only_without_voxel_remesh():
+    from generate import _export_material_double_sided
+
+    assert _export_material_double_sided(SimpleNamespace(voxel_remesh_pitch=0.0)) is True
+    assert _export_material_double_sided(SimpleNamespace(voxel_remesh_pitch=None)) is True
+    assert _export_material_double_sided(SimpleNamespace(voxel_remesh_pitch=1.0 / 128.0)) is False
+
+
+def test_unusable_resume_checkpoint_dir_refuses_full_pipeline_fallback():
+    from generate import _raise_unusable_resume_checkpoint_dir
+
+    with pytest.raises(ValueError, match="Refusing to run full pipeline fallback"):
+        _raise_unusable_resume_checkpoint_dir(
+            "/tmp/checkpoints",
+            ["mesh_clean", "mesh_uv"],
+            reason="no texture and mesh_raw checkpoint pair",
+        )
+
+
 def test_uv_visible_orientation_result_records_post_repair_provenance(monkeypatch):
     import trellmlx.mesh_cleanup
     from generate import _orient_uv_faces_for_export
