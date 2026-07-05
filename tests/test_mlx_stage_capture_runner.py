@@ -106,7 +106,7 @@ def test_generate_exposes_stage_stop_checkpoints():
     assert "--stop-after-stage" in text
     assert (
         'choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_flow_block_trace", '
-        '"sparse_internals", "shape_slat", "decoder_output", "mesh_raw"]'
+        '"sparse_internals", "shape_slat", "decoder_output", "mesh_raw", "mesh_clean", "mesh_uv"]'
     ) in text
     for stage in (
         "conditioning",
@@ -116,9 +116,21 @@ def test_generate_exposes_stage_stop_checkpoints():
         "sparse_internals",
         "shape_slat",
         "decoder_output",
+        "mesh_raw",
+        "mesh_clean",
+        "mesh_uv",
     ):
         assert f'"{stage}"' in text
     assert text.count("save_checkpoint(") >= 8
+
+
+def test_mlx_stage_capture_runner_exposes_mesh_postprocess_stops():
+    text = (Path(__file__).resolve().parents[1] / "scripts" / "run_mlx_stage_capture.py").read_text()
+
+    assert '"mesh_clean"' in text
+    assert '"mesh_uv"' in text
+    assert '"mesh_clean": args.stop_after_stage == "mesh_clean"' in text
+    assert '"mesh_uv": args.stop_after_stage == "mesh_uv"' in text
 
 
 def test_generate_exposes_shared_noise_for_sparse_witness():

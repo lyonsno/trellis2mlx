@@ -806,7 +806,16 @@ def fix_normals(
     import trimesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     if not mesh.is_watertight:
-        return orient_faces_by_adjacency(vertices, faces, verbose=verbose)
+        oriented_vertices, oriented_faces = orient_faces_by_adjacency(
+            vertices,
+            faces,
+            verbose=verbose,
+        )
+        return remove_same_direction_manifold_conflicts(
+            oriented_vertices,
+            oriented_faces,
+            verbose=verbose,
+        )
 
     trimesh.repair.fix_normals(mesh, multibody=True)
     # np.array() to avoid returning trimesh TrackedArray (carries refs to Trimesh)

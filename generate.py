@@ -493,7 +493,7 @@ def main():
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--stop-after-stage",
-                        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_flow_block_trace", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw"],
+                        choices=["conditioning", "sparse_coords", "sparse_flow_step", "sparse_flow_block_trace", "sparse_internals", "shape_slat", "decoder_output", "mesh_raw", "mesh_clean", "mesh_uv"],
                         default=None,
                         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.")
     parser.add_argument("--shared-noise", metavar="NPZ",
@@ -1169,6 +1169,16 @@ def main():
                         vertices=vertices, faces=faces,
                         mesh_grid_size=mesh_grid_size,
                         mesh_coord_space=_mesh_coord_space())
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="mesh_clean",
+            next_stage="texture",
+            output_path=args.output,
+        )
+        if args.stop_after_stage == "mesh_clean":
+            print("  Stop after stage: mesh_clean", flush=True)
+            return
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
@@ -1268,6 +1278,16 @@ def main():
                         mesh_grid_size=mesh_grid_size,
                         mesh_coord_space=_mesh_coord_space(),
                         **uv_orientation.metadata)
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="mesh_uv",
+            next_stage="texture_bake",
+            output_path=args.output,
+        )
+        if args.stop_after_stage == "mesh_uv":
+            print("  Stop after stage: mesh_uv", flush=True)
+            return
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(

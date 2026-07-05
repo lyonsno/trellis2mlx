@@ -277,3 +277,135 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
     assert report["arrays"]["pos_block0_q_post_rope"]["mean_abs_diff"] == 0.75
     assert report["arrays"]["pos_block0_self_attn"]["mean_abs_diff"] == 0.5
     assert report["arrays"]["neg_block0_after_mlp"]["mean_abs_diff"] == 2.0
+
+
+def test_compare_mesh_stage_reports_reversed_face_orientation(tmp_path):
+    ref = tmp_path / "ref.npz"
+    mlx = tmp_path / "mlx.npz"
+    out = tmp_path / "comparison.json"
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    np.savez(ref, vertices=vertices, faces=np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int32))
+    np.savez(mlx, vertices=vertices, faces=np.array([[0, 2, 1], [1, 3, 2]], dtype=np.int32))
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/compare_stage_artifacts.py",
+            "--stage",
+            "mesh_raw",
+            "--reference",
+            str(ref),
+            "--candidate",
+            str(mlx),
+            "--output",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    orientation = report["face_orientation_overlap"]
+    assert orientation["common_face_sets"] == 2
+    assert orientation["same_orientation_faces"] == 1
+    assert orientation["reversed_orientation_faces"] == 1
+    assert report["faces"]["exact_row_match"] is False
+
+
+def test_compare_mesh_stage_reports_same_direction_edge_conflict(tmp_path):
+    ref = tmp_path / "ref.npz"
+    mlx = tmp_path / "mlx.npz"
+    out = tmp_path / "comparison.json"
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    valid_faces = np.array([[0, 1, 2], [2, 1, 3]], dtype=np.int32)
+    conflict_faces = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+    np.savez(ref, vertices=vertices, faces=valid_faces)
+    np.savez(mlx, vertices=vertices, faces=conflict_faces)
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/compare_stage_artifacts.py",
+            "--stage",
+            "mesh_clean",
+            "--reference",
+            str(ref),
+            "--candidate",
+            str(mlx),
+            "--output",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    assert report["reference_edge_consistency"]["same_direction_conflict_edges"] == 0
+    assert report["candidate_edge_consistency"]["same_direction_conflict_edges"] == 1
+
+
+def test_compare_mesh_uv_reports_uv_and_vmapping_deltas(tmp_path):
+    ref = tmp_path / "ref.npz"
+    mlx = tmp_path / "mlx.npz"
+    out = tmp_path / "comparison.json"
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    np.savez(
+        ref,
+        vertices=vertices,
+        faces=faces,
+        uvs=np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        vmapping=np.array([0, 1, 2], dtype=np.int32),
+    )
+    np.savez(
+        mlx,
+        vertices=vertices,
+        faces=faces,
+        uvs=np.array([[0.0, 0.0], [1.0, 0.25], [0.0, 1.0]], dtype=np.float32),
+        vmapping=np.array([0, 2, 1], dtype=np.int32),
+    )
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/compare_stage_artifacts.py",
+            "--stage",
+            "mesh_uv",
+            "--reference",
+            str(ref),
+            "--candidate",
+            str(mlx),
+            "--output",
+            str(out),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(out.read_text())
+    assert report["uvs"]["shape_match"] is True
+    assert report["uvs"]["max_abs_diff"] == 0.25
+    assert report["vmapping"]["exact_match"] is False
+    assert report["vmapping"]["mismatched_entries"] == 2

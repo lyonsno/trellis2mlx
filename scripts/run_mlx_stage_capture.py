@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
             "shape_slat",
             "decoder_output",
             "mesh_raw",
+            "mesh_clean",
+            "mesh_uv",
         ],
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -87,6 +89,8 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "shape_slat": args.stop_after_stage == "shape_slat",
             "decoder_output": args.stop_after_stage == "decoder_output",
             "raw_mesh": args.stop_after_stage == "mesh_raw",
+            "mesh_clean": args.stop_after_stage == "mesh_clean",
+            "mesh_uv": args.stop_after_stage == "mesh_uv",
             "final_glb": False,
         },
         "output_dir": output_dir,

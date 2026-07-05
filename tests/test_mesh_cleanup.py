@@ -366,6 +366,34 @@ class TestFixNormals:
         expected[[1, 2]] = expected[[1, 2]][:, ::-1]
         np.testing.assert_array_equal(oriented, expected)
 
+    def test_open_mesh_fix_normals_prunes_residual_same_direction_conflict(self):
+        """Open-mesh fallback should clear conflicts left by adjacency orientation."""
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.5, 0.5, 1.0],
+            [1.0, 0.5, 1.0],
+            [0.0, 0.5, 1.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [6, 0, 4],
+            [6, 5, 4],
+            [0, 3, 6],
+            [3, 5, 0],
+            [3, 5, 4],
+        ], dtype=np.int64)
+
+        _, oriented = orient_faces_by_adjacency(vertices, faces, verbose=False)
+        assert _same_direction_manifold_conflict_count(oriented) == 1
+
+        fixed_v, fixed_f = fix_normals(vertices, faces, verbose=False)
+
+        assert len(fixed_f) == len(faces) - 1
+        assert len(fixed_v) <= len(vertices)
+        assert _same_direction_manifold_conflict_count(fixed_f) == 0
+
     def test_radial_heuristic_orients_globally_inverted_patch_outward(self):
         """The optional radial heuristic can flip a consistent open component."""
         vertices, faces = _make_open_box()
