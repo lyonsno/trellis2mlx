@@ -74,6 +74,7 @@ def test_uv_visible_orientation_result_records_post_repair_provenance(monkeypatc
         "uv_visible_orient_input_faces": 2,
         "uv_visible_orient_changed_faces": 1,
         "uv_visible_back_only_repair_applied": 0,
+        "uv_visible_back_only_repair_image_size": 17,
         "uv_visible_back_only_repair_changed_faces": 0,
     }
 
@@ -89,6 +90,7 @@ def test_uv_visible_orientation_result_records_opt_in_back_only_repair(monkeypat
         return export_vertices, input_faces
 
     def fake_back_only_repair(export_vertices, input_faces, *, image_size, verbose):
+        assert image_size == 31
         repaired = input_faces.copy()
         repaired[1] = repaired[1][::-1]
         return export_vertices, repaired
@@ -111,6 +113,7 @@ def test_uv_visible_orientation_result_records_opt_in_back_only_repair(monkeypat
             no_uv_visible_orient=False,
             uv_visible_orient_size=17,
             uv_visible_back_only_repair=True,
+            uv_visible_back_only_repair_size=31,
         ),
     )
 
@@ -122,6 +125,7 @@ def test_uv_visible_orientation_result_records_opt_in_back_only_repair(monkeypat
         "uv_visible_orient_input_faces": 2,
         "uv_visible_orient_changed_faces": 0,
         "uv_visible_back_only_repair_applied": 1,
+        "uv_visible_back_only_repair_image_size": 31,
         "uv_visible_back_only_repair_changed_faces": 1,
     }
 
@@ -146,6 +150,7 @@ def test_uv_visible_orientation_result_records_skip_provenance():
         "uv_visible_orient_input_faces": 1,
         "uv_visible_orient_changed_faces": 0,
         "uv_visible_back_only_repair_applied": 0,
+        "uv_visible_back_only_repair_image_size": 17,
         "uv_visible_back_only_repair_changed_faces": 0,
     }
 

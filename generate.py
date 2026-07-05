@@ -161,6 +161,10 @@ class UvOrientationResult:
 
 def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
     input_faces = int(len(uv_faces))
+    back_only_repair_size = int(
+        getattr(args, "uv_visible_back_only_repair_size", None)
+        or args.uv_visible_orient_size
+    )
     if args.no_uv_visible_orient:
         print("  UV visible island orientation: skipped (--no-uv-visible-orient)", flush=True)
         return UvOrientationResult(
@@ -172,6 +176,7 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
                 "uv_visible_orient_input_faces": input_faces,
                 "uv_visible_orient_changed_faces": 0,
                 "uv_visible_back_only_repair_applied": 0,
+                "uv_visible_back_only_repair_image_size": back_only_repair_size,
                 "uv_visible_back_only_repair_changed_faces": 0,
             },
         )
@@ -201,7 +206,7 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
         _, repaired_faces = repair_back_only_uv_faces_by_visible_exterior(
             export_verts,
             oriented_faces,
-            image_size=args.uv_visible_orient_size,
+            image_size=back_only_repair_size,
             verbose=True,
         )
         back_only_changed = int((repaired_faces != oriented_faces).any(axis=1).sum())
@@ -226,6 +231,7 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
             "uv_visible_back_only_repair_applied": int(
                 bool(getattr(args, "uv_visible_back_only_repair", False))
             ),
+            "uv_visible_back_only_repair_image_size": back_only_repair_size,
             "uv_visible_back_only_repair_changed_faces": back_only_changed,
         },
     )
@@ -574,6 +580,8 @@ def main():
     parser.add_argument("--uv-visible-back-only-repair", action="store_true",
                         help="After UV island orientation, flip faces visible only through their back side. "
                              "Production one-sided-viewer repair, not reference parity.")
+    parser.add_argument("--uv-visible-back-only-repair-size", type=int, default=None,
+                        help="Image size for --uv-visible-back-only-repair. Defaults to --uv-visible-orient-size.")
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")
