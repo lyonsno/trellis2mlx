@@ -544,6 +544,46 @@ class TestFillSmallHolesPerimeter:
             ], dtype=np.int64),
         )
 
+    def test_fills_hole_when_boundary_edge_directions_disagree(self):
+        """Hole tracing must use boundary geometry, not directed raw winding."""
+        inner = 0.005
+        outer = 0.05
+        verts = np.array([
+            [0.0, 0.0, 0.0],
+            [inner, 0.0, 0.0],
+            [inner, inner, 0.0],
+            [0.0, inner, 0.0],
+            [-outer, -outer, 0.0],
+            [outer, -outer, 0.0],
+            [outer, outer, 0.0],
+            [-outer, outer, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ], dtype=np.int64)
+
+        _, filled = fill_small_holes(
+            verts,
+            faces,
+            max_hole_perimeter=4 * inner + 1e-4,
+            verbose=False,
+        )
+
+        assert len(filled) == len(faces) + 4
+        assert filled[-4:].tolist() == [
+            [1, 0, 8],
+            [2, 1, 8],
+            [3, 2, 8],
+            [3, 0, 8],
+        ]
+
     def test_filled_hole_conflicts_are_cleared_by_final_normal_repair(self):
         """Cumesh-order caps can conflict locally; final normal repair owns cleanup."""
         verts, faces = _make_open_box()

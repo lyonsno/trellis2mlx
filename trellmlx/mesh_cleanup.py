@@ -228,26 +228,69 @@ def fill_small_holes(
     if not boundary_edges:
         return vertices, faces
 
-    # Build directed adjacency for boundary vertices.
+    directed_adj = {}
+    for v0, v1 in boundary_edges:
+        directed_adj.setdefault(v0, []).append(v1)
+
+    loops = []
+    loop_edge_sets = set()
+
+    # Prefer the directed boundary order when it already closes. That preserves
+    # the observed cumesh cap ordering for consistently wound loops.
+    visited_directed_edges = set()
+    for start_edge in boundary_edges:
+        if start_edge in visited_directed_edges:
+            continue
+        loop = [start_edge[0], start_edge[1]]
+        visited_directed_edges.add(start_edge)
+        closed = False
+        while True:
+            current = loop[-1]
+            neighbors = directed_adj.get(current, [])
+            next_vertex = None
+            for n in neighbors:
+                e = (current, n)
+                if e not in visited_directed_edges:
+                    next_vertex = n
+                    visited_directed_edges.add(e)
+                    break
+            if next_vertex is None:
+                break
+            if next_vertex == loop[0] and len(loop) >= 3:
+                closed = True
+                break
+            if next_vertex in loop:
+                break
+            loop.append(next_vertex)
+        if closed:
+            loops.append(loop)
+            for i in range(len(loop)):
+                loop_edge_sets.add(tuple(sorted((loop[i], loop[(i + 1) % len(loop)]))))
+
+    # Fall back to undirected loop tracing for raw meshes whose boundary edge
+    # directions are inconsistent around a geometric hole.
     boundary_adj = {}
     for v0, v1 in boundary_edges:
-        boundary_adj.setdefault(v0, []).append(v1)
+        boundary_adj.setdefault(v0, set()).add(v1)
+        boundary_adj.setdefault(v1, set()).add(v0)
 
-    # Trace boundary loops
-    visited_edges = set()
-    loops = []
-    for start_edge in boundary_edges:
+    visited_edges = set(loop_edge_sets)
+    undirected_boundary_edges = sorted({tuple(sorted(edge)) for edge in boundary_edges})
+    for start_edge in undirected_boundary_edges:
         if start_edge in visited_edges:
             continue
         loop = [start_edge[0], start_edge[1]]
         visited_edges.add(start_edge)
         closed = False
         while True:
+            previous = loop[-2]
             current = loop[-1]
-            neighbors = boundary_adj.get(current, [])
+            neighbors = sorted(boundary_adj.get(current, ()))
             next_vertex = None
             for n in neighbors:
-                e = (current, n)
+                if n == previous:
+                    continue
+                e = tuple(sorted((current, n)))
                 if e not in visited_edges:
                     next_vertex = n
                     visited_edges.add(e)
@@ -261,6 +304,10 @@ def fill_small_holes(
                 break
             loop.append(next_vertex)
         if closed:
+            min_pos = int(np.argmin(loop))
+            loop = loop[min_pos:] + loop[:min_pos]
+            if len(loop) > 2 and loop[-1] < loop[1]:
+                loop = [loop[0]] + list(reversed(loop[1:]))
             loops.append(loop)
 
     if not loops:
