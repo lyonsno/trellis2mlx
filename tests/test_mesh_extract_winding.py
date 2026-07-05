@@ -18,10 +18,11 @@ def _export_vertices(vertices):
     return export
 
 
-def _source_table_faces(coords, intersected_flag, split_weight):
+def _source_table_faces_with_axes(coords, intersected_flag, split_weight):
     """Minimal copy of the Trellis-Mac/source table path, without route patches."""
     coord_to_idx = {tuple(coord.tolist()): i for i, coord in enumerate(coords)}
     faces = []
+    axes = []
     for voxel, flags in zip(coords, intersected_flag):
         for axis, enabled in enumerate(flags):
             if not enabled:
@@ -39,11 +40,12 @@ def _source_table_faces(coords, intersected_flag, split_weight):
             sw = split_weight[quad, 0]
             split = _QUAD_SPLIT_1 if sw[0] * sw[2] > sw[1] * sw[3] else _QUAD_SPLIT_2
             faces.append(quad[split].reshape(2, 3))
-    return np.vstack(faces).astype(np.int64)
+            axes.extend([axis, axis])
+    return np.vstack(faces).astype(np.int64), np.asarray(axes, dtype=np.int64)
 
 
-def test_flexible_dual_grid_matches_source_face_order_without_axis_flip():
-    """The source extractor tables do not apply a per-edge-axis winding flip."""
+def test_flexible_dual_grid_applies_export_winding_correction_to_source_tables():
+    """MLX export-space exterior winding reverses source-table axes 0 and 2."""
     from trellmlx.mesh_extract import flexible_dual_grid_to_mesh
 
     coords = np.array(
@@ -63,12 +65,14 @@ def test_flexible_dual_grid_matches_source_face_order_without_axis_flip():
         grid_size=3,
     )
 
-    expected = _source_table_faces(coords, intersected_flag, split_weight)
+    source_faces, source_axes = _source_table_faces_with_axes(coords, intersected_flag, split_weight)
+    expected = source_faces.copy()
+    expected[(source_axes == 0) | (source_axes == 2)] = expected[(source_axes == 0) | (source_axes == 2), ::-1]
     np.testing.assert_array_equal(faces, expected)
 
 
-def test_decoder_output_source_winding_is_not_projected_culling_authority():
-    """A projection proxy must not override source extractor face order."""
+def test_decoder_output_dense_cube_projects_front_faces_on_all_panels():
+    """A dense extracted shell should be front-facing under the GLB export convention."""
     from scripts.mesh_culling_attribution import (
         default_front_face_for_panel,
         projected_front_face_missing_attribution,
@@ -102,5 +106,4 @@ def test_decoder_output_source_winding_is_not_projected_culling_authority():
         panel_ratios[panel] = report["missing_pixel_ratio_vs_double_sided"]
 
     assert reference > 0
-    assert missing > 0
-    assert any(ratio > 0 for ratio in panel_ratios.values()), panel_ratios
+    assert missing == 0, panel_ratios

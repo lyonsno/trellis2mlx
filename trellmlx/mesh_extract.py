@@ -108,6 +108,7 @@ def flexible_dual_grid_to_mesh(
     edge_neighbors = coords[:, None, None, :] + _EDGE_NEIGHBOR_OFFSETS[None, :, :, :]
     # edge_neighbors: [N, 3, 4, 3]
     connected = edge_neighbors[intersected_flag]  # [M, 4, 3]
+    edge_axes = np.broadcast_to(np.arange(3, dtype=np.int64), intersected_flag.shape)[intersected_flag]
     M = connected.shape[0]
 
     if M == 0:
@@ -123,6 +124,7 @@ def flexible_dual_grid_to_mesh(
     # Filter: only keep quads where all 4 corners exist
     valid = np.all(indices != MISSING, axis=1)
     quad_indices = indices[valid]
+    quad_edge_axes = edge_axes[valid]
     L = quad_indices.shape[0]
 
     if L == 0:
@@ -169,7 +171,17 @@ def flexible_dual_grid_to_mesh(
             cond,
             quad_indices[:, _QUAD_SPLIT_1],
             quad_indices[:, _QUAD_SPLIT_2],
-        ).reshape(-1, 3)
+        )
+
+    # Keep source table topology, but orient quads for the MLX GLB exterior
+    # convention. Axes 0 and 2 are opposite after the port/export transform.
+    flip = (quad_edge_axes == 0) | (quad_edge_axes == 2)
+    if np.any(flip):
+        mesh_triangles = mesh_triangles.reshape(L, 2, 3)
+        mesh_triangles[flip] = mesh_triangles[flip, :, ::-1]
+        mesh_triangles = mesh_triangles.reshape(-1, 3)
+    else:
+        mesh_triangles = mesh_triangles.reshape(-1, 3)
 
     return mesh_vertices, mesh_triangles
 
