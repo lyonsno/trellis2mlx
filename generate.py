@@ -273,6 +273,7 @@ def _cleanup_and_simplify_mesh(
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
+    orient_faces_by_adjacency=None,
     save_postprocess_stage=None,
     log=print,
 ):
@@ -291,6 +292,26 @@ def _cleanup_and_simplify_mesh(
         t0 = time.perf_counter()
         vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, verbose=False)
         log(f"  Cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
+        save_stage("mesh_after_cleanup_final", vertices, faces)
+        return vertices, faces
+
+    def reference_final_cleanup(vertices, faces):
+        if no_cleanup:
+            return vertices, faces
+        if orient_faces_by_adjacency is None:
+            from trellmlx.mesh_cleanup import orient_faces_by_adjacency as orient_reference_faces
+        else:
+            orient_reference_faces = orient_faces_by_adjacency
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(
+            vertices,
+            faces,
+            keep_largest=keep_largest,
+            do_fix_normals=False,
+            verbose=False,
+        )
+        vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
+        log(f"  Reference cleanup final cleanup/orient: {time.perf_counter()-t0:.1f}s", flush=True)
         save_stage("mesh_after_cleanup_final", vertices, faces)
         return vertices, faces
 
@@ -358,7 +379,7 @@ def _cleanup_and_simplify_mesh(
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
             save_stage("mesh_after_final_simplify", vertices, faces)
 
-        vertices, faces = final_cleanup(vertices, faces)
+        vertices, faces = reference_final_cleanup(vertices, faces)
         return vertices, faces
 
     # Simplify-first mode: reduce face count before expensive cleanup
