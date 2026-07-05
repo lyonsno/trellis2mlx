@@ -171,10 +171,15 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
                 "uv_visible_orient_image_size": int(args.uv_visible_orient_size),
                 "uv_visible_orient_input_faces": input_faces,
                 "uv_visible_orient_changed_faces": 0,
+                "uv_visible_back_only_repair_applied": 0,
+                "uv_visible_back_only_repair_changed_faces": 0,
             },
         )
 
-    from trellmlx.mesh_cleanup import orient_uv_islands_by_visible_exterior
+    from trellmlx.mesh_cleanup import (
+        orient_uv_islands_by_visible_exterior,
+        repair_back_only_uv_faces_by_visible_exterior,
+    )
 
     export_verts = _glb_export_vertices(uv_verts)
     t0 = time.perf_counter()
@@ -190,14 +195,38 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
         f"changed {changed:,} faces ({time.perf_counter()-t0:.1f}s)",
         flush=True,
     )
+    back_only_changed = 0
+    if getattr(args, "uv_visible_back_only_repair", False):
+        repair_start = time.perf_counter()
+        _, repaired_faces = repair_back_only_uv_faces_by_visible_exterior(
+            export_verts,
+            oriented_faces,
+            image_size=args.uv_visible_orient_size,
+            verbose=True,
+        )
+        back_only_changed = int((repaired_faces != oriented_faces).any(axis=1).sum())
+        oriented_faces = repaired_faces
+        print(
+            f"  UV visible back-only face repair: changed {back_only_changed:,} faces "
+            f"({time.perf_counter()-repair_start:.1f}s)",
+            flush=True,
+        )
     return UvOrientationResult(
         faces=oriented_faces,
         metadata={
-            "uv_face_orientation_provenance": "post_visible_exterior_orient",
+            "uv_face_orientation_provenance": (
+                "post_visible_exterior_orient_with_back_only_repair"
+                if getattr(args, "uv_visible_back_only_repair", False)
+                else "post_visible_exterior_orient"
+            ),
             "uv_visible_orient_applied": 1,
             "uv_visible_orient_image_size": int(args.uv_visible_orient_size),
             "uv_visible_orient_input_faces": input_faces,
             "uv_visible_orient_changed_faces": changed,
+            "uv_visible_back_only_repair_applied": int(
+                bool(getattr(args, "uv_visible_back_only_repair", False))
+            ),
+            "uv_visible_back_only_repair_changed_faces": back_only_changed,
         },
     )
 
@@ -542,6 +571,9 @@ def main():
                         help="Skip post-UV visible-exterior island orientation before texture bake/export")
     parser.add_argument("--uv-visible-orient-size", type=int, default=192,
                         help="Image size for post-UV visible-exterior island orientation (default: 192)")
+    parser.add_argument("--uv-visible-back-only-repair", action="store_true",
+                        help="After UV island orientation, flip faces visible only through their back side. "
+                             "Production one-sided-viewer repair, not reference parity.")
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")

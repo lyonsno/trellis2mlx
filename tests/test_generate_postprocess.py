@@ -73,6 +73,56 @@ def test_uv_visible_orientation_result_records_post_repair_provenance(monkeypatc
         "uv_visible_orient_image_size": 17,
         "uv_visible_orient_input_faces": 2,
         "uv_visible_orient_changed_faces": 1,
+        "uv_visible_back_only_repair_applied": 0,
+        "uv_visible_back_only_repair_changed_faces": 0,
+    }
+
+
+def test_uv_visible_orientation_result_records_opt_in_back_only_repair(monkeypatch):
+    import trellmlx.mesh_cleanup
+    from generate import _orient_uv_faces_for_export
+
+    vertices = np.zeros((6, 3), dtype=np.float32)
+    faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+
+    def fake_visible_orient(export_vertices, input_faces, *, image_size, verbose):
+        return export_vertices, input_faces
+
+    def fake_back_only_repair(export_vertices, input_faces, *, image_size, verbose):
+        repaired = input_faces.copy()
+        repaired[1] = repaired[1][::-1]
+        return export_vertices, repaired
+
+    monkeypatch.setattr(
+        trellmlx.mesh_cleanup,
+        "orient_uv_islands_by_visible_exterior",
+        fake_visible_orient,
+    )
+    monkeypatch.setattr(
+        trellmlx.mesh_cleanup,
+        "repair_back_only_uv_faces_by_visible_exterior",
+        fake_back_only_repair,
+    )
+
+    result = _orient_uv_faces_for_export(
+        vertices,
+        faces,
+        SimpleNamespace(
+            no_uv_visible_orient=False,
+            uv_visible_orient_size=17,
+            uv_visible_back_only_repair=True,
+        ),
+    )
+
+    np.testing.assert_array_equal(result.faces, np.array([[0, 1, 2], [5, 4, 3]]))
+    assert result.metadata == {
+        "uv_face_orientation_provenance": "post_visible_exterior_orient_with_back_only_repair",
+        "uv_visible_orient_applied": 1,
+        "uv_visible_orient_image_size": 17,
+        "uv_visible_orient_input_faces": 2,
+        "uv_visible_orient_changed_faces": 0,
+        "uv_visible_back_only_repair_applied": 1,
+        "uv_visible_back_only_repair_changed_faces": 1,
     }
 
 
@@ -95,6 +145,8 @@ def test_uv_visible_orientation_result_records_skip_provenance():
         "uv_visible_orient_image_size": 17,
         "uv_visible_orient_input_faces": 1,
         "uv_visible_orient_changed_faces": 0,
+        "uv_visible_back_only_repair_applied": 0,
+        "uv_visible_back_only_repair_changed_faces": 0,
     }
 
 

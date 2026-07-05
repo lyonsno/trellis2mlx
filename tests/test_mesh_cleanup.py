@@ -21,6 +21,7 @@ from trellmlx.mesh_cleanup import (
     orient_faces_by_adjacency,
     orient_components_outward_by_radial_heuristic,
     orient_uv_islands_by_visible_exterior,
+    repair_back_only_uv_faces_by_visible_exterior,
     fix_normals,
 )
 
@@ -435,6 +436,37 @@ class TestFixNormals:
         changed_rows = np.flatnonzero((oriented != inverted).any(axis=1))
         np.testing.assert_array_equal(changed_rows, np.array([2, 3]))
         np.testing.assert_array_equal(oriented, expected)
+
+    def test_back_only_uv_repair_does_not_flip_bidirectional_faces(self, monkeypatch):
+        """Opt-in face repair is limited to faces never seen front-facing."""
+        import trellmlx.mesh_cleanup as mesh_cleanup
+
+        vertices = np.zeros((9, 3), dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],
+            [3, 4, 5],
+            [6, 7, 8],
+        ], dtype=np.int64)
+
+        def fake_visible_states(vertices64, faces_i64, *, image_size):
+            return {
+                0: {"front": 0, "back": 5, "views_front": {}, "views_back": {"+Z": 5}},
+                1: {"front": 7, "back": 3, "views_front": {"-Z": 7}, "views_back": {"+Z": 3}},
+                2: {"front": 4, "back": 0, "views_front": {"+X": 4}, "views_back": {}},
+            }
+
+        monkeypatch.setattr(mesh_cleanup, "_visible_face_orientation_states", fake_visible_states)
+
+        _, repaired = repair_back_only_uv_faces_by_visible_exterior(
+            vertices,
+            faces,
+            image_size=64,
+            verbose=False,
+        )
+
+        expected = faces.copy()
+        expected[0] = expected[0][::-1]
+        np.testing.assert_array_equal(repaired, expected)
 
 
 class TestRemoveSameDirectionManifoldConflicts:

@@ -8,6 +8,8 @@ The TRELLIS.2 decoder produces raw meshes with:
 This module cleans all three without cumesh (which segfaults on Metal).
 """
 
+from collections import defaultdict
+
 import numpy as np
 from scipy import sparse
 from scipy.sparse.csgraph import connected_components
@@ -723,6 +725,146 @@ _VISIBLE_EXTERIOR_VIEWS = {
 
 def _edge_function_2d(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> float:
     return float((p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0]))
+
+
+def _visible_face_orientation_states(
+    vertices64: np.ndarray,
+    faces_i64: np.ndarray,
+    *,
+    image_size: int,
+) -> dict[int, dict[str, object]]:
+    tri = vertices64[faces_i64]
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal_len = np.linalg.norm(normals, axis=1)
+    unit_normals = np.zeros_like(normals)
+    valid_normals = normal_len > 1e-12
+    unit_normals[valid_normals] = normals[valid_normals] / normal_len[valid_normals, None]
+
+    per_face: defaultdict[int, dict[str, object]] = defaultdict(
+        lambda: {"front": 0, "back": 0, "views_front": {}, "views_back": {}}
+    )
+
+    for view_name, (depth_axis, sign) in _VISIBLE_EXTERIOR_VIEWS.items():
+        axes = [axis for axis in range(3) if axis != depth_axis]
+        outward_axis = np.zeros(3, dtype=np.float64)
+        outward_axis[depth_axis] = float(sign)
+
+        coords = vertices64[:, axes]
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0)
+        span = maxs - mins
+        span[span == 0.0] = 1.0
+
+        margin = max(2.0, image_size * 0.05)
+        scale = min(
+            (image_size - 2.0 * margin) / span[0],
+            (image_size - 2.0 * margin) / span[1],
+        )
+        offset = np.array(
+            [
+                (image_size - span[0] * scale) / 2.0 - mins[0] * scale,
+                (image_size - span[1] * scale) / 2.0 - mins[1] * scale,
+            ],
+            dtype=np.float64,
+        )
+        projected = coords * scale + offset
+        depths = vertices64[:, depth_axis] * float(sign)
+
+        z_buffer = np.full((image_size, image_size), -np.inf, dtype=np.float64)
+        face_buffer = np.full((image_size, image_size), -1, dtype=np.int64)
+
+        for face_index, face in enumerate(faces_i64):
+            tri_2d = projected[face]
+            if not np.isfinite(tri_2d).all():
+                continue
+            area2 = _edge_function_2d(tri_2d[0], tri_2d[1], tri_2d[2])
+            if abs(area2) < 1e-8:
+                continue
+
+            min_xy = np.floor(tri_2d.min(axis=0)).astype(int)
+            max_xy = np.ceil(tri_2d.max(axis=0)).astype(int)
+            x0 = max(0, int(min_xy[0]))
+            y0 = max(0, int(min_xy[1]))
+            x1 = min(image_size - 1, int(max_xy[0]))
+            y1 = min(image_size - 1, int(max_xy[1]))
+            if x0 > x1 or y0 > y1:
+                continue
+
+            tri_depths = depths[face]
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    sample = np.array([x + 0.5, y + 0.5], dtype=np.float64)
+                    w0 = _edge_function_2d(tri_2d[1], tri_2d[2], sample) / area2
+                    w1 = _edge_function_2d(tri_2d[2], tri_2d[0], sample) / area2
+                    w2 = _edge_function_2d(tri_2d[0], tri_2d[1], sample) / area2
+                    if w0 < -1e-8 or w1 < -1e-8 or w2 < -1e-8:
+                        continue
+                    depth = w0 * tri_depths[0] + w1 * tri_depths[1] + w2 * tri_depths[2]
+                    if depth > z_buffer[y, x]:
+                        z_buffer[y, x] = depth
+                        face_buffer[y, x] = face_index
+
+        visible_faces, visible_counts = np.unique(
+            face_buffer[face_buffer >= 0],
+            return_counts=True,
+        )
+        if len(visible_faces) == 0:
+            continue
+        backfacing = (unit_normals[visible_faces] @ outward_axis) < -1e-6
+        for face_index, pixels, is_backfacing in zip(visible_faces, visible_counts, backfacing):
+            entry = per_face[int(face_index)]
+            if bool(is_backfacing):
+                entry["back"] = int(entry["back"]) + int(pixels)
+                entry["views_back"][view_name] = int(pixels)
+            else:
+                entry["front"] = int(entry["front"]) + int(pixels)
+                entry["views_front"][view_name] = int(pixels)
+
+    return dict(per_face)
+
+
+def repair_back_only_uv_faces_by_visible_exterior(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    image_size: int = 128,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flip UV/export faces that are visible only through their back side.
+
+    This is an explicit production visibility repair, not reference parity. It
+    intentionally leaves bidirectional faces alone: if a face is front-facing
+    in any exterior view, flipping it would trade one one-sided loss for
+    another.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+
+    vertices64 = np.asarray(vertices, dtype=np.float64)
+    faces_i64 = np.asarray(faces, dtype=np.int64)
+    per_face = _visible_face_orientation_states(vertices64, faces_i64, image_size=image_size)
+    flip_faces = np.asarray(
+        [
+            face
+            for face, state in per_face.items()
+            if int(state["back"]) > 0 and int(state["front"]) == 0
+        ],
+        dtype=np.int64,
+    )
+
+    if len(flip_faces) == 0:
+        return vertices, faces
+
+    oriented = np.array(faces, copy=True)
+    oriented[flip_faces] = oriented[flip_faces][:, ::-1]
+    if verbose:
+        print(
+            f"  Flipped {int(len(flip_faces)):,} back-only visible UV faces",
+            flush=True,
+        )
+    return vertices, oriented.astype(faces.dtype, copy=False)
 
 
 def orient_uv_islands_by_visible_exterior(
