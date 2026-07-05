@@ -287,7 +287,7 @@ def fill_small_holes(
         for i in range(len(loop)):
             v0 = loop[i]
             v1 = loop[(i + 1) % len(loop)]
-            new_faces.append([v1, v0, centroid_idx])
+            new_faces.append([max(v0, v1), min(v0, v1), centroid_idx])
         filled += 1
 
     if verbose and filled > 0:

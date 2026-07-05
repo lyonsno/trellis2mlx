@@ -505,12 +505,41 @@ class TestFillSmallHolesPerimeter:
         assert len(f_out) == len(faces) + 4
         assert len(v_out) == len(verts) + 1
 
-    def test_filled_hole_preserves_boundary_winding_consistency(self):
-        """Cap triangles must oppose the existing directed boundary edges."""
+    def test_filled_hole_face_order_matches_cumesh_canonical_edge_order(self):
+        """Cumesh caps each boundary edge as [max_vertex, min_vertex, center]."""
+        verts = np.array([
+            [0.0, 0.0, 0.0],
+            [0.005, 0.0, 0.0],
+            [0.0, 0.005, 0.0],
+        ], dtype=np.float32)
+        faces = np.array([[1, 0, 2]], dtype=np.int64)
+
+        _, f_out = fill_small_holes(
+            verts,
+            faces,
+            max_hole_perimeter=1.0,
+            verbose=False,
+        )
+
+        np.testing.assert_array_equal(
+            f_out[1:],
+            np.array([
+                [1, 0, 3],
+                [2, 0, 3],
+                [2, 1, 3],
+            ], dtype=np.int64),
+        )
+
+    def test_filled_hole_conflicts_are_cleared_by_final_normal_repair(self):
+        """Cumesh-order caps can conflict locally; final normal repair owns cleanup."""
         verts, faces = _make_open_box()
         v_out, f_out = fill_small_holes(verts, faces, max_hole_perimeter=3e-2, verbose=False)
         assert len(f_out) == len(faces) + 4
-        _assert_manifold_edges_oppositely_oriented(f_out)
+        assert _same_direction_manifold_conflict_count(f_out) > 0
+
+        _, fixed_f = fix_normals(v_out, f_out, verbose=False)
+
+        _assert_manifold_edges_oppositely_oriented(fixed_f)
 
 
 class TestCleanupMeshIntegration:
