@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 
 def test_source_face_index_map_tracks_same_reversed_and_unmatched_faces():
@@ -67,6 +68,39 @@ def test_visible_backface_attribution_reports_face_ids_and_pixels():
     assert report["visible_pixels"] > 0
     assert report["backfacing_visible_pixels"] == report["visible_pixels"]
     assert set(report["backface_pixels_by_face"]) == {0, 1}
+
+
+def test_visible_backface_attribution_accepts_oblique_view_direction():
+    from scripts.mesh_culling_attribution import visible_backface_attribution_for_direction
+
+    vertices = np.array(
+        [
+            [-0.5, 0.0, -0.5],
+            [0.5, 0.0, -0.5],
+            [0.5, 0.0, 0.5],
+            [-0.5, 0.0, 0.5],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+        ],
+        dtype=np.int64,
+    )
+
+    report = visible_backface_attribution_for_direction(
+        vertices=vertices,
+        faces=faces,
+        view_direction=np.array([0.0, 1.0, 1.0]),
+        image_size=32,
+    )
+
+    assert report["visible_pixels"] > 0
+    assert report["backfacing_visible_pixels"] == report["visible_pixels"]
+    assert set(report["backface_pixels_by_face"]) == {0, 1}
+    assert report["view_direction"] == [0.0, pytest.approx(2**-0.5), pytest.approx(2**-0.5)]
 
 
 def test_default_projected_front_face_convention_is_panel_specific():

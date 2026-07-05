@@ -133,26 +133,38 @@ def _face_normals_and_areas(vertices: np.ndarray, faces: np.ndarray) -> tuple[np
     return unit, areas
 
 
-def visible_backface_attribution(
+def _view_basis_for_direction(view_direction: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    outward = np.asarray(view_direction, dtype=np.float64)
+    norm = float(np.linalg.norm(outward))
+    if norm <= 1e-12:
+        raise ValueError("view_direction must be non-zero")
+    outward = outward / norm
+
+    helper = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(outward, helper))) > 0.95:
+        helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    axis_a = np.cross(helper, outward)
+    axis_a /= np.linalg.norm(axis_a)
+    axis_b = np.cross(outward, axis_a)
+    axis_b /= np.linalg.norm(axis_b)
+    return outward, axis_a, axis_b
+
+
+def visible_backface_attribution_for_direction(
     *,
     vertices: np.ndarray,
     faces: np.ndarray,
-    view_name: str,
+    view_direction: np.ndarray,
     image_size: int,
+    view_name: str | None = None,
 ) -> dict[str, Any]:
-    """Rasterize one axis view and return visible/backfacing face pixel counts."""
-    if view_name not in VISIBLE_EXTERIOR_VIEWS:
-        raise ValueError(f"unknown view {view_name}")
+    """Rasterize one orthographic exterior direction and count visible backfaces."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
     normals, _ = _face_normals_and_areas(vertices, faces)
+    outward_axis, axis_a, axis_b = _view_basis_for_direction(view_direction)
 
-    depth_axis, sign = VISIBLE_EXTERIOR_VIEWS[view_name]
-    axes = [axis for axis in range(3) if axis != depth_axis]
-    outward_axis = np.zeros(3, dtype=np.float64)
-    outward_axis[depth_axis] = float(sign)
-
-    coords = vertices[:, axes]
+    coords = np.column_stack((vertices @ axis_a, vertices @ axis_b))
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
     span = maxs - mins
@@ -168,7 +180,7 @@ def visible_backface_attribution(
         dtype=np.float64,
     )
     projected = coords * scale + offset
-    depths = vertices[:, depth_axis] * float(sign)
+    depths = vertices @ outward_axis
 
     z_buffer = np.full((image_size, image_size), -np.inf, dtype=np.float64)
     face_buffer = np.full((image_size, image_size), -1, dtype=np.int64)
@@ -210,6 +222,7 @@ def visible_backface_attribution(
     if len(visible_face_ids) == 0:
         return {
             "view": view_name,
+            "view_direction": outward_axis.tolist(),
             "visible_pixels": 0,
             "backfacing_visible_pixels": 0,
             "backfacing_visible_ratio": 0.0,
@@ -223,6 +236,7 @@ def visible_backface_attribution(
     backface_pixels_by_face = Counter(int(face) for face in back_face_ids)
     return {
         "view": view_name,
+        "view_direction": outward_axis.tolist(),
         "image_size": int(image_size),
         "visible_pixels": int(len(visible_face_ids)),
         "backfacing_visible_pixels": int(back.sum()),
@@ -232,6 +246,28 @@ def visible_backface_attribution(
         "visible_pixels_by_face": dict(visible_pixels_by_face),
         "backface_pixels_by_face": dict(backface_pixels_by_face),
     }
+
+
+def visible_backface_attribution(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    view_name: str,
+    image_size: int,
+) -> dict[str, Any]:
+    """Rasterize one axis view and return visible/backfacing face pixel counts."""
+    if view_name not in VISIBLE_EXTERIOR_VIEWS:
+        raise ValueError(f"unknown view {view_name}")
+    depth_axis, sign = VISIBLE_EXTERIOR_VIEWS[view_name]
+    direction = np.zeros(3, dtype=np.float64)
+    direction[depth_axis] = float(sign)
+    return visible_backface_attribution_for_direction(
+        vertices=vertices,
+        faces=faces,
+        view_direction=direction,
+        image_size=image_size,
+        view_name=view_name,
+    )
 
 
 def _load_npz(path: Path) -> dict[str, np.ndarray]:

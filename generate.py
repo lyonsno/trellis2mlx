@@ -118,6 +118,23 @@ def _mesh_coord_space():
     return TRELLIS_WORLD_COORD_SPACE
 
 
+def _make_postprocess_stage_saver(checkpoint_dir, mesh_grid_size):
+    def save_stage(stage, vertices, faces):
+        from trellmlx.checkpoint import save_checkpoint
+
+        save_checkpoint(
+            checkpoint_dir,
+            stage,
+            vertices=np.asarray(vertices),
+            faces=np.asarray(faces),
+            mesh_grid_size=mesh_grid_size,
+            mesh_coord_space=_mesh_coord_space(),
+            postprocess_stage=stage,
+        )
+
+    return save_stage
+
+
 def _glb_export_vertices(vertices):
     export_verts = vertices.copy()
     export_verts[:, 1], export_verts[:, 2] = vertices[:, 2].copy(), -vertices[:, 1].copy()
@@ -256,6 +273,7 @@ def _cleanup_and_simplify_mesh(
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
+    save_postprocess_stage=None,
     log=print,
 ):
     """Run mesh cleanup and multi-pass simplification.
@@ -263,12 +281,17 @@ def _cleanup_and_simplify_mesh(
     With simplify_first=True, simplifies the raw mesh before cleanup.
     Much faster on large meshes (cleanup on 200K faces vs 6M faces).
     """
+    def save_stage(stage, vertices, faces):
+        if save_postprocess_stage is not None:
+            save_postprocess_stage(stage, vertices, faces)
+
     def final_cleanup(vertices, faces):
         if no_cleanup:
             return vertices, faces
         t0 = time.perf_counter()
         vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, verbose=False)
         log(f"  Cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
+        save_stage("mesh_after_cleanup_final", vertices, faces)
         return vertices, faces
 
     if not no_cleanup:
@@ -291,6 +314,7 @@ def _cleanup_and_simplify_mesh(
         )
         log(f"  Reference cleanup initial hole fill: {len(vertices):,}V {len(faces):,}F "
             f"({time.perf_counter()-t0:.1f}s)", flush=True)
+        save_stage("mesh_after_initial_fill", vertices, faces)
 
         coarse_target = target_faces * 3
         if len(faces) > coarse_target:
@@ -299,6 +323,7 @@ def _cleanup_and_simplify_mesh(
             vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
             log(f"  Reference cleanup coarse simplify: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            save_stage("mesh_after_coarse_simplify", vertices, faces)
 
         t0 = time.perf_counter()
         vertices, faces = cleanup_mesh(
@@ -308,6 +333,7 @@ def _cleanup_and_simplify_mesh(
             do_fix_normals=False,
         )
         log(f"  Reference cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
+        save_stage("mesh_after_cleanup_pass1", vertices, faces)
 
         if len(faces) > target_faces:
             t0 = time.perf_counter()
@@ -331,6 +357,7 @@ def _cleanup_and_simplify_mesh(
                         break
             log(f"  Reference cleanup final simplify: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            save_stage("mesh_after_final_simplify", vertices, faces)
 
         vertices, faces = final_cleanup(vertices, faces)
         return vertices, faces
@@ -353,15 +380,18 @@ def _cleanup_and_simplify_mesh(
                     if len(faces) <= coarse_target * 1.1: break
                 log(f"  Pre-simplify (coarse): {len(vertices):,}V {len(faces):,}F "
                     f"({time.perf_counter()-t0:.1f}s)", flush=True)
+                save_stage("mesh_after_coarse_simplify", vertices, faces)
             if not no_cleanup:
                 t0 = time.perf_counter()
                 vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
                 log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+                save_stage("mesh_after_cleanup_pass1", vertices, faces)
             from trellmlx.simplify_qem_metal import simplify_qem
             t0 = time.perf_counter()
             vertices, faces = simplify_qem(vertices, faces, target_faces, verbose=True)
             log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            save_stage("mesh_after_final_simplify", vertices, faces)
             vertices, faces = final_cleanup(vertices, faces)
             return vertices, faces
         else:
@@ -375,17 +405,20 @@ def _cleanup_and_simplify_mesh(
                 vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
                 if len(faces) <= target_faces * 1.1: break
             log(f"  Pre-simplify: {len(vertices):,}V {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
+            save_stage("mesh_after_final_simplify", vertices, faces)
             # Single cleanup pass on the small mesh
             if not no_cleanup:
                 t0 = time.perf_counter()
                 vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest)
                 log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
+                save_stage("mesh_after_cleanup_final", vertices, faces)
             return vertices, faces
 
     if not no_cleanup:
         t0 = time.perf_counter()
         vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
         log(f"  Cleanup pass 1: {time.perf_counter()-t0:.1f}s", flush=True)
+        save_stage("mesh_after_cleanup_pass1", vertices, faces)
 
     if not target_faces or len(faces) <= target_faces:
         vertices, faces = final_cleanup(vertices, faces)
@@ -404,8 +437,10 @@ def _cleanup_and_simplify_mesh(
             vertices, faces, target_reduction=1.0 - ratio,
         )
         log(f"  Coarse simplify: {len(faces):,}F ({time.perf_counter()-t0:.1f}s)", flush=True)
+        save_stage("mesh_after_coarse_simplify", vertices, faces)
         if not no_cleanup:
             vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False, verbose=False)
+            save_stage("mesh_after_cleanup_pass2", vertices, faces)
 
     if len(faces) <= target_faces:
         vertices, faces = final_cleanup(vertices, faces)
@@ -419,6 +454,7 @@ def _cleanup_and_simplify_mesh(
             vertices, faces, target_faces, verbose=True)
         log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
             f"({time.perf_counter()-t0:.1f}s)", flush=True)
+        save_stage("mesh_after_final_simplify", vertices, faces)
         vertices, faces = final_cleanup(vertices, faces)
     else:
         did_final_simplify = False
@@ -437,6 +473,8 @@ def _cleanup_and_simplify_mesh(
                 break
         log(f"  Final simplify: {len(vertices):,}V {len(faces):,}F "
             f"({time.perf_counter()-t0:.1f}s)", flush=True)
+        if did_final_simplify:
+            save_stage("mesh_after_final_simplify", vertices, faces)
         if did_final_simplify:
             vertices, faces = final_cleanup(vertices, faces)
 
@@ -566,6 +604,10 @@ def main():
                 simplify_first=args.simplify_first,
                 reference_cleanup=args.reference_cleanup,
                 qem_simplify=args.qem_simplify,
+                save_postprocess_stage=(
+                    _make_postprocess_stage_saver(args.save_checkpoints, mesh_grid_size)
+                    if args.save_checkpoints else None
+                ),
             )
             vertices, faces = _apply_voxel_remesh_if_requested(
                 vertices,
@@ -588,6 +630,13 @@ def main():
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(args.save_checkpoints, "mesh_uv_pre_visible_orient",
+                                vertices=uv_verts, faces=uv_faces,
+                                uvs=uvs, vmapping=vmapping,
+                                mesh_grid_size=mesh_grid_size,
+                                mesh_coord_space=_mesh_coord_space())
             uv_orientation = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
             uv_faces = uv_orientation.faces
             if args.save_checkpoints:
@@ -1155,6 +1204,10 @@ def main():
         simplify_first=args.simplify_first,
         reference_cleanup=args.reference_cleanup,
         qem_simplify=args.qem_simplify,
+        save_postprocess_stage=(
+            _make_postprocess_stage_saver(args.save_checkpoints, mesh_grid_size)
+            if args.save_checkpoints else None
+        ),
     )
     vertices, faces = _apply_voxel_remesh_if_requested(
         vertices,
@@ -1268,6 +1321,13 @@ def main():
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_uv_pre_visible_orient",
+                        vertices=uv_verts, faces=uv_faces,
+                        uvs=uvs, vmapping=vmapping,
+                        mesh_grid_size=mesh_grid_size,
+                        mesh_coord_space=_mesh_coord_space())
     uv_orientation = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
     uv_faces = uv_orientation.faces
     if args.save_checkpoints:

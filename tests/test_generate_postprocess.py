@@ -240,6 +240,67 @@ def test_postprocess_reference_cleanup_fills_before_staged_simplification():
     ]
 
 
+def test_postprocess_reference_cleanup_records_stage_boundaries():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(190_000)]
+    records = []
+
+    def fill_holes(v, faces, max_hole_perimeter=3e-2, verbose=True):
+        return v, FaceBag(1_010_000)
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        return v, cleanup_outputs.pop(0)
+
+    def simplify(v, faces, target_reduction):
+        if len(records) <= 1:
+            return v, FaceBag(600_000)
+        return v, FaceBag(200_000)
+
+    def save_stage(stage, v, faces):
+        records.append((stage, len(faces)))
+
+    _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        cleanup_mesh=cleanup_mesh,
+        fill_holes=fill_holes,
+        simplify=simplify,
+        save_postprocess_stage=save_stage,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert records == [
+        ("mesh_after_initial_fill", 1_010_000),
+        ("mesh_after_coarse_simplify", 600_000),
+        ("mesh_after_cleanup_pass1", 500_000),
+        ("mesh_after_final_simplify", 200_000),
+        ("mesh_after_cleanup_final", 190_000),
+    ]
+
+
+def test_postprocess_stage_saver_writes_mesh_checkpoint(tmp_path):
+    from generate import _make_postprocess_stage_saver, _mesh_coord_space
+    from trellmlx.checkpoint import load_checkpoint
+
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+
+    save_stage = _make_postprocess_stage_saver(str(tmp_path), mesh_grid_size=512)
+    save_stage("mesh_after_cleanup_pass1", vertices, faces)
+
+    data = load_checkpoint(str(tmp_path), "mesh_after_cleanup_pass1")
+    np.testing.assert_array_equal(data["vertices"], vertices)
+    np.testing.assert_array_equal(data["faces"], faces)
+    assert data["mesh_grid_size"] == 512
+    assert data["mesh_coord_space"] == _mesh_coord_space()
+    assert data["postprocess_stage"] == "mesh_after_cleanup_pass1"
+
+
 def test_voxel_remesh_runs_final_cleanup_when_cleanup_enabled():
     from generate import _apply_voxel_remesh_if_requested
 
