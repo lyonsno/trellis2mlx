@@ -158,3 +158,63 @@ def test_face_table_arrays_include_uv_island_and_all_touched_faces():
     assert table["visible_pixels"].tolist() == [7, 0, 3]
     assert table["backface_pixels"].tolist() == [0, 0, 2]
     assert table["projected_missing_pixels"].tolist() == [0, 5, 0]
+
+
+def test_per_view_backface_classification_exposes_bidirectional_faces():
+    from collections import Counter
+
+    from scripts.mesh_culling_attribution import classify_per_view_backface_residuals
+
+    per_view_pixels = {
+        "+X": {
+            "visible_pixels_by_face": Counter({1: 3, 2: 1}),
+            "backface_pixels_by_face": Counter({1: 3, 2: 1}),
+        },
+        "-X": {
+            "visible_pixels_by_face": Counter({1: 4}),
+            "backface_pixels_by_face": Counter(),
+        },
+        "+Y": {
+            "visible_pixels_by_face": Counter({2: 2}),
+            "backface_pixels_by_face": Counter(),
+        },
+        "-Y": {
+            "visible_pixels_by_face": Counter(),
+            "backface_pixels_by_face": Counter(),
+        },
+        "+Z": {
+            "visible_pixels_by_face": Counter({3: 1}),
+            "backface_pixels_by_face": Counter({3: 1}),
+        },
+        "-Z": {
+            "visible_pixels_by_face": Counter({4: 1}),
+            "backface_pixels_by_face": Counter({4: 1}),
+        },
+    }
+
+    summary = classify_per_view_backface_residuals(
+        per_view_pixels=per_view_pixels,
+        source_orientation=np.array(["same", "same", "reversed", "same", "reversed"], dtype=object),
+    )
+
+    assert summary["classes_by_backface_pixels"] == {
+        "back_only_all_views": 2,
+        "bidirectional_opposite_front": 3,
+        "mixed_front_other_view": 1,
+    }
+    assert summary["classes_by_face"] == {
+        "back_only_all_views": 2,
+        "bidirectional_opposite_front": 1,
+        "mixed_front_other_view": 1,
+    }
+    assert summary["flip_all_residual_faces_thought_experiment"] == {
+        "current_back_pixels_on_residual_faces": 6,
+        "current_front_pixels_on_residual_faces_that_would_become_back": 6,
+        "net_back_pixels_after_flipping_residual_faces_minus_current": 0,
+    }
+    assert summary["source_orientation_by_class_backface_pixels"] == {
+        "back_only_all_views:reversed": 1,
+        "back_only_all_views:same": 1,
+        "bidirectional_opposite_front:same": 3,
+        "mixed_front_other_view:reversed": 1,
+    }

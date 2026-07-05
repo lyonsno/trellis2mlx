@@ -23,6 +23,19 @@ VISIBLE_EXTERIOR_VIEWS = {
     "+Z": (2, 1),
     "-Z": (2, -1),
 }
+OPPOSITE_EXTERIOR_VIEWS = {
+    "+X": "-X",
+    "-X": "+X",
+    "+Y": "-Y",
+    "-Y": "+Y",
+    "+Z": "-Z",
+    "-Z": "+Z",
+}
+PER_VIEW_BACKFACE_CLASSES = (
+    "back_only_all_views",
+    "bidirectional_opposite_front",
+    "mixed_front_other_view",
+)
 PANELS = ("front_xz", "side_yz", "top_xy")
 PANEL_FRONT_FACE = {
     "front_xz": "ccw",
@@ -268,6 +281,109 @@ def visible_backface_attribution(
         image_size=image_size,
         view_name=view_name,
     )
+
+
+def _face_pixel_counter(value: Any) -> Counter[int]:
+    return Counter({int(face): int(pixels) for face, pixels in dict(value).items()})
+
+
+def classify_per_view_backface_residuals(
+    *,
+    per_view_pixels: dict[str, dict[str, Any]],
+    source_orientation: np.ndarray | None = None,
+    example_limit_per_class: int = 12,
+) -> dict[str, Any]:
+    """Classify residual backface pixels by whether flipping those faces can help.
+
+    A face visible from one exterior side as a backface and from the opposite
+    side as a frontface is not an independently flippable winding defect: a
+    one-sided renderer can only choose one of those two sides.
+    """
+    per_face: defaultdict[int, dict[str, Any]] = defaultdict(
+        lambda: {
+            "visible": 0,
+            "front": 0,
+            "back": 0,
+            "views_visible": {},
+            "views_front": {},
+            "views_back": {},
+        }
+    )
+    for view_name, view in per_view_pixels.items():
+        visible = _face_pixel_counter(view.get("visible_pixels_by_face", {}))
+        backface = _face_pixel_counter(view.get("backface_pixels_by_face", {}))
+        for face, pixels in visible.items():
+            face_state = per_face[int(face)]
+            face_state["visible"] += int(pixels)
+            face_state["views_visible"][view_name] = int(pixels)
+            front_pixels = int(pixels) - int(backface.get(face, 0))
+            if front_pixels > 0:
+                face_state["front"] += front_pixels
+                face_state["views_front"][view_name] = front_pixels
+        for face, pixels in backface.items():
+            face_state = per_face[int(face)]
+            face_state["back"] += int(pixels)
+            face_state["views_back"][view_name] = int(pixels)
+
+    class_faces: Counter[str] = Counter()
+    class_back_pixels: Counter[str] = Counter()
+    orientation_pixels: Counter[str] = Counter()
+    examples: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    residual_faces = [face for face, state in per_face.items() if int(state["back"]) > 0]
+    for face in residual_faces:
+        state = per_face[face]
+        back_views = set(state["views_back"])
+        front_views = set(state["views_front"])
+        has_opposite_front = any(OPPOSITE_EXTERIOR_VIEWS.get(view) in front_views for view in back_views)
+        if has_opposite_front:
+            class_name = "bidirectional_opposite_front"
+        elif front_views:
+            class_name = "mixed_front_other_view"
+        else:
+            class_name = "back_only_all_views"
+
+        back_pixels = int(state["back"])
+        class_faces[class_name] += 1
+        class_back_pixels[class_name] += back_pixels
+
+        orientation = "not_provided"
+        if source_orientation is not None:
+            orientation_array = np.asarray(source_orientation, dtype=object)
+            orientation = str(orientation_array[face]) if 0 <= face < len(orientation_array) else "out_of_range"
+            orientation_pixels[f"{class_name}:{orientation}"] += back_pixels
+
+        if len(examples[class_name]) < example_limit_per_class:
+            examples[class_name].append(
+                {
+                    "glb_face": int(face),
+                    "source_orientation": orientation,
+                    "visible_pixels": int(state["visible"]),
+                    "front_pixels": int(state["front"]),
+                    "backface_pixels": back_pixels,
+                    "views_front": {str(k): int(v) for k, v in state["views_front"].items()},
+                    "views_back": {str(k): int(v) for k, v in state["views_back"].items()},
+                }
+            )
+
+    current_back_pixels = int(sum(int(per_face[face]["back"]) for face in residual_faces))
+    front_pixels_that_would_become_back = int(sum(int(per_face[face]["front"]) for face in residual_faces))
+
+    return {
+        "classes_by_face": {name: int(class_faces.get(name, 0)) for name in PER_VIEW_BACKFACE_CLASSES},
+        "classes_by_backface_pixels": {
+            name: int(class_back_pixels.get(name, 0)) for name in PER_VIEW_BACKFACE_CLASSES
+        },
+        "source_orientation_by_class_backface_pixels": dict(sorted(orientation_pixels.items())),
+        "flip_all_residual_faces_thought_experiment": {
+            "current_back_pixels_on_residual_faces": current_back_pixels,
+            "current_front_pixels_on_residual_faces_that_would_become_back": front_pixels_that_would_become_back,
+            "net_back_pixels_after_flipping_residual_faces_minus_current": (
+                front_pixels_that_would_become_back - current_back_pixels
+            ),
+        },
+        "examples_by_class": {name: examples.get(name, []) for name in PER_VIEW_BACKFACE_CLASSES},
+    }
 
 
 def _load_npz(path: Path) -> dict[str, np.ndarray]:
@@ -670,6 +786,7 @@ def build_report(
     source_orientation = source_map["orientation"]
 
     per_view = {}
+    per_view_pixels = {}
     all_backface_pixels: Counter[int] = Counter()
     all_visible_pixels: Counter[int] = Counter()
     for view_name in VISIBLE_EXTERIOR_VIEWS:
@@ -683,6 +800,10 @@ def build_report(
             key: value
             for key, value in view.items()
             if key not in ("visible_pixels_by_face", "backface_pixels_by_face")
+        }
+        per_view_pixels[view_name] = {
+            "visible_pixels_by_face": view["visible_pixels_by_face"],
+            "backface_pixels_by_face": view["backface_pixels_by_face"],
         }
         all_visible_pixels.update({int(k): int(v) for k, v in view["visible_pixels_by_face"].items()})
         all_backface_pixels.update({int(k): int(v) for k, v in view["backface_pixels_by_face"].items()})
@@ -798,6 +919,10 @@ def build_report(
             ),
         },
         "views": per_view,
+        "per_view_backface_classification": classify_per_view_backface_residuals(
+            per_view_pixels=per_view_pixels,
+            source_orientation=source_orientation,
+        ),
         "component_summary": {
             "component_count": int(len(component_sizes)),
             "largest_components": [
