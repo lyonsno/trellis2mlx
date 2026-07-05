@@ -828,9 +828,14 @@ def fix_normals(
             faces,
             verbose=verbose,
         )
-        return remove_same_direction_manifold_conflicts(
+        outward_vertices, outward_faces = orient_components_outward_by_radial_heuristic(
             oriented_vertices,
             oriented_faces,
+            verbose=verbose,
+        )
+        return remove_same_direction_manifold_conflicts(
+            outward_vertices,
+            outward_faces,
             verbose=verbose,
         )
 

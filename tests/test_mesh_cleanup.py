@@ -394,6 +394,20 @@ class TestFixNormals:
         assert len(fixed_v) <= len(vertices)
         assert _same_direction_manifold_conflict_count(fixed_f) == 0
 
+    def test_open_mesh_fix_normals_orients_consistent_inward_component_outward(self):
+        """Open cleanup must not stop at locally consistent but inward winding."""
+        vertices, faces = _make_open_box()
+        inverted = faces[:, ::-1].copy()
+        outward_before, inward_before = _radial_orientation_counts(vertices, inverted)
+        assert inward_before > outward_before
+
+        fixed_v, fixed_f = fix_normals(vertices, inverted, verbose=False)
+
+        outward_after, inward_after = _radial_orientation_counts(fixed_v, fixed_f)
+        assert len(fixed_f) == len(inverted)
+        _assert_manifold_edges_oppositely_oriented(fixed_f)
+        assert outward_after > inward_after
+
     def test_radial_heuristic_orients_globally_inverted_patch_outward(self):
         """The optional radial heuristic can flip a consistent open component."""
         vertices, faces = _make_open_box()
