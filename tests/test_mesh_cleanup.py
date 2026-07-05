@@ -607,11 +607,53 @@ class TestKeepLargestIsOptIn:
 
 
 class TestDefaultCleanupUsesSmallComponentRemoval:
-    """Default cleanup should use remove_small_components (fractional threshold),
+    """Default cleanup should use remove_small_components (area threshold),
     not keep_largest_component (binary), matching the reference pipeline."""
 
+    def test_component_filter_uses_surface_area_not_face_count_ratio(self):
+        """Few-face but large-area components should survive cumesh's area cutoff."""
+        # Large component: many tiny triangles with total area well below the
+        # two-triangle sheet below. A face-count ratio cutoff would delete the
+        # sheet; an area cutoff keeps it.
+        verts = []
+        for y in range(6):
+            for x in range(11):
+                verts.append([x * 0.0005, y * 0.0005, 0.0])
+
+        faces = []
+        for y in range(5):
+            for x in range(10):
+                v00 = y * 11 + x
+                v10 = v00 + 1
+                v01 = v00 + 11
+                v11 = v01 + 1
+                faces.append([v00, v10, v11])
+                faces.append([v00, v11, v01])
+
+        sheet_base = len(verts)
+        verts.extend([
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ])
+        faces.extend([
+            [sheet_base, sheet_base + 1, sheet_base + 2],
+            [sheet_base, sheet_base + 2, sheet_base + 3],
+        ])
+
+        cleaned_v, cleaned_f = remove_small_components(
+            np.asarray(verts, dtype=np.float32),
+            np.asarray(faces, dtype=np.int64),
+            min_ratio=0.5,
+            verbose=False,
+        )
+
+        assert len(cleaned_f) == 2
+        assert cleaned_v[:, 0].max() > 1.5
+
     def test_default_removes_tiny_components_preserves_large_ones(self):
-        """A tiny 1-face fragment should be removed when min_component_ratio
+        """A tiny 1-face fragment should be removed when the area threshold
         makes the threshold meaningful."""
         v1, f1 = _make_tetrahedron()
         # Small component: single tiny triangle far away
@@ -620,8 +662,8 @@ class TestDefaultCleanupUsesSmallComponentRemoval:
         verts = np.vstack([v1, v2])
         faces = np.vstack([f1, f2])
 
-        # With min_component_ratio=0.5, threshold = int(4 * 0.5) = 2
-        # The 1-face fragment is below threshold and gets removed
+        # With min_component_ratio=0.5, the tetrahedron surface area is above
+        # the threshold and the tiny fragment is below it.
         cleaned_v, cleaned_f = cleanup_mesh(
             verts, faces, min_component_ratio=0.5, verbose=False,
         )
@@ -641,8 +683,8 @@ class TestDefaultCleanupUsesSmallComponentRemoval:
         # Both should survive — they're equal size, both above threshold
         assert len(cleaned_f) == 8
 
-    def test_cleanup_mesh_accepts_min_component_ratio(self):
-        """cleanup_mesh should accept min_component_ratio parameter."""
+    def test_cleanup_mesh_accepts_legacy_min_component_ratio_parameter(self):
+        """cleanup_mesh still accepts the old parameter name for min area."""
         v1, f1 = _make_tetrahedron()
         cleaned_v, cleaned_f = cleanup_mesh(
             v1, f1, min_component_ratio=1e-5, verbose=False,

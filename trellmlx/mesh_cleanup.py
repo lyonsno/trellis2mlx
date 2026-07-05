@@ -28,7 +28,7 @@ def cleanup_mesh(
     Pipeline:
     1. Remove duplicate faces
     2. Repair non-manifold edges
-    3. Remove small connected components (fractional threshold, matching
+    3. Remove small connected components (surface-area threshold, matching
        reference ``cumesh.remove_small_connected_components(1e-5)``), or
        keep only the largest if ``keep_largest=True``
     4. Fill small holes
@@ -41,9 +41,9 @@ def cleanup_mesh(
             units). Matches reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
         keep_largest: If True, discard all components except the largest.
             Overrides min_component_ratio.
-        min_component_ratio: Remove components with fewer faces than this
-            fraction of the largest component. Default 1e-5 matches the
-            reference pipeline.
+        min_component_ratio: Backward-compatible name for the absolute
+            minimum component surface area to keep. Default 1e-5 matches the
+            reference ``cumesh.remove_small_connected_components(1e-5)``.
         do_fix_normals: Run winding unification. The reference only does this once
             at the end, so callers can skip it for intermediate cleanup passes
             before simplification.
@@ -124,10 +124,10 @@ def remove_small_components(
     min_ratio: float = 1e-5,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove connected components smaller than min_ratio of the largest.
+    """Remove connected components below an absolute surface-area cutoff.
 
     Matches the reference ``cumesh.remove_small_connected_components(1e-5)``.
-    Pure size thresholding only — no shape heuristics.
+    Pure surface-area thresholding only — no shape heuristics.
     """
     if len(faces) == 0:
         return vertices, faces
@@ -138,21 +138,38 @@ def remove_small_components(
     if n_components <= 1:
         return vertices, faces
 
-    component_sizes = np.bincount(labels)
-    largest = component_sizes.max()
-    threshold = int(largest * min_ratio)
+    component_areas = _component_surface_areas(vertices, faces, labels, n_components)
+    threshold = float(min_ratio)
 
-    keep_mask = component_sizes[labels] >= threshold
+    keep_components = component_areas >= threshold
+    keep_mask = keep_components[labels]
 
     kept_faces = faces[keep_mask]
     removed = n_faces - len(kept_faces)
-    removed_count = (component_sizes < threshold).sum()
+    removed_count = (~keep_components).sum()
 
     if verbose and removed > 0:
         print(f"  Removed {removed_count} small components "
               f"({removed:,} faces, {removed/n_faces*100:.1f}%)", flush=True)
 
     return _reindex_mesh(vertices, kept_faces)
+
+
+def _component_surface_areas(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    labels: np.ndarray,
+    n_components: int,
+) -> np.ndarray:
+    """Compute total triangle area for each face-connected component."""
+    tri = vertices[np.asarray(faces, dtype=np.int64)]
+    face_areas = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]),
+        axis=1,
+    )
+    component_areas = np.zeros(n_components, dtype=np.float64)
+    np.add.at(component_areas, labels, face_areas)
+    return component_areas
 
 
 def _face_connected_components(faces, n_faces):
