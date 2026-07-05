@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 
 class FaceBag:
@@ -10,6 +11,72 @@ class FaceBag:
 
     def __len__(self):
         return self.count
+
+
+def test_uv_visible_orientation_result_records_post_repair_provenance(monkeypatch):
+    import trellmlx.mesh_cleanup
+    from generate import _orient_uv_faces_for_export
+
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+
+    def fake_visible_orient(export_vertices, input_faces, *, image_size, verbose):
+        assert image_size == 17
+        assert verbose is True
+        oriented = input_faces.copy()
+        oriented[1] = oriented[1][::-1]
+        return export_vertices, oriented
+
+    monkeypatch.setattr(
+        trellmlx.mesh_cleanup,
+        "orient_uv_islands_by_visible_exterior",
+        fake_visible_orient,
+    )
+
+    result = _orient_uv_faces_for_export(
+        vertices,
+        faces,
+        SimpleNamespace(no_uv_visible_orient=False, uv_visible_orient_size=17),
+    )
+
+    np.testing.assert_array_equal(result.faces, np.array([[0, 1, 2], [2, 3, 1]]))
+    assert result.metadata == {
+        "uv_face_orientation_provenance": "post_visible_exterior_orient",
+        "uv_visible_orient_applied": 1,
+        "uv_visible_orient_image_size": 17,
+        "uv_visible_orient_input_faces": 2,
+        "uv_visible_orient_changed_faces": 1,
+    }
+
+
+def test_uv_visible_orientation_result_records_skip_provenance():
+    from generate import _orient_uv_faces_for_export
+
+    vertices = np.zeros((3, 3), dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+
+    result = _orient_uv_faces_for_export(
+        vertices,
+        faces,
+        SimpleNamespace(no_uv_visible_orient=True, uv_visible_orient_size=17),
+    )
+
+    assert result.faces is faces
+    assert result.metadata == {
+        "uv_face_orientation_provenance": "raw_uv_unwrap_no_visible_orient",
+        "uv_visible_orient_applied": 0,
+        "uv_visible_orient_image_size": 17,
+        "uv_visible_orient_input_faces": 1,
+        "uv_visible_orient_changed_faces": 0,
+    }
 
 
 def test_postprocess_skips_final_simplify_if_cleanup_drops_below_target():

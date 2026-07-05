@@ -14,6 +14,7 @@ import argparse
 import gc
 import os
 import time
+from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
@@ -123,10 +124,26 @@ def _glb_export_vertices(vertices):
     return export_verts
 
 
+@dataclass(frozen=True)
+class UvOrientationResult:
+    faces: np.ndarray
+    metadata: dict[str, int | str]
+
+
 def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
+    input_faces = int(len(uv_faces))
     if args.no_uv_visible_orient:
         print("  UV visible island orientation: skipped (--no-uv-visible-orient)", flush=True)
-        return uv_faces
+        return UvOrientationResult(
+            faces=uv_faces,
+            metadata={
+                "uv_face_orientation_provenance": "raw_uv_unwrap_no_visible_orient",
+                "uv_visible_orient_applied": 0,
+                "uv_visible_orient_image_size": int(args.uv_visible_orient_size),
+                "uv_visible_orient_input_faces": input_faces,
+                "uv_visible_orient_changed_faces": 0,
+            },
+        )
 
     from trellmlx.mesh_cleanup import orient_uv_islands_by_visible_exterior
 
@@ -144,7 +161,16 @@ def _orient_uv_faces_for_export(uv_verts, uv_faces, args):
         f"changed {changed:,} faces ({time.perf_counter()-t0:.1f}s)",
         flush=True,
     )
-    return oriented_faces
+    return UvOrientationResult(
+        faces=oriented_faces,
+        metadata={
+            "uv_face_orientation_provenance": "post_visible_exterior_orient",
+            "uv_visible_orient_applied": 1,
+            "uv_visible_orient_image_size": int(args.uv_visible_orient_size),
+            "uv_visible_orient_input_faces": input_faces,
+            "uv_visible_orient_changed_faces": changed,
+        },
+    )
 
 
 def _validate_mesh_checkpoint_vertices(vertices, *, mesh_grid_size, coord_space=None, stage="mesh"):
@@ -550,14 +576,16 @@ def main():
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
-            uv_faces = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
+            uv_orientation = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
+            uv_faces = uv_orientation.faces
             if args.save_checkpoints:
                 from trellmlx.checkpoint import save_checkpoint
                 save_checkpoint(args.save_checkpoints, "mesh_uv",
                                 vertices=uv_verts, faces=uv_faces,
                                 uvs=uvs, vmapping=vmapping,
                                 mesh_grid_size=mesh_grid_size,
-                                mesh_coord_space=_mesh_coord_space())
+                                mesh_coord_space=_mesh_coord_space(),
+                                **uv_orientation.metadata)
 
             base_color, metallic_roughness, alpha_mode = bake_texture(
                 uv_verts, uv_faces, uvs, vmapping,
@@ -1210,14 +1238,16 @@ def main():
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
-    uv_faces = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
+    uv_orientation = _orient_uv_faces_for_export(uv_verts, uv_faces, args)
+    uv_faces = uv_orientation.faces
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_uv",
                         vertices=uv_verts, faces=uv_faces,
                         uvs=uvs, vmapping=vmapping,
                         mesh_grid_size=mesh_grid_size,
-                        mesh_coord_space=_mesh_coord_space())
+                        mesh_coord_space=_mesh_coord_space(),
+                        **uv_orientation.metadata)
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(
