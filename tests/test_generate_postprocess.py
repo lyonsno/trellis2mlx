@@ -212,8 +212,8 @@ def test_postprocess_reference_cleanup_fills_before_staged_simplification():
         cleanup_calls.append((len(faces), do_fix_normals, verbose))
         return v, cleanup_outputs.pop(0)
 
-    def simplify(v, faces, target_reduction):
-        simplify_calls.append(target_reduction)
+    def simplify(v, faces, target_reduction=None, target_count=None):
+        simplify_calls.append((target_reduction, target_count))
         if len(simplify_calls) == 1:
             return v, FaceBag(600_000)
         return v, FaceBag(200_000)
@@ -233,7 +233,7 @@ def test_postprocess_reference_cleanup_fills_before_staged_simplification():
     assert out_vertices is vertices
     assert len(out_faces) == 190_000
     assert fill_calls == [(1_000_000, pytest.approx(3e-2), True)]
-    assert simplify_calls == [pytest.approx(0.4), pytest.approx(0.6)]
+    assert simplify_calls == [(None, 600_000), (None, 200_000)]
     assert cleanup_calls == [
         (600_000, False, True),
         (200_000, True, False),
@@ -253,7 +253,7 @@ def test_postprocess_reference_cleanup_records_stage_boundaries():
     def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
         return v, cleanup_outputs.pop(0)
 
-    def simplify(v, faces, target_reduction):
+    def simplify(v, faces, target_reduction=None, target_count=None):
         if len(records) <= 1:
             return v, FaceBag(600_000)
         return v, FaceBag(200_000)
@@ -280,6 +280,50 @@ def test_postprocess_reference_cleanup_records_stage_boundaries():
         ("mesh_after_cleanup_pass1", 500_000),
         ("mesh_after_final_simplify", 200_000),
         ("mesh_after_cleanup_final", 190_000),
+    ]
+
+
+def test_postprocess_reference_cleanup_qem_uses_qem_for_both_simplify_stages(monkeypatch):
+    import trellmlx.simplify_qem_metal as qem_module
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(190_000)]
+    qem_calls = []
+
+    def fill_holes(v, faces, max_hole_perimeter=3e-2, verbose=True):
+        return v, FaceBag(1_000_000)
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        return v, cleanup_outputs.pop(0)
+
+    def fast_simplify(*args, **kwargs):
+        raise AssertionError("fast_simplification should not run in reference cleanup QEM mode")
+
+    def simplify_qem(v, faces, target_faces, verbose=True):
+        qem_calls.append((len(faces), target_faces, verbose))
+        return v, FaceBag(target_faces)
+
+    monkeypatch.setattr(qem_module, "simplify_qem", simplify_qem)
+
+    out_vertices, out_faces = _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        cleanup_mesh=cleanup_mesh,
+        fill_holes=fill_holes,
+        simplify=fast_simplify,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert out_vertices is vertices
+    assert len(out_faces) == 190_000
+    assert qem_calls == [
+        (1_000_000, 600_000, True),
+        (500_000, 200_000, True),
     ]
 
 

@@ -319,8 +319,11 @@ def _cleanup_and_simplify_mesh(
         coarse_target = target_faces * 3
         if len(faces) > coarse_target:
             t0 = time.perf_counter()
-            ratio = coarse_target / len(faces)
-            vertices, faces = simplify(vertices, faces, target_reduction=1.0 - ratio)
+            if qem_simplify:
+                from trellmlx.simplify_qem_metal import simplify_qem
+                vertices, faces = simplify_qem(vertices, faces, coarse_target, verbose=True)
+            else:
+                vertices, faces = simplify(vertices, faces, target_count=coarse_target)
             log(f"  Reference cleanup coarse simplify: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
             save_stage("mesh_after_coarse_simplify", vertices, faces)
@@ -344,14 +347,10 @@ def _cleanup_and_simplify_mesh(
                 for _ in range(3):
                     if len(faces) <= target_faces:
                         break
-                    ratio = target_faces / len(faces)
-                    target_reduction = 1.0 - ratio
-                    if target_reduction <= 0:
-                        break
                     vertices, faces = simplify(
                         vertices,
                         faces,
-                        target_reduction=target_reduction,
+                        target_count=target_faces,
                     )
                     if len(faces) <= target_faces * 1.1:
                         break
