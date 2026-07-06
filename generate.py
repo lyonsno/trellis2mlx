@@ -119,9 +119,12 @@ def _cleanup_and_simplify_mesh(
     no_cleanup,
     keep_largest=False,
     simplify_first=False,
+    reference_cleanup=False,
     qem_simplify=False,
     cleanup_mesh=None,
+    fill_holes=None,
     simplify=None,
+    orient_faces_by_adjacency=None,
     log=print,
 ):
     """Run mesh cleanup and multi-pass simplification.
@@ -137,9 +140,84 @@ def _cleanup_and_simplify_mesh(
         log(f"  Cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
         return vertices, faces
 
+    def reference_final_cleanup(vertices, faces):
+        if no_cleanup:
+            return vertices, faces
+        if orient_faces_by_adjacency is None:
+            from trellmlx.mesh_cleanup import orient_faces_by_adjacency as orient_reference_faces
+        else:
+            orient_reference_faces = orient_faces_by_adjacency
+
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(
+            vertices,
+            faces,
+            keep_largest=keep_largest,
+            do_fix_normals=False,
+            verbose=False,
+        )
+        vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
+        log(f"  Reference cleanup final cleanup/orient: {time.perf_counter()-t0:.1f}s", flush=True)
+        return vertices, faces
+
     if not no_cleanup:
         if cleanup_mesh is None:
             from trellmlx.mesh_cleanup import cleanup_mesh
+
+    if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
+        if fill_holes is None:
+            from trellmlx.mesh_cleanup import fill_small_holes as fill_holes
+        if simplify is None:
+            import fast_simplification
+            simplify = fast_simplification.simplify
+
+        t0 = time.perf_counter()
+        vertices, faces = fill_holes(
+            vertices,
+            faces,
+            max_hole_perimeter=3e-2,
+            verbose=True,
+        )
+        log(
+            f"  Reference cleanup initial hole fill: {len(vertices):,}V {len(faces):,}F "
+            f"({time.perf_counter()-t0:.1f}s)",
+            flush=True,
+        )
+
+        coarse_target = target_faces * 3
+        if len(faces) > coarse_target:
+            t0 = time.perf_counter()
+            vertices, faces = simplify(vertices, faces, target_count=coarse_target)
+            log(
+                f"  Reference cleanup coarse simplify: {len(vertices):,}V {len(faces):,}F "
+                f"({time.perf_counter()-t0:.1f}s)",
+                flush=True,
+            )
+
+        t0 = time.perf_counter()
+        vertices, faces = cleanup_mesh(
+            vertices,
+            faces,
+            keep_largest=keep_largest,
+            do_fix_normals=False,
+            verbose=True,
+        )
+        log(
+            f"  Reference cleanup pass 1: {len(vertices):,}V {len(faces):,}F "
+            f"({time.perf_counter()-t0:.1f}s)",
+            flush=True,
+        )
+
+        if len(faces) > target_faces:
+            t0 = time.perf_counter()
+            vertices, faces = simplify(vertices, faces, target_count=target_faces)
+            log(
+                f"  Reference cleanup final simplify: {len(vertices):,}V {len(faces):,}F "
+                f"({time.perf_counter()-t0:.1f}s)",
+                flush=True,
+            )
+
+        return reference_final_cleanup(vertices, faces)
 
     # Simplify-first mode: reduce face count before expensive cleanup
     if simplify_first and target_faces and len(faces) > target_faces:
@@ -277,6 +355,9 @@ def main():
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
     parser.add_argument("--simplify-first", action="store_true",
                         help="Simplify before cleanup (much faster on large meshes, skips multi-pass)")
+    parser.add_argument("--reference-cleanup", action="store_true",
+                        help="Use reference cleanup order: initial hole fill, coarse simplify, "
+                             "cleanup, final simplify, final cleanup, adjacency orientation")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
@@ -343,6 +424,7 @@ def main():
                 no_cleanup=args.no_cleanup,
                 keep_largest=args.keep_largest,
                 simplify_first=args.simplify_first,
+                reference_cleanup=args.reference_cleanup,
                 qem_simplify=args.qem_simplify,
             )
 
@@ -730,6 +812,7 @@ def main():
         no_cleanup=args.no_cleanup,
         keep_largest=args.keep_largest,
         simplify_first=args.simplify_first,
+        reference_cleanup=args.reference_cleanup,
         qem_simplify=args.qem_simplify,
     )
 

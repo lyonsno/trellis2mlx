@@ -404,6 +404,63 @@ def fix_normals(
     return np.array(mesh.vertices, dtype=vertices.dtype), np.array(mesh.faces, dtype=faces.dtype)
 
 
+def orient_faces_by_adjacency(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unify adjacent face winding without choosing outward orientation.
+
+    Reference TRELLIS runs final cleanup before orientation, then separately
+    unifies face orientation. This helper preserves the first face orientation
+    in each connected component and only flips neighbors that share an edge in
+    the same directed order.
+    """
+    if len(faces) == 0:
+        return vertices, faces
+
+    oriented = np.array(faces, copy=True)
+    edge_faces: dict[tuple[int, int], list[tuple[int, tuple[int, int]]]] = {}
+    for face_index, face in enumerate(oriented):
+        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            ia = int(a)
+            ib = int(b)
+            key = (min(ia, ib), max(ia, ib))
+            edge_faces.setdefault(key, []).append((face_index, (ia, ib)))
+
+    adjacency: list[list[tuple[int, bool]]] = [[] for _ in range(len(oriented))]
+    for entries in edge_faces.values():
+        if len(entries) != 2:
+            continue
+        (face_a, edge_a), (face_b, edge_b) = entries
+        same_direction = edge_a == edge_b
+        adjacency[face_a].append((face_b, same_direction))
+        adjacency[face_b].append((face_a, same_direction))
+
+    flips = np.zeros(len(oriented), dtype=np.bool_)
+    seen = np.zeros(len(oriented), dtype=np.bool_)
+    for root in range(len(oriented)):
+        if seen[root]:
+            continue
+        seen[root] = True
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            for neighbor, same_direction in adjacency[current]:
+                if seen[neighbor]:
+                    continue
+                flips[neighbor] = bool(flips[current] ^ same_direction)
+                seen[neighbor] = True
+                stack.append(neighbor)
+
+    if flips.any():
+        oriented[flips] = oriented[flips][:, [0, 2, 1]]
+        if verbose:
+            print(f"  Oriented {int(flips.sum()):,} faces by adjacency", flush=True)
+
+    return vertices, oriented.astype(faces.dtype, copy=False)
+
+
 def _reindex_mesh(vertices, faces):
     """Remove unreferenced vertices and reindex faces."""
     used = np.unique(faces)

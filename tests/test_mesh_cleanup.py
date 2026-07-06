@@ -347,3 +347,30 @@ class TestIntermediateCleanupSkipsNormals:
 
         # Both should have same face count, but winding may differ
         assert len(f1) == len(f2)
+
+
+def test_orient_faces_by_adjacency_flips_same_direction_neighbor_only():
+    from trellmlx.mesh_cleanup import orient_faces_by_adjacency
+
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [1, 2, 3],
+        ],
+        dtype=np.int64,
+    )
+
+    out_vertices, out_faces = orient_faces_by_adjacency(vertices, faces, verbose=False)
+
+    assert out_vertices is vertices
+    np.testing.assert_array_equal(out_faces[0], faces[0])
+    np.testing.assert_array_equal(out_faces[1], np.array([1, 3, 2]))
