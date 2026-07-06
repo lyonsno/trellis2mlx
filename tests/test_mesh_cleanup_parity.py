@@ -178,6 +178,20 @@ def test_mesh_cleanup_parity_harness_can_label_qem_probe_route(tmp_path):
     assert report["effective_route"] == "local-reference-cleanup:qem-probe"
     assert report["settings"]["local_simplifier"] == "qem-probe"
     assert report["source_contract"]["qem_probe_status"] == "probe_only_not_reference_equivalent"
+    simplify_entries = [
+        entry for entry in report["operation_trace"]
+        if entry["operation"] in {"simplify_coarse", "simplify_final"}
+    ]
+    assert simplify_entries
+    assert all("simplifier_step_trace" in entry for entry in simplify_entries)
+
+
+def test_external_reference_cleanup_code_records_simplifier_step_trace():
+    harness = _load_script_module()
+    code = harness._external_reference_code()
+
+    assert "simplify_step" in code
+    assert "simplifier_step_trace" in code
 
 
 def test_mesh_cleanup_parity_harness_keeps_fast_simplifier_default_route(tmp_path):

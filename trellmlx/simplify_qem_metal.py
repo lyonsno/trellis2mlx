@@ -161,6 +161,7 @@ def simplify_qem(
     lambda_skinny: float = 1e-3,
     initial_thresh: float = 1e-8,
     verbose: bool = True,
+    step_trace: list[dict] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simplify mesh using QEM edge collapse with topology guards."""
     if len(faces) <= target_faces:
@@ -187,6 +188,14 @@ def simplify_qem(
         n_after = len(faces)
         removed = n_before - n_after
         iteration += 1
+        if step_trace is not None:
+            step_trace.append({
+                "iteration": iteration,
+                "threshold": thresh,
+                "input_faces": n_before,
+                "output_faces": n_after,
+                "removed_faces": removed,
+            })
 
         if verbose and iteration % 5 == 0:
             elapsed = time.perf_counter() - t0

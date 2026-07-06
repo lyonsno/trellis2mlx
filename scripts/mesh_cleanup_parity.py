@@ -114,7 +114,15 @@ import torch
 import cumesh
 
 
-def record(trace, operation, input_faces, output_faces, requested_target_faces=None, do_fix_normals=None):
+def record(
+    trace,
+    operation,
+    input_faces,
+    output_faces,
+    requested_target_faces=None,
+    do_fix_normals=None,
+    simplifier_step_trace=None,
+):
     entry = {
         "operation": operation,
         "input_faces": int(input_faces),
@@ -124,7 +132,48 @@ def record(trace, operation, input_faces, output_faces, requested_target_faces=N
         entry["requested_target_faces"] = int(requested_target_faces)
     if do_fix_normals is not None:
         entry["do_fix_normals"] = bool(do_fix_normals)
+    if simplifier_step_trace is not None:
+        entry["simplifier_step_trace"] = simplifier_step_trace
     trace.append(entry)
+
+
+def mesh_face_count(mesh):
+    value = mesh.num_faces
+    return int(value() if callable(value) else value)
+
+
+def simplify_with_step_trace(mesh, target_faces):
+    threshold = 1e-8
+    lambda_edge_length = 1e-2
+    lambda_skinny = 1e-3
+    input_faces = mesh_face_count(mesh)
+    step_trace = []
+    iteration = 0
+    while True:
+        before = mesh_face_count(mesh)
+        new_num_vert, new_num_face = mesh.simplify_step(
+            lambda_edge_length,
+            lambda_skinny,
+            threshold,
+            False,
+        )
+        iteration += 1
+        new_num_vert = int(new_num_vert)
+        new_num_face = int(new_num_face)
+        removed = before - new_num_face
+        step_trace.append({
+            "iteration": iteration,
+            "threshold": threshold,
+            "input_faces": before,
+            "output_faces": new_num_face,
+            "output_vertices": new_num_vert,
+            "removed_faces": removed,
+        })
+        if new_num_face <= target_faces:
+            break
+        if removed / max(before, 1) < 1e-2:
+            threshold *= 10
+    return input_faces, mesh_face_count(mesh), step_trace
 
 
 mesh_path, target_faces_text, output_npz, trace_json = sys.argv[1:5]
@@ -139,33 +188,45 @@ mesh.init(torch.from_numpy(vertices), torch.from_numpy(faces))
 trace = []
 
 coarse_target = target_faces * 3
-if mesh.num_faces > coarse_target:
-    input_faces = mesh.num_faces
-    mesh.simplify(coarse_target, verbose=False)
-    record(trace, "simplify_coarse", input_faces, mesh.num_faces, requested_target_faces=coarse_target)
+if mesh_face_count(mesh) > coarse_target:
+    input_faces, output_faces, step_trace = simplify_with_step_trace(mesh, coarse_target)
+    record(
+        trace,
+        "simplify_coarse",
+        input_faces,
+        output_faces,
+        requested_target_faces=coarse_target,
+        simplifier_step_trace=step_trace,
+    )
 
-input_faces = mesh.num_faces
+input_faces = mesh_face_count(mesh)
 mesh.remove_duplicate_faces()
 mesh.repair_non_manifold_edges()
 mesh.remove_small_connected_components(1e-5)
 mesh.fill_holes(max_hole_perimeter=3e-2)
-record(trace, "cleanup_initial", input_faces, mesh.num_faces, do_fix_normals=False)
+record(trace, "cleanup_initial", input_faces, mesh_face_count(mesh), do_fix_normals=False)
 
-if mesh.num_faces > target_faces:
-    input_faces = mesh.num_faces
-    mesh.simplify(target_faces, verbose=False)
-    record(trace, "simplify_final", input_faces, mesh.num_faces, requested_target_faces=target_faces)
+if mesh_face_count(mesh) > target_faces:
+    input_faces, output_faces, step_trace = simplify_with_step_trace(mesh, target_faces)
+    record(
+        trace,
+        "simplify_final",
+        input_faces,
+        output_faces,
+        requested_target_faces=target_faces,
+        simplifier_step_trace=step_trace,
+    )
 
-input_faces = mesh.num_faces
+input_faces = mesh_face_count(mesh)
 mesh.remove_duplicate_faces()
 mesh.repair_non_manifold_edges()
 mesh.remove_small_connected_components(1e-5)
 mesh.fill_holes(max_hole_perimeter=3e-2)
-record(trace, "cleanup_final", input_faces, mesh.num_faces, do_fix_normals=False)
+record(trace, "cleanup_final", input_faces, mesh_face_count(mesh), do_fix_normals=False)
 
-input_faces = mesh.num_faces
+input_faces = mesh_face_count(mesh)
 mesh.unify_face_orientations()
-record(trace, "unify_face_orientations", input_faces, mesh.num_faces)
+record(trace, "unify_face_orientations", input_faces, mesh_face_count(mesh))
 
 out_vertices, out_faces = mesh.read()
 np.savez_compressed(
@@ -238,16 +299,24 @@ def _fixture_simplify(vertices, faces, target_reduction=None, target_count=None)
     return vertices, faces[:target_count]
 
 
-def _fixture_qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None):
+def _fixture_qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None, step_trace=None):
+    if step_trace is not None and target_count is not None and len(faces) > target_count:
+        step_trace.append({
+            "iteration": 1,
+            "threshold": 1e-8,
+            "input_faces": len(faces),
+            "output_faces": target_count,
+            "removed_faces": len(faces) - target_count,
+        })
     return _fixture_simplify(vertices, faces, target_reduction=target_reduction, target_count=target_count)
 
 
-def _qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None):
+def _qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None, step_trace=None):
     if target_count is None:
         raise ValueError("qem-probe simplifier requires target_count")
     from trellmlx.simplify_qem_metal import simplify_qem
 
-    return simplify_qem(vertices, faces, int(target_count), verbose=False)
+    return simplify_qem(vertices, faces, int(target_count), verbose=False, step_trace=step_trace)
 
 
 def _fixture_cleanup(vertices, faces, **kwargs):
@@ -265,18 +334,38 @@ def _run_local_reference_cleanup(
     from generate import _cleanup_and_simplify_mesh
 
     operation_trace: list[dict[str, Any]] = []
+    simplifier_step_traces: list[list[dict[str, Any]]] = []
     kwargs: dict[str, Any] = {}
+    if local_simplifier == "qem-probe":
+        def simplify(vertices, faces, target_reduction=None, target_count=None):
+            step_trace: list[dict[str, Any]] = []
+            if fixture_mode:
+                output = _fixture_qem_probe_simplify(
+                    vertices,
+                    faces,
+                    target_reduction=target_reduction,
+                    target_count=target_count,
+                    step_trace=step_trace,
+                )
+            else:
+                output = _qem_probe_simplify(
+                    vertices,
+                    faces,
+                    target_reduction=target_reduction,
+                    target_count=target_count,
+                    step_trace=step_trace,
+                )
+            simplifier_step_traces.append(step_trace)
+            return output
+        kwargs["simplify"] = simplify
     if fixture_mode:
         from trellmlx.mesh_cleanup import orient_faces_by_adjacency
-        simplify = _fixture_qem_probe_simplify if local_simplifier == "qem-probe" else _fixture_simplify
 
         kwargs.update(
             cleanup_mesh=_fixture_cleanup,
-            simplify=simplify,
+            simplify=kwargs.get("simplify", _fixture_simplify),
             orient_faces_by_adjacency=orient_faces_by_adjacency,
         )
-    elif local_simplifier == "qem-probe":
-        kwargs["simplify"] = _qem_probe_simplify
 
     output_vertices, output_faces = _cleanup_and_simplify_mesh(
         vertices,
@@ -288,6 +377,12 @@ def _run_local_reference_cleanup(
         log=lambda *args, **kwargs: None,
         **kwargs,
     )
+    if simplifier_step_traces:
+        trace_index = 0
+        for entry in operation_trace:
+            if entry.get("operation") in {"simplify_coarse", "simplify_final"}:
+                entry["simplifier_step_trace"] = simplifier_step_traces[trace_index]
+                trace_index += 1
     return output_vertices, output_faces, operation_trace
 
 
