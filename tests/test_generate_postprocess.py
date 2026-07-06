@@ -157,3 +157,87 @@ def test_postprocess_reference_cleanup_matches_gpu_source_order_and_orientation(
         (200_000, False, False),
     ]
     assert orient_calls == [(190_000, False)]
+
+
+def test_postprocess_reference_cleanup_records_operation_trace():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(190_000)]
+    operation_trace = []
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        return v, cleanup_outputs.pop(0)
+
+    def simplify(v, faces, target_reduction=None, target_count=None):
+        if target_count == 600_000:
+            return v, FaceBag(590_000)
+        if target_count == 200_000:
+            return v, FaceBag(180_000)
+        raise AssertionError(f"unexpected simplify target {target_count}")
+
+    def orient_faces_by_adjacency(v, faces, verbose=True):
+        return v, faces
+
+    _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        cleanup_mesh=cleanup_mesh,
+        fill_holes=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no prefill")),
+        simplify=simplify,
+        orient_faces_by_adjacency=orient_faces_by_adjacency,
+        operation_trace=operation_trace,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert operation_trace == [
+        {
+            "operation": "simplify_coarse",
+            "input_faces": 1_000_000,
+            "requested_target_faces": 600_000,
+            "output_faces": 590_000,
+        },
+        {
+            "operation": "cleanup_initial",
+            "input_faces": 590_000,
+            "output_faces": 500_000,
+            "do_fix_normals": False,
+        },
+        {
+            "operation": "simplify_final",
+            "input_faces": 500_000,
+            "requested_target_faces": 200_000,
+            "output_faces": 180_000,
+        },
+        {
+            "operation": "cleanup_final",
+            "input_faces": 180_000,
+            "output_faces": 190_000,
+            "do_fix_normals": False,
+        },
+        {
+            "operation": "orient_faces_by_adjacency",
+            "input_faces": 190_000,
+            "output_faces": 190_000,
+        },
+    ]
+
+
+def test_postprocess_reference_cleanup_rejects_qem_simplify_until_parity_gate():
+    from generate import _cleanup_and_simplify_mesh
+
+    with pytest.raises(ValueError, match="reference_cleanup.*qem_simplify"):
+        _cleanup_and_simplify_mesh(
+            FaceBag(10),
+            FaceBag(1_000_000),
+            target_faces=200_000,
+            no_cleanup=False,
+            reference_cleanup=True,
+            qem_simplify=True,
+            cleanup_mesh=lambda v, faces, **kwargs: (v, faces),
+            simplify=lambda v, faces, **kwargs: (v, faces),
+            log=lambda *args, **kwargs: None,
+        )

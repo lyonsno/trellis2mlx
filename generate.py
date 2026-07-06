@@ -125,6 +125,7 @@ def _cleanup_and_simplify_mesh(
     fill_holes=None,
     simplify=None,
     orient_faces_by_adjacency=None,
+    operation_trace=None,
     log=print,
 ):
     """Run mesh cleanup and multi-pass simplification.
@@ -149,6 +150,7 @@ def _cleanup_and_simplify_mesh(
             orient_reference_faces = orient_faces_by_adjacency
 
         t0 = time.perf_counter()
+        cleanup_input_faces = len(faces)
         vertices, faces = cleanup_mesh(
             vertices,
             faces,
@@ -156,7 +158,21 @@ def _cleanup_and_simplify_mesh(
             do_fix_normals=False,
             verbose=False,
         )
+        if operation_trace is not None:
+            operation_trace.append({
+                "operation": "cleanup_final",
+                "input_faces": cleanup_input_faces,
+                "output_faces": len(faces),
+                "do_fix_normals": False,
+            })
+        orient_input_faces = len(faces)
         vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
+        if operation_trace is not None:
+            operation_trace.append({
+                "operation": "orient_faces_by_adjacency",
+                "input_faces": orient_input_faces,
+                "output_faces": len(faces),
+            })
         log(f"  Reference cleanup final cleanup/orient: {time.perf_counter()-t0:.1f}s", flush=True)
         return vertices, faces
 
@@ -165,6 +181,8 @@ def _cleanup_and_simplify_mesh(
             from trellmlx.mesh_cleanup import cleanup_mesh
 
     if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
+        if qem_simplify:
+            raise ValueError("reference_cleanup cannot be combined with qem_simplify until the QEM parity gate passes")
         if simplify is None:
             import fast_simplification
             simplify = fast_simplification.simplify
@@ -172,7 +190,15 @@ def _cleanup_and_simplify_mesh(
         coarse_target = target_faces * 3
         if len(faces) > coarse_target:
             t0 = time.perf_counter()
+            simplify_input_faces = len(faces)
             vertices, faces = simplify(vertices, faces, target_count=coarse_target)
+            if operation_trace is not None:
+                operation_trace.append({
+                    "operation": "simplify_coarse",
+                    "input_faces": simplify_input_faces,
+                    "requested_target_faces": coarse_target,
+                    "output_faces": len(faces),
+                })
             log(
                 f"  Reference cleanup coarse simplify: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)",
@@ -180,6 +206,7 @@ def _cleanup_and_simplify_mesh(
             )
 
         t0 = time.perf_counter()
+        cleanup_input_faces = len(faces)
         vertices, faces = cleanup_mesh(
             vertices,
             faces,
@@ -187,6 +214,13 @@ def _cleanup_and_simplify_mesh(
             do_fix_normals=False,
             verbose=True,
         )
+        if operation_trace is not None:
+            operation_trace.append({
+                "operation": "cleanup_initial",
+                "input_faces": cleanup_input_faces,
+                "output_faces": len(faces),
+                "do_fix_normals": False,
+            })
         log(
             f"  Reference cleanup pass 1: {len(vertices):,}V {len(faces):,}F "
             f"({time.perf_counter()-t0:.1f}s)",
@@ -195,7 +229,15 @@ def _cleanup_and_simplify_mesh(
 
         if len(faces) > target_faces:
             t0 = time.perf_counter()
+            simplify_input_faces = len(faces)
             vertices, faces = simplify(vertices, faces, target_count=target_faces)
+            if operation_trace is not None:
+                operation_trace.append({
+                    "operation": "simplify_final",
+                    "input_faces": simplify_input_faces,
+                    "requested_target_faces": target_faces,
+                    "output_faces": len(faces),
+                })
             log(
                 f"  Reference cleanup final simplify: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)",
