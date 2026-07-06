@@ -108,6 +108,14 @@ class TestSimplifyNoop:
         np.testing.assert_array_equal(f2, f)
 
 
+class TestSourceQEMNumerics:
+    def test_qem_accumulates_source_float32_quadrics(self):
+        v, f = _make_subdivided_icosphere(1)
+        qems = _compute_qem(v, f, len(v))
+
+        assert qems.dtype == np.float32
+
+
 class TestNormalFlipGuard:
     def test_no_inverted_normals_after_simplify(self):
         v, f = _make_subdivided_icosphere(2)

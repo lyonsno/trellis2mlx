@@ -269,14 +269,11 @@ def _compute_qem(vertices, faces, V):
     d = -np.sum(normals * v0, axis=1)
 
     a, b, c = normals[:, 0], normals[:, 1], normals[:, 2]
-    # float64 for QEM accumulation — more precise than the reference (float32)
-    # but produces subtly different collapse orderings. Kept because QEM
-    # quadric accumulation is numerically sensitive to catastrophic cancellation.
     face_qem = np.column_stack([
         a*a, a*b, a*c, a*d, b*b, b*c, b*d, c*c, c*d, d*d
-    ]).astype(np.float64)
+    ]).astype(np.float32)
 
-    qems = np.zeros((V, 10), dtype=np.float64)
+    qems = np.zeros((V, 10), dtype=np.float32)
     for k in range(3):
         np.add.at(qems, faces[:, k], face_qem)
 
@@ -294,7 +291,7 @@ def _compute_base_costs(vertices, edges, qems, is_boundary, lambda_edge_length):
     v_new = p0 * w0[:, None] + p1 * (1 - w0[:, None])
 
     q = qems[ev0] + qems[ev1]
-    vx, vy, vz = v_new[:, 0].astype(np.float64), v_new[:, 1].astype(np.float64), v_new[:, 2].astype(np.float64)
+    vx, vy, vz = v_new[:, 0], v_new[:, 1], v_new[:, 2]
     qem_cost = (
         q[:,0]*vx*vx + 2*q[:,1]*vx*vy + 2*q[:,2]*vx*vz + 2*q[:,3]*vx +
         q[:,4]*vy*vy + 2*q[:,5]*vy*vz + 2*q[:,6]*vy +
@@ -435,12 +432,9 @@ def _simplify_step(vertices, faces, *, lambda_edge_length, lambda_skinny, collap
                     face_min_cost[fi] = c
                     face_min_edge[fi] = ei
 
-    # Conflict-free collapse.
-    # Note: the reference does this in a single GPU pass against a frozen
-    # propagated-cost snapshot. We iterate sequentially and mutate faces_kept
-    # during iteration, so earlier collapses can block later ones that the
-    # reference would allow. This is strictly more conservative (fewer
-    # collapses per step, more iterations needed), not incorrect.
+    # Conflict-free collapse. Match the reference's single GPU pass against a
+    # frozen propagated-cost snapshot: an edge is eligible when every face
+    # adjacent to either endpoint chose that edge as its minimum-cost edge.
     faces_kept = np.ones(F, dtype=np.bool_)
     collapsed_any = False
 
@@ -451,9 +445,6 @@ def _simplify_step(vertices, faces, *, lambda_edge_length, lambda_skinny, collap
         for vi in [v0i, v1i]:
             for idx in range(vf_offset[vi], vf_offset[vi + 1]):
                 fi = vf_data[idx]
-                if not faces_kept[fi]:
-                    agreed = False
-                    break
                 if face_min_edge[fi] != ei:
                     agreed = False
                     break
