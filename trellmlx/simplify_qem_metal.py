@@ -414,23 +414,25 @@ def _simplify_step(vertices, faces, *, lambda_edge_length, lambda_skinny, collap
             vertices, faces, edges, v_new, base_costs, edge_len2,
             vf_offset, vf_data, lambda_skinny)
 
-    # Propagate minimum cost to faces
-    face_min_cost = np.full(F, np.inf, dtype=np.float32)
+    # Propagate minimum cost to faces using the source packed-key ordering.
+    # The Metal source compares raw uint64 keys:
+    #   (as_type<uint>(float_cost) << 32) | edge_id
+    # so tiny negative float32 costs do not behave like numeric minima.
+    face_min_key = np.full(F, np.uint64(0xFFFFFFFFFFFFFFFF), dtype=np.uint64)
     face_min_edge = np.full(F, -1, dtype=np.int32)
 
-    # Iterate in edge-index order. Use strict < so the lowest edge index
-    # wins ties, matching the reference packed atomic_ulong min behavior
-    # where (cost_bits << 32 | edge_id) gives lexicographic (cost, id) order.
-    eligible = np.where(cost <= collapse_thresh)[0]
-    for ei in eligible:
+    cost_bits = np.asarray(cost, dtype=np.float32).view(np.uint32)
+    for ei in range(E):
+        pack = (np.uint64(cost_bits[ei]) << np.uint64(32)) | np.uint64(np.uint32(ei))
         v0i, v1i = edges[ei]
-        c = cost[ei]
         for vi in [v0i, v1i]:
             for idx in range(vf_offset[vi], vf_offset[vi + 1]):
                 fi = vf_data[idx]
-                if c < face_min_cost[fi]:
-                    face_min_cost[fi] = c
+                if pack < face_min_key[fi]:
+                    face_min_key[fi] = pack
                     face_min_edge[fi] = ei
+
+    eligible = np.where(cost <= collapse_thresh)[0]
 
     # Conflict-free collapse. Match the reference's single GPU pass against a
     # frozen propagated-cost snapshot: an edge is eligible when every face

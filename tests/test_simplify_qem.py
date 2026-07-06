@@ -13,6 +13,7 @@ from trellmlx.simplify_qem_metal import (
     _build_adjacency,
     _compute_qem,
     _compute_base_costs,
+    _simplify_step,
     _topology_check_cpu,
     HAS_MLX,
 )
@@ -114,6 +115,67 @@ class TestSourceQEMNumerics:
         qems = _compute_qem(v, f, len(v))
 
         assert qems.dtype == np.float32
+
+    def test_face_min_propagation_uses_source_packed_float_order(self, monkeypatch):
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],
+            [0, 3, 4],
+        ], dtype=np.int32)
+
+        edges = np.array([[0, 1], [1, 2]], dtype=np.int32)
+        vf_offset = np.array([0, 2, 3, 4, 5, 6], dtype=np.int32)
+        vf_data = np.array([0, 1, 0, 0, 1, 1], dtype=np.int32)
+        v_new = np.array([
+            [9.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ], dtype=np.float32)
+        costs = np.array([-1e-6, 1e-9], dtype=np.float32)
+
+        monkeypatch.setattr("trellmlx.simplify_qem_metal.HAS_MLX", False)
+        monkeypatch.setattr(
+            "trellmlx.simplify_qem_metal._build_adjacency",
+            lambda _faces, _v: (
+                edges,
+                len(edges),
+                np.zeros(len(vertices), dtype=np.bool_),
+                vf_offset,
+                vf_data,
+            ),
+        )
+        monkeypatch.setattr(
+            "trellmlx.simplify_qem_metal._compute_qem",
+            lambda _vertices, _faces, _v: np.zeros((len(vertices), 10), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            "trellmlx.simplify_qem_metal._compute_base_costs",
+            lambda *_args, **_kwargs: (
+                np.zeros(len(edges), dtype=np.float32),
+                v_new,
+                np.ones(len(edges), dtype=np.float32),
+            ),
+        )
+        monkeypatch.setattr(
+            "trellmlx.simplify_qem_metal._topology_check_cpu",
+            lambda *_args, **_kwargs: costs,
+        )
+
+        out_vertices, out_faces = _simplify_step(
+            vertices.copy(),
+            faces.copy(),
+            lambda_edge_length=1e-2,
+            lambda_skinny=1e-3,
+            collapse_thresh=1e-8,
+        )
+
+        np.testing.assert_array_equal(out_faces, np.array([[0, 1, 2]], dtype=np.int32))
+        np.testing.assert_allclose(out_vertices[0], vertices[0])
 
 
 class TestNormalFlipGuard:
