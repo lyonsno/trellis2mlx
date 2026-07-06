@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +26,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument("--fixture", choices=["two-triangle-sheet"])
     source.add_argument("--raw-mesh", type=Path, help="NPZ containing vertices and faces arrays")
     parser.add_argument("--target-faces", type=int, default=200_000)
+    parser.add_argument("--reference-python", type=Path, help="Python executable with cumesh available")
+    parser.add_argument("--require-reference", action="store_true", help="Fail if the reference backend cannot run")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--overwrite-report", action="store_true")
     return parser.parse_args(argv)
+
+
+class ReferenceBackendError(RuntimeError):
+    def __init__(self, backend: dict[str, Any]):
+        super().__init__(backend.get("error", "reference backend failed"))
+        self.backend = backend
 
 
 def _jsonable(value: Any) -> Any:
@@ -85,6 +95,135 @@ def _probe_reference_backend() -> dict[str, Any]:
     except Exception as exc:
         return {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
     return {"status": "available", "module": "cumesh"}
+
+
+def _external_reference_code() -> str:
+    return r'''
+import json
+import sys
+import time
+
+import numpy as np
+import torch
+import cumesh
+
+
+def record(trace, operation, input_faces, output_faces, requested_target_faces=None, do_fix_normals=None):
+    entry = {
+        "operation": operation,
+        "input_faces": int(input_faces),
+        "output_faces": int(output_faces),
+    }
+    if requested_target_faces is not None:
+        entry["requested_target_faces"] = int(requested_target_faces)
+    if do_fix_normals is not None:
+        entry["do_fix_normals"] = bool(do_fix_normals)
+    trace.append(entry)
+
+
+mesh_path, target_faces_text, output_npz, trace_json = sys.argv[1:5]
+target_faces = int(target_faces_text)
+data = np.load(mesh_path)
+vertices = np.asarray(data["vertices"], dtype=np.float32)
+faces = np.asarray(data["faces"], dtype=np.int32)
+
+t0 = time.perf_counter()
+mesh = cumesh.CuMesh()
+mesh.init(torch.from_numpy(vertices), torch.from_numpy(faces))
+trace = []
+
+coarse_target = target_faces * 3
+if mesh.num_faces > coarse_target:
+    input_faces = mesh.num_faces
+    mesh.simplify(coarse_target, verbose=False)
+    record(trace, "simplify_coarse", input_faces, mesh.num_faces, requested_target_faces=coarse_target)
+
+input_faces = mesh.num_faces
+mesh.remove_duplicate_faces()
+mesh.repair_non_manifold_edges()
+mesh.remove_small_connected_components(1e-5)
+mesh.fill_holes(max_hole_perimeter=3e-2)
+record(trace, "cleanup_initial", input_faces, mesh.num_faces, do_fix_normals=False)
+
+if mesh.num_faces > target_faces:
+    input_faces = mesh.num_faces
+    mesh.simplify(target_faces, verbose=False)
+    record(trace, "simplify_final", input_faces, mesh.num_faces, requested_target_faces=target_faces)
+
+input_faces = mesh.num_faces
+mesh.remove_duplicate_faces()
+mesh.repair_non_manifold_edges()
+mesh.remove_small_connected_components(1e-5)
+mesh.fill_holes(max_hole_perimeter=3e-2)
+record(trace, "cleanup_final", input_faces, mesh.num_faces, do_fix_normals=False)
+
+input_faces = mesh.num_faces
+mesh.unify_face_orientations()
+record(trace, "unify_face_orientations", input_faces, mesh.num_faces)
+
+out_vertices, out_faces = mesh.read()
+np.savez_compressed(
+    output_npz,
+    vertices=out_vertices.cpu().numpy().astype(np.float32, copy=False),
+    faces=out_faces.cpu().numpy().astype(np.int64, copy=False),
+)
+Path = __import__("pathlib").Path
+Path(trace_json).write_text(json.dumps({
+    "operation_trace": trace,
+    "elapsed_seconds": time.perf_counter() - t0,
+}, indent=2, sort_keys=True) + "\n")
+'''
+
+
+def _run_external_reference_cleanup(
+    *,
+    reference_python: Path,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_faces: int,
+) -> tuple[np.ndarray | None, np.ndarray | None, list[dict[str, Any]], dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="trellis2mlx-cumesh-reference-") as tmp:
+        tmp_path = Path(tmp)
+        input_npz = tmp_path / "input_mesh.npz"
+        output_npz = tmp_path / "output_mesh.npz"
+        trace_json = tmp_path / "trace.json"
+        np.savez_compressed(
+            input_npz,
+            vertices=np.asarray(vertices, dtype=np.float32),
+            faces=np.asarray(faces, dtype=np.int32),
+        )
+        cmd = [
+            str(reference_python),
+            "-c",
+            _external_reference_code(),
+            str(input_npz),
+            str(target_faces),
+            str(output_npz),
+            str(trace_json),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            return None, None, [], {
+                "status": "failed",
+                "python": str(reference_python),
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "error": completed.stderr or completed.stdout or "reference backend failed",
+            }
+        output = np.load(output_npz)
+        trace = json.loads(trace_json.read_text())
+        return (
+            np.asarray(output["vertices"]),
+            np.asarray(output["faces"]),
+            trace.get("operation_trace", []),
+            {
+                "status": "available",
+                "python": str(reference_python),
+                "route": "external-cumesh",
+                "elapsed_seconds": trace.get("elapsed_seconds"),
+            },
+        )
 
 
 def _fixture_simplify(vertices, faces, target_reduction=None, target_count=None):
@@ -160,6 +299,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         target_faces=args.target_faces,
         fixture_mode=asset["route"] == "fixture",
     )
+    reference_vertices = None
+    reference_faces = None
+    reference_operation_trace: list[dict[str, Any]] | None = None
+    reference_backend = _probe_reference_backend()
+    if args.reference_python:
+        (
+            reference_vertices,
+            reference_faces,
+            reference_operation_trace,
+            reference_backend,
+        ) = _run_external_reference_cleanup(
+            reference_python=args.reference_python,
+            vertices=vertices,
+            faces=faces,
+            target_faces=args.target_faces,
+        )
+        if args.require_reference and reference_backend.get("status") != "available":
+            raise ReferenceBackendError(reference_backend)
+
     report = build_mesh_cleanup_parity_report(
         requested_route=requested_route,
         effective_route="local-reference-cleanup",
@@ -168,7 +326,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         output_vertices=output_vertices,
         output_faces=output_faces,
         operation_trace=operation_trace,
-        reference_backend=_probe_reference_backend(),
+        reference_backend=reference_backend,
+        reference_vertices=reference_vertices,
+        reference_faces=reference_faces,
+        reference_operation_trace=reference_operation_trace,
     )
     report.update({
         "status": "ok",
@@ -185,6 +346,17 @@ def main(argv: list[str] | None = None) -> int:
     requested_route = "raw-mesh" if args.raw_mesh else f"fixture:{args.fixture}"
     try:
         report = run(args)
+    except ReferenceBackendError as exc:
+        report = _failure_report(
+            requested_route=requested_route,
+            report_path=args.report,
+            phase="reference_backend",
+            error=exc.backend.get("error", str(exc)),
+        )
+        report["effective_route"] = "local-reference-cleanup"
+        report["reference_backend"] = exc.backend
+        _write_json(args.report, report)
+        return 1
     except Exception as exc:
         report = _failure_report(
             requested_route=requested_route,

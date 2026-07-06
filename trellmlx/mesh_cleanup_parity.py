@@ -25,8 +25,11 @@ REFERENCE_CLEANUP_CONTRACT: dict[str, Any] = {
         "cleanup_initial",
         "simplify_final",
         "cleanup_final",
-        "orient_faces_by_adjacency",
+        "unify_face_orientations",
     ],
+    "local_equivalent_operations": {
+        "unify_face_orientations": "orient_faces_by_adjacency",
+    },
     "qem_status": "primitive_choice_only_not_reference_equivalent",
 }
 
@@ -103,6 +106,9 @@ def build_mesh_cleanup_parity_report(
     output_faces: np.ndarray,
     operation_trace: list[dict[str, Any]],
     reference_backend: dict[str, Any],
+    reference_vertices: np.ndarray | None = None,
+    reference_faces: np.ndarray | None = None,
+    reference_operation_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a durable report payload for cleanup parity experiments."""
     if not requested_route:
@@ -112,13 +118,42 @@ def build_mesh_cleanup_parity_report(
     if "status" not in reference_backend:
         raise ValueError("reference_backend must include status")
 
-    return {
+    output_scalars = compute_mesh_cleanup_scalars(output_vertices, output_faces)
+    report = {
         "schema": "trellis2mlx.mesh_cleanup_parity_report.v1",
         "requested_route": requested_route,
         "effective_route": effective_route,
         "source_contract": REFERENCE_CLEANUP_CONTRACT,
         "reference_backend": dict(reference_backend),
         "input_scalars": compute_mesh_cleanup_scalars(input_vertices, input_faces),
-        "output_scalars": compute_mesh_cleanup_scalars(output_vertices, output_faces),
+        "output_scalars": output_scalars,
         "operation_trace": [dict(entry) for entry in operation_trace],
     }
+    if reference_vertices is not None and reference_faces is not None:
+        reference_scalars = compute_mesh_cleanup_scalars(reference_vertices, reference_faces)
+        report["reference_scalars"] = reference_scalars
+        report["reference_operation_trace"] = [
+            dict(entry) for entry in (reference_operation_trace or [])
+        ]
+        report["comparison"] = {
+            "vertex_count_delta_local_minus_reference": (
+                output_scalars["vertex_count"] - reference_scalars["vertex_count"]
+            ),
+            "face_count_delta_local_minus_reference": (
+                output_scalars["face_count"] - reference_scalars["face_count"]
+            ),
+            "component_count_delta_local_minus_reference": (
+                output_scalars["component_count"] - reference_scalars["component_count"]
+            ),
+            "boundary_edge_delta_local_minus_reference": (
+                output_scalars["boundary_edge_count"] - reference_scalars["boundary_edge_count"]
+            ),
+            "nonmanifold_edge_delta_local_minus_reference": (
+                output_scalars["nonmanifold_edge_count"] - reference_scalars["nonmanifold_edge_count"]
+            ),
+            "same_direction_shared_edge_delta_local_minus_reference": (
+                output_scalars["same_direction_shared_edge_count"]
+                - reference_scalars["same_direction_shared_edge_count"]
+            ),
+        }
+    return report

@@ -34,8 +34,11 @@ def test_reference_cleanup_contract_names_source_order_without_prefill():
         "cleanup_initial",
         "simplify_final",
         "cleanup_final",
-        "orient_faces_by_adjacency",
+        "unify_face_orientations",
     ]
+    assert REFERENCE_CLEANUP_CONTRACT["local_equivalent_operations"] == {
+        "unify_face_orientations": "orient_faces_by_adjacency",
+    }
     assert "initial_hole_fill" not in REFERENCE_CLEANUP_CONTRACT["operations"]
     assert REFERENCE_CLEANUP_CONTRACT["qem_status"] == "primitive_choice_only_not_reference_equivalent"
 
@@ -198,3 +201,66 @@ def test_mesh_cleanup_parity_script_runs_from_script_path(tmp_path):
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
     assert report["effective_route"] == "local-reference-cleanup"
+
+
+def test_mesh_cleanup_parity_required_reference_backend_fails_loud(tmp_path):
+    harness = _load_script_module()
+    report_path = tmp_path / "cleanup-parity-reference-failure.json"
+
+    exit_code = harness.main([
+        "--fixture",
+        "two-triangle-sheet",
+        "--target-faces",
+        "1",
+        "--reference-python",
+        sys.executable,
+        "--require-reference",
+        "--report",
+        str(report_path),
+    ])
+
+    assert exit_code == 1
+    report = json.loads(report_path.read_text())
+    assert report["schema"] == "trellis2mlx.mesh_cleanup_parity_report.v1"
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "reference_backend"
+    assert report["requested_route"] == "fixture:two-triangle-sheet"
+    assert report["effective_route"] == "local-reference-cleanup"
+    assert "ModuleNotFoundError" in report["reference_backend"]["error"]
+    assert ("cumesh" in report["reference_backend"]["error"]) or ("torch" in report["reference_backend"]["error"])
+
+
+def test_mesh_cleanup_parity_report_can_compare_reference_scalars():
+    from trellmlx.mesh_cleanup_parity import build_mesh_cleanup_parity_report
+
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    input_faces = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+    local_faces = np.array([[0, 1, 2]], dtype=np.int64)
+    reference_faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+
+    report = build_mesh_cleanup_parity_report(
+        requested_route="fixture:two-triangle-sheet",
+        effective_route="local-reference-cleanup",
+        input_vertices=vertices,
+        input_faces=input_faces,
+        output_vertices=vertices,
+        output_faces=local_faces,
+        operation_trace=[],
+        reference_backend={"status": "available", "python": "/ref/python"},
+        reference_vertices=vertices,
+        reference_faces=reference_faces,
+        reference_operation_trace=[],
+    )
+
+    assert report["reference_scalars"]["face_count"] == 2
+    assert report["comparison"]["vertex_count_delta_local_minus_reference"] == 0
+    assert report["comparison"]["face_count_delta_local_minus_reference"] == -1
+    assert report["comparison"]["same_direction_shared_edge_delta_local_minus_reference"] == 0
