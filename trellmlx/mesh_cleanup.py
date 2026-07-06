@@ -19,7 +19,7 @@ def cleanup_mesh(
     *,
     max_hole_perimeter: float = 3e-2,
     keep_largest: bool = False,
-    min_component_ratio: float = 1e-5,
+    min_component_area: float = 1e-5,
     do_fix_normals: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -28,7 +28,7 @@ def cleanup_mesh(
     Pipeline:
     1. Remove duplicate faces
     2. Repair non-manifold edges
-    3. Remove small connected components (fractional threshold, matching
+    3. Remove small connected components (area threshold, matching
        reference ``cumesh.remove_small_connected_components(1e-5)``), or
        keep only the largest if ``keep_largest=True``
     4. Fill small holes
@@ -40,10 +40,9 @@ def cleanup_mesh(
         max_hole_perimeter: Fill holes with perimeter smaller than this (world-space
             units). Matches reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
         keep_largest: If True, discard all components except the largest.
-            Overrides min_component_ratio.
-        min_component_ratio: Remove components with fewer faces than this
-            fraction of the largest component. Default 1e-5 matches the
-            reference pipeline.
+            Overrides min_component_area.
+        min_component_area: Remove components whose summed face area is below this
+            absolute threshold. Default 1e-5 matches the reference pipeline.
         do_fix_normals: Run winding unification. The reference only does this once
             at the end, so callers can skip it for intermediate cleanup passes
             before simplification.
@@ -67,7 +66,7 @@ def cleanup_mesh(
         vertices, faces = keep_largest_component(vertices, faces, verbose)
     else:
         vertices, faces = remove_small_components(
-            vertices, faces, min_ratio=min_component_ratio, verbose=verbose,
+            vertices, faces, min_area=min_component_area, verbose=verbose,
         )
 
     # Step 4: Fill small holes on the remaining mesh
@@ -121,13 +120,13 @@ def keep_largest_component(
 def remove_small_components(
     vertices: np.ndarray,
     faces: np.ndarray,
-    min_ratio: float = 1e-5,
+    min_area: float = 1e-5,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove connected components smaller than min_ratio of the largest.
+    """Remove connected components whose summed face area is below min_area.
 
     Matches the reference ``cumesh.remove_small_connected_components(1e-5)``.
-    Pure size thresholding only — no shape heuristics.
+    Pure summed-area thresholding only — no shape heuristics.
     """
     if len(faces) == 0:
         return vertices, faces
@@ -138,15 +137,18 @@ def remove_small_components(
     if n_components <= 1:
         return vertices, faces
 
-    component_sizes = np.bincount(labels)
-    largest = component_sizes.max()
-    threshold = int(largest * min_ratio)
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    cross = np.cross(v1 - v0, v2 - v0)
+    face_areas = 0.5 * np.sqrt((cross ** 2).sum(axis=1))
+    component_areas = np.bincount(labels, weights=face_areas, minlength=n_components)
 
-    keep_mask = component_sizes[labels] >= threshold
+    keep_mask = component_areas[labels] >= min_area
 
     kept_faces = faces[keep_mask]
     removed = n_faces - len(kept_faces)
-    removed_count = (component_sizes < threshold).sum()
+    removed_count = int((component_areas < min_area).sum())
 
     if verbose and removed > 0:
         print(f"  Removed {removed_count} small components "
@@ -171,7 +173,7 @@ def _face_connected_components(faces, n_faces):
                 cols.extend([face_list[j], face_list[i]])
 
     if not rows:
-        return 1, np.zeros(n_faces, dtype=np.int32)
+        return n_faces, np.arange(n_faces, dtype=np.int32)
 
     adj = sparse.csr_matrix(
         (np.ones(len(rows), dtype=np.int8), (rows, cols)),
@@ -303,11 +305,12 @@ def repair_non_manifold_edges(
     faces: np.ndarray,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove faces that create non-manifold edges (edges shared by 3+ faces).
+    """Split vertices across non-manifold edges without deleting faces.
 
-    For each non-manifold edge, keeps the two largest adjacent faces and
-    removes the rest. Vectorized: uses packed int64 edge keys, np.unique
-    for grouping, and batch area computation.
+    This mirrors cumesh's repair path: make one ID per face corner, union corner
+    IDs only across manifold edges (edges with exactly two incident faces), then
+    rebuild faces from the compressed corner IDs. Edges shared by 3+ faces are
+    not unioned, so the adjacent faces keep separate vertex instances.
     """
     if len(faces) == 0:
         return vertices, faces
@@ -330,8 +333,20 @@ def repair_non_manifold_edges(
     all_edges = np.concatenate([e0, e1, e2], axis=0)  # [3F, 2]
     all_edges.sort(axis=1)
 
-    # Face index for each edge
+    # Face and local-corner indices for each edge occurrence. The local-corner
+    # arrays are ordered to match the sorted edge endpoints.
     face_idx = np.tile(np.arange(n_faces, dtype=np.int64), 3)
+    edge_local_pairs = [(0, 1), (1, 2), (2, 0)]
+    first_corners = []
+    second_corners = []
+    for local_a, local_b in edge_local_pairs:
+        va = faces_i64[:, local_a]
+        vb = faces_i64[:, local_b]
+        a_first = va <= vb
+        first_corners.append(np.where(a_first, local_a, local_b))
+        second_corners.append(np.where(a_first, local_b, local_a))
+    edge_first_corner = np.concatenate(first_corners).astype(np.int64, copy=False)
+    edge_second_corner = np.concatenate(second_corners).astype(np.int64, copy=False)
 
     # Pack edge pairs into single int64 for fast grouping
     edge_keys = all_edges[:, 0] * (2**32) + all_edges[:, 1]
@@ -340,6 +355,8 @@ def repair_non_manifold_edges(
     sort_order = np.argsort(edge_keys)
     sorted_keys = edge_keys[sort_order]
     sorted_face_idx = face_idx[sort_order]
+    sorted_first_corner = edge_first_corner[sort_order]
+    sorted_second_corner = edge_second_corner[sort_order]
 
     # Find group boundaries
     breaks = np.concatenate([
@@ -348,40 +365,55 @@ def repair_non_manifold_edges(
         [len(sorted_keys)],
     ])
 
-    # Find non-manifold edges (group size > 2)
+    # Only manifold edges contribute vertex-adjacency pairs in cumesh.
     group_sizes = np.diff(breaks)
-    non_manifold_mask = group_sizes > 2
-    if not non_manifold_mask.any():
+    manifold_mask = group_sizes == 2
+    if not manifold_mask.any():
+        return vertices, faces
+    if manifold_mask.all():
         return vertices, faces
 
-    # Precompute all face areas
-    v0 = vertices[faces[:, 0]]
-    v1 = vertices[faces[:, 1]]
-    v2 = vertices[faces[:, 2]]
-    cross = np.cross(v1 - v0, v2 - v0)
-    face_areas = 0.5 * np.sqrt((cross ** 2).sum(axis=1))
+    parent = np.arange(n_faces * 3, dtype=np.int64)
 
-    # For each non-manifold edge group, keep the 2 largest-area faces
-    faces_to_remove = set()
-    nm_indices = np.where(non_manifold_mask)[0]
-    for gi in nm_indices:
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            if root_a < root_b:
+                parent[root_b] = root_a
+            else:
+                parent[root_a] = root_b
+
+    for gi in np.where(manifold_mask)[0]:
         start, end = breaks[gi], breaks[gi + 1]
-        group_faces = sorted_face_idx[start:end]
-        group_areas = face_areas[group_faces]
-        keep_idx = np.argsort(group_areas)[-2:]
-        for i in range(len(group_faces)):
-            if i not in keep_idx:
-                faces_to_remove.add(group_faces[i])
+        face_a = int(sorted_face_idx[start])
+        face_b = int(sorted_face_idx[start + 1])
+        union(face_a * 3 + int(sorted_first_corner[start]), face_b * 3 + int(sorted_first_corner[start + 1]))
+        union(face_a * 3 + int(sorted_second_corner[start]), face_b * 3 + int(sorted_second_corner[start + 1]))
 
-    if not faces_to_remove:
-        return vertices, faces
+    roots = np.array([find(i) for i in range(n_faces * 3)], dtype=np.int64)
+    unique_roots, inverse = np.unique(roots, return_inverse=True)
+    corner_vertices = faces.reshape(-1)
+    representative_corners = unique_roots
+    new_vertices = vertices[corner_vertices[representative_corners]]
+    new_faces = inverse.reshape(n_faces, 3).astype(faces.dtype, copy=False)
+
+    non_manifold_edges = int((group_sizes > 2).sum())
+    split_vertices = len(new_vertices) - len(vertices)
 
     if verbose:
-        print(f"  Removed {len(faces_to_remove)} non-manifold faces", flush=True)
+        print(
+            f"  Split {split_vertices} vertices across {non_manifold_edges} non-manifold edges",
+            flush=True,
+        )
 
-    keep_mask = np.ones(n_faces, dtype=bool)
-    keep_mask[list(faces_to_remove)] = False
-    return _reindex_mesh(vertices, faces[keep_mask])
+    return new_vertices.astype(vertices.dtype, copy=False), new_faces
 
 
 def fix_normals(

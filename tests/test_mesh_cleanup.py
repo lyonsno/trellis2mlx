@@ -101,8 +101,8 @@ class TestRemoveDuplicateFaces:
 
 
 class TestRepairNonManifoldEdges:
-    def test_removes_non_manifold_faces(self):
-        """An edge shared by 3+ faces is non-manifold. Repair should reduce to 2."""
+    def test_splits_non_manifold_edges_without_removing_faces(self):
+        """Source cumesh repairs non-manifold edges by vertex splitting."""
         verts, faces = _make_tetrahedron()
         # Add extra face sharing edge (0,1) — now edge (0,1) has 3 adjacent faces
         extra_vert = np.array([[0.5, -1, 0.5]], dtype=np.float32)
@@ -111,8 +111,14 @@ class TestRepairNonManifoldEdges:
         faces = np.vstack([faces, extra_face])
 
         cleaned_v, cleaned_f = repair_non_manifold_edges(verts, faces)
-        # The extra face (smallest area on edge 0,1) should be removed
-        assert len(cleaned_f) == 4
+        assert len(cleaned_f) == len(faces)
+        assert len(cleaned_v) > len(verts)
+        edge_counts = {}
+        for face in cleaned_f:
+            for i in range(3):
+                edge = tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+        assert max(edge_counts.values()) <= 2
 
     def test_noop_on_manifold_mesh(self):
         verts, faces = _make_tetrahedron()
@@ -287,26 +293,30 @@ class TestKeepLargestIsOptIn:
 
 
 class TestDefaultCleanupUsesSmallComponentRemoval:
-    """Default cleanup should use remove_small_components (fractional threshold),
+    """Default cleanup should use remove_small_components (area threshold),
     not keep_largest_component (binary), matching the reference pipeline."""
 
-    def test_default_removes_tiny_components_preserves_large_ones(self):
-        """A tiny 1-face fragment should be removed when min_component_ratio
-        makes the threshold meaningful."""
-        v1, f1 = _make_tetrahedron()
-        # Small component: single tiny triangle far away
-        v2 = np.array([[10, 10, 10], [10.001, 10, 10], [10, 10.001, 10]], dtype=np.float32)
-        f2 = np.array([[0, 1, 2]], dtype=np.uint32) + len(v1)
-        verts = np.vstack([v1, v2])
-        faces = np.vstack([f1, f2])
+    def test_remove_small_components_uses_source_area_threshold_not_face_count(self):
+        """Source cumesh keeps components by summed face area >= min_area."""
+        verts = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [10.0, 10.0, 10.0],
+            [10.001, 10.0, 10.0],
+            [10.0, 10.001, 10.0],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 2],
+            [3, 4, 5],
+        ], dtype=np.int64)
 
-        # With min_component_ratio=0.5, threshold = int(4 * 0.5) = 2
-        # The 1-face fragment is below threshold and gets removed
-        cleaned_v, cleaned_f = cleanup_mesh(
-            verts, faces, min_component_ratio=0.5, verbose=False,
+        cleaned_v, cleaned_f = remove_small_components(
+            verts, faces, min_area=1e-5, verbose=False,
         )
-        assert len(cleaned_f) == 4
-        assert cleaned_v[:, 0].max() < 5
+
+        assert len(cleaned_f) == 1
+        assert cleaned_v[:, 0].max() <= 1.0
 
     def test_default_preserves_substantial_second_component(self):
         """Two equal tetrahedra should both survive default cleanup
@@ -321,11 +331,11 @@ class TestDefaultCleanupUsesSmallComponentRemoval:
         # Both should survive — they're equal size, both above threshold
         assert len(cleaned_f) == 8
 
-    def test_cleanup_mesh_accepts_min_component_ratio(self):
-        """cleanup_mesh should accept min_component_ratio parameter."""
+    def test_cleanup_mesh_accepts_min_component_area(self):
+        """cleanup_mesh should accept source-named min_component_area parameter."""
         v1, f1 = _make_tetrahedron()
         cleaned_v, cleaned_f = cleanup_mesh(
-            v1, f1, min_component_ratio=1e-5, verbose=False,
+            v1, f1, min_component_area=1e-5, verbose=False,
         )
         assert len(cleaned_f) == 4
 
