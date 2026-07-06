@@ -241,3 +241,51 @@ def test_postprocess_reference_cleanup_rejects_qem_simplify_until_parity_gate():
             simplify=lambda v, faces, **kwargs: (v, faces),
             log=lambda *args, **kwargs: None,
         )
+
+
+def test_postprocess_reference_cleanup_accepts_source_native_qem_backend():
+    from generate import _cleanup_and_simplify_mesh
+
+    calls = []
+    cleanup_outputs = [250_000, 190_000]
+
+    def cleanup_mesh(v, faces, **kwargs):
+        return v, FaceBag(cleanup_outputs.pop(0))
+
+    def source_simplify(v, faces, target_faces, **kwargs):
+        calls.append((len(faces), target_faces, kwargs))
+        return v, FaceBag(target_faces)
+
+    vertices, faces = _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        cleanup_mesh=cleanup_mesh,
+        source_native_simplify=source_simplify,
+        orient_faces_by_adjacency=lambda v, faces, **kwargs: (v, faces),
+        simplify=lambda v, faces, **kwargs: (v, FaceBag(kwargs["target_count"])),
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert len(faces) == 190_000
+    assert calls == [(250_000, 200_000, {"verbose": True})]
+
+
+def test_postprocess_rejects_unknown_qem_backend():
+    from generate import _cleanup_and_simplify_mesh
+
+    with pytest.raises(ValueError, match="unknown qem_backend"):
+        _cleanup_and_simplify_mesh(
+            FaceBag(10),
+            FaceBag(1_000_000),
+            target_faces=200_000,
+            no_cleanup=False,
+            qem_simplify=True,
+            qem_backend="definitely-not-real",
+            cleanup_mesh=lambda v, faces, **kwargs: (v, faces),
+            log=lambda *args, **kwargs: None,
+        )

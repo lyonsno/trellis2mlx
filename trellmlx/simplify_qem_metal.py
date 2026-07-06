@@ -134,6 +134,7 @@ _EDGE_COST_SOURCE = '''
 _edge_cost_kernel = None
 _source_qem_kernel = None
 _source_base_cost_kernel = None
+_source_full_edge_cost_kernel = None
 
 def _get_edge_cost_kernel():
     global _edge_cost_kernel
@@ -155,11 +156,171 @@ def _get_edge_cost_kernel():
 
 
 _SOURCE_QEM_HEADER = '''
-inline float3 cross_f3(float3 a, float3 b) {
-    return float3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+struct SourceVec3 {
+    float x, y, z;
+
+    SourceVec3() thread : x(0), y(0), z(0) {}
+    SourceVec3(float ax, float ay, float az) thread : x(ax), y(ay), z(az) {}
+
+    SourceVec3 operator+(const thread SourceVec3& o) const thread {
+        return SourceVec3(x + o.x, y + o.y, z + o.z);
+    }
+    thread SourceVec3& operator+=(const thread SourceVec3& o) thread {
+        x += o.x; y += o.y; z += o.z; return *this;
+    }
+    SourceVec3 operator-(const thread SourceVec3& o) const thread {
+        return SourceVec3(x - o.x, y - o.y, z - o.z);
+    }
+    thread SourceVec3& operator-=(const thread SourceVec3& o) thread {
+        x -= o.x; y -= o.y; z -= o.z; return *this;
+    }
+    SourceVec3 operator*(float s) const thread {
+        return SourceVec3(x * s, y * s, z * s);
+    }
+    thread SourceVec3& operator*=(float s) thread {
+        x *= s; y *= s; z *= s; return *this;
+    }
+    float dot(const thread SourceVec3& o) const thread {
+        return x * o.x + y * o.y + z * o.z;
+    }
+    float norm() const thread {
+        return sqrt(x * x + y * y + z * z);
+    }
+    float norm2() const thread {
+        return x * x + y * y + z * z;
+    }
+    void normalize() thread {
+        float inv = rsqrt(x * x + y * y + z * z);
+        x *= inv; y *= inv; z *= inv;
+    }
+    SourceVec3 cross(const thread SourceVec3& o) const thread {
+        return SourceVec3(y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x);
+    }
+};
+
+struct SourceQEM {
+    float e[10];
+
+    void zero() thread {
+        for (int i = 0; i < 10; i++) e[i] = 0.0f;
+    }
+    void add_plane(float4 p) thread {
+        float a = p.x, b = p.y, c = p.z, d = p.w;
+        e[0] += a*a; e[1] += a*b; e[2] += a*c; e[3] += a*d;
+        e[4] += b*b; e[5] += b*c; e[6] += b*d;
+        e[7] += c*c; e[8] += c*d;
+        e[9] += d*d;
+    }
+    SourceQEM operator+(const thread SourceQEM& o) const thread {
+        SourceQEM res;
+        for (int i = 0; i < 10; i++) res.e[i] = e[i] + o.e[i];
+        return res;
+    }
+    float evaluate(const thread SourceVec3& p) const thread {
+        float x = p.x, y = p.y, z = p.z;
+        return e[0]*x*x + 2*e[1]*x*y + 2*e[2]*x*z + 2*e[3]*x
+             + e[4]*y*y + 2*e[5]*y*z + 2*e[6]*y
+             + e[7]*z*z + 2*e[8]*z + e[9];
+    }
+};
+
+inline SourceVec3 load_source_vec3(device const float* verts, int vi) {
+    return SourceVec3(verts[vi * 3 + 0], verts[vi * 3 + 1], verts[vi * 3 + 2]);
 }
-inline float dot_f3(float3 a, float3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
+inline SourceQEM load_source_qem(device const float* qems, int vi) {
+    SourceQEM q;
+    uint base = uint(vi) * 10;
+    for (int i = 0; i < 10; i++) q.e[i] = qems[base + uint(i)];
+    return q;
+}
+inline void store_source_qem(device float* qems, uint vi, thread const SourceQEM& q) {
+    uint base = vi * 10;
+    for (int i = 0; i < 10; i++) qems[base + uint(i)] = q.e[i];
+}
+inline bool process_incident_tri_source_indices(
+    int ia,
+    int ib,
+    int ic,
+    int keep_vert,
+    int other_vert,
+    device const float* verts,
+    thread const SourceVec3& v_new,
+    thread float& skinny_cost,
+    thread int& num_tri
+) {
+    if (ia == other_vert || ib == other_vert || ic == other_vert) {
+        return true;
+    }
+
+    SourceVec3 a = load_source_vec3(verts, ia);
+    SourceVec3 b = load_source_vec3(verts, ib);
+    SourceVec3 c = load_source_vec3(verts, ic);
+
+    SourceVec3 na = (ia == keep_vert) ? v_new : a;
+    SourceVec3 nb = (ib == keep_vert) ? v_new : b;
+    SourceVec3 nc = (ic == keep_vert) ? v_new : c;
+
+    SourceVec3 old_normal = (b - a).cross(c - a);
+    SourceVec3 new_e1 = nb - na;
+    SourceVec3 new_e2 = nc - na;
+    SourceVec3 new_normal = new_e1.cross(new_e2);
+    float new_area = 0.5f * new_normal.norm();
+
+    if (old_normal.dot(new_normal) < 0.0f) {
+        return false;
+    }
+
+    SourceVec3 new_e0 = nc - nb;
+    float denom = new_e0.norm2() + new_e1.norm2() + new_e2.norm2();
+    if (denom < 1e-12f) denom = 1e-12f;
+    float shape = 4.0f * sqrt(3.0f) * new_area / denom;
+    skinny_cost += 1.0f - clamp(shape, 0.0f, 1.0f);
+    num_tri += 1;
+    return true;
+}
+inline bool process_incident_tri_source(
+    int tri_idx,
+    int keep_vert,
+    int other_vert,
+    device const float* verts,
+    constant const int* face_v,
+    thread const SourceVec3& v_new,
+    thread float& skinny_cost,
+    thread int& num_tri
+) {
+    return process_incident_tri_source_indices(
+        face_v[tri_idx * 3 + 0],
+        face_v[tri_idx * 3 + 1],
+        face_v[tri_idx * 3 + 2],
+        keep_vert,
+        other_vert,
+        verts,
+        v_new,
+        skinny_cost,
+        num_tri
+    );
+}
+inline bool process_incident_tri_source(
+    int tri_idx,
+    int keep_vert,
+    int other_vert,
+    device const float* verts,
+    device const int* face_v,
+    thread const SourceVec3& v_new,
+    thread float& skinny_cost,
+    thread int& num_tri
+) {
+    return process_incident_tri_source_indices(
+        face_v[tri_idx * 3 + 0],
+        face_v[tri_idx * 3 + 1],
+        face_v[tri_idx * 3 + 2],
+        keep_vert,
+        other_vert,
+        verts,
+        v_new,
+        skinny_cost,
+        num_tri
+    );
 }
 '''
 
@@ -167,8 +328,8 @@ _SOURCE_QEM_SOURCE = '''
     uint vi = thread_position_in_grid.x;
     if (vi >= num_vertices_buf[0]) return;
 
-    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
-    float q5 = 0.0f, q6 = 0.0f, q7 = 0.0f, q8 = 0.0f, q9 = 0.0f;
+    SourceQEM v_qem;
+    v_qem.zero();
 
     for (int ptr = vf_offset[vi]; ptr < vf_offset[vi + 1]; ptr++) {
         int fi = vf_data[ptr];
@@ -176,37 +337,18 @@ _SOURCE_QEM_SOURCE = '''
         int ib = face_v[fi * 3 + 1];
         int ic = face_v[fi * 3 + 2];
 
-        float3 v0 = float3(verts[ia * 3 + 0], verts[ia * 3 + 1], verts[ia * 3 + 2]);
-        float3 e1 = float3(verts[ib * 3 + 0], verts[ib * 3 + 1], verts[ib * 3 + 2]) - v0;
-        float3 e2 = float3(verts[ic * 3 + 0], verts[ic * 3 + 1], verts[ic * 3 + 2]) - v0;
-        float3 n = cross_f3(e1, e2);
-        float inv_norm = rsqrt(dot_f3(n, n));
-        n *= inv_norm;
-        float d = -dot_f3(n, v0);
-
-        q0 += n.x * n.x;
-        q1 += n.x * n.y;
-        q2 += n.x * n.z;
-        q3 += n.x * d;
-        q4 += n.y * n.y;
-        q5 += n.y * n.z;
-        q6 += n.y * d;
-        q7 += n.z * n.z;
-        q8 += n.z * d;
-        q9 += d * d;
+        SourceVec3 f_v0 = load_source_vec3(verts, ia);
+        SourceVec3 e1 = load_source_vec3(verts, ib);
+        SourceVec3 e2 = load_source_vec3(verts, ic);
+        e1 -= f_v0;
+        e2 -= f_v0;
+        SourceVec3 n = e1.cross(e2);
+        n.normalize();
+        float d = -(n.dot(f_v0));
+        v_qem.add_plane(float4(n.x, n.y, n.z, d));
     }
 
-    uint base = vi * 10;
-    out_qems[base + 0] = q0;
-    out_qems[base + 1] = q1;
-    out_qems[base + 2] = q2;
-    out_qems[base + 3] = q3;
-    out_qems[base + 4] = q4;
-    out_qems[base + 5] = q5;
-    out_qems[base + 6] = q6;
-    out_qems[base + 7] = q7;
-    out_qems[base + 8] = q8;
-    out_qems[base + 9] = q9;
+    store_source_qem(out_qems, vi, v_qem);
 '''
 
 _SOURCE_BASE_COST_SOURCE = '''
@@ -215,43 +357,100 @@ _SOURCE_BASE_COST_SOURCE = '''
 
     int e0 = edge_v0[ei];
     int e1 = edge_v1[ei];
-    float3 v0 = float3(verts[e0 * 3 + 0], verts[e0 * 3 + 1], verts[e0 * 3 + 2]);
-    float3 v1 = float3(verts[e1 * 3 + 0], verts[e1 * 3 + 1], verts[e1 * 3 + 2]);
+    SourceVec3 v0 = load_source_vec3(verts, e0);
+    SourceVec3 v1 = load_source_vec3(verts, e1);
 
     float w0 = 0.5f;
     if (boundary[e0] != 0 && boundary[e1] == 0) w0 = 1.0f;
     else if (boundary[e0] == 0 && boundary[e1] != 0) w0 = 0.0f;
-    float3 v = v0 * w0 + v1 * (1.0f - w0);
+    SourceVec3 v = v0 * w0 + v1 * (1.0f - w0);
 
-    uint q0_base = uint(e0) * 10;
-    uint q1_base = uint(e1) * 10;
-    float q0 = qems[q0_base + 0] + qems[q1_base + 0];
-    float q1 = qems[q0_base + 1] + qems[q1_base + 1];
-    float q2 = qems[q0_base + 2] + qems[q1_base + 2];
-    float q3 = qems[q0_base + 3] + qems[q1_base + 3];
-    float q4 = qems[q0_base + 4] + qems[q1_base + 4];
-    float q5 = qems[q0_base + 5] + qems[q1_base + 5];
-    float q6 = qems[q0_base + 6] + qems[q1_base + 6];
-    float q7 = qems[q0_base + 7] + qems[q1_base + 7];
-    float q8 = qems[q0_base + 8] + qems[q1_base + 8];
-    float q9 = qems[q0_base + 9] + qems[q1_base + 9];
+    SourceQEM q0 = load_source_qem(qems, e0);
+    SourceQEM q1 = load_source_qem(qems, e1);
+    SourceQEM edge_qem = q0 + q1;
+    float qem_cost = edge_qem.evaluate(v);
 
-    float x = v.x;
-    float y = v.y;
-    float z = v.z;
-    float qem_cost =
-        q0 * x * x + 2.0f * q1 * x * y + 2.0f * q2 * x * z + 2.0f * q3 * x +
-        q4 * y * y + 2.0f * q5 * y * z + 2.0f * q6 * y +
-        q7 * z * z + 2.0f * q8 * z + q9;
-
-    float3 delta = v1 - v0;
-    float edge_len2 = dot(delta, delta);
+    float edge_len2 = (v1 - v0).norm2();
     out_qem_costs[ei] = qem_cost;
     out_edge_len2[ei] = edge_len2;
     out_base_costs[ei] = qem_cost + lambda_edge_length_buf[0] * edge_len2;
     out_vnew[ei * 3 + 0] = v.x;
     out_vnew[ei * 3 + 1] = v.y;
     out_vnew[ei * 3 + 2] = v.z;
+'''
+
+_SOURCE_FULL_EDGE_COST_SOURCE = '''
+
+    uint ei = thread_position_in_grid.x;
+    if (ei >= num_edges_buf[0]) return;
+
+    int e0 = edge_v0[ei];
+    int e1 = edge_v1[ei];
+    SourceVec3 v0 = load_source_vec3(verts, e0);
+    SourceVec3 v1 = load_source_vec3(verts, e1);
+
+    float w0 = 0.5f;
+    if (boundary[e0] != 0 && boundary[e1] == 0) w0 = 1.0f;
+    else if (boundary[e0] == 0 && boundary[e1] != 0) w0 = 0.0f;
+    SourceVec3 v = v0 * w0 + v1 * (1.0f - w0);
+
+    SourceQEM q0 = load_source_qem(qems, e0);
+    SourceQEM q1 = load_source_qem(qems, e1);
+    SourceQEM edge_qem = q0 + q1;
+    float qem_cost = edge_qem.evaluate(v);
+
+    float edge_len2 = (v1 - v0).norm2();
+    float cost = qem_cost + lambda_edge_length_buf[0] * edge_len2;
+
+    float skinny_cost = 0.0f;
+    int num_tri = 0;
+    for (int ptr = vf_offset[e0]; ptr < vf_offset[e0 + 1]; ptr++) {
+        if (!process_incident_tri_source(vf_data[ptr], e0, e1, verts, face_v, v, skinny_cost, num_tri)) {
+            out_costs[ei] = INFINITY;
+            out_vnew[ei * 3 + 0] = v.x;
+            out_vnew[ei * 3 + 1] = v.y;
+            out_vnew[ei * 3 + 2] = v.z;
+            out_edge_len2[ei] = edge_len2;
+            out_qem_costs[ei] = qem_cost;
+            out_skinny_avgs[ei] = INFINITY;
+            out_skinny_terms[ei] = INFINITY;
+            out_status[ei * 2 + 0] = num_tri;
+            out_status[ei * 2 + 1] = 1;
+            return;
+        }
+    }
+    for (int ptr = vf_offset[e1]; ptr < vf_offset[e1 + 1]; ptr++) {
+        if (!process_incident_tri_source(vf_data[ptr], e1, e0, verts, face_v, v, skinny_cost, num_tri)) {
+            out_costs[ei] = INFINITY;
+            out_vnew[ei * 3 + 0] = v.x;
+            out_vnew[ei * 3 + 1] = v.y;
+            out_vnew[ei * 3 + 2] = v.z;
+            out_edge_len2[ei] = edge_len2;
+            out_qem_costs[ei] = qem_cost;
+            out_skinny_avgs[ei] = INFINITY;
+            out_skinny_terms[ei] = INFINITY;
+            out_status[ei * 2 + 0] = num_tri;
+            out_status[ei * 2 + 1] = 1;
+            return;
+        }
+    }
+
+    if (num_tri > 0) {
+        skinny_cost /= float(num_tri);
+    }
+    float skinny_term = lambda_skinny_buf[0] * skinny_cost * edge_len2;
+    cost += skinny_term;
+
+    out_costs[ei] = cost;
+    out_vnew[ei * 3 + 0] = v.x;
+    out_vnew[ei * 3 + 1] = v.y;
+    out_vnew[ei * 3 + 2] = v.z;
+    out_edge_len2[ei] = edge_len2;
+    out_qem_costs[ei] = qem_cost;
+    out_skinny_avgs[ei] = skinny_cost;
+    out_skinny_terms[ei] = skinny_term;
+    out_status[ei * 2 + 0] = num_tri;
+    out_status[ei * 2 + 1] = 0;
 '''
 
 
@@ -282,6 +481,26 @@ def _get_source_base_cost_kernel():
             header=_SOURCE_QEM_HEADER,
         )
     return _source_base_cost_kernel
+
+
+def _get_source_full_edge_cost_kernel():
+    global _source_full_edge_cost_kernel
+    if _source_full_edge_cost_kernel is None:
+        _source_full_edge_cost_kernel = mx.fast.metal_kernel(
+            name="qem_source_shaped_full_edge_costs",
+            input_names=[
+                "edge_v0", "edge_v1", "verts", "face_v", "vf_offset", "vf_data",
+                "qems", "boundary", "num_edges_buf", "lambda_edge_length_buf",
+                "lambda_skinny_buf",
+            ],
+            output_names=[
+                "out_costs", "out_vnew", "out_edge_len2", "out_qem_costs",
+                "out_skinny_avgs", "out_skinny_terms", "out_status",
+            ],
+            source=_SOURCE_FULL_EDGE_COST_SOURCE,
+            header=_SOURCE_QEM_HEADER,
+        )
+    return _source_full_edge_cost_kernel
 
 
 def _compute_qem_metal_source_shaped(vertices, faces, vf_offset, vf_data):
@@ -351,6 +570,73 @@ def _compute_base_costs_metal_source_shaped(vertices, edges, qems, is_boundary, 
         np.array(outputs[1], dtype=np.float32),
         np.array(outputs[2], dtype=np.float32),
         np.array(outputs[3], dtype=np.float32),
+    )
+
+
+def _compute_edge_costs_metal_source_full(
+    vertices,
+    faces,
+    edges,
+    qems,
+    is_boundary,
+    vf_offset,
+    vf_data,
+    lambda_edge_length,
+    lambda_skinny,
+):
+    """Compute source-shaped QEM final edge costs and debug terms in one Metal kernel."""
+    if not HAS_MLX:
+        raise RuntimeError("mlx-metal-source-full QEM backend requires MLX")
+    E = len(edges)
+    if E == 0:
+        return (
+            np.empty((0,), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+        )
+
+    kernel = _get_source_full_edge_cost_kernel()
+    edge_v0 = mx.array(np.asarray(edges[:, 0], dtype=np.int32))
+    edge_v1 = mx.array(np.asarray(edges[:, 1], dtype=np.int32))
+    verts_flat = mx.array(np.asarray(vertices, dtype=np.float32).ravel())
+    faces_flat = mx.array(np.asarray(faces, dtype=np.int32).ravel())
+    vf_off_mx = mx.array(np.asarray(vf_offset, dtype=np.int32))
+    vf_dat_mx = mx.array(np.asarray(vf_data, dtype=np.int32))
+    qems_flat = mx.array(np.asarray(qems, dtype=np.float32).ravel())
+    boundary = mx.array(np.asarray(is_boundary, dtype=np.int32))
+    num_edges_mx = mx.array([E], dtype=mx.uint32)
+    lambda_edge_mx = mx.array([lambda_edge_length], dtype=mx.float32)
+    lambda_skinny_mx = mx.array([lambda_skinny], dtype=mx.float32)
+    tg = min(256, E)
+    grid = ((E + tg - 1) // tg * tg, 1, 1)
+
+    outputs = kernel(
+        inputs=[
+            edge_v0, edge_v1, verts_flat, faces_flat, vf_off_mx, vf_dat_mx,
+            qems_flat, boundary, num_edges_mx, lambda_edge_mx, lambda_skinny_mx,
+        ],
+        template=[],
+        grid=grid,
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(E,), (E, 3), (E,), (E,), (E,), (E,), (E, 2)],
+        output_dtypes=[
+            mx.float32, mx.float32, mx.float32, mx.float32,
+            mx.float32, mx.float32, mx.int32,
+        ],
+    )
+    mx.eval(*outputs)
+    return (
+        np.array(outputs[0], dtype=np.float32),
+        np.array(outputs[1], dtype=np.float32),
+        np.array(outputs[2], dtype=np.float32),
+        np.array(outputs[3], dtype=np.float32),
+        np.array(outputs[4], dtype=np.float32),
+        np.array(outputs[5], dtype=np.float32),
+        np.array(outputs[6], dtype=np.int32),
     )
 
 

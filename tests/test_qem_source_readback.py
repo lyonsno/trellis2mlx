@@ -78,6 +78,32 @@ def test_local_qem_readback_records_source_shaped_metal_backend_identity():
     json.dumps(readback, default=lambda value: value.tolist() if hasattr(value, "tolist") else value)
 
 
+def test_local_qem_readback_records_full_source_edge_cost_backend_identity():
+    from trellmlx.simplify_qem_metal import HAS_MLX
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    if not HAS_MLX:
+        pytest.skip("full source-shaped Metal QEM backend requires MLX")
+
+    vertices, faces = _fixture_mesh()
+    readback = local_simplify_step_readback(
+        vertices,
+        faces,
+        collapse_thresh=np.float32(1e-8),
+        qem_backend="mlx-metal-source-full",
+    )
+
+    assert readback["settings"]["qem_backend"] == "mlx-metal-source-full"
+    assert readback["settings"]["local_edge_cost_backend"] == "mlx-metal-source-full"
+    assert readback["qems"].shape == (len(vertices), 10)
+    assert readback["qems"].dtype == np.float32
+    assert readback["costs"].shape == (len(readback["edges"]),)
+    assert readback["terms"].shape == (len(readback["edges"]), 7)
+    assert readback["status"].shape == (len(readback["edges"]), 2)
+    assert np.isfinite(readback["costs"]).all()
+    assert np.isfinite(readback["terms"]).all()
+
+
 def test_local_qem_readback_rejects_unknown_qem_backend():
     from trellmlx.qem_source_readback import local_simplify_step_readback
 
@@ -475,6 +501,59 @@ def test_qem_source_readback_script_records_source_shaped_metal_backend(tmp_path
     assert result.returncode == 0, result.stderr
     report = json.loads(report_path.read_text())
     assert report["settings"]["qem_backend"] == "mlx-metal-source"
+    assert report["settings"]["local_topology_backend"] == "mlx-metal"
+
+
+def test_qem_source_readback_script_records_full_source_edge_cost_backend(tmp_path):
+    from trellmlx.simplify_qem_metal import HAS_MLX
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    if not HAS_MLX:
+        pytest.skip("full source-shaped Metal QEM backend requires MLX")
+
+    mesh_path = tmp_path / "mesh.npz"
+    source_path = tmp_path / "source-readback.npz"
+    report_path = tmp_path / "qem-source-readback-full-metal.json"
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(
+        vertices,
+        faces,
+        collapse_thresh=np.float32(1e-8),
+        qem_backend="mlx-metal-source-full",
+    )
+    np.savez(mesh_path, vertices=vertices, faces=faces)
+    np.savez(
+        source_path,
+        edges=local["edges"],
+        costs=local["costs"],
+        props=local["props"],
+        qems=local["qems"],
+        terms=local["terms"],
+        status=local["status"],
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--mesh",
+            str(mesh_path),
+            "--source-readback",
+            str(source_path),
+            "--local-qem-backend",
+            "mlx-metal-source-full",
+            "--report",
+            str(report_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["settings"]["qem_backend"] == "mlx-metal-source-full"
+    assert report["settings"]["local_edge_cost_backend"] == "mlx-metal-source-full"
     assert report["settings"]["local_topology_backend"] == "mlx-metal"
 
 

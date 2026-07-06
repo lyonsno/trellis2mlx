@@ -121,9 +121,11 @@ def _cleanup_and_simplify_mesh(
     simplify_first=False,
     reference_cleanup=False,
     qem_simplify=False,
+    qem_backend="mlx",
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
+    source_native_simplify=None,
     orient_faces_by_adjacency=None,
     operation_trace=None,
     log=print,
@@ -133,6 +135,20 @@ def _cleanup_and_simplify_mesh(
     With simplify_first=True, simplifies the raw mesh before cleanup.
     Much faster on large meshes (cleanup on 200K faces vs 6M faces).
     """
+    def run_qem_simplify(vertices, faces, target_faces, *, verbose=True):
+        if qem_backend == "mlx":
+            from trellmlx.simplify_qem_metal import simplify_qem
+            return simplify_qem(vertices, faces, target_faces, verbose=verbose)
+        if qem_backend == "source-native":
+            if source_native_simplify is None:
+                from trellmlx.source_mtlmesh import simplify_source_native
+                return simplify_source_native(vertices, faces, target_faces, verbose=verbose)
+            return source_native_simplify(vertices, faces, target_faces, verbose=verbose)
+        raise ValueError(f"unknown qem_backend: {qem_backend}")
+
+    if qem_simplify and qem_backend not in {"mlx", "source-native"}:
+        raise ValueError(f"unknown qem_backend: {qem_backend}")
+
     def final_cleanup(vertices, faces):
         if no_cleanup:
             return vertices, faces
@@ -181,7 +197,7 @@ def _cleanup_and_simplify_mesh(
             from trellmlx.mesh_cleanup import cleanup_mesh
 
     if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
-        if qem_simplify:
+        if qem_simplify and qem_backend != "source-native":
             raise ValueError("reference_cleanup cannot be combined with qem_simplify until the QEM parity gate passes")
         if simplify is None:
             import fast_simplification
@@ -230,10 +246,15 @@ def _cleanup_and_simplify_mesh(
         if len(faces) > target_faces:
             t0 = time.perf_counter()
             simplify_input_faces = len(faces)
-            vertices, faces = simplify(vertices, faces, target_count=target_faces)
+            if qem_simplify:
+                vertices, faces = run_qem_simplify(vertices, faces, target_faces, verbose=True)
+                simplify_operation = "simplify_final_source_native_qem"
+            else:
+                vertices, faces = simplify(vertices, faces, target_count=target_faces)
+                simplify_operation = "simplify_final"
             if operation_trace is not None:
                 operation_trace.append({
-                    "operation": "simplify_final",
+                    "operation": simplify_operation,
                     "input_faces": simplify_input_faces,
                     "requested_target_faces": target_faces,
                     "output_faces": len(faces),
@@ -268,9 +289,8 @@ def _cleanup_and_simplify_mesh(
                 t0 = time.perf_counter()
                 vertices, faces = cleanup_mesh(vertices, faces, keep_largest=keep_largest, do_fix_normals=False)
                 log(f"  Cleanup: {time.perf_counter()-t0:.1f}s", flush=True)
-            from trellmlx.simplify_qem_metal import simplify_qem
             t0 = time.perf_counter()
-            vertices, faces = simplify_qem(vertices, faces, target_faces, verbose=True)
+            vertices, faces = run_qem_simplify(vertices, faces, target_faces, verbose=True)
             log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
                 f"({time.perf_counter()-t0:.1f}s)", flush=True)
             vertices, faces = final_cleanup(vertices, faces)
@@ -325,8 +345,7 @@ def _cleanup_and_simplify_mesh(
     # Pass 2: Final simplify to target, then cleanup
     t0 = time.perf_counter()
     if qem_simplify and len(faces) > target_faces:
-        from trellmlx.simplify_qem_metal import simplify_qem
-        vertices, faces = simplify_qem(
+        vertices, faces = run_qem_simplify(
             vertices, faces, target_faces, verbose=True)
         log(f"  QEM final: {len(vertices):,}V {len(faces):,}F "
             f"({time.perf_counter()-t0:.1f}s)", flush=True)
@@ -394,6 +413,9 @@ def main():
     parser.add_argument("--qem-simplify", action="store_true",
                         help="Use QEM simplification with topology guards (Metal-accelerated, "
                              "prevents holes from simplification). Slower but preserves mesh quality.")
+    parser.add_argument("--qem-backend", choices=["mlx", "source-native"], default="mlx",
+                        help="QEM simplifier backend for --qem-simplify. 'mlx' is the local probe; "
+                             "'source-native' calls the reference mtlmesh/cumesh backend when installed.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
@@ -453,6 +475,7 @@ def main():
                 simplify_first=args.simplify_first,
                 reference_cleanup=args.reference_cleanup,
                 qem_simplify=args.qem_simplify,
+                qem_backend=args.qem_backend,
             )
 
             # Jump straight to texture baking
@@ -841,6 +864,7 @@ def main():
         simplify_first=args.simplify_first,
         reference_cleanup=args.reference_cleanup,
         qem_simplify=args.qem_simplify,
+        qem_backend=args.qem_backend,
     )
 
     # === Stage 4: Texture SLat ===

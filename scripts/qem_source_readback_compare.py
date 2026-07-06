@@ -75,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--collapse-thresh", type=float, default=1e-8)
     parser.add_argument(
         "--local-qem-backend",
-        choices=["cpu-vectorized", "mlx-metal-source"],
+        choices=["cpu-vectorized", "mlx-metal-source", "mlx-metal-source-full"],
         default="cpu-vectorized",
         help="Local QEM/base-cost backend to compare against source readbacks",
     )

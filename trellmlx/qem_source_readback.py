@@ -18,6 +18,7 @@ from trellmlx.simplify_qem_metal import (
 if HAS_MLX:
     from trellmlx.simplify_qem_metal import (
         _compute_base_costs_metal_source_shaped,
+        _compute_edge_costs_metal_source_full,
         _compute_qem_metal_source_shaped,
         _topology_check_metal,
     )
@@ -271,6 +272,7 @@ def local_simplify_step_readback(
             lambda_edge_length,
         )
         qem_costs = _qem_cost_from_qems(qems, edges, v_new)
+        local_edge_cost_backend = "cpu-vectorized"
     elif qem_backend == "mlx-metal-source":
         if not HAS_MLX:
             raise RuntimeError("qem_backend='mlx-metal-source' requires MLX")
@@ -282,6 +284,32 @@ def local_simplify_step_readback(
             is_boundary,
             lambda_edge_length,
         )
+        local_edge_cost_backend = "split-topology"
+    elif qem_backend == "mlx-metal-source-full":
+        if not HAS_MLX:
+            raise RuntimeError("qem_backend='mlx-metal-source-full' requires MLX")
+        qems = _compute_qem_metal_source_shaped(vertices, faces, vf_offset, vf_data)
+        (
+            costs,
+            v_new,
+            edge_len2,
+            qem_costs,
+            skinny_avgs,
+            skinny_terms,
+            status,
+        ) = _compute_edge_costs_metal_source_full(
+            vertices,
+            faces,
+            edges,
+            qems,
+            is_boundary,
+            vf_offset,
+            vf_data,
+            lambda_edge_length,
+            lambda_skinny,
+        )
+        base_costs = (qem_costs + np.float32(lambda_edge_length) * edge_len2).astype(np.float32)
+        local_edge_cost_backend = "mlx-metal-source-full"
     else:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
 
@@ -295,36 +323,43 @@ def local_simplify_step_readback(
         if not np.isfinite(value).all():
             raise ValueError(f"nonfinite local QEM evidence from qem_backend={qem_backend}: {name}")
 
-    if HAS_MLX:
-        costs = _topology_check_metal(
-            vertices,
-            faces,
-            edges,
-            v_new,
-            base_costs,
-            edge_len2,
-            vf_offset,
-            vf_data,
-            lambda_skinny,
-        )
+    if qem_backend == "mlx-metal-source-full":
         topology_backend = "mlx-metal"
     else:
-        costs = _topology_check_cpu(
-            vertices,
-            faces,
-            edges,
-            v_new,
-            base_costs,
-            edge_len2,
-            vf_offset,
-            vf_data,
-            lambda_skinny,
-        )
-        topology_backend = "cpu"
+        if HAS_MLX:
+            costs = _topology_check_metal(
+                vertices,
+                faces,
+                edges,
+                v_new,
+                base_costs,
+                edge_len2,
+                vf_offset,
+                vf_data,
+                lambda_skinny,
+            )
+            topology_backend = "mlx-metal"
+        else:
+            costs = _topology_check_cpu(
+                vertices,
+                faces,
+                edges,
+                v_new,
+                base_costs,
+                edge_len2,
+                vf_offset,
+                vf_data,
+                lambda_skinny,
+            )
+            topology_backend = "cpu"
+        skinny_avgs, status = _topology_terms_cpu(vertices, faces, edges, v_new, vf_offset, vf_data)
+        skinny_terms = (costs - base_costs.astype(np.float32)).astype(np.float32)
 
     costs = np.asarray(costs, dtype=np.float32)
-    skinny_avgs, status = _topology_terms_cpu(vertices, faces, edges, v_new, vf_offset, vf_data)
-    skinny_terms = (costs - base_costs.astype(np.float32)).astype(np.float32)
+    for name, value in (("costs", costs), ("skinny_terms", skinny_terms)):
+        finite_or_inf = np.isfinite(value) | np.isinf(value)
+        if not finite_or_inf.all():
+            raise ValueError(f"nonfinite local QEM evidence from qem_backend={qem_backend}: {name}")
     terms = np.column_stack([
         v_new.astype(np.float32),
         qem_costs,
@@ -362,6 +397,7 @@ def local_simplify_step_readback(
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
             "qem_backend": qem_backend,
+            "local_edge_cost_backend": local_edge_cost_backend,
             "topology_backend": topology_backend,
         },
         "edges": edges.astype(np.int32, copy=False),
@@ -622,6 +658,7 @@ def build_qem_source_readback_report(
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
             "qem_backend": local["settings"]["qem_backend"],
+            "local_edge_cost_backend": local["settings"]["local_edge_cost_backend"],
             "local_topology_backend": local["settings"]["topology_backend"],
         },
         "identity": {
@@ -746,6 +783,7 @@ def build_qem_source_distribution_report(
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
             "qem_backend": run_reports[0]["settings"]["qem_backend"],
+            "local_edge_cost_backend": run_reports[0]["settings"]["local_edge_cost_backend"],
             "local_topology_backend": run_reports[0]["settings"]["local_topology_backend"],
         },
         "local_collapse_counts": local_counts,
