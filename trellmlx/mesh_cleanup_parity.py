@@ -31,6 +31,7 @@ REFERENCE_CLEANUP_CONTRACT: dict[str, Any] = {
         "unify_face_orientations": "orient_faces_by_adjacency",
     },
     "qem_status": "primitive_choice_only_not_reference_equivalent",
+    "qem_probe_status": "probe_only_not_reference_equivalent",
 }
 
 

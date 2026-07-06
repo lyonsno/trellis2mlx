@@ -89,7 +89,7 @@ def test_cleanup_parity_report_records_route_identity_and_jsonable_scalars():
 
     report = build_mesh_cleanup_parity_report(
         requested_route="reference-cleanup",
-        effective_route="local-reference-cleanup",
+        effective_route="local-reference-cleanup:fast-simplification",
         input_vertices=vertices,
         input_faces=input_faces,
         output_vertices=vertices,
@@ -103,7 +103,7 @@ def test_cleanup_parity_report_records_route_identity_and_jsonable_scalars():
 
     assert report["schema"] == "trellis2mlx.mesh_cleanup_parity_report.v1"
     assert report["requested_route"] == "reference-cleanup"
-    assert report["effective_route"] == "local-reference-cleanup"
+    assert report["effective_route"] == "local-reference-cleanup:fast-simplification"
     assert report["source_contract"]["operations"][0] == "simplify_coarse"
     assert report["reference_backend"] == {"status": "unavailable", "reason": "cumesh import failed"}
     assert report["input_scalars"]["same_direction_shared_edge_count"] == 1
@@ -148,7 +148,7 @@ def test_mesh_cleanup_parity_harness_writes_fixture_report(tmp_path):
     report = json.loads(report_path.read_text())
     assert report["schema"] == "trellis2mlx.mesh_cleanup_parity_report.v1"
     assert report["requested_route"] == "fixture:two-triangle-sheet"
-    assert report["effective_route"] == "local-reference-cleanup"
+    assert report["effective_route"] == "local-reference-cleanup:fast-simplification"
     assert report["asset"]["route"] == "fixture"
     assert report["asset"]["name"] == "two-triangle-sheet"
     assert report["source_contract"]["operations"][0] == "simplify_coarse"
@@ -156,6 +156,47 @@ def test_mesh_cleanup_parity_harness_writes_fixture_report(tmp_path):
     assert "input_scalars" in report
     assert "output_scalars" in report
     assert isinstance(report["operation_trace"], list)
+
+
+def test_mesh_cleanup_parity_harness_can_label_qem_probe_route(tmp_path):
+    harness = _load_script_module()
+    report_path = tmp_path / "cleanup-parity-qem-probe.json"
+
+    exit_code = harness.main([
+        "--fixture",
+        "two-triangle-sheet",
+        "--target-faces",
+        "1",
+        "--local-simplifier",
+        "qem-probe",
+        "--report",
+        str(report_path),
+    ])
+
+    assert exit_code == 0
+    report = json.loads(report_path.read_text())
+    assert report["effective_route"] == "local-reference-cleanup:qem-probe"
+    assert report["settings"]["local_simplifier"] == "qem-probe"
+    assert report["source_contract"]["qem_probe_status"] == "probe_only_not_reference_equivalent"
+
+
+def test_mesh_cleanup_parity_harness_keeps_fast_simplifier_default_route(tmp_path):
+    harness = _load_script_module()
+    report_path = tmp_path / "cleanup-parity-fast-default.json"
+
+    exit_code = harness.main([
+        "--fixture",
+        "two-triangle-sheet",
+        "--target-faces",
+        "1",
+        "--report",
+        str(report_path),
+    ])
+
+    assert exit_code == 0
+    report = json.loads(report_path.read_text())
+    assert report["effective_route"] == "local-reference-cleanup:fast-simplification"
+    assert report["settings"]["local_simplifier"] == "fast-simplification"
 
 
 def test_mesh_cleanup_parity_harness_writes_failure_report_for_missing_raw_mesh(tmp_path):
@@ -200,7 +241,7 @@ def test_mesh_cleanup_parity_script_runs_from_script_path(tmp_path):
     assert result.returncode == 0
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
-    assert report["effective_route"] == "local-reference-cleanup"
+    assert report["effective_route"] == "local-reference-cleanup:fast-simplification"
 
 
 def test_mesh_cleanup_parity_required_reference_backend_fails_loud(tmp_path):

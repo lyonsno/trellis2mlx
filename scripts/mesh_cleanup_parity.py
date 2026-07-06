@@ -26,6 +26,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument("--fixture", choices=["two-triangle-sheet"])
     source.add_argument("--raw-mesh", type=Path, help="NPZ containing vertices and faces arrays")
     parser.add_argument("--target-faces", type=int, default=200_000)
+    parser.add_argument(
+        "--local-simplifier",
+        choices=["fast-simplification", "qem-probe"],
+        default="fast-simplification",
+        help="Local simplifier used inside the reference-cleanup harness route",
+    )
     parser.add_argument("--reference-python", type=Path, help="Python executable with cumesh available")
     parser.add_argument("--require-reference", action="store_true", help="Fail if the reference backend cannot run")
     parser.add_argument("--report", type=Path, required=True)
@@ -232,6 +238,18 @@ def _fixture_simplify(vertices, faces, target_reduction=None, target_count=None)
     return vertices, faces[:target_count]
 
 
+def _fixture_qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None):
+    return _fixture_simplify(vertices, faces, target_reduction=target_reduction, target_count=target_count)
+
+
+def _qem_probe_simplify(vertices, faces, target_reduction=None, target_count=None):
+    if target_count is None:
+        raise ValueError("qem-probe simplifier requires target_count")
+    from trellmlx.simplify_qem_metal import simplify_qem
+
+    return simplify_qem(vertices, faces, int(target_count), verbose=False)
+
+
 def _fixture_cleanup(vertices, faces, **kwargs):
     return vertices, faces
 
@@ -242,6 +260,7 @@ def _run_local_reference_cleanup(
     *,
     target_faces: int,
     fixture_mode: bool,
+    local_simplifier: str,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     from generate import _cleanup_and_simplify_mesh
 
@@ -249,12 +268,15 @@ def _run_local_reference_cleanup(
     kwargs: dict[str, Any] = {}
     if fixture_mode:
         from trellmlx.mesh_cleanup import orient_faces_by_adjacency
+        simplify = _fixture_qem_probe_simplify if local_simplifier == "qem-probe" else _fixture_simplify
 
         kwargs.update(
             cleanup_mesh=_fixture_cleanup,
-            simplify=_fixture_simplify,
+            simplify=simplify,
             orient_faces_by_adjacency=orient_faces_by_adjacency,
         )
+    elif local_simplifier == "qem-probe":
+        kwargs["simplify"] = _qem_probe_simplify
 
     output_vertices, output_faces = _cleanup_and_simplify_mesh(
         vertices,
@@ -298,6 +320,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         faces,
         target_faces=args.target_faces,
         fixture_mode=asset["route"] == "fixture",
+        local_simplifier=args.local_simplifier,
     )
     reference_vertices = None
     reference_faces = None
@@ -320,7 +343,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     report = build_mesh_cleanup_parity_report(
         requested_route=requested_route,
-        effective_route="local-reference-cleanup",
+        effective_route=f"local-reference-cleanup:{args.local_simplifier}",
         input_vertices=vertices,
         input_faces=faces,
         output_vertices=output_vertices,
@@ -334,7 +357,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report.update({
         "status": "ok",
         "asset": asset,
-        "settings": {"target_faces": args.target_faces},
+        "settings": {
+            "target_faces": args.target_faces,
+            "local_simplifier": args.local_simplifier,
+        },
         "elapsed_seconds": time.perf_counter() - t0,
     })
     return report
