@@ -14,7 +14,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from trellmlx.qem_source_readback import (  # noqa: E402
+    REPORT_SCHEMA,
+    SOURCE_DISTRIBUTION_SCHEMA,
     _jsonable,
+    build_qem_source_distribution_report,
     build_qem_source_readback_report,
     failure_report,
     load_mesh_npz,
@@ -24,6 +27,35 @@ from trellmlx.qem_source_readback import (  # noqa: E402
 
 REQUESTED_ROUTE = "qem-source-readback-compare"
 EFFECTIVE_ROUTE = "local-qem-step-vs-source-readback"
+DISTRIBUTION_REQUESTED_ROUTE = "qem-source-distribution-compare"
+DISTRIBUTION_EFFECTIVE_ROUTE = "local-qem-step-vs-source-distribution"
+
+
+def _route_identity(source_count: int) -> tuple[str, str, str]:
+    if source_count > 1:
+        return DISTRIBUTION_REQUESTED_ROUTE, DISTRIBUTION_EFFECTIVE_ROUTE, SOURCE_DISTRIBUTION_SCHEMA
+    return REQUESTED_ROUTE, EFFECTIVE_ROUTE, REPORT_SCHEMA
+
+
+def _failure_report(
+    *,
+    failure_phase: str,
+    error: Exception,
+    mesh_path: Path | None,
+    source_readback_path: Path | None,
+    source_readback_paths: list[Path],
+) -> dict:
+    requested_route, effective_route, schema = _route_identity(len(source_readback_paths))
+    return failure_report(
+        requested_route=requested_route,
+        effective_route=effective_route,
+        failure_phase=failure_phase,
+        error=error,
+        mesh_path=mesh_path,
+        source_readback_path=source_readback_path,
+        schema=schema,
+        source_readback_paths=source_readback_paths if len(source_readback_paths) > 1 else None,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -32,6 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--source-readback",
         type=Path,
+        action="append",
         required=True,
         help="NPZ containing source edges, costs, props, and optional qems arrays",
     )
@@ -66,56 +99,69 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         _write_json(
             args.report,
-            failure_report(
-                requested_route=REQUESTED_ROUTE,
-                effective_route=EFFECTIVE_ROUTE,
+            _failure_report(
                 failure_phase="mesh",
                 error=exc,
                 mesh_path=args.mesh,
-                source_readback_path=args.source_readback,
+                source_readback_path=None,
+                source_readback_paths=args.source_readback,
             ),
         )
         return 1
 
+    sources = []
     try:
-        source = load_source_readback_npz(args.source_readback)
+        for source_readback_path in args.source_readback:
+            sources.append(load_source_readback_npz(source_readback_path))
     except Exception as exc:
         _write_json(
             args.report,
-            failure_report(
-                requested_route=REQUESTED_ROUTE,
-                effective_route=EFFECTIVE_ROUTE,
+            _failure_report(
                 failure_phase="source_readback",
                 error=exc,
                 mesh_path=args.mesh,
-                source_readback_path=args.source_readback,
+                source_readback_path=source_readback_path,
+                source_readback_paths=args.source_readback,
             ),
         )
         return 1
 
     try:
-        report = build_qem_source_readback_report(
-            requested_route=REQUESTED_ROUTE,
-            effective_route=EFFECTIVE_ROUTE,
-            mesh_path=args.mesh,
-            source_readback_path=args.source_readback,
-            vertices=vertices,
-            faces=faces,
-            source=source,
-            lambda_edge_length=args.lambda_edge_length,
-            lambda_skinny=args.lambda_skinny,
-            collapse_thresh=args.collapse_thresh,
-        )
+        if len(sources) == 1:
+            report = build_qem_source_readback_report(
+                requested_route=REQUESTED_ROUTE,
+                effective_route=EFFECTIVE_ROUTE,
+                mesh_path=args.mesh,
+                source_readback_path=args.source_readback[0],
+                vertices=vertices,
+                faces=faces,
+                source=sources[0],
+                lambda_edge_length=args.lambda_edge_length,
+                lambda_skinny=args.lambda_skinny,
+                collapse_thresh=args.collapse_thresh,
+            )
+        else:
+            report = build_qem_source_distribution_report(
+                requested_route=DISTRIBUTION_REQUESTED_ROUTE,
+                effective_route=DISTRIBUTION_EFFECTIVE_ROUTE,
+                mesh_path=args.mesh,
+                source_readback_paths=args.source_readback,
+                vertices=vertices,
+                faces=faces,
+                sources=sources,
+                lambda_edge_length=args.lambda_edge_length,
+                lambda_skinny=args.lambda_skinny,
+                collapse_thresh=args.collapse_thresh,
+            )
     except Exception as exc:
         _write_json(
             args.report,
-            failure_report(
-                requested_route=REQUESTED_ROUTE,
-                effective_route=EFFECTIVE_ROUTE,
+            _failure_report(
                 failure_phase="compare",
                 error=exc,
                 mesh_path=args.mesh,
-                source_readback_path=args.source_readback,
+                source_readback_path=args.source_readback[0] if len(args.source_readback) == 1 else None,
+                source_readback_paths=args.source_readback,
             ),
         )
         return 1

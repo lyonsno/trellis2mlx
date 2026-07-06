@@ -168,6 +168,53 @@ def test_qem_source_readback_report_attributes_optional_source_terms():
     json.dumps(report, allow_nan=False)
 
 
+def test_qem_source_distribution_report_preserves_run_ranges_and_local_placement():
+    from trellmlx.qem_source_readback import (
+        build_qem_source_distribution_report,
+        local_simplify_step_readback,
+    )
+
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(vertices, faces, collapse_thresh=np.float32(1e-8))
+    source_a = {
+        "edges": local["edges"].copy(),
+        "costs": local["costs"].copy(),
+        "props": local["props"].copy(),
+        "qems": local["qems"].copy(),
+        "terms": local["terms"].copy(),
+    }
+    source_b = {
+        "edges": local["edges"].copy(),
+        "costs": local["costs"].copy(),
+        "props": local["props"].copy(),
+        "qems": local["qems"].copy(),
+        "terms": local["terms"].copy(),
+    }
+    source_b["costs"][:] = np.float32(1.0)
+    source_b["props"][:] = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+    report = build_qem_source_distribution_report(
+        requested_route="qem-source-distribution-compare",
+        effective_route="local-qem-step-vs-source-distribution",
+        mesh_path=Path("/tmp/fixture-mesh.npz"),
+        source_readback_paths=[Path("/tmp/source-a.npz"), Path("/tmp/source-b.npz")],
+        vertices=vertices,
+        faces=faces,
+        sources=[source_a, source_b],
+        collapse_thresh=np.float32(1e-8),
+    )
+
+    assert report["schema"] == "trellis2mlx.qem_source_distribution_compare.v1"
+    assert report["status"] == "ok"
+    assert report["source_distribution"]["run_count"] == 2
+    assert report["source_distribution"]["removed_faces"]["min"] <= local["collapse_counts"]["removed_faces"]
+    assert report["source_distribution"]["removed_faces"]["max"] >= local["collapse_counts"]["removed_faces"]
+    assert report["local_vs_distribution"]["removed_faces_position"] == "inside"
+    assert "source_run_reports" in report
+    assert len(report["source_run_reports"]) == 2
+    json.dumps(report, allow_nan=False)
+
+
 def test_qem_source_readback_harness_writes_failure_report_for_missing_source_npz(tmp_path):
     harness = _load_script_module()
     mesh_path = tmp_path / "mesh.npz"
@@ -191,6 +238,93 @@ def test_qem_source_readback_harness_writes_failure_report_for_missing_source_np
     assert report["failure_phase"] == "source_readback"
     assert report["requested_route"] == "qem-source-readback-compare"
     assert report["last_trustworthy_evidence"]["report_written"] is True
+
+
+def test_qem_source_readback_harness_preserves_distribution_failure_identity(tmp_path):
+    harness = _load_script_module()
+    mesh_path = tmp_path / "mesh.npz"
+    source_a_path = tmp_path / "source-a.npz"
+    source_b_path = tmp_path / "missing-source-b.npz"
+    report_path = tmp_path / "qem-source-distribution-failure.json"
+    vertices, faces = _fixture_mesh()
+    np.savez(mesh_path, vertices=vertices, faces=faces)
+    np.savez(
+        source_a_path,
+        edges=np.empty((0, 2), dtype=np.int32),
+        costs=np.empty((0,), dtype=np.float32),
+        props=np.empty((len(faces),), dtype=np.uint64),
+    )
+
+    exit_code = harness.main([
+        "--mesh",
+        str(mesh_path),
+        "--source-readback",
+        str(source_a_path),
+        "--source-readback",
+        str(source_b_path),
+        "--report",
+        str(report_path),
+    ])
+
+    assert exit_code == 1
+    report = json.loads(report_path.read_text())
+    assert report["schema"] == "trellis2mlx.qem_source_distribution_compare.v1"
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "source_readback"
+    assert report["requested_route"] == "qem-source-distribution-compare"
+    assert report["effective_route"] == "local-qem-step-vs-source-distribution"
+    assert report["asset"]["source_readback_path"] == str(source_b_path)
+    assert report["asset"]["source_readback_paths"] == [str(source_a_path), str(source_b_path)]
+    assert "missing-source-b.npz" in report["error"]
+
+
+def test_qem_source_readback_harness_preserves_distribution_compare_failure_identity(tmp_path, monkeypatch):
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    harness = _load_script_module()
+    mesh_path = tmp_path / "mesh.npz"
+    source_a_path = tmp_path / "source-a.npz"
+    source_b_path = tmp_path / "source-b.npz"
+    report_path = tmp_path / "qem-source-distribution-compare-failure.json"
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(vertices, faces, collapse_thresh=np.float32(1e-8))
+    np.savez(mesh_path, vertices=vertices, faces=faces)
+    for source_path in (source_a_path, source_b_path):
+        np.savez(
+            source_path,
+            edges=local["edges"],
+            costs=local["costs"],
+            props=local["props"],
+            qems=local["qems"],
+            terms=local["terms"],
+        )
+
+    def fail_distribution_compare(**_kwargs):
+        raise ValueError("forced distribution compare failure")
+
+    monkeypatch.setattr(harness, "build_qem_source_distribution_report", fail_distribution_compare)
+
+    exit_code = harness.main([
+        "--mesh",
+        str(mesh_path),
+        "--source-readback",
+        str(source_a_path),
+        "--source-readback",
+        str(source_b_path),
+        "--report",
+        str(report_path),
+    ])
+
+    assert exit_code == 1
+    report = json.loads(report_path.read_text())
+    assert report["schema"] == "trellis2mlx.qem_source_distribution_compare.v1"
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "compare"
+    assert report["requested_route"] == "qem-source-distribution-compare"
+    assert report["effective_route"] == "local-qem-step-vs-source-distribution"
+    assert report["asset"]["source_readback_path"] is None
+    assert report["asset"]["source_readback_paths"] == [str(source_a_path), str(source_b_path)]
+    assert "forced distribution compare failure" in report["error"]
 
 
 def test_qem_source_readback_script_runs_from_script_path(tmp_path):
@@ -231,3 +365,54 @@ def test_qem_source_readback_script_runs_from_script_path(tmp_path):
     assert report["status"] == "ok"
     assert report["identity"]["edge_order_exact"] is True
     assert report["collapse_identity"]["collapsed_edge_ids_exact"] is True
+
+
+def test_qem_source_readback_script_accepts_multiple_source_readbacks(tmp_path):
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    mesh_path = tmp_path / "mesh.npz"
+    source_a_path = tmp_path / "source-a.npz"
+    source_b_path = tmp_path / "source-b.npz"
+    report_path = tmp_path / "qem-source-distribution.json"
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(vertices, faces, collapse_thresh=np.float32(1e-8))
+    np.savez(mesh_path, vertices=vertices, faces=faces)
+    np.savez(
+        source_a_path,
+        edges=local["edges"],
+        costs=local["costs"],
+        props=local["props"],
+        qems=local["qems"],
+        terms=local["terms"],
+    )
+    np.savez(
+        source_b_path,
+        edges=local["edges"],
+        costs=local["costs"],
+        props=local["props"],
+        qems=local["qems"],
+        terms=local["terms"],
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--mesh",
+            str(mesh_path),
+            "--source-readback",
+            str(source_a_path),
+            "--source-readback",
+            str(source_b_path),
+            "--report",
+            str(report_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["schema"] == "trellis2mlx.qem_source_distribution_compare.v1"
+    assert report["source_distribution"]["run_count"] == 2

@@ -20,6 +20,7 @@ if HAS_MLX:
 
 
 REPORT_SCHEMA = "trellis2mlx.qem_source_readback_compare.v1"
+SOURCE_DISTRIBUTION_SCHEMA = "trellis2mlx.qem_source_distribution_compare.v1"
 LOCAL_READBACK_SCHEMA = "trellis2mlx.qem_local_step_readback.v1"
 
 
@@ -615,6 +616,123 @@ def build_qem_source_readback_report(
     }
 
 
+def _range_summary(values: list[int | float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "min": None, "max": None, "values": []}
+    return {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+        "values": values,
+    }
+
+
+def _position_against_range(value: int | float, summary: dict[str, Any]) -> str:
+    if summary["count"] == 0:
+        return "no_source_runs"
+    if value < summary["min"]:
+        return "below"
+    if value > summary["max"]:
+        return "above"
+    return "inside"
+
+
+def build_qem_source_distribution_report(
+    *,
+    requested_route: str,
+    effective_route: str,
+    mesh_path: Path,
+    source_readback_paths: list[Path],
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    sources: list[dict[str, np.ndarray]],
+    lambda_edge_length: float = 1e-2,
+    lambda_skinny: float = 1e-3,
+    collapse_thresh: np.float32 = np.float32(1e-8),
+) -> dict[str, Any]:
+    if not sources:
+        raise ValueError("at least one source readback is required")
+    if len(source_readback_paths) != len(sources):
+        raise ValueError("source_readback_paths and sources must have the same length")
+
+    run_reports = [
+        build_qem_source_readback_report(
+            requested_route=requested_route,
+            effective_route=effective_route,
+            mesh_path=mesh_path,
+            source_readback_path=source_path,
+            vertices=vertices,
+            faces=faces,
+            source=source,
+            lambda_edge_length=lambda_edge_length,
+            lambda_skinny=lambda_skinny,
+            collapse_thresh=collapse_thresh,
+        )
+        for source_path, source in zip(source_readback_paths, sources, strict=True)
+    ]
+
+    local_counts = run_reports[0]["collapse_counts"]["local_costs"]
+    removed_faces = [report["collapse_counts"]["source_costs"]["removed_faces"] for report in run_reports]
+    collapsed_edges = [report["collapse_counts"]["source_costs"]["collapsed_edges"] for report in run_reports]
+    eligible = [report["collapse_counts"]["source_costs"]["eligible"] for report in run_reports]
+    negative = [report["collapse_counts"]["source_costs"]["negative"] for report in run_reports]
+    positive_le_threshold = [
+        report["collapse_counts"]["source_costs"]["positive_le_threshold"]
+        for report in run_reports
+    ]
+    cost_bit_exact = [
+        report["cost_summary"]["source_vs_local_bit_exact_edges"]
+        for report in run_reports
+    ]
+    collapsed_sets = [
+        set(report["collapse_identity"]["source_collapsed_edge_ids"])
+        for report in run_reports
+    ]
+    collapsed_intersection = set.intersection(*collapsed_sets) if collapsed_sets else set()
+    collapsed_union = set.union(*collapsed_sets) if collapsed_sets else set()
+
+    removed_summary = _range_summary(removed_faces)
+    collapsed_summary = _range_summary(collapsed_edges)
+    eligible_summary = _range_summary(eligible)
+
+    return {
+        "schema": SOURCE_DISTRIBUTION_SCHEMA,
+        "status": "ok",
+        "requested_route": requested_route,
+        "effective_route": effective_route,
+        "asset": {
+            "mesh_path": str(mesh_path),
+            "source_readback_paths": [str(path) for path in source_readback_paths],
+            "input_vertices": int(len(vertices)),
+            "input_faces": int(len(faces)),
+        },
+        "settings": {
+            "lambda_edge_length": float(lambda_edge_length),
+            "lambda_skinny": float(lambda_skinny),
+            "collapse_thresh": float(collapse_thresh),
+            "local_topology_backend": run_reports[0]["settings"]["local_topology_backend"],
+        },
+        "local_collapse_counts": local_counts,
+        "source_distribution": {
+            "run_count": len(run_reports),
+            "removed_faces": removed_summary,
+            "collapsed_edges": collapsed_summary,
+            "eligible": eligible_summary,
+            "negative": _range_summary(negative),
+            "positive_le_threshold": _range_summary(positive_le_threshold),
+            "cost_bit_exact_edges": _range_summary(cost_bit_exact),
+            "collapsed_edge_id_intersection_count": len(collapsed_intersection),
+            "collapsed_edge_id_union_count": len(collapsed_union),
+        },
+        "local_vs_distribution": {
+            "removed_faces_position": _position_against_range(local_counts["removed_faces"], removed_summary),
+            "collapsed_edges_position": _position_against_range(local_counts["collapsed_edges"], collapsed_summary),
+            "eligible_position": _position_against_range(local_counts["eligible"], eligible_summary),
+        },
+        "source_run_reports": run_reports,
+    }
+
+
 def failure_report(
     *,
     requested_route: str,
@@ -623,18 +741,24 @@ def failure_report(
     error: Exception,
     mesh_path: Path | None,
     source_readback_path: Path | None,
+    schema: str = REPORT_SCHEMA,
+    source_readback_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
+    asset = {
+        "mesh_path": str(mesh_path) if mesh_path is not None else None,
+        "source_readback_path": str(source_readback_path) if source_readback_path is not None else None,
+    }
+    if source_readback_paths is not None:
+        asset["source_readback_paths"] = [str(path) for path in source_readback_paths]
+
     return {
-        "schema": REPORT_SCHEMA,
+        "schema": schema,
         "status": "failed",
         "requested_route": requested_route,
         "effective_route": effective_route,
         "failure_phase": failure_phase,
         "error": f"{type(error).__name__}: {error}",
-        "asset": {
-            "mesh_path": str(mesh_path) if mesh_path is not None else None,
-            "source_readback_path": str(source_readback_path) if source_readback_path is not None else None,
-        },
+        "asset": asset,
         "last_trustworthy_evidence": {
             "report_written": True,
             "route_identity_known": bool(requested_route and effective_route),
@@ -644,8 +768,10 @@ def failure_report(
 
 __all__ = [
     "REPORT_SCHEMA",
+    "SOURCE_DISTRIBUTION_SCHEMA",
     "LOCAL_READBACK_SCHEMA",
     "_jsonable",
+    "build_qem_source_distribution_report",
     "build_qem_source_readback_report",
     "failure_report",
     "load_mesh_npz",
