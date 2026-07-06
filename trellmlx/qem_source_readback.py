@@ -16,7 +16,11 @@ from trellmlx.simplify_qem_metal import (
 )
 
 if HAS_MLX:
-    from trellmlx.simplify_qem_metal import _topology_check_metal
+    from trellmlx.simplify_qem_metal import (
+        _compute_base_costs_metal_source_shaped,
+        _compute_qem_metal_source_shaped,
+        _topology_check_metal,
+    )
 
 
 REPORT_SCHEMA = "trellis2mlx.qem_source_readback_compare.v1"
@@ -249,6 +253,7 @@ def local_simplify_step_readback(
     lambda_edge_length: float = 1e-2,
     lambda_skinny: float = 1e-3,
     collapse_thresh: np.float32 = np.float32(1e-8),
+    qem_backend: str = "cpu-vectorized",
 ) -> dict[str, Any]:
     vertices = np.asarray(vertices, dtype=np.float32).copy()
     faces = np.asarray(faces, dtype=np.int32).copy()
@@ -256,14 +261,39 @@ def local_simplify_step_readback(
     face_count = len(faces)
 
     edges, _edge_count, is_boundary, vf_offset, vf_data = _build_adjacency(faces, vertex_count)
-    qems = _compute_qem(vertices, faces, vertex_count)
-    base_costs, v_new, edge_len2 = _compute_base_costs(
-        vertices,
-        edges,
-        qems,
-        is_boundary,
-        lambda_edge_length,
-    )
+    if qem_backend == "cpu-vectorized":
+        qems = _compute_qem(vertices, faces, vertex_count)
+        base_costs, v_new, edge_len2 = _compute_base_costs(
+            vertices,
+            edges,
+            qems,
+            is_boundary,
+            lambda_edge_length,
+        )
+        qem_costs = _qem_cost_from_qems(qems, edges, v_new)
+    elif qem_backend == "mlx-metal-source":
+        if not HAS_MLX:
+            raise RuntimeError("qem_backend='mlx-metal-source' requires MLX")
+        qems = _compute_qem_metal_source_shaped(vertices, faces, vf_offset, vf_data)
+        base_costs, v_new, edge_len2, qem_costs = _compute_base_costs_metal_source_shaped(
+            vertices,
+            edges,
+            qems,
+            is_boundary,
+            lambda_edge_length,
+        )
+    else:
+        raise ValueError(f"unknown qem_backend: {qem_backend}")
+
+    for name, value in (
+        ("qems", qems),
+        ("base_costs", base_costs),
+        ("collapse_positions", v_new),
+        ("edge_length2", edge_len2),
+        ("qem_costs", qem_costs),
+    ):
+        if not np.isfinite(value).all():
+            raise ValueError(f"nonfinite local QEM evidence from qem_backend={qem_backend}: {name}")
 
     if HAS_MLX:
         costs = _topology_check_metal(
@@ -293,7 +323,6 @@ def local_simplify_step_readback(
         topology_backend = "cpu"
 
     costs = np.asarray(costs, dtype=np.float32)
-    qem_costs = _qem_cost_from_qems(qems, edges, v_new)
     skinny_avgs, status = _topology_terms_cpu(vertices, faces, edges, v_new, vf_offset, vf_data)
     skinny_terms = (costs - base_costs.astype(np.float32)).astype(np.float32)
     terms = np.column_stack([
@@ -332,6 +361,7 @@ def local_simplify_step_readback(
             "lambda_edge_length": float(lambda_edge_length),
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
+            "qem_backend": qem_backend,
             "topology_backend": topology_backend,
         },
         "edges": edges.astype(np.int32, copy=False),
@@ -539,6 +569,7 @@ def build_qem_source_readback_report(
     lambda_edge_length: float = 1e-2,
     lambda_skinny: float = 1e-3,
     collapse_thresh: np.float32 = np.float32(1e-8),
+    qem_backend: str = "cpu-vectorized",
 ) -> dict[str, Any]:
     if not requested_route:
         raise ValueError("requested_route must be non-empty")
@@ -553,6 +584,7 @@ def build_qem_source_readback_report(
         lambda_edge_length=lambda_edge_length,
         lambda_skinny=lambda_skinny,
         collapse_thresh=collapse_thresh,
+        qem_backend=qem_backend,
     )
     _edges, _edge_count, _is_boundary, vf_offset, vf_data = _build_adjacency(faces, len(vertices))
 
@@ -589,6 +621,7 @@ def build_qem_source_readback_report(
             "lambda_edge_length": float(lambda_edge_length),
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
+            "qem_backend": local["settings"]["qem_backend"],
             "local_topology_backend": local["settings"]["topology_backend"],
         },
         "identity": {
@@ -649,6 +682,7 @@ def build_qem_source_distribution_report(
     lambda_edge_length: float = 1e-2,
     lambda_skinny: float = 1e-3,
     collapse_thresh: np.float32 = np.float32(1e-8),
+    qem_backend: str = "cpu-vectorized",
 ) -> dict[str, Any]:
     if not sources:
         raise ValueError("at least one source readback is required")
@@ -667,6 +701,7 @@ def build_qem_source_distribution_report(
             lambda_edge_length=lambda_edge_length,
             lambda_skinny=lambda_skinny,
             collapse_thresh=collapse_thresh,
+            qem_backend=qem_backend,
         )
         for source_path, source in zip(source_readback_paths, sources, strict=True)
     ]
@@ -710,6 +745,7 @@ def build_qem_source_distribution_report(
             "lambda_edge_length": float(lambda_edge_length),
             "lambda_skinny": float(lambda_skinny),
             "collapse_thresh": float(collapse_thresh),
+            "qem_backend": run_reports[0]["settings"]["qem_backend"],
             "local_topology_backend": run_reports[0]["settings"]["local_topology_backend"],
         },
         "local_collapse_counts": local_counts,
@@ -743,6 +779,7 @@ def failure_report(
     source_readback_path: Path | None,
     schema: str = REPORT_SCHEMA,
     source_readback_paths: list[Path] | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     asset = {
         "mesh_path": str(mesh_path) if mesh_path is not None else None,
@@ -751,7 +788,7 @@ def failure_report(
     if source_readback_paths is not None:
         asset["source_readback_paths"] = [str(path) for path in source_readback_paths]
 
-    return {
+    report = {
         "schema": schema,
         "status": "failed",
         "requested_route": requested_route,
@@ -764,6 +801,9 @@ def failure_report(
             "route_identity_known": bool(requested_route and effective_route),
         },
     }
+    if settings is not None:
+        report["settings"] = settings
+    return report
 
 
 __all__ = [

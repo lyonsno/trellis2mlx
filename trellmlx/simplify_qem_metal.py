@@ -132,6 +132,8 @@ _EDGE_COST_SOURCE = '''
 '''
 
 _edge_cost_kernel = None
+_source_qem_kernel = None
+_source_base_cost_kernel = None
 
 def _get_edge_cost_kernel():
     global _edge_cost_kernel
@@ -150,6 +152,206 @@ def _get_edge_cost_kernel():
             header=_EDGE_COST_HEADER,
         )
     return _edge_cost_kernel
+
+
+_SOURCE_QEM_HEADER = '''
+inline float3 cross_f3(float3 a, float3 b) {
+    return float3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
+inline float dot_f3(float3 a, float3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+'''
+
+_SOURCE_QEM_SOURCE = '''
+    uint vi = thread_position_in_grid.x;
+    if (vi >= num_vertices_buf[0]) return;
+
+    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
+    float q5 = 0.0f, q6 = 0.0f, q7 = 0.0f, q8 = 0.0f, q9 = 0.0f;
+
+    for (int ptr = vf_offset[vi]; ptr < vf_offset[vi + 1]; ptr++) {
+        int fi = vf_data[ptr];
+        int ia = face_v[fi * 3 + 0];
+        int ib = face_v[fi * 3 + 1];
+        int ic = face_v[fi * 3 + 2];
+
+        float3 v0 = float3(verts[ia * 3 + 0], verts[ia * 3 + 1], verts[ia * 3 + 2]);
+        float3 e1 = float3(verts[ib * 3 + 0], verts[ib * 3 + 1], verts[ib * 3 + 2]) - v0;
+        float3 e2 = float3(verts[ic * 3 + 0], verts[ic * 3 + 1], verts[ic * 3 + 2]) - v0;
+        float3 n = cross_f3(e1, e2);
+        float inv_norm = rsqrt(dot_f3(n, n));
+        n *= inv_norm;
+        float d = -dot_f3(n, v0);
+
+        q0 += n.x * n.x;
+        q1 += n.x * n.y;
+        q2 += n.x * n.z;
+        q3 += n.x * d;
+        q4 += n.y * n.y;
+        q5 += n.y * n.z;
+        q6 += n.y * d;
+        q7 += n.z * n.z;
+        q8 += n.z * d;
+        q9 += d * d;
+    }
+
+    uint base = vi * 10;
+    out_qems[base + 0] = q0;
+    out_qems[base + 1] = q1;
+    out_qems[base + 2] = q2;
+    out_qems[base + 3] = q3;
+    out_qems[base + 4] = q4;
+    out_qems[base + 5] = q5;
+    out_qems[base + 6] = q6;
+    out_qems[base + 7] = q7;
+    out_qems[base + 8] = q8;
+    out_qems[base + 9] = q9;
+'''
+
+_SOURCE_BASE_COST_SOURCE = '''
+    uint ei = thread_position_in_grid.x;
+    if (ei >= num_edges_buf[0]) return;
+
+    int e0 = edge_v0[ei];
+    int e1 = edge_v1[ei];
+    float3 v0 = float3(verts[e0 * 3 + 0], verts[e0 * 3 + 1], verts[e0 * 3 + 2]);
+    float3 v1 = float3(verts[e1 * 3 + 0], verts[e1 * 3 + 1], verts[e1 * 3 + 2]);
+
+    float w0 = 0.5f;
+    if (boundary[e0] != 0 && boundary[e1] == 0) w0 = 1.0f;
+    else if (boundary[e0] == 0 && boundary[e1] != 0) w0 = 0.0f;
+    float3 v = v0 * w0 + v1 * (1.0f - w0);
+
+    uint q0_base = uint(e0) * 10;
+    uint q1_base = uint(e1) * 10;
+    float q0 = qems[q0_base + 0] + qems[q1_base + 0];
+    float q1 = qems[q0_base + 1] + qems[q1_base + 1];
+    float q2 = qems[q0_base + 2] + qems[q1_base + 2];
+    float q3 = qems[q0_base + 3] + qems[q1_base + 3];
+    float q4 = qems[q0_base + 4] + qems[q1_base + 4];
+    float q5 = qems[q0_base + 5] + qems[q1_base + 5];
+    float q6 = qems[q0_base + 6] + qems[q1_base + 6];
+    float q7 = qems[q0_base + 7] + qems[q1_base + 7];
+    float q8 = qems[q0_base + 8] + qems[q1_base + 8];
+    float q9 = qems[q0_base + 9] + qems[q1_base + 9];
+
+    float x = v.x;
+    float y = v.y;
+    float z = v.z;
+    float qem_cost =
+        q0 * x * x + 2.0f * q1 * x * y + 2.0f * q2 * x * z + 2.0f * q3 * x +
+        q4 * y * y + 2.0f * q5 * y * z + 2.0f * q6 * y +
+        q7 * z * z + 2.0f * q8 * z + q9;
+
+    float3 delta = v1 - v0;
+    float edge_len2 = dot(delta, delta);
+    out_qem_costs[ei] = qem_cost;
+    out_edge_len2[ei] = edge_len2;
+    out_base_costs[ei] = qem_cost + lambda_edge_length_buf[0] * edge_len2;
+    out_vnew[ei * 3 + 0] = v.x;
+    out_vnew[ei * 3 + 1] = v.y;
+    out_vnew[ei * 3 + 2] = v.z;
+'''
+
+
+def _get_source_qem_kernel():
+    global _source_qem_kernel
+    if _source_qem_kernel is None:
+        _source_qem_kernel = mx.fast.metal_kernel(
+            name="qem_source_shaped_vertex_qems",
+            input_names=["verts", "face_v", "vf_offset", "vf_data", "num_vertices_buf"],
+            output_names=["out_qems"],
+            source=_SOURCE_QEM_SOURCE,
+            header=_SOURCE_QEM_HEADER,
+        )
+    return _source_qem_kernel
+
+
+def _get_source_base_cost_kernel():
+    global _source_base_cost_kernel
+    if _source_base_cost_kernel is None:
+        _source_base_cost_kernel = mx.fast.metal_kernel(
+            name="qem_source_shaped_base_costs",
+            input_names=[
+                "edge_v0", "edge_v1", "verts", "qems", "boundary",
+                "num_edges_buf", "lambda_edge_length_buf",
+            ],
+            output_names=["out_base_costs", "out_vnew", "out_edge_len2", "out_qem_costs"],
+            source=_SOURCE_BASE_COST_SOURCE,
+            header=_SOURCE_QEM_HEADER,
+        )
+    return _source_base_cost_kernel
+
+
+def _compute_qem_metal_source_shaped(vertices, faces, vf_offset, vf_data):
+    """Compute per-vertex QEMs using a source-shaped Metal vertex-face loop."""
+    if not HAS_MLX:
+        raise RuntimeError("mlx-metal-source QEM backend requires MLX")
+    V = len(vertices)
+    if V == 0:
+        return np.empty((0, 10), dtype=np.float32)
+
+    kernel = _get_source_qem_kernel()
+    verts_flat = mx.array(np.asarray(vertices, dtype=np.float32).ravel())
+    faces_flat = mx.array(np.asarray(faces, dtype=np.int32).ravel())
+    vf_off_mx = mx.array(np.asarray(vf_offset, dtype=np.int32))
+    vf_dat_mx = mx.array(np.asarray(vf_data, dtype=np.int32))
+    num_vertices_mx = mx.array([V], dtype=mx.uint32)
+    tg = min(256, V)
+    grid = ((V + tg - 1) // tg * tg, 1, 1)
+
+    outputs = kernel(
+        inputs=[verts_flat, faces_flat, vf_off_mx, vf_dat_mx, num_vertices_mx],
+        template=[],
+        grid=grid,
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(V, 10)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(outputs[0])
+    return np.array(outputs[0], dtype=np.float32)
+
+
+def _compute_base_costs_metal_source_shaped(vertices, edges, qems, is_boundary, lambda_edge_length):
+    """Compute QEM base costs and collapse positions with source-shaped Metal arithmetic."""
+    if not HAS_MLX:
+        raise RuntimeError("mlx-metal-source QEM backend requires MLX")
+    E = len(edges)
+    if E == 0:
+        return (
+            np.empty((0,), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    kernel = _get_source_base_cost_kernel()
+    edge_v0 = mx.array(np.asarray(edges[:, 0], dtype=np.int32))
+    edge_v1 = mx.array(np.asarray(edges[:, 1], dtype=np.int32))
+    verts_flat = mx.array(np.asarray(vertices, dtype=np.float32).ravel())
+    qems_flat = mx.array(np.asarray(qems, dtype=np.float32).ravel())
+    boundary = mx.array(np.asarray(is_boundary, dtype=np.int32))
+    num_edges_mx = mx.array([E], dtype=mx.uint32)
+    lambda_mx = mx.array([lambda_edge_length], dtype=mx.float32)
+    tg = min(256, E)
+    grid = ((E + tg - 1) // tg * tg, 1, 1)
+
+    outputs = kernel(
+        inputs=[edge_v0, edge_v1, verts_flat, qems_flat, boundary, num_edges_mx, lambda_mx],
+        template=[],
+        grid=grid,
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(E,), (E, 3), (E,), (E,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32, mx.float32],
+    )
+    mx.eval(*outputs)
+    return (
+        np.array(outputs[0], dtype=np.float32),
+        np.array(outputs[1], dtype=np.float32),
+        np.array(outputs[2], dtype=np.float32),
+        np.array(outputs[3], dtype=np.float32),
+    )
 
 
 def simplify_qem(

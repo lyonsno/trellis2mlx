@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 
 SCRIPT = Path("scripts/qem_source_readback_compare.py")
@@ -51,6 +52,60 @@ def test_local_qem_readback_records_costs_props_and_collapsed_edges():
     assert readback["collapse_counts"]["eligible"] >= readback["collapse_counts"]["collapsed_edges"]
     assert isinstance(readback["collapsed_edge_ids"], list)
     assert all(isinstance(edge_id, int) for edge_id in readback["collapsed_edge_ids"])
+
+
+def test_local_qem_readback_records_source_shaped_metal_backend_identity():
+    from trellmlx.simplify_qem_metal import HAS_MLX
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    if not HAS_MLX:
+        pytest.skip("source-shaped Metal QEM backend requires MLX")
+
+    vertices, faces = _fixture_mesh()
+    readback = local_simplify_step_readback(
+        vertices,
+        faces,
+        collapse_thresh=np.float32(1e-8),
+        qem_backend="mlx-metal-source",
+    )
+
+    assert readback["settings"]["qem_backend"] == "mlx-metal-source"
+    assert readback["qems"].shape == (len(vertices), 10)
+    assert readback["qems"].dtype == np.float32
+    assert readback["costs"].shape == (len(readback["edges"]),)
+    assert readback["terms"].shape == (len(readback["edges"]), 7)
+    assert readback["terms"].dtype == np.float32
+    json.dumps(readback, default=lambda value: value.tolist() if hasattr(value, "tolist") else value)
+
+
+def test_local_qem_readback_rejects_unknown_qem_backend():
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    vertices, faces = _fixture_mesh()
+
+    with pytest.raises(ValueError, match="unknown qem_backend"):
+        local_simplify_step_readback(vertices, faces, qem_backend="bogus")
+
+
+def test_local_qem_readback_rejects_nonfinite_source_shaped_metal_evidence():
+    from trellmlx.simplify_qem_metal import HAS_MLX
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    if not HAS_MLX:
+        pytest.skip("source-shaped Metal QEM backend requires MLX")
+
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="nonfinite local QEM evidence.*mlx-metal-source"):
+        local_simplify_step_readback(vertices, faces, qem_backend="mlx-metal-source")
 
 
 def test_qem_source_readback_report_compares_source_bits_and_collapse_ids():
@@ -262,6 +317,8 @@ def test_qem_source_readback_harness_preserves_distribution_failure_identity(tmp
         str(source_a_path),
         "--source-readback",
         str(source_b_path),
+        "--local-qem-backend",
+        "mlx-metal-source",
         "--report",
         str(report_path),
     ])
@@ -311,6 +368,8 @@ def test_qem_source_readback_harness_preserves_distribution_compare_failure_iden
         str(source_a_path),
         "--source-readback",
         str(source_b_path),
+        "--local-qem-backend",
+        "mlx-metal-source",
         "--report",
         str(report_path),
     ])
@@ -322,6 +381,7 @@ def test_qem_source_readback_harness_preserves_distribution_compare_failure_iden
     assert report["failure_phase"] == "compare"
     assert report["requested_route"] == "qem-source-distribution-compare"
     assert report["effective_route"] == "local-qem-step-vs-source-distribution"
+    assert report["settings"]["qem_backend"] == "mlx-metal-source"
     assert report["asset"]["source_readback_path"] is None
     assert report["asset"]["source_readback_paths"] == [str(source_a_path), str(source_b_path)]
     assert "forced distribution compare failure" in report["error"]
@@ -365,6 +425,57 @@ def test_qem_source_readback_script_runs_from_script_path(tmp_path):
     assert report["status"] == "ok"
     assert report["identity"]["edge_order_exact"] is True
     assert report["collapse_identity"]["collapsed_edge_ids_exact"] is True
+
+
+def test_qem_source_readback_script_records_source_shaped_metal_backend(tmp_path):
+    from trellmlx.simplify_qem_metal import HAS_MLX
+    from trellmlx.qem_source_readback import local_simplify_step_readback
+
+    if not HAS_MLX:
+        pytest.skip("source-shaped Metal QEM backend requires MLX")
+
+    mesh_path = tmp_path / "mesh.npz"
+    source_path = tmp_path / "source-readback.npz"
+    report_path = tmp_path / "qem-source-readback-metal.json"
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(
+        vertices,
+        faces,
+        collapse_thresh=np.float32(1e-8),
+        qem_backend="mlx-metal-source",
+    )
+    np.savez(mesh_path, vertices=vertices, faces=faces)
+    np.savez(
+        source_path,
+        edges=local["edges"],
+        costs=local["costs"],
+        props=local["props"],
+        qems=local["qems"],
+        terms=local["terms"],
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--mesh",
+            str(mesh_path),
+            "--source-readback",
+            str(source_path),
+            "--local-qem-backend",
+            "mlx-metal-source",
+            "--report",
+            str(report_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["settings"]["qem_backend"] == "mlx-metal-source"
+    assert report["settings"]["local_topology_backend"] == "mlx-metal"
 
 
 def test_qem_source_readback_script_accepts_multiple_source_readbacks(tmp_path):
