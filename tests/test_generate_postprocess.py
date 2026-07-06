@@ -108,7 +108,7 @@ def test_postprocess_no_cleanup_still_simplifies_without_cleanup_import():
     assert simplify_calls == [pytest.approx(0.4), pytest.approx(2 / 3)]
 
 
-def test_postprocess_reference_cleanup_final_cleanup_matches_source_orientation():
+def test_postprocess_reference_cleanup_matches_gpu_source_order_and_orientation():
     from generate import _cleanup_and_simplify_mesh
 
     vertices = FaceBag(10)
@@ -118,7 +118,7 @@ def test_postprocess_reference_cleanup_final_cleanup_matches_source_orientation(
     orient_calls = []
 
     def fill_holes(v, faces, max_hole_perimeter=3e-2, verbose=True):
-        return v, FaceBag(1_000_000)
+        raise AssertionError("reference GPU source does not standalone-fill holes before coarse simplify")
 
     def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
         cleanup_calls.append((len(faces), do_fix_normals, verbose))

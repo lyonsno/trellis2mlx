@@ -165,24 +165,9 @@ def _cleanup_and_simplify_mesh(
             from trellmlx.mesh_cleanup import cleanup_mesh
 
     if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
-        if fill_holes is None:
-            from trellmlx.mesh_cleanup import fill_small_holes as fill_holes
         if simplify is None:
             import fast_simplification
             simplify = fast_simplification.simplify
-
-        t0 = time.perf_counter()
-        vertices, faces = fill_holes(
-            vertices,
-            faces,
-            max_hole_perimeter=3e-2,
-            verbose=True,
-        )
-        log(
-            f"  Reference cleanup initial hole fill: {len(vertices):,}V {len(faces):,}F "
-            f"({time.perf_counter()-t0:.1f}s)",
-            flush=True,
-        )
 
         coarse_target = target_faces * 3
         if len(faces) > coarse_target:
@@ -356,8 +341,8 @@ def main():
     parser.add_argument("--simplify-first", action="store_true",
                         help="Simplify before cleanup (much faster on large meshes, skips multi-pass)")
     parser.add_argument("--reference-cleanup", action="store_true",
-                        help="Use reference cleanup order: initial hole fill, coarse simplify, "
-                             "cleanup, final simplify, final cleanup, adjacency orientation")
+                        help="Use reference cleanup order: coarse simplify, cleanup, final simplify, "
+                             "final cleanup, adjacency orientation")
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
