@@ -68,6 +68,10 @@ def load_source_readback_npz(path: Path) -> dict[str, np.ndarray]:
         source["qems"] = np.asarray(data["qems"], dtype=np.float32)
     if "boundaries" in data.files:
         source["boundaries"] = np.asarray(data["boundaries"], dtype=np.int32)
+    if "terms" in data.files:
+        source["terms"] = np.asarray(data["terms"], dtype=np.float32)
+    if "status" in data.files:
+        source["status"] = np.asarray(data["status"], dtype=np.int32)
     return source
 
 
@@ -168,6 +172,75 @@ def _collapse_counts(costs: np.ndarray, collapsed_edges: list[int], removed_face
     }
 
 
+def _topology_terms_cpu(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    edges: np.ndarray,
+    v_new: np.ndarray,
+    vf_offset: np.ndarray,
+    vf_data: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    skinny_avgs = np.zeros(len(edges), dtype=np.float32)
+    status = np.zeros((len(edges), 2), dtype=np.int32)
+
+    for ei, (v0i, v1i) in enumerate(edges):
+        vn = v_new[ei]
+        skinny_cost = np.float32(0.0)
+        num_tri = 0
+        flipped = False
+
+        for vi, other in ((v0i, v1i), (v1i, v0i)):
+            for idx in range(vf_offset[vi], vf_offset[vi + 1]):
+                fi = vf_data[idx]
+                fv = faces[fi]
+                if other in fv:
+                    continue
+
+                fa, fb, fc = vertices[fv[0]], vertices[fv[1]], vertices[fv[2]]
+                na = vn if fv[0] == vi else fa
+                nb = vn if fv[1] == vi else fb
+                nc = vn if fv[2] == vi else fc
+
+                old_n = np.cross(fb - fa, fc - fa)
+                new_e1, new_e2 = nb - na, nc - na
+                new_n = np.cross(new_e1, new_e2)
+
+                if np.dot(old_n, new_n) < 0.0:
+                    flipped = True
+                    break
+
+                new_area = np.float32(0.5) * np.float32(np.linalg.norm(new_n))
+                new_e0 = nc - nb
+                denom = np.float32(np.dot(new_e0, new_e0) + np.dot(new_e1, new_e1) + np.dot(new_e2, new_e2))
+                if denom < np.float32(1e-12):
+                    denom = np.float32(1e-12)
+                shape = np.float32(4.0) * np.float32(np.sqrt(np.float32(3.0))) * new_area / denom
+                skinny_cost = np.float32(skinny_cost + (np.float32(1.0) - np.clip(shape, np.float32(0.0), np.float32(1.0))))
+                num_tri += 1
+            if flipped:
+                break
+
+        status[ei, 0] = num_tri
+        status[ei, 1] = int(flipped)
+        if flipped:
+            skinny_avgs[ei] = np.inf
+        elif num_tri > 0:
+            skinny_avgs[ei] = np.float32(skinny_cost / np.float32(num_tri))
+
+    return skinny_avgs, status
+
+
+def _qem_cost_from_qems(qems: np.ndarray, edges: np.ndarray, v_new: np.ndarray) -> np.ndarray:
+    ev0, ev1 = edges[:, 0], edges[:, 1]
+    q = (qems[ev0] + qems[ev1]).astype(np.float32)
+    vx, vy, vz = v_new[:, 0], v_new[:, 1], v_new[:, 2]
+    return (
+        q[:, 0] * vx * vx + 2 * q[:, 1] * vx * vy + 2 * q[:, 2] * vx * vz + 2 * q[:, 3] * vx +
+        q[:, 4] * vy * vy + 2 * q[:, 5] * vy * vz + 2 * q[:, 6] * vy +
+        q[:, 7] * vz * vz + 2 * q[:, 8] * vz + q[:, 9]
+    ).astype(np.float32)
+
+
 def local_simplify_step_readback(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -219,6 +292,16 @@ def local_simplify_step_readback(
         topology_backend = "cpu"
 
     costs = np.asarray(costs, dtype=np.float32)
+    qem_costs = _qem_cost_from_qems(qems, edges, v_new)
+    skinny_avgs, status = _topology_terms_cpu(vertices, faces, edges, v_new, vf_offset, vf_data)
+    skinny_terms = (costs - base_costs.astype(np.float32)).astype(np.float32)
+    terms = np.column_stack([
+        v_new.astype(np.float32),
+        qem_costs,
+        edge_len2.astype(np.float32),
+        skinny_avgs,
+        skinny_terms,
+    ]).astype(np.float32)
     props, face_min_edge = _propagate_cost_keys(
         edges=edges,
         vf_offset=vf_offset,
@@ -254,6 +337,8 @@ def local_simplify_step_readback(
         "costs": costs,
         "props": props,
         "qems": qems.astype(np.float32, copy=False),
+        "terms": terms,
+        "status": status,
         "face_min_edge": face_min_edge,
         "collapsed_edge_ids": collapsed,
         "collapse_counts": _collapse_counts(costs, collapsed, removed_faces, np.float32(collapse_thresh)),
@@ -290,7 +375,9 @@ def _source_collapse_state(
 def _bit_exact_count(a: np.ndarray, b: np.ndarray) -> int:
     if a.shape != b.shape:
         return 0
-    return int((a.view(np.uint8).reshape(a.shape + (-1,)) == b.view(np.uint8).reshape(b.shape + (-1,))).all(axis=-1).sum())
+    a_bytes = np.ascontiguousarray(a).view(np.uint8).reshape(a.shape + (-1,))
+    b_bytes = np.ascontiguousarray(b).view(np.uint8).reshape(b.shape + (-1,))
+    return int((a_bytes == b_bytes).all(axis=-1).sum())
 
 
 def _float_summary(local: np.ndarray, source: np.ndarray) -> dict[str, Any]:
@@ -320,6 +407,98 @@ def _float_summary(local: np.ndarray, source: np.ndarray) -> dict[str, Any]:
         "nonfinite_exact_pair_count": nonfinite_exact,
         "source_vs_local_max_abs_finite_diff": max_abs,
         "source_vs_local_mean_abs_finite_diff": mean_abs,
+    }
+
+
+def _float_entry_summary(local: np.ndarray, source: np.ndarray) -> dict[str, Any]:
+    local = np.asarray(local, dtype=np.float32)
+    source = np.asarray(source, dtype=np.float32)
+    same_shape = local.shape == source.shape
+    paired = min(local.size, source.size)
+    local_flat = local.reshape(-1)[:paired]
+    source_flat = source.reshape(-1)[:paired]
+    finite_pairs = np.isfinite(local_flat) & np.isfinite(source_flat)
+    if finite_pairs.any():
+        diff = np.abs(source_flat[finite_pairs] - local_flat[finite_pairs])
+        max_abs = float(diff.max())
+        mean_abs = float(diff.mean())
+    else:
+        max_abs = 0.0
+        mean_abs = 0.0
+    exact = int((local_flat.view(np.uint32) == source_flat.view(np.uint32)).sum()) if same_shape else 0
+    return {
+        "same_shape": same_shape,
+        "local_entries": int(local.size),
+        "source_entries": int(source.size),
+        "bit_exact_entries": exact,
+        "finite_pair_count": int(finite_pairs.sum()),
+        "nonfinite_pair_count": int(paired - finite_pairs.sum()),
+        "max_abs_finite_diff": max_abs,
+        "mean_abs_finite_diff": mean_abs,
+    }
+
+
+def _term_summary(local: dict[str, Any], source: dict[str, np.ndarray], lambda_edge_length: float) -> dict[str, Any]:
+    if "terms" not in source:
+        return {"available": False}
+
+    local_terms = np.asarray(local["terms"], dtype=np.float32)
+    source_terms = np.asarray(source["terms"], dtype=np.float32)
+    if local_terms.shape != source_terms.shape or local_terms.ndim != 2 or local_terms.shape[1] < 7:
+        return {
+            "available": True,
+            "same_shape": False,
+            "local_shape": list(local_terms.shape),
+            "source_shape": list(source_terms.shape),
+        }
+
+    local_base = (local_terms[:, 3] + np.float32(lambda_edge_length) * local_terms[:, 4]).astype(np.float32)
+    source_base = (source_terms[:, 3] + np.float32(lambda_edge_length) * source_terms[:, 4]).astype(np.float32)
+    local_skinny = local_terms[:, 6]
+    source_skinny = source_terms[:, 6]
+    finite = (
+        np.isfinite(local_base)
+        & np.isfinite(source_base)
+        & np.isfinite(local_skinny)
+        & np.isfinite(source_skinny)
+    )
+    base_diff = np.zeros_like(local_base, dtype=np.float32)
+    skinny_diff = np.zeros_like(local_skinny, dtype=np.float32)
+    base_diff[finite] = np.abs(source_base[finite] - local_base[finite])
+    skinny_diff[finite] = np.abs(source_skinny[finite] - local_skinny[finite])
+
+    qem_eval_split: dict[str, Any] = {
+        "source_qem_local_eval_vs_source_qem_cost": {"available": False},
+    }
+    if "qems" in source:
+        source_qem_eval = _qem_cost_from_qems(
+            np.asarray(source["qems"], dtype=np.float32),
+            np.asarray(source["edges"], dtype=np.int32),
+            source_terms[:, :3],
+        )
+        qem_eval_split["source_qem_local_eval_vs_source_qem_cost"] = {
+            "available": True,
+            **_float_summary(source_qem_eval, source_terms[:, 3]),
+        }
+
+    return {
+        "available": True,
+        "same_shape": True,
+        "collapse_position": _float_entry_summary(local_terms[:, :3], source_terms[:, :3]),
+        "qem_cost": _float_summary(local_terms[:, 3], source_terms[:, 3]),
+        "edge_length2": _float_summary(local_terms[:, 4], source_terms[:, 4]),
+        "skinny_avg": _float_summary(local_terms[:, 5], source_terms[:, 5]),
+        "skinny_term": _float_summary(local_terms[:, 6], source_terms[:, 6]),
+        "attribution": {
+            "finite_all_edges": int(finite.sum()),
+            "base_diff_ge_skinny_diff_edges": int((base_diff[finite] >= skinny_diff[finite]).sum()),
+            "skinny_diff_gt_base_diff_edges": int((skinny_diff[finite] > base_diff[finite]).sum()),
+            "base_diff_mean": float(base_diff[finite].mean()) if finite.any() else 0.0,
+            "skinny_diff_mean": float(skinny_diff[finite].mean()) if finite.any() else 0.0,
+            "base_diff_max": float(base_diff[finite].max()) if finite.any() else 0.0,
+            "skinny_diff_max": float(skinny_diff[finite].max()) if finite.any() else 0.0,
+        },
+        "qem_eval_split": qem_eval_split,
     }
 
 
@@ -431,6 +610,7 @@ def build_qem_source_readback_report(
             "source_only_collapsed_edge_ids": sorted(set(source_collapsed) - set(local_collapsed)),
         },
         "cost_summary": _float_summary(local["costs"], source["costs"]),
+        "term_summary": _term_summary(local, source, lambda_edge_length),
         "qem_summary": _qem_summary(local["qems"], source.get("qems")),
     }
 

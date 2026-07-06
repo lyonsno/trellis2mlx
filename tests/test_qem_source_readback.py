@@ -126,6 +126,48 @@ def test_qem_source_readback_cost_summary_keeps_nonfinite_values_out_of_diffs():
     json.dumps(report, allow_nan=False)
 
 
+def test_qem_source_readback_report_attributes_optional_source_terms():
+    from trellmlx.qem_source_readback import (
+        build_qem_source_readback_report,
+        local_simplify_step_readback,
+    )
+
+    vertices, faces = _fixture_mesh()
+    local = local_simplify_step_readback(vertices, faces, collapse_thresh=np.float32(1e-8))
+    source = {
+        "edges": local["edges"].copy(),
+        "costs": local["costs"].copy(),
+        "props": local["props"].copy(),
+        "qems": local["qems"].copy(),
+        "terms": local["terms"].copy(),
+        "status": local["status"].copy(),
+    }
+    source["terms"][:, 3] = np.nextafter(source["terms"][:, 3], np.float32(np.inf), dtype=np.float32)
+    source["costs"] = (
+        source["terms"][:, 3]
+        + np.float32(1e-2) * source["terms"][:, 4]
+        + source["terms"][:, 6]
+    ).astype(np.float32)
+
+    report = build_qem_source_readback_report(
+        requested_route="qem-source-readback-compare",
+        effective_route="local-qem-step-vs-source-readback",
+        mesh_path=Path("/tmp/fixture-mesh.npz"),
+        source_readback_path=Path("/tmp/source-readback.npz"),
+        vertices=vertices,
+        faces=faces,
+        source=source,
+        collapse_thresh=np.float32(1e-8),
+    )
+
+    assert report["term_summary"]["available"] is True
+    assert report["term_summary"]["collapse_position"]["bit_exact_entries"] == local["terms"][:, :3].size
+    assert report["term_summary"]["qem_cost"]["source_vs_local_bit_exact_edges"] == 0
+    assert "base_diff_ge_skinny_diff_edges" in report["term_summary"]["attribution"]
+    assert report["term_summary"]["qem_eval_split"]["source_qem_local_eval_vs_source_qem_cost"]["available"] is True
+    json.dumps(report, allow_nan=False)
+
+
 def test_qem_source_readback_harness_writes_failure_report_for_missing_source_npz(tmp_path):
     harness = _load_script_module()
     mesh_path = tmp_path / "mesh.npz"
