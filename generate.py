@@ -570,6 +570,9 @@ def main():
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
+    parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
+                        help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
+                             "to match direct reference trace hooks.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -858,8 +861,9 @@ def main():
         if args.stop_after_stage == "sparse_flow_block_trace":
             pos_cond = cond.astype(mx.float32)
             neg_cond_fp32 = neg_cond.astype(mx.float32)
-            pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond)
-            neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32)
+            use_kv_cache = not args.sparse_flow_trace_no_kv_cache
+            pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond) if use_kv_cache else None
+            neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32) if use_kv_cache else None
             t_tensor = mx.array([1000.0], dtype=mx.float32)
             trace_block_index = args.sparse_flow_trace_block_index
             pos_trace = ss_flow.trace_block(
@@ -895,6 +899,7 @@ def main():
                 "sparse_flow_block_trace",
                 **trace_payload,
                 trace_block_index=np.array(trace_block_index, dtype=np.int32),
+                sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
                 t=np.array(1000.0, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),
                 rescale_t=np.array(5.0, dtype=np.float32),
