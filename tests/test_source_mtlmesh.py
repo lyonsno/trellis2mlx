@@ -441,6 +441,7 @@ def test_source_native_postprocess_uses_one_mesh_object_and_records_trace(monkey
     assert out_vertices.shape == (4, 3)
     assert out_faces.shape == (3, 3)
     assert [entry["operation"] for entry in trace] == [
+        "prefill_holes_source_native",
         "simplify_coarse_source_native_qem",
         "cleanup_initial_source_native",
         "simplify_final_source_native_qem",
@@ -449,6 +450,7 @@ def test_source_native_postprocess_uses_one_mesh_object_and_records_trace(monkey
     ]
     assert FakeMesh.instances[0].calls == [
         "init",
+        ("fill_holes", 3e-2),
         ("simplify", 10, 9, False, {"thresh": 1e-08, "lambda_edge_length": 0.01, "lambda_skinny": 0.001}),
         "remove_duplicate_faces",
         "repair_non_manifold_edges",
@@ -461,5 +463,5 @@ def test_source_native_postprocess_uses_one_mesh_object_and_records_trace(monkey
         ("fill_holes", 3e-2),
         "unify_face_orientations",
     ]
-    assert trace[0]["simplifier_route"] == "high_level_simplify"
-    assert trace[2]["simplifier_route"] == "high_level_simplify"
+    assert trace[1]["simplifier_route"] == "high_level_simplify"
+    assert trace[3]["simplifier_route"] == "high_level_simplify"

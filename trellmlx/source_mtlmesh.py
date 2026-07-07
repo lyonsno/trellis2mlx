@@ -715,6 +715,14 @@ def postprocess_source_native(
     mesh.init(verts_t, faces_t)
     trace: list[dict] = []
 
+    input_faces = _mesh_face_count(mesh)
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+    trace.append({
+        "operation": "prefill_holes_source_native",
+        "input_faces": int(input_faces),
+        "output_faces": int(_mesh_face_count(mesh)),
+    })
+
     coarse_target = int(target_faces) * 3
     if _mesh_face_count(mesh) > coarse_target:
         input_faces = _mesh_face_count(mesh)
