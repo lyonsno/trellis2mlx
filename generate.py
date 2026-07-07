@@ -295,6 +295,16 @@ def _cleanup_and_simplify_mesh(
             )
             if operation_trace is not None:
                 operation_trace.extend(source_trace)
+            if keep_largest:
+                from trellmlx.mesh_cleanup import keep_largest_component
+                keep_largest_input_faces = len(faces)
+                vertices, faces = keep_largest_component(vertices, faces, verbose=False)
+                if operation_trace is not None:
+                    operation_trace.append({
+                        "operation": "keep_largest_component",
+                        "input_faces": keep_largest_input_faces,
+                        "output_faces": len(faces),
+                    })
             log(f"  Source-native reference postprocess: {len(vertices):,}V {len(faces):,}F", flush=True)
             return vertices, faces
 

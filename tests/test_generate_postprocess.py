@@ -501,6 +501,67 @@ def test_postprocess_source_native_qem_backend_uses_combined_source_route_by_def
     ]
 
 
+def test_postprocess_combined_source_route_honors_keep_largest(monkeypatch):
+    from generate import _cleanup_and_simplify_mesh
+    import trellmlx.mesh_cleanup as mesh_cleanup
+
+    operation_trace = []
+    keep_largest_calls = []
+
+    def source_postprocess(v, faces, target_faces, **kwargs):
+        return (
+            v,
+            FaceBag(target_faces + 7),
+            [
+                {
+                    "operation": "source_full_combined",
+                    "input_faces": len(faces),
+                    "requested_target_faces": target_faces,
+                    "output_faces": target_faces + 7,
+                }
+            ],
+        )
+
+    def keep_largest_component(v, faces, verbose=True):
+        keep_largest_calls.append((len(faces), verbose))
+        return v, FaceBag(150_000)
+
+    monkeypatch.setattr(mesh_cleanup, "keep_largest_component", keep_largest_component)
+
+    out_vertices, out_faces = _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        keep_largest=True,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_postprocess=source_postprocess,
+        cleanup_mesh=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no local cleanup")),
+        simplify=lambda v, faces, **kwargs: (_ for _ in ()).throw(AssertionError("no local simplify")),
+        operation_trace=operation_trace,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert len(out_vertices) == 10
+    assert len(out_faces) == 150_000
+    assert keep_largest_calls == [(200_007, False)]
+    assert operation_trace == [
+        {
+            "operation": "source_full_combined",
+            "input_faces": 1_000_000,
+            "requested_target_faces": 200_000,
+            "output_faces": 200_007,
+        },
+        {
+            "operation": "keep_largest_component",
+            "input_faces": 200_007,
+            "output_faces": 150_000,
+        },
+    ]
+
+
 def test_postprocess_rejects_unknown_qem_backend():
     from generate import _cleanup_and_simplify_mesh
 
