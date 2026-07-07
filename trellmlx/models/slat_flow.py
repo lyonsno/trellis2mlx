@@ -23,6 +23,7 @@ from .sparse_structure_flow import (
     FeedForward,
     ModulatedBlock,
     _layernorm_noaffine,
+    _infer_compute_dtype,
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
@@ -94,6 +95,7 @@ class SLatFlowModel(nn.Module):
 
         Returns list of (K, V) tuples, one per block.
         """
+        cond = cond.astype(_infer_compute_dtype(self))
         cache = []
         for block in self.blocks:
             k, v = block.cross_attn.project_kv(cond)
@@ -110,6 +112,7 @@ class SLatFlowModel(nn.Module):
         concat_cond: mx.array = None,  # [N, C'] features to concatenate with x
         cross_kv_cache: list = None,  # precomputed cross-attention KV per block
     ) -> mx.array:
+        input_dtype = x.dtype
         N = x.shape[0]
         B = t.shape[0] if len(t.shape) else 1
         cond_B = cond.shape[0] if cond is not None and len(cond.shape) else B
@@ -127,6 +130,10 @@ class SLatFlowModel(nn.Module):
 
         # Project to model channels
         x = self.input_layer(x)  # [N, C]
+        compute_dtype = _infer_compute_dtype(self)
+        x = x.astype(compute_dtype)
+        mod = mod.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
 
         # Build RoPE phases from coordinates if provided
         rope_phases = None
@@ -146,6 +153,7 @@ class SLatFlowModel(nn.Module):
                     mx.eval(x)
 
         # Output projection
+        x = x.astype(input_dtype)
         x = _layernorm_noaffine(x)
         x = self.out_layer(x)  # [N, out_channels]
 

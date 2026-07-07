@@ -772,11 +772,6 @@ def main():
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(ss_flow, bits=args.quantize)
-    # Upcast sparse structure flow to fp32 for CFG rescale stability.
-    # bf16 precision noise gets amplified ~5x per Euler step through the
-    # std ratio in CFG rescale, producing catastrophic divergence after
-    # 4 steps. fp32 reduces this. Cost: ~2.4GB extra for ~20s.
-    ss_flow.apply(lambda x: x.astype(mx.float32))
     if args.compile:
         ss_flow.compile()
     ss_dec = SparseStructureDecoder()

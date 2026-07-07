@@ -14,6 +14,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils
 
 from ..modules.norm import LayerNorm32
 from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
@@ -237,6 +238,14 @@ def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     return x.astype(orig_dtype)
 
 
+def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:
+    """Infer the source checkpoint dtype currently loaded into a flow module."""
+    for _, value in mlx.utils.tree_flatten(module.parameters()):
+        if hasattr(value, "dtype") and value.dtype in (mx.bfloat16, mx.float16):
+            return value.dtype
+    return mx.float32
+
+
 class SparseStructureFlowModel(nn.Module):
     """TRELLIS.2 Sparse Structure Flow Model.
 
@@ -314,6 +323,7 @@ class SparseStructureFlowModel(nn.Module):
 
     def build_cross_kv_cache(self, cond: mx.array) -> list[tuple]:
         """Precompute cross-attention K, V for all blocks."""
+        cond = cond.astype(_infer_compute_dtype(self))
         cache = []
         for block in self.blocks:
             k, v = block.cross_attn.project_kv(cond)
@@ -328,6 +338,7 @@ class SparseStructureFlowModel(nn.Module):
         cond: mx.array,        # [B, L, context_channels] image conditioning
         cross_kv_cache: list = None,
     ) -> mx.array:
+        input_dtype = x.dtype
         B = x.shape[0]
         R = x.shape[2]
 
@@ -342,6 +353,10 @@ class SparseStructureFlowModel(nn.Module):
 
         # Project to model channels
         x = self.input_layer(x)
+        compute_dtype = _infer_compute_dtype(self)
+        x = x.astype(compute_dtype)
+        mod = mod.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
 
         # Compute 3D RoPE phases from actual input resolution
         head_dim = self.model_channels // self.num_heads
@@ -360,6 +375,7 @@ class SparseStructureFlowModel(nn.Module):
                     mx.eval(x)
 
         # Output projection
+        x = x.astype(input_dtype)
         x = _layernorm_noaffine(x)
         x = self.out_layer(x)                          # [B*R³, out_C]
 

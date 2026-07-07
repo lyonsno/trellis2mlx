@@ -109,10 +109,6 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
             if _should_permute_conv(mlx_key, tuple(tensor.shape)):
                 tensor = tensor.transpose(0, 2, 3, 4, 1)
 
-            # Convert bf16 to f16 (MLX supports f16 natively)
-            if tensor.dtype == mx.bfloat16:
-                tensor = tensor.astype(mx.float16)
-
             weights[mlx_key] = tensor
     else:
         with safe_open(checkpoint_path, framework="numpy") as sf:
