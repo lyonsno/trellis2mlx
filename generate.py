@@ -599,6 +599,18 @@ def main():
                 source_native_source_root=args.source_native_source_root,
                 source_native_python=args.source_native_python,
             )
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(args.save_checkpoints, "mesh_clean",
+                                vertices=vertices, faces=faces,
+                                mesh_grid_size=mesh_grid_size)
+                maybe_checkpoint_yield(
+                    stop_file=args.checkpoint_stop_file,
+                    checkpoint_dir=args.save_checkpoints,
+                    completed_stage="mesh_clean",
+                    next_stage="texture_bake",
+                    output_path=args.output,
+                )
 
             # Jump straight to texture baking
             from trellmlx.texture_bake import bake_texture
@@ -607,6 +619,20 @@ def main():
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            if args.save_checkpoints:
+                from trellmlx.checkpoint import save_checkpoint
+                save_checkpoint(args.save_checkpoints, "mesh_uv",
+                                vertices=uv_verts, faces=uv_faces,
+                                uvs=uvs, vmapping=vmapping,
+                                mesh_grid_size=mesh_grid_size,
+                                uv_method=method_name)
+                maybe_checkpoint_yield(
+                    stop_file=args.checkpoint_stop_file,
+                    checkpoint_dir=args.save_checkpoints,
+                    completed_stage="mesh_uv",
+                    next_stage="texture_bake",
+                    output_path=args.output,
+                )
 
             base_color, metallic_roughness, alpha_mode = bake_texture(
                 uv_verts, uv_faces, uvs, vmapping,
@@ -990,6 +1016,20 @@ def main():
         source_native_source_root=args.source_native_source_root,
         source_native_python=args.source_native_python,
     )
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_clean",
+                        vertices=vertices, faces=faces,
+                        mesh_grid_size=mesh_grid_size)
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="mesh_clean",
+            next_stage="texture",
+            output_path=args.output,
+            resume_supported=False,
+            resume_blocker="mesh_clean checkpoint exists, but texture checkpoint is still required for resume",
+        )
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
@@ -1079,6 +1119,20 @@ def main():
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(args.save_checkpoints, "mesh_uv",
+                        vertices=uv_verts, faces=uv_faces,
+                        uvs=uvs, vmapping=vmapping,
+                        mesh_grid_size=mesh_grid_size,
+                        uv_method=method_name)
+        maybe_checkpoint_yield(
+            stop_file=args.checkpoint_stop_file,
+            checkpoint_dir=args.save_checkpoints,
+            completed_stage="mesh_uv",
+            next_stage="texture_bake",
+            output_path=args.output,
+        )
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(
