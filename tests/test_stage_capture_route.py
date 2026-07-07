@@ -13,6 +13,8 @@ def test_generate_exposes_stage_capture_cli_contracts():
     for stage in (
         "conditioning",
         "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_block_trace",
         "sparse_internals",
         "shape_slat",
         "decoder_output",
@@ -81,3 +83,57 @@ def test_stage_capture_wrapper_builds_generate_stop_route(tmp_path):
     assert command[command.index("--shared-noise") + 1] == "noise.npz"
     assert "--no-cascade" in command
     assert "--no-rembg" in command
+
+
+def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_step",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--shared-noise",
+            "noise.npz",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_step"
+
+
+def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--shared-noise",
+            "noise.npz",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_block_trace"

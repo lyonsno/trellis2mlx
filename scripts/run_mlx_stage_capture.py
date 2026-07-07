@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "conditioning",
             "sparse_coords",
+            "sparse_flow_step",
+            "sparse_flow_block_trace",
             "sparse_internals",
             "shape_slat",
             "decoder_output",
@@ -75,6 +77,8 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             for stage in (
                 "conditioning",
                 "sparse_coords",
+                "sparse_flow_step",
+                "sparse_flow_block_trace",
                 "sparse_internals",
                 "shape_slat",
                 "decoder_output",

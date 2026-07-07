@@ -74,7 +74,8 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
         List of checkpoint keys that were not loaded (missing in model).
     """
     # Get the model's parameter tree
-    model_keys = set(k for k, _ in mlx.utils.tree_flatten(model.parameters()))
+    model_params = dict(mlx.utils.tree_flatten(model.parameters()))
+    model_keys = set(model_params)
 
     weights = {}
     unloaded = []
@@ -109,6 +110,7 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
             if _should_permute_conv(mlx_key, tuple(tensor.shape)):
                 tensor = tensor.transpose(0, 2, 3, 4, 1)
 
+            tensor = _cast_to_destination_dtype(tensor, model_params[mlx_key])
             weights[mlx_key] = tensor
     else:
         with safe_open(checkpoint_path, framework="numpy") as sf:
@@ -129,10 +131,9 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
                 if _should_permute_conv(mlx_key, tensor.shape):
                     tensor = tensor.transpose(0, 2, 3, 4, 1)
 
-                if tensor.dtype == np.float32:
-                    tensor = tensor.astype(np.float16)
-
-                weights[mlx_key] = mx.array(tensor)
+                tensor = mx.array(tensor)
+                tensor = _cast_to_destination_dtype(tensor, model_params[mlx_key])
+                weights[mlx_key] = tensor
 
     # Check for model keys not found in checkpoint
     loaded_keys = set(weights.keys())
@@ -151,3 +152,9 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
             print(f"  Skipped {len(unloaded)} checkpoint keys")
 
     return unloaded
+
+
+def _cast_to_destination_dtype(tensor: mx.array, destination: mx.array) -> mx.array:
+    if hasattr(destination, "dtype") and hasattr(tensor, "astype") and tensor.dtype != destination.dtype:
+        return tensor.astype(destination.dtype)
+    return tensor

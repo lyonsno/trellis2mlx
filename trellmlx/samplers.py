@@ -23,6 +23,8 @@ def flow_euler_sample(
     sigma_min: float = 1e-5,
     verbose: bool = True,
     concat_cond: mx.array = None,
+    capture_first_step: dict | None = None,
+    stop_after_first_step: bool = False,
     **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
@@ -74,6 +76,7 @@ def flow_euler_sample(
             guidance_strength != 1.0
             and guidance_interval[0] <= t <= guidance_interval[1]
         )
+        capture_this_step = capture_first_step is not None and step_idx == 0
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
@@ -89,9 +92,18 @@ def flow_euler_sample(
 
             # CFG combination
             pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+            pred_cfg = pred
 
             # CFG rescale (reduces overexposure)
-            if guidance_rescale > 0:
+            x_0_pos = None
+            x_0_cfg = None
+            std_pos = None
+            std_cfg = None
+            ratio_raw = None
+            std_ratio = None
+            x_0_rescaled = None
+            x_0 = None
+            if guidance_rescale > 0 or capture_this_step:
                 x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
@@ -104,9 +116,16 @@ def flow_euler_sample(
                 std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) * bessel)
                 std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) * bessel)
 
-                x_0_rescaled = x_0_cfg * (std_pos / std_cfg)
-                x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
-                pred = _xstart_to_pred(sample, t, x_0, sigma_min)
+                safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
+                ratio_raw = std_pos / safe_std_cfg
+                ratio_raw = mx.where(std_cfg > 0, ratio_raw, mx.ones_like(ratio_raw))
+                std_ratio = ratio_raw
+                x_0_rescaled = x_0_cfg * std_ratio
+                if guidance_rescale > 0:
+                    x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
+                    pred = _xstart_to_pred(sample, t, x_0, sigma_min)
+                else:
+                    x_0 = x_0_cfg
         else:
             # Single forward pass with positive conditioning
             kw = dict(**model_kwargs)
@@ -114,13 +133,63 @@ def flow_euler_sample(
                 kw['cross_kv_cache'] = pos_kv_cache
             pred = model(sample, t_tensor, cond, **kw)
             mx.eval(pred)
+            pred_pos = pred
+            pred_neg = pred
+            pred_cfg = pred
+            x_0_pos = None
+            x_0_cfg = None
+            std_pos = None
+            std_cfg = None
+            ratio_raw = None
+            std_ratio = None
+            x_0_rescaled = None
+            x_0 = None
+            if capture_this_step:
+                x_0 = _pred_to_xstart(sample, t, pred, sigma_min)
+                x_0_pos = x_0
+                x_0_cfg = x_0
+                reduce_dims = list(range(1, x_0.ndim))
+                n = 1
+                for d in reduce_dims:
+                    n *= x_0.shape[d]
+                bessel = n / (n - 1)
+                std_pos = mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True) * bessel)
+                std_cfg = std_pos
+                ratio_raw = mx.ones_like(std_pos)
+                std_ratio = ratio_raw
+                x_0_rescaled = x_0
 
         # Euler step
-        sample = sample - (t - t_prev) * pred
+        sample_next = sample - (t - t_prev) * pred
+        if capture_first_step is not None and step_idx == 0:
+            capture_first_step.update(
+                {
+                    "pred_pos": pred_pos,
+                    "pred_neg": pred_neg,
+                    "pred_cfg": pred_cfg,
+                    "x0_pos": x_0_pos,
+                    "x0_cfg": x_0_cfg,
+                    "std_pos": std_pos,
+                    "std_cfg": std_cfg,
+                    "ratio_raw": ratio_raw,
+                    "std_ratio": std_ratio,
+                    "ratio_effective": std_ratio,
+                    "x0_rescaled": x_0_rescaled,
+                    "x0_after_rescale": x_0,
+                    "pred_final": pred,
+                    "sample_next": sample_next,
+                    "t": mx.array(t, dtype=mx.float32),
+                    "t_prev": mx.array(t_prev, dtype=mx.float32),
+                }
+            )
+            mx.eval(*[value for value in capture_first_step.values() if value is not None])
+        sample = sample_next
         mx.eval(sample)
 
         if verbose:
             print(f" done", flush=True)
+        if stop_after_first_step:
+            break
 
     return sample
 

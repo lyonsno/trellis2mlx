@@ -41,6 +41,7 @@ class DINOv3ViT(nn.Module):
         num_register_tokens: int = 4,
         intermediate_size: int = 4096,
         rope_theta: float = 100.0,
+        layer_norm_eps: float = 1e-5,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -50,6 +51,7 @@ class DINOv3ViT(nn.Module):
         self.num_register_tokens = num_register_tokens
         self.num_prefix_tokens = 1 + num_register_tokens  # CLS + registers
         self.rope_theta = rope_theta
+        self.layer_norm_eps = layer_norm_eps
 
         # Embeddings
         self.cls_token = mx.zeros((1, 1, hidden_size))
@@ -63,7 +65,7 @@ class DINOv3ViT(nn.Module):
 
         # Transformer layers
         self.layers = [
-            DINOv3Layer(hidden_size, num_heads, intermediate_size)
+            DINOv3Layer(hidden_size, num_heads, intermediate_size, layer_norm_eps=layer_norm_eps)
             for _ in range(num_layers)
         ]
 
@@ -100,7 +102,7 @@ class DINOv3ViT(nn.Module):
         # The checkpoint has learned norm.weight/bias from DINOv3 pretraining,
         # but TRELLIS.2 was trained on features WITHOUT those applied.
         # Applying them produces 0 sparse voxels (out of distribution).
-        x = mx.fast.layer_norm(x, None, None, 1e-6)
+        x = mx.fast.layer_norm(x, None, None, self.layer_norm_eps)
 
         return x
 
@@ -126,13 +128,20 @@ class DINOv3ViT(nn.Module):
 class DINOv3Layer(nn.Module):
     """Single DINOv3 transformer layer."""
 
-    def __init__(self, hidden_size: int, num_heads: int, intermediate_size: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        intermediate_size: int,
+        *,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.attention = DINOv3Attention(hidden_size, num_heads)
         self.layer_scale1 = mx.zeros((hidden_size,))
 
-        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.mlp = DINOv3MLP(hidden_size, intermediate_size)
         self.layer_scale2 = mx.zeros((hidden_size,))
 

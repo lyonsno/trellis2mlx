@@ -45,6 +45,15 @@ class TestRoPE:
         diff = mx.max(mx.abs(out - x)).item()
         assert diff > 0.01, "Non-identity phases should change the output"
 
+    def test_apply_rope_preserves_input_dtype(self):
+        from trellmlx.modules.rope import build_rope_phases, apply_rope
+        T, H, D = 8, 2, 128
+        x = mx.random.normal((T, H, D)).astype(mx.bfloat16)
+        phases = build_rope_phases(resolution=2, head_dim=D)
+        out = apply_rope(x, phases)
+        mx.eval(out)
+        assert out.dtype == mx.bfloat16
+
 
 class TestDynamicResolution:
     def test_different_resolution_than_constructor(self):

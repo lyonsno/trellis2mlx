@@ -72,6 +72,7 @@ def apply_rope(x: mx.array, phases: mx.array) -> mx.array:
     Returns:
         [T, H, D] with RoPE applied
     """
+    orig_dtype = x.dtype
     T, H, D = x.shape
     half = D // 2
 
@@ -94,4 +95,4 @@ def apply_rope(x: mx.array, phases: mx.array) -> mx.array:
     out1 = x0 * sin_p + x1 * cos_p
 
     out = mx.concatenate([out0, out1], axis=-1)  # [T, H, D//2, 2]
-    return out.reshape(T, H, D)
+    return out.reshape(T, H, D).astype(orig_dtype)

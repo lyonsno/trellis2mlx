@@ -25,7 +25,6 @@ class LayerNorm32(nn.Module):
         mean = mx.mean(x, axis=-1, keepdims=True)
         var = mx.var(x, axis=-1, keepdims=True)
         x = (x - mean) * mx.rsqrt(var + self.eps)
-        x = x.astype(orig_dtype)
         if self.affine:
             x = x * self.weight + self.bias
-        return x
+        return x.astype(orig_dtype)

@@ -553,6 +553,8 @@ def main():
         choices=[
             "conditioning",
             "sparse_coords",
+            "sparse_flow_step",
+            "sparse_flow_block_trace",
             "sparse_internals",
             "shape_slat",
             "decoder_output",
@@ -850,12 +852,107 @@ def main():
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
         # Cast conditioning to fp32 to match the fp32 sparse structure model
+        if args.stop_after_stage == "sparse_flow_block_trace":
+            pos_cond = cond.astype(mx.float32)
+            neg_cond_fp32 = neg_cond.astype(mx.float32)
+            pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond)
+            neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32)
+            t_tensor = mx.array([1000.0], dtype=mx.float32)
+            pos_trace = ss_flow.trace_first_block(
+                noise, t_tensor, pos_cond, cross_kv_cache=pos_kv_cache
+            )
+            neg_trace = ss_flow.trace_first_block(
+                noise, t_tensor, neg_cond_fp32, cross_kv_cache=neg_kv_cache
+            )
+            def trace_np(value):
+                return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
+
+            from trellmlx.checkpoint import save_checkpoint
+            save_checkpoint(
+                args.save_checkpoints,
+                "sparse_flow_block_trace",
+                pos_input_projected=trace_np(pos_trace["input_projected"]),
+                pos_block0_norm1=trace_np(pos_trace["block0_norm1"]),
+                pos_block0_modulated_self_input=trace_np(pos_trace["block0_modulated_self_input"]),
+                pos_block0_q_pre_norm=trace_np(pos_trace["block0_q_pre_norm"]),
+                pos_block0_k_pre_norm=trace_np(pos_trace["block0_k_pre_norm"]),
+                pos_block0_v=trace_np(pos_trace["block0_v"]),
+                pos_block0_q_post_norm=trace_np(pos_trace["block0_q_post_norm"]),
+                pos_block0_k_post_norm=trace_np(pos_trace["block0_k_post_norm"]),
+                pos_block0_q_post_rope=trace_np(pos_trace["block0_q_post_rope"]),
+                pos_block0_k_post_rope=trace_np(pos_trace["block0_k_post_rope"]),
+                pos_block0_attention_raw=trace_np(pos_trace["block0_attention_raw"]),
+                pos_block0_self_attn=trace_np(pos_trace["block0_self_attn"]),
+                pos_block0_after_self=trace_np(pos_trace["block0_after_self"]),
+                pos_block0_cross_attn=trace_np(pos_trace["block0_cross_attn"]),
+                pos_block0_after_cross=trace_np(pos_trace["block0_after_cross"]),
+                pos_block0_mlp=trace_np(pos_trace["block0_mlp"]),
+                pos_block0_after_mlp=trace_np(pos_trace["block0_after_mlp"]),
+                neg_input_projected=trace_np(neg_trace["input_projected"]),
+                neg_block0_norm1=trace_np(neg_trace["block0_norm1"]),
+                neg_block0_modulated_self_input=trace_np(neg_trace["block0_modulated_self_input"]),
+                neg_block0_q_pre_norm=trace_np(neg_trace["block0_q_pre_norm"]),
+                neg_block0_k_pre_norm=trace_np(neg_trace["block0_k_pre_norm"]),
+                neg_block0_v=trace_np(neg_trace["block0_v"]),
+                neg_block0_q_post_norm=trace_np(neg_trace["block0_q_post_norm"]),
+                neg_block0_k_post_norm=trace_np(neg_trace["block0_k_post_norm"]),
+                neg_block0_q_post_rope=trace_np(neg_trace["block0_q_post_rope"]),
+                neg_block0_k_post_rope=trace_np(neg_trace["block0_k_post_rope"]),
+                neg_block0_attention_raw=trace_np(neg_trace["block0_attention_raw"]),
+                neg_block0_self_attn=trace_np(neg_trace["block0_self_attn"]),
+                neg_block0_after_self=trace_np(neg_trace["block0_after_self"]),
+                neg_block0_cross_attn=trace_np(neg_trace["block0_cross_attn"]),
+                neg_block0_after_cross=trace_np(neg_trace["block0_after_cross"]),
+                neg_block0_mlp=trace_np(neg_trace["block0_mlp"]),
+                neg_block0_after_mlp=trace_np(neg_trace["block0_after_mlp"]),
+                t=np.array(1000.0, dtype=np.float32),
+                steps=np.array(n_steps, dtype=np.int32),
+                rescale_t=np.array(5.0, dtype=np.float32),
+            )
+            print("  Stop after stage: sparse_flow_block_trace", flush=True)
+            return
+
+        step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
-                                steps=n_steps, verbose=False)
+                                steps=n_steps, verbose=False,
+                                capture_first_step=step_capture,
+                                stop_after_first_step=args.stop_after_stage == "sparse_flow_step")
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if args.save_checkpoints and args.stop_after_stage == "sparse_flow_step":
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_flow_step",
+            noise=np.array(noise).astype(np.float32, copy=False),
+            pred_pos=np.array(step_capture["pred_pos"]).astype(np.float32, copy=False),
+            pred_neg=np.array(step_capture["pred_neg"]).astype(np.float32, copy=False),
+            pred_cfg=np.array(step_capture["pred_cfg"]).astype(np.float32, copy=False),
+            x0_pos=np.array(step_capture["x0_pos"]).astype(np.float32, copy=False),
+            x0_cfg=np.array(step_capture["x0_cfg"]).astype(np.float32, copy=False),
+            std_pos=np.array(step_capture["std_pos"]).astype(np.float32, copy=False),
+            std_cfg=np.array(step_capture["std_cfg"]).astype(np.float32, copy=False),
+            ratio_raw=np.array(step_capture["ratio_raw"]).astype(np.float32, copy=False),
+            std_ratio=np.array(step_capture["std_ratio"]).astype(np.float32, copy=False),
+            ratio_effective=np.array(step_capture["ratio_effective"]).astype(np.float32, copy=False),
+            x0_rescaled=np.array(step_capture["x0_rescaled"]).astype(np.float32, copy=False),
+            x0_after_rescale=np.array(step_capture["x0_after_rescale"]).astype(np.float32, copy=False),
+            pred_final=np.array(step_capture["pred_final"]).astype(np.float32, copy=False),
+            sample_next=np.array(step_capture["sample_next"]).astype(np.float32, copy=False),
+            t=np.array(step_capture["t"]).astype(np.float32, copy=False),
+            t_prev=np.array(step_capture["t_prev"]).astype(np.float32, copy=False),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(7.5, dtype=np.float32),
+            guidance_rescale=np.array(0.7, dtype=np.float32),
+            guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
+            rescale_t=np.array(5.0, dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
+        )
+        print("  Stop after stage: sparse_flow_step", flush=True)
+        return
 
     logits = ss_dec(z_s.astype(mx.float32))
     mx.eval(logits)

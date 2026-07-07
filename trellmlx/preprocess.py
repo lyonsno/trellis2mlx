@@ -65,10 +65,10 @@ def preprocess_image(image_path: str, max_size: int = 1024) -> Image.Image:
     half = size // 2
 
     bbox = (
-        int(center_x - half),
-        int(center_y - half),
-        int(center_x + half),
-        int(center_y + half),
+        center_x - half,
+        center_y - half,
+        center_x + half,
+        center_y + half,
     )
     output = output.crop(bbox)
 

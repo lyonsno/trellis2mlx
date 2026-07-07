@@ -24,6 +24,7 @@ from .sparse_structure_flow import (
     ModulatedBlock,
     _layernorm_noaffine,
     _infer_compute_dtype,
+    _cast_block_linears,
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
@@ -82,6 +83,8 @@ class SLatFlowModel(nn.Module):
             ModulatedBlock(model_channels, num_heads, context_channels, mlp_hidden)
             for _ in range(num_blocks)
         ]
+        for block in self.blocks:
+            _cast_block_linears(block, mx.bfloat16)
 
         # Compilation state (call .compile() to enable)
         self._compiled = False
@@ -154,7 +157,7 @@ class SLatFlowModel(nn.Module):
 
         # Output projection
         x = x.astype(input_dtype)
-        x = _layernorm_noaffine(x)
+        x = _layernorm_noaffine(x, eps=1e-5)
         x = self.out_layer(x)  # [N, out_channels]
 
         return x

@@ -130,6 +130,42 @@ class MultiHeadAttention(nn.Module):
 
         return self.to_out(out)
 
+    def trace_self_attention(
+        self,
+        x: mx.array,
+        rope_phases: mx.array = None,
+    ) -> tuple[mx.array, dict[str, mx.array]]:
+        B_T = x.shape[0]
+        qkv = self.to_qkv(x)
+        qkv = qkv.reshape(B_T, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        trace = {
+            "block0_q_pre_norm": q,
+            "block0_k_pre_norm": k,
+            "block0_v": v,
+        }
+
+        q = self.q_rms_norm(q)
+        k = self.k_rms_norm(k)
+        trace["block0_q_post_norm"] = q
+        trace["block0_k_post_norm"] = k
+
+        if rope_phases is not None:
+            q = apply_rope(q, rope_phases)
+            k = apply_rope(k, rope_phases)
+        trace["block0_q_post_rope"] = q
+        trace["block0_k_post_rope"] = k
+
+        q_b = q[None].transpose(0, 2, 1, 3)
+        k_b = k[None].transpose(0, 2, 1, 3)
+        v_b = v[None].transpose(0, 2, 1, 3)
+        out = scaled_dot_product_attention(q_b, k_b, v_b)
+        out = out.transpose(0, 2, 1, 3).reshape(B_T, self.channels)
+        trace["block0_attention_raw"] = out
+
+        return self.to_out(out), trace
+
 
 class FeedForward(nn.Module):
     """MLP with GELU. Matches TRELLIS weight layout: mlp.0 and mlp.2."""
@@ -140,7 +176,15 @@ class FeedForward(nn.Module):
         self.mlp_2 = nn.Linear(hidden_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.mlp_2(nn.gelu_approx(self.mlp_0(x)))
+        return self.mlp_2(_gelu_tanh(self.mlp_0(x)))
+
+
+def _gelu_tanh(x: mx.array) -> mx.array:
+    """PyTorch nn.GELU(approximate="tanh") with source dtype restoration."""
+    orig_dtype = x.dtype
+    x = x.astype(mx.float32)
+    x = 0.5 * x * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+    return x.astype(orig_dtype)
 
 
 class ModulatedBlock(nn.Module):
@@ -192,7 +236,7 @@ class ModulatedBlock(nn.Module):
         cross_kv_cache: tuple = None,  # precomputed (K, V) for cross-attention
     ) -> mx.array:
         # Add per-block learned bias
-        mod = mod + self.modulation
+        mod = (mod + self.modulation).astype(mod.dtype)
 
         # Split into 6 modulation params
         C = self.channels
@@ -227,6 +271,56 @@ class ModulatedBlock(nn.Module):
 
         return x
 
+    def trace(
+        self,
+        x: mx.array,
+        mod: mx.array,
+        context: mx.array,
+        rope_phases: mx.array = None,
+        cross_kv_cache: tuple = None,
+    ) -> tuple[mx.array, dict[str, mx.array]]:
+        mod = (mod + self.modulation).astype(mod.dtype)
+
+        C = self.channels
+        shift_msa = mod[0*C:1*C]
+        scale_msa = mod[1*C:2*C]
+        gate_msa  = mod[2*C:3*C]
+        shift_mlp = mod[3*C:4*C]
+        scale_mlp = mod[4*C:5*C]
+        gate_mlp  = mod[5*C:6*C]
+
+        trace: dict[str, mx.array] = {}
+
+        h = _layernorm_noaffine(x)
+        trace["block0_norm1"] = h
+        h = h * (1 + scale_msa) + shift_msa
+        trace["block0_modulated_self_input"] = h
+        h, attn_trace = self.self_attn.trace_self_attention(h, rope_phases=rope_phases)
+        trace.update(attn_trace)
+        trace["block0_self_attn"] = h
+        h = h * gate_msa
+        x = x + h
+        trace["block0_after_self"] = x
+
+        h = self.norm2(x)
+        if cross_kv_cache is not None:
+            h = self.cross_attn(h, cached_kv=cross_kv_cache)
+        else:
+            h = self.cross_attn(h, context)
+        trace["block0_cross_attn"] = h
+        x = x + h
+        trace["block0_after_cross"] = x
+
+        h = _layernorm_noaffine(x)
+        h = h * (1 + scale_mlp) + shift_mlp
+        h = self.mlp(h)
+        trace["block0_mlp"] = h
+        h = h * gate_mlp
+        x = x + h
+        trace["block0_after_mlp"] = x
+
+        return x, trace
+
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     """LayerNorm without learnable affine (controlled by adaLN)."""
@@ -244,6 +338,22 @@ def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:
         if hasattr(value, "dtype") and value.dtype in (mx.bfloat16, mx.float16):
             return value.dtype
     return mx.float32
+
+
+def _cast_block_linears(block: ModulatedBlock, dtype: mx.Dtype) -> None:
+    linears = (
+        block.self_attn.to_qkv,
+        block.self_attn.to_out,
+        block.cross_attn.to_q,
+        block.cross_attn.to_kv,
+        block.cross_attn.to_out,
+        block.mlp.mlp_0,
+        block.mlp.mlp_2,
+    )
+    for linear in linears:
+        linear.weight = linear.weight.astype(dtype)
+        if linear.bias is not None:
+            linear.bias = linear.bias.astype(dtype)
 
 
 class SparseStructureFlowModel(nn.Module):
@@ -300,6 +410,8 @@ class SparseStructureFlowModel(nn.Module):
             ModulatedBlock(model_channels, num_heads, context_channels, mlp_hidden)
             for _ in range(num_blocks)
         ]
+        for block in self.blocks:
+            _cast_block_linears(block, mx.bfloat16)
 
         # Compilation state (call .compile() to enable)
         self._compiled = False
@@ -330,6 +442,40 @@ class SparseStructureFlowModel(nn.Module):
             cache.append((k, v))
         mx.eval(*[t for pair in cache for t in pair])
         return cache
+
+    def trace_first_block(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        B = x.shape[0]
+        R = x.shape[2]
+
+        t_emb = self.t_embedder(t)
+        mod = self.adaLN_modulation(t_emb)
+
+        x = x.reshape(B, self.in_channels, -1)
+        x = x.transpose(0, 2, 1)
+        x = x.reshape(B * R * R * R, self.in_channels)
+        x = self.input_layer(x)
+        compute_dtype = _infer_compute_dtype(self)
+        x = x.astype(compute_dtype)
+        mod = mod.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
+
+        head_dim = self.model_channels // self.num_heads
+        rope_phases = build_rope_phases(R, head_dim)
+
+        assert B == 1, f"Only B=1 supported for inference, got B={B}"
+        block_kv = cross_kv_cache[0] if cross_kv_cache is not None else None
+        _x_after, trace = self.blocks[0].trace(
+            x, mod[0], cond, rope_phases=rope_phases, cross_kv_cache=block_kv
+        )
+        trace["input_projected"] = x
+        mx.eval(*trace.values())
+        return trace
 
     def __call__(
         self,
@@ -376,7 +522,8 @@ class SparseStructureFlowModel(nn.Module):
 
         # Output projection
         x = x.astype(input_dtype)
-        x = _layernorm_noaffine(x)
+        # PyTorch F.layer_norm defaults to eps=1e-5 in the TRELLIS.2 source.
+        x = _layernorm_noaffine(x, eps=1e-5)
         x = self.out_layer(x)                          # [B*R³, out_C]
 
         # Reshape back to 3D

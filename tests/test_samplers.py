@@ -49,3 +49,73 @@ def test_cfg_rescale_matches_reference_without_ratio_clamp():
 
     assert float(unclamped_ratio.item()) > 2.0
     np.testing.assert_allclose(np.array(out), np.array(expected), rtol=1e-6, atol=1e-6)
+
+
+def test_flow_euler_can_capture_first_sparse_step_and_stop():
+    from trellmlx.samplers import flow_euler_sample, _pred_to_xstart, _xstart_to_pred
+
+    noise = mx.zeros((1, 4), dtype=mx.float32)
+    cond = mx.ones((1, 1), dtype=mx.float32)
+    neg_cond = mx.zeros((1, 1), dtype=mx.float32)
+    pred_pos = mx.array([[0.2, -0.4, 0.6, -0.8]], dtype=mx.float32)
+    pred_neg = mx.array([[-0.1, 0.3, -0.5, 0.7]], dtype=mx.float32)
+    capture = {}
+
+    class TwoPassModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, sample, t, conditioning):
+            self.calls += 1
+            return pred_pos if self.calls == 1 else pred_neg
+
+    model = TwoPassModel()
+    out = flow_euler_sample(
+        model,
+        noise,
+        cond,
+        neg_cond,
+        steps=4,
+        guidance_strength=2.0,
+        guidance_rescale=0.7,
+        guidance_interval=(0.0, 1.0),
+        rescale_t=1.0,
+        verbose=False,
+        capture_first_step=capture,
+        stop_after_first_step=True,
+    )
+
+    assert model.calls == 2
+    expected_keys = {
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "sample_next",
+        "t",
+        "t_prev",
+    }
+    assert set(capture) == expected_keys
+
+    pred_cfg = 2.0 * pred_pos + (1 - 2.0) * pred_neg
+    x0_pos = _pred_to_xstart(noise, 1.0, pred_pos, 1e-5)
+    x0_cfg = _pred_to_xstart(noise, 1.0, pred_cfg, 1e-5)
+    std_pos = mx.std(x0_pos, axis=[1], keepdims=True)
+    std_cfg = mx.std(x0_cfg, axis=[1], keepdims=True)
+    x0_after = 0.7 * (x0_cfg * (std_pos / std_cfg)) + 0.3 * x0_cfg
+    expected_pred = _xstart_to_pred(noise, 1.0, x0_after, 1e-5)
+    expected_next = noise - 0.25 * expected_pred
+
+    np.testing.assert_allclose(np.array(capture["sample_next"]), np.array(expected_next), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.array(out), np.array(expected_next), rtol=1e-6, atol=1e-6)
+    assert float(capture["t"].item()) == 1.0
+    assert float(capture["t_prev"].item()) == 0.75
