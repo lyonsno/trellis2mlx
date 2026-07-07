@@ -122,6 +122,7 @@ def _cleanup_and_simplify_mesh(
     reference_cleanup=False,
     qem_simplify=False,
     qem_backend="mlx",
+    source_native_source_root=None,
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
@@ -136,14 +137,27 @@ def _cleanup_and_simplify_mesh(
     Much faster on large meshes (cleanup on 200K faces vs 6M faces).
     """
     def run_qem_simplify(vertices, faces, target_faces, *, verbose=True):
+        source_native_kwargs = {"verbose": verbose}
+        if source_native_source_root is not None:
+            source_native_kwargs["expected_source_root"] = source_native_source_root
         if qem_backend == "mlx":
             from trellmlx.simplify_qem_metal import simplify_qem
             return simplify_qem(vertices, faces, target_faces, verbose=verbose)
         if qem_backend == "source-native":
             if source_native_simplify is None:
                 from trellmlx.source_mtlmesh import simplify_source_native
-                return simplify_source_native(vertices, faces, target_faces, verbose=verbose)
-            return source_native_simplify(vertices, faces, target_faces, verbose=verbose)
+                return simplify_source_native(
+                    vertices,
+                    faces,
+                    target_faces,
+                    **source_native_kwargs,
+                )
+            return source_native_simplify(
+                vertices,
+                faces,
+                target_faces,
+                **source_native_kwargs,
+            )
         raise ValueError(f"unknown qem_backend: {qem_backend}")
 
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
@@ -416,6 +430,9 @@ def main():
     parser.add_argument("--qem-backend", choices=["mlx", "source-native"], default="mlx",
                         help="QEM simplifier backend for --qem-simplify. 'mlx' is the local probe; "
                              "'source-native' calls the reference mtlmesh/cumesh backend when installed.")
+    parser.add_argument("--source-native-source-root",
+                        help="Expected mtlmesh/cumesh source root for --qem-backend source-native "
+                             "(for example /Users/noahlyons/dev/trellis-mac/deps/mtlmesh).")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
@@ -476,6 +493,7 @@ def main():
                 reference_cleanup=args.reference_cleanup,
                 qem_simplify=args.qem_simplify,
                 qem_backend=args.qem_backend,
+                source_native_source_root=args.source_native_source_root,
             )
 
             # Jump straight to texture baking
@@ -865,6 +883,7 @@ def main():
         reference_cleanup=args.reference_cleanup,
         qem_simplify=args.qem_simplify,
         qem_backend=args.qem_backend,
+        source_native_source_root=args.source_native_source_root,
     )
 
     # === Stage 4: Texture SLat ===

@@ -275,6 +275,47 @@ def test_postprocess_reference_cleanup_accepts_source_native_qem_backend():
     assert calls == [(250_000, 200_000, {"verbose": True})]
 
 
+def test_postprocess_source_native_qem_backend_receives_expected_source_root():
+    from generate import _cleanup_and_simplify_mesh
+
+    calls = []
+    cleanup_outputs = [250_000, 190_000]
+
+    def cleanup_mesh(v, faces, **kwargs):
+        return v, FaceBag(cleanup_outputs.pop(0))
+
+    def source_simplify(v, faces, target_faces, **kwargs):
+        calls.append((len(faces), target_faces, kwargs))
+        return v, FaceBag(target_faces)
+
+    _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_source_root="/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+        cleanup_mesh=cleanup_mesh,
+        source_native_simplify=source_simplify,
+        orient_faces_by_adjacency=lambda v, faces, **kwargs: (v, faces),
+        simplify=lambda v, faces, **kwargs: (v, FaceBag(kwargs["target_count"])),
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [
+        (
+            250_000,
+            200_000,
+            {
+                "verbose": True,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        )
+    ]
+
+
 def test_postprocess_rejects_unknown_qem_backend():
     from generate import _cleanup_and_simplify_mesh
 
