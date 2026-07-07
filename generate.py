@@ -548,9 +548,26 @@ def main():
                              "for --qem-backend source-native.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
+    parser.add_argument(
+        "--stop-after-stage",
+        choices=[
+            "conditioning",
+            "sparse_coords",
+            "sparse_internals",
+            "shape_slat",
+            "decoder_output",
+            "mesh_raw",
+            "mesh_clean",
+            "mesh_uv",
+        ],
+        default=None,
+        help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.",
+    )
+    parser.add_argument("--shared-noise", metavar="NPZ",
+                        help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
-                             "after a durable checkpoint boundary. Requires --save-checkpoints.")
+                        "after a durable checkpoint boundary. Requires --save-checkpoints.")
     parser.add_argument("--resume", metavar="DIR",
                         help="Resume from checkpoints in DIR (skips completed inference stages)")
     parser.add_argument("--edit-target", metavar="IMAGE",
@@ -574,6 +591,9 @@ def main():
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
+    if args.stop_after_stage and not args.save_checkpoints:
+        parser.error("--save-checkpoints is required when --stop-after-stage is set")
+    shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
     if args.resume:
@@ -744,6 +764,17 @@ def main():
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
     neg_cond = mx.zeros_like(cond)
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "conditioning",
+            cond=np.array(cond),
+            neg_cond=np.array(neg_cond),
+        )
+        if args.stop_after_stage == "conditioning":
+            print("  Stop after stage: conditioning", flush=True)
+            return
 
     # VS3D: extract target conditioning and relabel source cond
     if vs3d_mode:
@@ -777,7 +808,11 @@ def main():
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
-    noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
+    if shared_noise is not None:
+        noise = mx.array(shared_noise["ss_noise"]).astype(mx.float32)
+        print(f"  Shared sparse noise: {args.shared_noise} {noise.shape}", flush=True)
+    else:
+        noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
     t0 = time.perf_counter()
 
     if vs3d_mode:
@@ -834,7 +869,37 @@ def main():
     lr_coords = np.argwhere(decoded_ds)
     print(f"  {len(lr_coords)} sparse voxels at {lr_resolution}³", flush=True)
 
+    lr_coords_4d = np.column_stack([np.zeros(len(lr_coords), dtype=np.int32), lr_coords])
+    if args.save_checkpoints and args.stop_after_stage == "sparse_internals":
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_internals",
+            z_s=np.array(z_s).astype(np.float32, copy=False),
+            logits=np.array(logits).astype(np.float32, copy=False),
+            decoded=decoded.astype(np.bool_),
+            decoded_ds=decoded_ds.astype(np.bool_),
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            lr_resolution=lr_resolution,
+            sparse_decoder_resolution=int(decoded.shape[0]),
+        )
+        print("  Stop after stage: sparse_internals", flush=True)
+        return
+
     cleanup_model(ss_flow, ss_dec)
+
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_coords",
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            coords_3d=lr_coords.astype(np.int32, copy=False),
+            lr_resolution=lr_resolution,
+        )
+        if args.stop_after_stage == "sparse_coords":
+            print("  Stop after stage: sparse_coords", flush=True)
+            return
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
@@ -855,7 +920,6 @@ def main():
 
     N_lr = len(lr_coords)
     lr_noise = mx.random.normal((N_lr, 32))
-    lr_coords_4d = np.column_stack([np.zeros(N_lr, dtype=np.int32), lr_coords])
 
     t0 = time.perf_counter()
     lr_slat = flow_euler_sample(
@@ -948,6 +1012,20 @@ def main():
         gc.collect()
 
     # Keep hr_slat — needed for texture conditioning
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "shape_slat",
+            feats=np.array(hr_slat).astype(np.float32, copy=False),
+            coords=quant_coords.astype(np.int32, copy=False),
+            coords_3d=hr_coords_3d.astype(np.int32, copy=False),
+            mesh_grid_size=hr_resolution,
+            cascade=not args.no_cascade,
+        )
+        if args.stop_after_stage == "shape_slat":
+            print("  Stop after stage: shape_slat", flush=True)
+            return
 
     # === Stage 3: Shape Decode ===
     print("\n=== Stage 3: Decode Shape ===", flush=True)
@@ -979,6 +1057,19 @@ def main():
     # (2^4=16x) bring them back to hr_resolution scale.
     # grid_size = hr_resolution gives correct [-0.5, 0.5] world-space scaling.
     mesh_grid_size = hr_resolution
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import save_checkpoint
+        save_checkpoint(
+            args.save_checkpoints,
+            "decoder_output",
+            feats=dec_feats_np.astype(np.float32, copy=False),
+            coords=dec_coords_np.astype(np.int32, copy=False),
+            shape_subs=[np.array(mask) for mask in shape_subs],
+            mesh_grid_size=mesh_grid_size,
+        )
+        if args.stop_after_stage == "decoder_output":
+            print("  Stop after stage: decoder_output", flush=True)
+            return
     print(f"  {dec_coords_np.shape[0]:,} voxels, coord range "
           f"[{dec_coords_np[:,1:].min()}, {dec_coords_np[:,1:].max()}], "
           f"grid_size={mesh_grid_size}", flush=True)
@@ -1007,6 +1098,9 @@ def main():
             resume_supported=False,
             resume_blocker="mesh_raw checkpoint exists, but mesh-only resume is not implemented",
         )
+        if args.stop_after_stage == "mesh_raw":
+            print("  Stop after stage: mesh_raw", flush=True)
+            return
 
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
@@ -1035,6 +1129,9 @@ def main():
             resume_supported=False,
             resume_blocker="mesh_clean checkpoint exists, but texture checkpoint is still required for resume",
         )
+        if args.stop_after_stage == "mesh_clean":
+            print("  Stop after stage: mesh_clean", flush=True)
+            return
 
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
@@ -1111,6 +1208,9 @@ def main():
             next_stage="texture_bake",
             output_path=args.output,
         )
+        if args.stop_after_stage == "mesh_uv":
+            print("  Stop after stage: mesh_uv", flush=True)
+            return
 
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
