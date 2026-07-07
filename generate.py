@@ -130,6 +130,7 @@ def _cleanup_and_simplify_mesh(
     source_native_simplify=None,
     source_native_cleanup=None,
     source_native_orient=None,
+    source_native_postprocess=None,
     orient_faces_by_adjacency=None,
     operation_trace=None,
     log=print,
@@ -186,6 +187,17 @@ def _cleanup_and_simplify_mesh(
             from trellmlx.source_mtlmesh import cleanup_source_native
             return cleanup_source_native(vertices, faces, **source_native_kwargs)
         return source_native_cleanup(vertices, faces, **source_native_kwargs)
+
+    def run_source_native_postprocess(vertices, faces, target_faces, *, verbose=True):
+        source_native_kwargs = {"verbose": verbose}
+        if source_native_source_root is not None:
+            source_native_kwargs["expected_source_root"] = source_native_source_root
+        if source_native_python is not None:
+            source_native_kwargs["reference_python"] = source_native_python
+        if source_native_postprocess is None:
+            from trellmlx.source_mtlmesh import postprocess_source_native
+            return postprocess_source_native(vertices, faces, target_faces, **source_native_kwargs)
+        return source_native_postprocess(vertices, faces, target_faces, **source_native_kwargs)
 
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
@@ -260,6 +272,32 @@ def _cleanup_and_simplify_mesh(
     if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
         if qem_simplify and qem_backend != "source-native":
             raise ValueError("reference_cleanup cannot be combined with qem_simplify until the QEM parity gate passes")
+        use_combined_source_native = (
+            qem_simplify
+            and qem_backend == "source-native"
+            and (
+                source_native_postprocess is not None
+                or not any([
+                    source_native_simplify is not None,
+                    source_native_cleanup is not None,
+                    source_native_orient is not None,
+                    orient_faces_by_adjacency is not None,
+                    local_cleanup_override,
+                ])
+            )
+        )
+        if use_combined_source_native:
+            vertices, faces, source_trace = run_source_native_postprocess(
+                vertices,
+                faces,
+                target_faces,
+                verbose=True,
+            )
+            if operation_trace is not None:
+                operation_trace.extend(source_trace)
+            log(f"  Source-native reference postprocess: {len(vertices):,}V {len(faces):,}F", flush=True)
+            return vertices, faces
+
         if simplify is None:
             import fast_simplification
             simplify = fast_simplification.simplify

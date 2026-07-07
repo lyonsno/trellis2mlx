@@ -439,6 +439,68 @@ def test_postprocess_source_native_qem_backend_uses_source_native_cleanup():
     ]
 
 
+def test_postprocess_source_native_qem_backend_uses_combined_source_route_by_default():
+    from generate import _cleanup_and_simplify_mesh
+
+    operation_trace = []
+    calls = []
+
+    def source_postprocess(v, faces, target_faces, **kwargs):
+        calls.append((len(faces), target_faces, kwargs))
+        return (
+            v,
+            FaceBag(target_faces + 7),
+            [
+                {
+                    "operation": "source_full_combined",
+                    "input_faces": len(faces),
+                    "requested_target_faces": target_faces,
+                    "output_faces": target_faces + 7,
+                }
+            ],
+        )
+
+    def local_cleanup(*args, **kwargs):
+        raise AssertionError("combined source-native route must not call local cleanup")
+
+    out_vertices, out_faces = _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_source_root="/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+        source_native_postprocess=source_postprocess,
+        cleanup_mesh=local_cleanup,
+        simplify=lambda v, faces, **kwargs: (_ for _ in ()).throw(AssertionError("no local simplify")),
+        operation_trace=operation_trace,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert len(out_vertices) == 10
+    assert len(out_faces) == 200_007
+    assert calls == [
+        (
+            1_000_000,
+            200_000,
+            {
+                "verbose": True,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        )
+    ]
+    assert operation_trace == [
+        {
+            "operation": "source_full_combined",
+            "input_faces": 1_000_000,
+            "requested_target_faces": 200_000,
+            "output_faces": 200_007,
+        }
+    ]
+
+
 def test_postprocess_rejects_unknown_qem_backend():
     from generate import _cleanup_and_simplify_mesh
 
