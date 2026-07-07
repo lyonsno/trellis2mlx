@@ -220,6 +220,29 @@ class TestFillSmallHolesPerimeter:
         assert len(f_out) == len(faces) + 4
         assert len(v_out) == len(verts) + 1
 
+    def test_filled_cap_faces_match_source_edge_order(self):
+        """Source cumesh emits cap faces as [high, low, centroid] per boundary edge."""
+        verts = np.array([
+            [0, 0, 0],
+            [0.005, 0, 0],
+            [0, 0.005, 0],
+            [0, 0, 0.005],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0, 1, 3],
+            [1, 2, 3],
+            [2, 0, 3],
+        ], dtype=np.int64)
+
+        v_out, f_out = fill_small_holes(verts, faces, max_hole_perimeter=3e-2, verbose=False)
+
+        centroid_index = len(v_out) - 1
+        assert f_out[len(faces):].tolist() == [
+            [1, 0, centroid_index],
+            [2, 0, centroid_index],
+            [2, 1, centroid_index],
+        ]
+
 
 class TestCleanupMeshIntegration:
     def test_cleanup_tuning_arguments_are_keyword_only(self):

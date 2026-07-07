@@ -263,10 +263,12 @@ def fill_small_holes(
         centroid = loop_verts.mean(axis=0)
         centroid_idx = len(vertices)
         vertices = np.vstack([vertices, centroid[None]])
-        for i in range(len(loop)):
-            v0 = loop[i]
-            v1 = loop[(i + 1) % len(loop)]
-            new_faces.append([v0, v1, centroid_idx])
+        loop_edges = sorted(
+            tuple(sorted((int(loop[i]), int(loop[(i + 1) % len(loop)]))))
+            for i in range(len(loop))
+        )
+        for v0, v1 in loop_edges:
+            new_faces.append([v1, v0, centroid_idx])
         filled += 1
 
     if verbose and filled > 0:
