@@ -41,6 +41,48 @@ np.savez_compressed(output_npz, vertices=vertices, faces=faces)
 '''
 
 
+def _as_int(value) -> int:
+    if hasattr(value, "item"):
+        return int(value.item())
+    if callable(value):
+        return int(value())
+    return int(value)
+
+
+def _mesh_face_count(mesh) -> int:
+    return _as_int(getattr(mesh, "num_faces"))
+
+
+def _simplify_with_step_loop(
+    mesh,
+    target_faces: int,
+    *,
+    lambda_edge_length: float,
+    lambda_skinny: float,
+    thresh: float,
+) -> None:
+    num_face = _mesh_face_count(mesh)
+    if num_face <= target_faces:
+        return
+
+    while True:
+        new_num_vert, new_num_face = mesh.simplify_step(
+            float(lambda_edge_length),
+            float(lambda_skinny),
+            float(thresh),
+            False,
+        )
+        del new_num_vert
+        new_num_face = _as_int(new_num_face)
+        if new_num_face <= target_faces:
+            break
+
+        removed = num_face - new_num_face
+        if removed / max(num_face, 1) < 1e-2:
+            thresh *= 10
+        num_face = new_num_face
+
+
 def _run_source_native_subprocess(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -192,10 +234,19 @@ def simplify_source_native(
         "lambda_skinny": float(lambda_skinny),
         "thresh": float(thresh),
     }
-    try:
-        mesh.simplify(int(target_faces), verbose=verbose, options=options)
-    except TypeError:
-        mesh.simplify(int(target_faces), verbose=verbose)
+    if hasattr(mesh, "simplify_step"):
+        _simplify_with_step_loop(
+            mesh,
+            int(target_faces),
+            lambda_edge_length=options["lambda_edge_length"],
+            lambda_skinny=options["lambda_skinny"],
+            thresh=options["thresh"],
+        )
+    else:
+        try:
+            mesh.simplify(int(target_faces), verbose=verbose, options=options)
+        except TypeError:
+            mesh.simplify(int(target_faces), verbose=verbose)
 
     out_vertices, out_faces = mesh.read()
     if hasattr(out_vertices, "detach"):

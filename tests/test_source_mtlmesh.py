@@ -1,5 +1,7 @@
 import subprocess
 from pathlib import Path
+import sys
+import types
 
 import numpy as np
 
@@ -74,3 +76,64 @@ def test_source_native_subprocess_failure_names_reference_python(monkeypatch):
 
     assert "/ref/python" in message
     assert "backend exploded" in message
+
+
+def test_source_native_uses_simplify_step_loop_when_available(monkeypatch):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        calls = []
+
+        def init(self, vertices, faces):
+            self.vertices = vertices
+            self.faces = faces
+            self.num_faces = 10
+
+        def simplify_step(self, lambda_edge_length, lambda_skinny, threshold, timing):
+            self.calls.append((lambda_edge_length, lambda_skinny, threshold, timing))
+            if len(self.calls) == 1:
+                self.num_faces = 10
+                return 8, 10
+            self.num_faces = 4
+            return 5, 4
+
+        def simplify(self, *args, **kwargs):
+            raise AssertionError("source-native wrapper must use simplify_step when available")
+
+        def read(self):
+            return (
+                np.zeros((5, 3), dtype=np.float32),
+                np.zeros((4, 3), dtype=np.int32),
+            )
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(source_mtlmesh, "_load_source_mesh_class", lambda **kwargs: FakeMesh)
+
+    vertices = np.zeros((6, 3), dtype=np.float32)
+    faces = np.zeros((10, 3), dtype=np.int32)
+
+    out_vertices, out_faces = source_mtlmesh.simplify_source_native(
+        vertices,
+        faces,
+        5,
+        verbose=False,
+    )
+
+    assert out_vertices.shape == (5, 3)
+    assert out_faces.shape == (4, 3)
+    assert FakeMesh.calls == [
+        (1e-2, 1e-3, 1e-8, False),
+        (1e-2, 1e-3, 10 * 1e-8, False),
+    ]
