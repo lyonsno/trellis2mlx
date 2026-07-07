@@ -272,7 +272,10 @@ def test_postprocess_reference_cleanup_accepts_source_native_qem_backend():
     )
 
     assert len(faces) == 190_000
-    assert calls == [(250_000, 200_000, {"verbose": True})]
+    assert calls == [
+        (1_000_000, 600_000, {"verbose": True}),
+        (250_000, 200_000, {"verbose": True}),
+    ]
 
 
 def test_postprocess_source_native_qem_backend_receives_expected_source_root():
@@ -305,6 +308,14 @@ def test_postprocess_source_native_qem_backend_receives_expected_source_root():
     )
 
     assert calls == [
+        (
+            1_000_000,
+            600_000,
+            {
+                "verbose": True,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        ),
         (
             250_000,
             200_000,

@@ -123,6 +123,7 @@ def _cleanup_and_simplify_mesh(
     qem_simplify=False,
     qem_backend="mlx",
     source_native_source_root=None,
+    source_native_python=None,
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
@@ -140,6 +141,8 @@ def _cleanup_and_simplify_mesh(
         source_native_kwargs = {"verbose": verbose}
         if source_native_source_root is not None:
             source_native_kwargs["expected_source_root"] = source_native_source_root
+        if source_native_python is not None:
+            source_native_kwargs["reference_python"] = source_native_python
         if qem_backend == "mlx":
             from trellmlx.simplify_qem_metal import simplify_qem
             return simplify_qem(vertices, faces, target_faces, verbose=verbose)
@@ -221,10 +224,15 @@ def _cleanup_and_simplify_mesh(
         if len(faces) > coarse_target:
             t0 = time.perf_counter()
             simplify_input_faces = len(faces)
-            vertices, faces = simplify(vertices, faces, target_count=coarse_target)
+            if qem_simplify:
+                vertices, faces = run_qem_simplify(vertices, faces, coarse_target, verbose=True)
+                simplify_operation = "simplify_coarse_source_native_qem"
+            else:
+                vertices, faces = simplify(vertices, faces, target_count=coarse_target)
+                simplify_operation = "simplify_coarse"
             if operation_trace is not None:
                 operation_trace.append({
-                    "operation": "simplify_coarse",
+                    "operation": simplify_operation,
                     "input_faces": simplify_input_faces,
                     "requested_target_faces": coarse_target,
                     "output_faces": len(faces),
@@ -433,6 +441,9 @@ def main():
     parser.add_argument("--source-native-source-root",
                         help="Expected mtlmesh/cumesh source root for --qem-backend source-native "
                              "(for example /Users/noahlyons/dev/trellis-mac/deps/mtlmesh).")
+    parser.add_argument("--source-native-python",
+                        help="Python executable that can import the expected mtlmesh/cumesh and torch "
+                             "for --qem-backend source-native.")
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
@@ -494,6 +505,7 @@ def main():
                 qem_simplify=args.qem_simplify,
                 qem_backend=args.qem_backend,
                 source_native_source_root=args.source_native_source_root,
+                source_native_python=args.source_native_python,
             )
 
             # Jump straight to texture baking
@@ -884,6 +896,7 @@ def main():
         qem_simplify=args.qem_simplify,
         qem_backend=args.qem_backend,
         source_native_source_root=args.source_native_source_root,
+        source_native_python=args.source_native_python,
     )
 
     # === Stage 4: Texture SLat ===
