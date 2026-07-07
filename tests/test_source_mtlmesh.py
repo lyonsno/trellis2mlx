@@ -93,6 +93,47 @@ def test_source_native_orient_can_run_in_reference_python_subprocess(monkeypatch
     assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
 
 
+def test_source_native_cleanup_can_run_in_reference_python_subprocess(monkeypatch):
+    from trellmlx.source_mtlmesh import cleanup_source_native
+
+    calls = []
+
+    def fake_run(cmd, *, capture_output, text, check, env):
+        calls.append((cmd, env))
+        input_npz = Path(cmd[-3])
+        output_npz = Path(cmd[-2])
+        data = np.load(input_npz)
+        np.savez_compressed(
+            output_npz,
+            vertices=np.asarray(data["vertices"], dtype=np.float32)[:3],
+            faces=np.asarray(data["faces"], dtype=np.int32)[:1],
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="route ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+
+    out_vertices, out_faces = cleanup_source_native(
+        vertices,
+        faces,
+        verbose=False,
+        reference_python="/ref/python",
+        expected_source_root="/ref/mtlmesh",
+    )
+
+    assert out_vertices.shape == (3, 3)
+    assert out_faces.shape == (1, 3)
+    cmd, env = calls[0]
+    assert cmd[0] == "/ref/python"
+    assert cmd[-1] == "/ref/mtlmesh"
+    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+
+
 def test_source_native_subprocess_failure_names_reference_python(monkeypatch):
     from trellmlx.source_mtlmesh import simplify_source_native
 
@@ -225,3 +266,62 @@ def test_source_native_orient_calls_unify_face_orientations(monkeypatch):
     assert out_vertices.shape == (4, 3)
     assert out_faces.shape == (2, 3)
     assert FakeMesh.calls == ["unify_face_orientations"]
+
+
+def test_source_native_cleanup_calls_source_primitives(monkeypatch):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        calls = []
+
+        def init(self, vertices, faces):
+            self.vertices = vertices
+            self.faces = faces
+
+        def remove_duplicate_faces(self):
+            self.calls.append("remove_duplicate_faces")
+
+        def repair_non_manifold_edges(self):
+            self.calls.append("repair_non_manifold_edges")
+
+        def remove_small_connected_components(self, min_area):
+            self.calls.append(("remove_small_connected_components", min_area))
+
+        def fill_holes(self, max_hole_perimeter):
+            self.calls.append(("fill_holes", max_hole_perimeter))
+
+        def read(self):
+            return (
+                np.zeros((4, 3), dtype=np.float32),
+                np.zeros((2, 3), dtype=np.int32),
+            )
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(source_mtlmesh, "_load_source_mesh_class", lambda **kwargs: FakeMesh)
+
+    out_vertices, out_faces = source_mtlmesh.cleanup_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((2, 3), dtype=np.int32),
+        verbose=False,
+    )
+
+    assert out_vertices.shape == (4, 3)
+    assert out_faces.shape == (2, 3)
+    assert FakeMesh.calls == [
+        "remove_duplicate_faces",
+        "repair_non_manifold_edges",
+        ("remove_small_connected_components", 1e-5),
+        ("fill_holes", 3e-2),
+    ]

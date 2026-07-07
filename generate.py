@@ -128,6 +128,7 @@ def _cleanup_and_simplify_mesh(
     fill_holes=None,
     simplify=None,
     source_native_simplify=None,
+    source_native_cleanup=None,
     source_native_orient=None,
     orient_faces_by_adjacency=None,
     operation_trace=None,
@@ -175,8 +176,21 @@ def _cleanup_and_simplify_mesh(
             return orient_source_native(vertices, faces, **source_native_kwargs)
         return source_native_orient(vertices, faces, **source_native_kwargs)
 
+    def run_source_native_cleanup(vertices, faces, *, verbose=True):
+        source_native_kwargs = {"verbose": verbose}
+        if source_native_source_root is not None:
+            source_native_kwargs["expected_source_root"] = source_native_source_root
+        if source_native_python is not None:
+            source_native_kwargs["reference_python"] = source_native_python
+        if source_native_cleanup is None:
+            from trellmlx.source_mtlmesh import cleanup_source_native
+            return cleanup_source_native(vertices, faces, **source_native_kwargs)
+        return source_native_cleanup(vertices, faces, **source_native_kwargs)
+
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
+
+    local_cleanup_override = cleanup_mesh is not None
 
     def final_cleanup(vertices, faces):
         if no_cleanup:
@@ -189,6 +203,11 @@ def _cleanup_and_simplify_mesh(
     def reference_final_cleanup(vertices, faces):
         if no_cleanup:
             return vertices, faces
+        use_source_native_cleanup = (
+            qem_simplify
+            and qem_backend == "source-native"
+            and (source_native_cleanup is not None or not local_cleanup_override)
+        )
         use_source_native_orientation = qem_simplify and qem_backend == "source-native"
         if use_source_native_orientation and (
             source_native_orient is not None or orient_faces_by_adjacency is None
@@ -204,16 +223,21 @@ def _cleanup_and_simplify_mesh(
 
         t0 = time.perf_counter()
         cleanup_input_faces = len(faces)
-        vertices, faces = cleanup_mesh(
-            vertices,
-            faces,
-            keep_largest=keep_largest,
-            do_fix_normals=False,
-            verbose=False,
-        )
+        if use_source_native_cleanup:
+            vertices, faces = run_source_native_cleanup(vertices, faces, verbose=False)
+            cleanup_operation = "cleanup_final_source_native"
+        else:
+            vertices, faces = cleanup_mesh(
+                vertices,
+                faces,
+                keep_largest=keep_largest,
+                do_fix_normals=False,
+                verbose=False,
+            )
+            cleanup_operation = "cleanup_final"
         if operation_trace is not None:
             operation_trace.append({
-                "operation": "cleanup_final",
+                "operation": cleanup_operation,
                 "input_faces": cleanup_input_faces,
                 "output_faces": len(faces),
                 "do_fix_normals": False,
@@ -239,6 +263,11 @@ def _cleanup_and_simplify_mesh(
         if simplify is None:
             import fast_simplification
             simplify = fast_simplification.simplify
+        use_source_native_cleanup = (
+            qem_simplify
+            and qem_backend == "source-native"
+            and (source_native_cleanup is not None or not local_cleanup_override)
+        )
 
         coarse_target = target_faces * 3
         if len(faces) > coarse_target:
@@ -265,16 +294,21 @@ def _cleanup_and_simplify_mesh(
 
         t0 = time.perf_counter()
         cleanup_input_faces = len(faces)
-        vertices, faces = cleanup_mesh(
-            vertices,
-            faces,
-            keep_largest=keep_largest,
-            do_fix_normals=False,
-            verbose=True,
-        )
+        if use_source_native_cleanup:
+            vertices, faces = run_source_native_cleanup(vertices, faces, verbose=True)
+            cleanup_operation = "cleanup_initial_source_native"
+        else:
+            vertices, faces = cleanup_mesh(
+                vertices,
+                faces,
+                keep_largest=keep_largest,
+                do_fix_normals=False,
+                verbose=True,
+            )
+            cleanup_operation = "cleanup_initial"
         if operation_trace is not None:
             operation_trace.append({
-                "operation": "cleanup_initial",
+                "operation": cleanup_operation,
                 "input_faces": cleanup_input_faces,
                 "output_faces": len(faces),
                 "do_fix_normals": False,

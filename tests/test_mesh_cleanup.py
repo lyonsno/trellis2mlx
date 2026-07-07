@@ -93,6 +93,24 @@ class TestRemoveDuplicateFaces:
         cleaned_v, cleaned_f = remove_duplicate_faces(verts, faces)
         assert len(cleaned_f) == len(faces)
 
+    def test_compacts_unreferenced_vertices_even_without_duplicates(self):
+        """Source mtlmesh removes unreferenced vertices after duplicate cleanup."""
+        verts = np.array(
+            [
+                [0, 0, 0],
+                [9, 9, 9],
+                [1, 0, 0],
+                [0, 1, 0],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 2, 3]], dtype=np.int64)
+
+        cleaned_v, cleaned_f = remove_duplicate_faces(verts, faces)
+
+        np.testing.assert_array_equal(cleaned_v, verts[[0, 2, 3]])
+        np.testing.assert_array_equal(cleaned_f, np.array([[0, 1, 2]], dtype=np.int64))
+
     def test_empty_mesh(self):
         verts = np.zeros((0, 3), dtype=np.float32)
         faces = np.zeros((0, 3), dtype=np.int64)

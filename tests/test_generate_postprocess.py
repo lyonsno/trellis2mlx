@@ -380,6 +380,65 @@ def test_postprocess_source_native_qem_backend_uses_source_native_orientation():
     }
 
 
+def test_postprocess_source_native_qem_backend_uses_source_native_cleanup():
+    from generate import _cleanup_and_simplify_mesh
+
+    operation_trace = []
+    cleanup_calls = []
+
+    def local_cleanup(*args, **kwargs):
+        raise AssertionError("source-native reference cleanup must not use local cleanup")
+
+    def source_simplify(v, faces, target_faces, **kwargs):
+        return v, FaceBag(target_faces)
+
+    def source_cleanup(v, faces, **kwargs):
+        cleanup_calls.append((len(faces), kwargs))
+        return v, FaceBag(len(faces))
+
+    _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_source_root="/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+        cleanup_mesh=local_cleanup,
+        source_native_simplify=source_simplify,
+        source_native_cleanup=source_cleanup,
+        source_native_orient=lambda v, faces, **kwargs: (v, faces),
+        operation_trace=operation_trace,
+        simplify=lambda v, faces, **kwargs: (v, FaceBag(kwargs["target_count"])),
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert cleanup_calls == [
+        (
+            600_000,
+            {
+                "verbose": True,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        ),
+        (
+            200_000,
+            {
+                "verbose": False,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        ),
+    ]
+    assert [entry["operation"] for entry in operation_trace] == [
+        "simplify_coarse_source_native_qem",
+        "cleanup_initial_source_native",
+        "simplify_final_source_native_qem",
+        "cleanup_final_source_native",
+        "orient_faces_source_native",
+    ]
+
+
 def test_postprocess_rejects_unknown_qem_backend():
     from generate import _cleanup_and_simplify_mesh
 

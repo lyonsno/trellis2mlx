@@ -283,7 +283,11 @@ def remove_duplicate_faces(
     faces: np.ndarray,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Remove duplicate faces (including permutations of the same triangle)."""
+    """Remove duplicate faces and compact unreferenced vertices.
+
+    Source mtlmesh calls ``remove_unreferenced_vertices`` at the end of
+    ``remove_duplicate_faces`` even when no duplicate face was found.
+    """
     if len(faces) == 0:
         return vertices, faces
 
@@ -292,14 +296,14 @@ def remove_duplicate_faces(
     _, unique_idx = np.unique(canonical, axis=0, return_index=True)
 
     if len(unique_idx) == len(faces):
-        return vertices, faces
+        return _reindex_mesh(vertices, faces)
 
     removed = len(faces) - len(unique_idx)
     if verbose:
         print(f"  Removed {removed} duplicate faces", flush=True)
 
     unique_idx.sort()  # preserve original order
-    return vertices, faces[unique_idx]
+    return _reindex_mesh(vertices, faces[unique_idx])
 
 
 def repair_non_manifold_edges(
