@@ -137,3 +137,33 @@ def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
     command = _build_generate_command(args, tmp_path / "checkpoints")
 
     assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_block_trace"
+
+
+def test_stage_capture_wrapper_forwards_sparse_flow_trace_block_index(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--sparse-flow-trace-block-index",
+            "5",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-trace-block-index" in command
+    assert command[command.index("--sparse-flow-trace-block-index") + 1] == "5"
+    assert route_identity["route"]["sparse_flow_trace_block_index"] == 5

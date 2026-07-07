@@ -567,6 +567,9 @@ def main():
     )
     parser.add_argument("--shared-noise", metavar="NPZ",
                         help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
+    parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
+                        help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
+                             "sparse_flow_block_trace (default: 0).")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -858,58 +861,45 @@ def main():
             pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond)
             neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32)
             t_tensor = mx.array([1000.0], dtype=mx.float32)
-            pos_trace = ss_flow.trace_first_block(
-                noise, t_tensor, pos_cond, cross_kv_cache=pos_kv_cache
+            trace_block_index = args.sparse_flow_trace_block_index
+            pos_trace = ss_flow.trace_block(
+                noise,
+                t_tensor,
+                pos_cond,
+                block_index=trace_block_index,
+                cross_kv_cache=pos_kv_cache,
             )
-            neg_trace = ss_flow.trace_first_block(
-                noise, t_tensor, neg_cond_fp32, cross_kv_cache=neg_kv_cache
+            neg_trace = ss_flow.trace_block(
+                noise,
+                t_tensor,
+                neg_cond_fp32,
+                block_index=trace_block_index,
+                cross_kv_cache=neg_kv_cache,
             )
             def trace_np(value):
                 return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
 
             from trellmlx.checkpoint import save_checkpoint
+            trace_payload = {
+                f"pos_{name}": trace_np(value)
+                for name, value in pos_trace.items()
+            }
+            trace_payload.update(
+                {
+                    f"neg_{name}": trace_np(value)
+                    for name, value in neg_trace.items()
+                }
+            )
             save_checkpoint(
                 args.save_checkpoints,
                 "sparse_flow_block_trace",
-                pos_input_projected=trace_np(pos_trace["input_projected"]),
-                pos_block0_norm1=trace_np(pos_trace["block0_norm1"]),
-                pos_block0_modulated_self_input=trace_np(pos_trace["block0_modulated_self_input"]),
-                pos_block0_q_pre_norm=trace_np(pos_trace["block0_q_pre_norm"]),
-                pos_block0_k_pre_norm=trace_np(pos_trace["block0_k_pre_norm"]),
-                pos_block0_v=trace_np(pos_trace["block0_v"]),
-                pos_block0_q_post_norm=trace_np(pos_trace["block0_q_post_norm"]),
-                pos_block0_k_post_norm=trace_np(pos_trace["block0_k_post_norm"]),
-                pos_block0_q_post_rope=trace_np(pos_trace["block0_q_post_rope"]),
-                pos_block0_k_post_rope=trace_np(pos_trace["block0_k_post_rope"]),
-                pos_block0_attention_raw=trace_np(pos_trace["block0_attention_raw"]),
-                pos_block0_self_attn=trace_np(pos_trace["block0_self_attn"]),
-                pos_block0_after_self=trace_np(pos_trace["block0_after_self"]),
-                pos_block0_cross_attn=trace_np(pos_trace["block0_cross_attn"]),
-                pos_block0_after_cross=trace_np(pos_trace["block0_after_cross"]),
-                pos_block0_mlp=trace_np(pos_trace["block0_mlp"]),
-                pos_block0_after_mlp=trace_np(pos_trace["block0_after_mlp"]),
-                neg_input_projected=trace_np(neg_trace["input_projected"]),
-                neg_block0_norm1=trace_np(neg_trace["block0_norm1"]),
-                neg_block0_modulated_self_input=trace_np(neg_trace["block0_modulated_self_input"]),
-                neg_block0_q_pre_norm=trace_np(neg_trace["block0_q_pre_norm"]),
-                neg_block0_k_pre_norm=trace_np(neg_trace["block0_k_pre_norm"]),
-                neg_block0_v=trace_np(neg_trace["block0_v"]),
-                neg_block0_q_post_norm=trace_np(neg_trace["block0_q_post_norm"]),
-                neg_block0_k_post_norm=trace_np(neg_trace["block0_k_post_norm"]),
-                neg_block0_q_post_rope=trace_np(neg_trace["block0_q_post_rope"]),
-                neg_block0_k_post_rope=trace_np(neg_trace["block0_k_post_rope"]),
-                neg_block0_attention_raw=trace_np(neg_trace["block0_attention_raw"]),
-                neg_block0_self_attn=trace_np(neg_trace["block0_self_attn"]),
-                neg_block0_after_self=trace_np(neg_trace["block0_after_self"]),
-                neg_block0_cross_attn=trace_np(neg_trace["block0_cross_attn"]),
-                neg_block0_after_cross=trace_np(neg_trace["block0_after_cross"]),
-                neg_block0_mlp=trace_np(neg_trace["block0_mlp"]),
-                neg_block0_after_mlp=trace_np(neg_trace["block0_after_mlp"]),
+                **trace_payload,
+                trace_block_index=np.array(trace_block_index, dtype=np.int32),
                 t=np.array(1000.0, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),
                 rescale_t=np.array(5.0, dtype=np.float32),
             )
-            print("  Stop after stage: sparse_flow_block_trace", flush=True)
+            print(f"  Stop after stage: sparse_flow_block_trace block={trace_block_index}", flush=True)
             return
 
         step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None

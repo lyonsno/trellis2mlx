@@ -67,3 +67,28 @@ def test_compare_stage_cli_writes_json_report(tmp_path):
     assert report["stage"] == "conditioning"
     assert report["arrays"]["cond"]["max_abs_diff"] == 1.0
     assert report["arrays"]["neg_cond"]["max_abs_diff"] == 0.0
+
+
+def test_sparse_flow_block_trace_comparison_reports_dynamic_block_arrays(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        reference,
+        trace_block_index=np.array(5, dtype=np.int32),
+        pos_block5_after_mlp=np.array([[1.0, 2.0]], dtype=np.float32),
+        neg_block5_after_mlp=np.array([[3.0, 4.0]], dtype=np.float32),
+    )
+    np.savez(
+        candidate,
+        trace_block_index=np.array(5, dtype=np.int32),
+        pos_block5_after_mlp=np.array([[1.5, 1.0]], dtype=np.float32),
+        neg_block5_after_mlp=np.array([[2.0, 7.0]], dtype=np.float32),
+    )
+
+    report = compare_stage("sparse_flow_block_trace", reference, candidate)
+
+    assert report["arrays"]["trace_block_index"]["max_abs_diff"] == 0.0
+    assert report["arrays"]["pos_block5_after_mlp"]["max_abs_diff"] == 1.0
+    assert report["arrays"]["neg_block5_after_mlp"]["max_abs_diff"] == 3.0

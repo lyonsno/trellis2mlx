@@ -21,10 +21,6 @@ class LayerNorm32(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         orig_dtype = x.dtype
-        x = x.astype(mx.float32)
-        mean = mx.mean(x, axis=-1, keepdims=True)
-        var = mx.var(x, axis=-1, keepdims=True)
-        x = (x - mean) * mx.rsqrt(var + self.eps)
-        if self.affine:
-            x = x * self.weight + self.bias
-        return x.astype(orig_dtype)
+        weight = self.weight if self.affine else None
+        bias = self.bias if self.affine else None
+        return mx.fast.layer_norm(x, weight, bias, self.eps).astype(orig_dtype)

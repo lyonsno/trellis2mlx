@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--shared-noise")
+    parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0)
     return parser
 
 
@@ -66,6 +67,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "preprocess_rembg": not args.no_rembg,
             "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
             "shared_noise_sha256": _sha256_file(args.shared_noise) if args.shared_noise else None,
+            "sparse_flow_trace_block_index": args.sparse_flow_trace_block_index,
         },
         "source": {
             "image_path": image_path,
@@ -197,6 +199,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--no-rembg")
     if args.shared_noise:
         command.extend(["--shared-noise", str(Path(args.shared_noise))])
+    if args.stop_after_stage == "sparse_flow_block_trace":
+        command.extend(["--sparse-flow-trace-block-index", str(args.sparse_flow_trace_block_index)])
     return command
 
 

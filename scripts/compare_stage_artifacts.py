@@ -12,44 +12,6 @@ from typing import Any
 import numpy as np
 
 
-_SPARSE_FLOW_BLOCK_TRACE_KEYS = (
-    "pos_input_projected",
-    "pos_block0_norm1",
-    "pos_block0_modulated_self_input",
-    "pos_block0_q_pre_norm",
-    "pos_block0_k_pre_norm",
-    "pos_block0_v",
-    "pos_block0_q_post_norm",
-    "pos_block0_k_post_norm",
-    "pos_block0_q_post_rope",
-    "pos_block0_k_post_rope",
-    "pos_block0_attention_raw",
-    "pos_block0_self_attn",
-    "pos_block0_after_self",
-    "pos_block0_cross_attn",
-    "pos_block0_after_cross",
-    "pos_block0_mlp",
-    "pos_block0_after_mlp",
-    "neg_input_projected",
-    "neg_block0_norm1",
-    "neg_block0_modulated_self_input",
-    "neg_block0_q_pre_norm",
-    "neg_block0_k_pre_norm",
-    "neg_block0_v",
-    "neg_block0_q_post_norm",
-    "neg_block0_k_post_norm",
-    "neg_block0_q_post_rope",
-    "neg_block0_k_post_rope",
-    "neg_block0_attention_raw",
-    "neg_block0_self_attn",
-    "neg_block0_after_self",
-    "neg_block0_cross_attn",
-    "neg_block0_after_cross",
-    "neg_block0_mlp",
-    "neg_block0_after_mlp",
-)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare TRELLIS stage artifacts")
     parser.add_argument(
@@ -124,8 +86,7 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
         if stage == "sparse_flow_block_trace":
             report["arrays"] = {
                 name: _array_delta(ref[name], cand[name])
-                for name in _SPARSE_FLOW_BLOCK_TRACE_KEYS
-                if name in ref and name in cand
+                for name in sorted(set(ref.files) & set(cand.files))
             }
             return report
         if stage == "sparse_internals":

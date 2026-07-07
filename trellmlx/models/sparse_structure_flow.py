@@ -134,6 +134,7 @@ class MultiHeadAttention(nn.Module):
         self,
         x: mx.array,
         rope_phases: mx.array = None,
+        trace_prefix: str = "block0",
     ) -> tuple[mx.array, dict[str, mx.array]]:
         B_T = x.shape[0]
         qkv = self.to_qkv(x)
@@ -141,28 +142,28 @@ class MultiHeadAttention(nn.Module):
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
         trace = {
-            "block0_q_pre_norm": q,
-            "block0_k_pre_norm": k,
-            "block0_v": v,
+            f"{trace_prefix}_q_pre_norm": q,
+            f"{trace_prefix}_k_pre_norm": k,
+            f"{trace_prefix}_v": v,
         }
 
         q = self.q_rms_norm(q)
         k = self.k_rms_norm(k)
-        trace["block0_q_post_norm"] = q
-        trace["block0_k_post_norm"] = k
+        trace[f"{trace_prefix}_q_post_norm"] = q
+        trace[f"{trace_prefix}_k_post_norm"] = k
 
         if rope_phases is not None:
             q = apply_rope(q, rope_phases)
             k = apply_rope(k, rope_phases)
-        trace["block0_q_post_rope"] = q
-        trace["block0_k_post_rope"] = k
+        trace[f"{trace_prefix}_q_post_rope"] = q
+        trace[f"{trace_prefix}_k_post_rope"] = k
 
         q_b = q[None].transpose(0, 2, 1, 3)
         k_b = k[None].transpose(0, 2, 1, 3)
         v_b = v[None].transpose(0, 2, 1, 3)
         out = scaled_dot_product_attention(q_b, k_b, v_b)
         out = out.transpose(0, 2, 1, 3).reshape(B_T, self.channels)
-        trace["block0_attention_raw"] = out
+        trace[f"{trace_prefix}_attention_raw"] = out
 
         return self.to_out(out), trace
 
@@ -278,6 +279,7 @@ class ModulatedBlock(nn.Module):
         context: mx.array,
         rope_phases: mx.array = None,
         cross_kv_cache: tuple = None,
+        trace_prefix: str = "block0",
     ) -> tuple[mx.array, dict[str, mx.array]]:
         mod = (mod + self.modulation).astype(mod.dtype)
 
@@ -292,44 +294,50 @@ class ModulatedBlock(nn.Module):
         trace: dict[str, mx.array] = {}
 
         h = _layernorm_noaffine(x)
-        trace["block0_norm1"] = h
+        trace[f"{trace_prefix}_norm1"] = h
         h = h * (1 + scale_msa) + shift_msa
-        trace["block0_modulated_self_input"] = h
-        h, attn_trace = self.self_attn.trace_self_attention(h, rope_phases=rope_phases)
+        trace[f"{trace_prefix}_modulated_self_input"] = h
+        h, attn_trace = self.self_attn.trace_self_attention(
+            h,
+            rope_phases=rope_phases,
+            trace_prefix=trace_prefix,
+        )
         trace.update(attn_trace)
-        trace["block0_self_attn"] = h
+        trace[f"{trace_prefix}_self_attn"] = h
         h = h * gate_msa
         x = x + h
-        trace["block0_after_self"] = x
+        trace[f"{trace_prefix}_after_self"] = x
 
         h = self.norm2(x)
         if cross_kv_cache is not None:
             h = self.cross_attn(h, cached_kv=cross_kv_cache)
         else:
             h = self.cross_attn(h, context)
-        trace["block0_cross_attn"] = h
+        trace[f"{trace_prefix}_cross_attn"] = h
         x = x + h
-        trace["block0_after_cross"] = x
+        trace[f"{trace_prefix}_after_cross"] = x
 
         h = _layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
-        h = self.mlp(h)
-        trace["block0_mlp"] = h
+        trace[f"{trace_prefix}_mlp_input"] = h
+        h_fc1 = self.mlp.mlp_0(h)
+        trace[f"{trace_prefix}_mlp_fc1"] = h_fc1
+        h_gelu = _gelu_tanh(h_fc1)
+        trace[f"{trace_prefix}_mlp_gelu"] = h_gelu
+        h = self.mlp.mlp_2(h_gelu)
+        trace[f"{trace_prefix}_mlp_fc2"] = h
+        trace[f"{trace_prefix}_mlp"] = h
         h = h * gate_mlp
+        trace[f"{trace_prefix}_mlp_gated"] = h
         x = x + h
-        trace["block0_after_mlp"] = x
+        trace[f"{trace_prefix}_after_mlp"] = x
 
         return x, trace
 
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     """LayerNorm without learnable affine (controlled by adaLN)."""
-    orig_dtype = x.dtype
-    x = x.astype(mx.float32)
-    mean = mx.mean(x, axis=-1, keepdims=True)
-    var = mx.var(x, axis=-1, keepdims=True)
-    x = (x - mean) * mx.rsqrt(var + eps)
-    return x.astype(orig_dtype)
+    return mx.fast.layer_norm(x, None, None, eps)
 
 
 def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:
@@ -450,6 +458,19 @@ class SparseStructureFlowModel(nn.Module):
         cond: mx.array,
         cross_kv_cache: list = None,
     ) -> dict[str, mx.array]:
+        return self.trace_block(x, t, cond, block_index=0, cross_kv_cache=cross_kv_cache)
+
+    def trace_block(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        block_index: int = 0,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        if block_index < 0 or block_index >= len(self.blocks):
+            raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
+
         B = x.shape[0]
         R = x.shape[2]
 
@@ -469,11 +490,31 @@ class SparseStructureFlowModel(nn.Module):
         rope_phases = build_rope_phases(R, head_dim)
 
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
-        block_kv = cross_kv_cache[0] if cross_kv_cache is not None else None
-        _x_after, trace = self.blocks[0].trace(
-            x, mod[0], cond, rope_phases=rope_phases, cross_kv_cache=block_kv
-        )
-        trace["input_projected"] = x
+        trace: dict[str, mx.array] = {"input_projected": x}
+        for i, block in enumerate(self.blocks):
+            block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+            if i == block_index:
+                trace_prefix = f"block{block_index}"
+                trace[f"{trace_prefix}_input"] = x
+                _x_after, block_trace = block.trace(
+                    x,
+                    mod[0],
+                    cond,
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                    trace_prefix=trace_prefix,
+                )
+                trace.update(block_trace)
+                break
+            x = block(
+                x,
+                mod[0],
+                cond,
+                rope_phases=rope_phases,
+                cross_kv_cache=block_kv,
+            )
+            if (i + 1) % 6 == 0:
+                mx.eval(x)
         mx.eval(*trace.values())
         return trace
 
