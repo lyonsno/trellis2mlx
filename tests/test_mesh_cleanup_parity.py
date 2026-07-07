@@ -42,6 +42,9 @@ def test_reference_cleanup_contract_names_source_order_without_prefill():
     assert REFERENCE_CLEANUP_CONTRACT["local_equivalent_operations"] == {
         "unify_face_orientations": "orient_faces_by_adjacency",
     }
+    assert REFERENCE_CLEANUP_CONTRACT["source_native_equivalent_operations"] == {
+        "unify_face_orientations": "orient_source_native",
+    }
     assert "initial_hole_fill" not in REFERENCE_CLEANUP_CONTRACT["operations"]
     assert REFERENCE_CLEANUP_CONTRACT["qem_status"] == "primitive_choice_only_not_reference_equivalent"
 

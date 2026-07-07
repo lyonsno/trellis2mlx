@@ -30,6 +30,9 @@ REFERENCE_CLEANUP_CONTRACT: dict[str, Any] = {
     "local_equivalent_operations": {
         "unify_face_orientations": "orient_faces_by_adjacency",
     },
+    "source_native_equivalent_operations": {
+        "unify_face_orientations": "orient_source_native",
+    },
     "qem_status": "primitive_choice_only_not_reference_equivalent",
     "qem_probe_status": "probe_only_not_reference_equivalent",
 }

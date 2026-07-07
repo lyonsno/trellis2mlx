@@ -50,6 +50,49 @@ def test_source_native_simplify_can_run_in_reference_python_subprocess(monkeypat
     assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
 
 
+def test_source_native_orient_can_run_in_reference_python_subprocess(monkeypatch):
+    from trellmlx.source_mtlmesh import orient_source_native
+
+    calls = []
+
+    def fake_run(cmd, *, capture_output, text, check, env):
+        calls.append((cmd, env))
+        input_npz = Path(cmd[-3])
+        output_npz = Path(cmd[-2])
+        data = np.load(input_npz)
+        faces = np.asarray(data["faces"], dtype=np.int32).copy()
+        faces[1] = faces[1][[0, 2, 1]]
+        np.savez_compressed(
+            output_npz,
+            vertices=np.asarray(data["vertices"], dtype=np.float32),
+            faces=faces,
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="route ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+
+    out_vertices, out_faces = orient_source_native(
+        vertices,
+        faces,
+        verbose=False,
+        reference_python="/ref/python",
+        expected_source_root="/ref/mtlmesh",
+    )
+
+    np.testing.assert_array_equal(out_vertices, vertices)
+    np.testing.assert_array_equal(out_faces[1], np.array([1, 3, 2], dtype=np.int32))
+    cmd, env = calls[0]
+    assert cmd[0] == "/ref/python"
+    assert cmd[-1] == "/ref/mtlmesh"
+    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+
+
 def test_source_native_subprocess_failure_names_reference_python(monkeypatch):
     from trellmlx.source_mtlmesh import simplify_source_native
 
@@ -137,3 +180,48 @@ def test_source_native_uses_simplify_step_loop_when_available(monkeypatch):
         (1e-2, 1e-3, 1e-8, False),
         (1e-2, 1e-3, 10 * 1e-8, False),
     ]
+
+
+def test_source_native_orient_calls_unify_face_orientations(monkeypatch):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        calls = []
+
+        def init(self, vertices, faces):
+            self.vertices = vertices
+            self.faces = faces
+
+        def unify_face_orientations(self):
+            self.calls.append("unify_face_orientations")
+
+        def read(self):
+            return (
+                np.zeros((4, 3), dtype=np.float32),
+                np.zeros((2, 3), dtype=np.int32),
+            )
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(source_mtlmesh, "_load_source_mesh_class", lambda **kwargs: FakeMesh)
+
+    out_vertices, out_faces = source_mtlmesh.orient_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((2, 3), dtype=np.int32),
+        verbose=False,
+    )
+
+    assert out_vertices.shape == (4, 3)
+    assert out_faces.shape == (2, 3)
+    assert FakeMesh.calls == ["unify_face_orientations"]

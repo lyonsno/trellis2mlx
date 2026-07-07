@@ -128,6 +128,7 @@ def _cleanup_and_simplify_mesh(
     fill_holes=None,
     simplify=None,
     source_native_simplify=None,
+    source_native_orient=None,
     orient_faces_by_adjacency=None,
     operation_trace=None,
     log=print,
@@ -163,6 +164,17 @@ def _cleanup_and_simplify_mesh(
             )
         raise ValueError(f"unknown qem_backend: {qem_backend}")
 
+    def run_source_native_orient(vertices, faces, *, verbose=False):
+        source_native_kwargs = {"verbose": verbose}
+        if source_native_source_root is not None:
+            source_native_kwargs["expected_source_root"] = source_native_source_root
+        if source_native_python is not None:
+            source_native_kwargs["reference_python"] = source_native_python
+        if source_native_orient is None:
+            from trellmlx.source_mtlmesh import orient_source_native
+            return orient_source_native(vertices, faces, **source_native_kwargs)
+        return source_native_orient(vertices, faces, **source_native_kwargs)
+
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
 
@@ -177,10 +189,18 @@ def _cleanup_and_simplify_mesh(
     def reference_final_cleanup(vertices, faces):
         if no_cleanup:
             return vertices, faces
-        if orient_faces_by_adjacency is None:
+        use_source_native_orientation = qem_simplify and qem_backend == "source-native"
+        if use_source_native_orientation and (
+            source_native_orient is not None or orient_faces_by_adjacency is None
+        ):
+            orient_reference_faces = run_source_native_orient
+            orient_operation = "orient_faces_source_native"
+        elif orient_faces_by_adjacency is None:
             from trellmlx.mesh_cleanup import orient_faces_by_adjacency as orient_reference_faces
+            orient_operation = "orient_faces_by_adjacency"
         else:
             orient_reference_faces = orient_faces_by_adjacency
+            orient_operation = "orient_faces_by_adjacency"
 
         t0 = time.perf_counter()
         cleanup_input_faces = len(faces)
@@ -202,7 +222,7 @@ def _cleanup_and_simplify_mesh(
         vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
         if operation_trace is not None:
             operation_trace.append({
-                "operation": "orient_faces_by_adjacency",
+                "operation": orient_operation,
                 "input_faces": orient_input_faces,
                 "output_faces": len(faces),
             })

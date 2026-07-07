@@ -327,6 +327,59 @@ def test_postprocess_source_native_qem_backend_receives_expected_source_root():
     ]
 
 
+def test_postprocess_source_native_qem_backend_uses_source_native_orientation():
+    from generate import _cleanup_and_simplify_mesh
+
+    operation_trace = []
+    calls = []
+
+    def cleanup_mesh(v, faces, **kwargs):
+        return v, FaceBag(len(faces))
+
+    def source_simplify(v, faces, target_faces, **kwargs):
+        return v, FaceBag(target_faces)
+
+    def source_orient(v, faces, **kwargs):
+        calls.append((len(faces), kwargs))
+        return v, FaceBag(len(faces))
+
+    def local_orient(*args, **kwargs):
+        raise AssertionError("source-native reference cleanup must not use local orientation")
+
+    _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_source_root="/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+        cleanup_mesh=cleanup_mesh,
+        source_native_simplify=source_simplify,
+        source_native_orient=source_orient,
+        orient_faces_by_adjacency=local_orient,
+        operation_trace=operation_trace,
+        simplify=lambda v, faces, **kwargs: (v, FaceBag(kwargs["target_count"])),
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [
+        (
+            200_000,
+            {
+                "verbose": False,
+                "expected_source_root": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh",
+            },
+        )
+    ]
+    assert operation_trace[-1] == {
+        "operation": "orient_faces_source_native",
+        "input_faces": 200_000,
+        "output_faces": 200_000,
+    }
+
+
 def test_postprocess_rejects_unknown_qem_backend():
     from generate import _cleanup_and_simplify_mesh
 

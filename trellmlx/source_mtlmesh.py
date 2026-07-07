@@ -41,6 +41,28 @@ np.savez_compressed(output_npz, vertices=vertices, faces=faces)
 '''
 
 
+def _external_source_native_orient_code() -> str:
+    return r'''
+import sys
+
+import numpy as np
+
+from trellmlx.source_mtlmesh import orient_source_native
+
+
+verbose = sys.argv[1] == "1"
+input_npz, output_npz, expected_root = sys.argv[2:5]
+data = np.load(input_npz)
+vertices, faces = orient_source_native(
+    np.asarray(data["vertices"], dtype=np.float32),
+    np.asarray(data["faces"], dtype=np.int32),
+    verbose=verbose,
+    expected_source_root=expected_root or None,
+)
+np.savez_compressed(output_npz, vertices=vertices, faces=faces)
+'''
+
+
 def _as_int(value) -> int:
     if hasattr(value, "item"):
         return int(value.item())
@@ -136,6 +158,66 @@ def _run_source_native_subprocess(
         if not output_npz.exists():
             raise RuntimeError(
                 f"qem_backend='source-native' reference_python {reference_python} "
+                "completed without writing output mesh"
+            )
+        output = np.load(output_npz)
+        return (
+            np.asarray(output["vertices"], dtype=np.float32),
+            np.asarray(output["faces"], dtype=np.int32),
+        )
+
+
+def _run_source_native_orient_subprocess(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    reference_python: str | Path,
+    verbose: bool,
+    expected_source_root: str | Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(repo_root)
+        if not existing_pythonpath
+        else str(repo_root) + os.pathsep + existing_pythonpath
+    )
+
+    with tempfile.TemporaryDirectory(prefix="trellis2mlx-source-native-orient-") as tmp:
+        tmp_path = Path(tmp)
+        input_npz = tmp_path / "input_mesh.npz"
+        output_npz = tmp_path / "output_mesh.npz"
+        np.savez_compressed(
+            input_npz,
+            vertices=np.asarray(vertices, dtype=np.float32),
+            faces=np.asarray(faces, dtype=np.int32),
+        )
+        cmd = [
+            str(reference_python),
+            "-c",
+            _external_source_native_orient_code(),
+            "1" if verbose else "0",
+            str(input_npz),
+            str(output_npz),
+            str(expected_source_root or ""),
+        ]
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr or completed.stdout or "no subprocess output"
+            raise RuntimeError(
+                f"source-native orientation reference_python {reference_python} "
+                f"failed with exit code {completed.returncode}: {detail}"
+            )
+        if not output_npz.exists():
+            raise RuntimeError(
+                f"source-native orientation reference_python {reference_python} "
                 "completed without writing output mesh"
             )
         output = np.load(output_npz)
@@ -247,6 +329,50 @@ def simplify_source_native(
             mesh.simplify(int(target_faces), verbose=verbose, options=options)
         except TypeError:
             mesh.simplify(int(target_faces), verbose=verbose)
+
+    out_vertices, out_faces = mesh.read()
+    if hasattr(out_vertices, "detach"):
+        out_vertices = out_vertices.detach().cpu().numpy()
+    if hasattr(out_faces, "detach"):
+        out_faces = out_faces.detach().cpu().numpy()
+    return (
+        np.asarray(out_vertices, dtype=np.float32),
+        np.asarray(out_faces, dtype=np.int32),
+    )
+
+
+def orient_source_native(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    verbose: bool = True,
+    expected_source_root: str | Path | None = None,
+    reference_python: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unify face orientation with the reference mtlmesh/cumesh backend."""
+    if reference_python is not None:
+        return _run_source_native_orient_subprocess(
+            vertices,
+            faces,
+            reference_python=reference_python,
+            verbose=verbose,
+            expected_source_root=expected_source_root,
+        )
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "source-native orientation requires torch for the reference "
+            "mtlmesh/cumesh backend"
+        ) from exc
+
+    mesh_cls = _load_source_mesh_class(expected_source_root=expected_source_root)
+    mesh = mesh_cls()
+    verts_t = torch.from_numpy(np.asarray(vertices, dtype=np.float32)).contiguous()
+    faces_t = torch.from_numpy(np.asarray(faces, dtype=np.int32)).contiguous()
+    mesh.init(verts_t, faces_t)
+    mesh.unify_face_orientations()
 
     out_vertices, out_faces = mesh.read()
     if hasattr(out_vertices, "detach"):
