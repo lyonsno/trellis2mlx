@@ -33,6 +33,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Local simplifier used inside the reference-cleanup harness route",
     )
     parser.add_argument("--reference-python", type=Path, help="Python executable with cumesh available")
+    parser.add_argument(
+        "--reference-source-root",
+        type=Path,
+        help="Expected mtlmesh/cumesh source root for --reference-python",
+    )
     parser.add_argument("--require-reference", action="store_true", help="Fail if the reference backend cannot run")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--overwrite-report", action="store_true")
@@ -105,13 +110,96 @@ def _probe_reference_backend() -> dict[str, Any]:
 
 def _external_reference_code() -> str:
     return r'''
+import inspect
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 import time
 
 import numpy as np
 import torch
 import cumesh
+from cumesh.metal_backend import MtlMesh
+
+
+FORBIDDEN_SOURCE_MARKERS = ("Hunyuan3D-MLX", "Hunyuan3D", "ZimengXiong/Hunyuan3D-MLX")
+
+
+def find_git_root(path):
+    current = Path(path).expanduser().resolve(strict=False)
+    if current.is_file():
+        current = current.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def git_output(root, *args):
+    if not root:
+        return None
+    completed = subprocess.run(
+        ["git", "-C", root, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def route_identity():
+    import cumesh.metal_backend as metal_backend
+
+    metal_backend_file = inspect.getfile(metal_backend)
+    git_root = find_git_root(metal_backend_file)
+    remote = git_output(git_root, "remote", "get-url", "origin")
+    return {
+        "status": "available",
+        "python": sys.executable,
+        "cumesh_file": getattr(cumesh, "__file__", None),
+        "cumesh_path": list(getattr(cumesh, "__path__", [])),
+        "has_CuMesh": hasattr(cumesh, "CuMesh"),
+        "metal_backend_file": metal_backend_file,
+        "has_MtlMesh": hasattr(metal_backend, "MtlMesh"),
+        "git_root": git_root,
+        "git_remote": remote,
+        "git_commit": git_output(git_root, "rev-parse", "HEAD"),
+    }
+
+
+def is_relative_to(path, root):
+    try:
+        Path(path).expanduser().resolve(strict=False).relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_route(identity, expected_root_text):
+    values = []
+    for key in ("cumesh_file", "metal_backend_file", "git_root", "git_remote"):
+        value = identity.get(key)
+        if value:
+            values.append(str(value))
+    values.extend(str(value) for value in identity.get("cumesh_path", []))
+    for value in values:
+        if any(marker in value for marker in FORBIDDEN_SOURCE_MARKERS):
+            raise RuntimeError(f"forbidden source route for mtlmesh/cumesh: {value}")
+    if expected_root_text:
+        root = Path(expected_root_text).expanduser().resolve(strict=False)
+        paths = [
+            identity.get("metal_backend_file"),
+            identity.get("cumesh_file"),
+            identity.get("git_root"),
+            *identity.get("cumesh_path", []),
+        ]
+        if not any(path and is_relative_to(path, root) for path in paths):
+            raise RuntimeError(f"mtlmesh/cumesh route does not match expected source root: {root}")
+    return identity
 
 
 def record(
@@ -176,14 +264,16 @@ def simplify_with_step_trace(mesh, target_faces):
     return input_faces, mesh_face_count(mesh), step_trace
 
 
-mesh_path, target_faces_text, output_npz, trace_json = sys.argv[1:5]
+mesh_path, target_faces_text, output_npz, trace_json, expected_root = sys.argv[1:6]
 target_faces = int(target_faces_text)
 data = np.load(mesh_path)
 vertices = np.asarray(data["vertices"], dtype=np.float32)
 faces = np.asarray(data["faces"], dtype=np.int32)
+identity = validate_route(route_identity(), expected_root)
 
 t0 = time.perf_counter()
-mesh = cumesh.CuMesh()
+mesh_cls = getattr(cumesh, "CuMesh", None) or MtlMesh
+mesh = mesh_cls()
 mesh.init(torch.from_numpy(vertices), torch.from_numpy(faces))
 trace = []
 
@@ -238,6 +328,7 @@ Path = __import__("pathlib").Path
 Path(trace_json).write_text(json.dumps({
     "operation_trace": trace,
     "elapsed_seconds": time.perf_counter() - t0,
+    "route_identity": identity,
 }, indent=2, sort_keys=True) + "\n")
 '''
 
@@ -248,6 +339,7 @@ def _run_external_reference_cleanup(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces: int,
+    reference_source_root: Path | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, list[dict[str, Any]], dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="trellis2mlx-cumesh-reference-") as tmp:
         tmp_path = Path(tmp)
@@ -267,6 +359,7 @@ def _run_external_reference_cleanup(
             str(target_faces),
             str(output_npz),
             str(trace_json),
+            str(reference_source_root or ""),
         ]
         completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
@@ -288,6 +381,7 @@ def _run_external_reference_cleanup(
                 "status": "available",
                 "python": str(reference_python),
                 "route": "external-cumesh",
+                "route_identity": trace.get("route_identity"),
                 "elapsed_seconds": trace.get("elapsed_seconds"),
             },
         )
@@ -432,6 +526,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             vertices=vertices,
             faces=faces,
             target_faces=args.target_faces,
+            reference_source_root=args.reference_source_root,
         )
         if args.require_reference and reference_backend.get("status") != "available":
             raise ReferenceBackendError(reference_backend)

@@ -28,6 +28,9 @@ def test_reference_cleanup_contract_names_source_order_without_prefill():
         "TRELLIS.2/o-voxel/o_voxel/postprocess.py"
     )
     assert REFERENCE_CLEANUP_CONTRACT["postprocess_source"]["line_range"] == [133, 162]
+    cumesh_path = REFERENCE_CLEANUP_CONTRACT["cumesh_simplify_source"]["path"]
+    assert "/trellis-mac/deps/mtlmesh/" in cumesh_path
+    assert "Hunyuan" not in cumesh_path
     assert REFERENCE_CLEANUP_CONTRACT["cumesh_simplify_source"]["line_range"] == [320, 355]
     assert REFERENCE_CLEANUP_CONTRACT["operations"] == [
         "simplify_coarse",
@@ -192,6 +195,8 @@ def test_external_reference_cleanup_code_records_simplifier_step_trace():
 
     assert "simplify_step" in code
     assert "simplifier_step_trace" in code
+    assert "route_identity" in code
+    assert "forbidden source route" in code
 
 
 def test_mesh_cleanup_parity_harness_keeps_fast_simplifier_default_route(tmp_path):

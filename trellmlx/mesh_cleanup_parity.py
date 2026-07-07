@@ -16,7 +16,7 @@ REFERENCE_CLEANUP_CONTRACT: dict[str, Any] = {
         "line_range": [133, 162],
     },
     "cumesh_simplify_source": {
-        "path": "/Users/noahlyons/dev/Hunyuan3D-MLX/libraries/mtlmesh/cumesh/cumesh.py",
+        "path": "/Users/noahlyons/dev/trellis-mac/deps/mtlmesh/cumesh/cumesh.py",
         "line_range": [320, 355],
         "stop_condition": "break when new_num_face <= target_num_faces",
     },
