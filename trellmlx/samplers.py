@@ -49,6 +49,7 @@ def flow_euler_sample(
 
     if concat_cond is not None:
         model_kwargs['concat_cond'] = concat_cond
+    sparse_token_rescale = "coords" in model_kwargs and len(noise.shape) == 2
 
     # Build cross-attention KV caches if the model supports it.
     # The image conditioning doesn't change between steps, so KV projections
@@ -107,14 +108,8 @@ def flow_euler_sample(
                 x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
 
-                reduce_dims = list(range(1, x_0_pos.ndim))
-                # Match PyTorch torch.std() Bessel correction (ddof=1).
-                n = 1
-                for d in reduce_dims:
-                    n *= x_0_pos.shape[d]
-                bessel = n / (n - 1)
-                std_pos = mx.sqrt(mx.var(x_0_pos, axis=reduce_dims, keepdims=True) * bessel)
-                std_cfg = mx.sqrt(mx.var(x_0_cfg, axis=reduce_dims, keepdims=True) * bessel)
+                std_pos = _cfg_rescale_std(x_0_pos, sparse_tokens=sparse_token_rescale)
+                std_cfg = _cfg_rescale_std(x_0_cfg, sparse_tokens=sparse_token_rescale)
 
                 safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
                 ratio_raw = std_pos / safe_std_cfg
@@ -148,12 +143,7 @@ def flow_euler_sample(
                 x_0 = _pred_to_xstart(sample, t, pred, sigma_min)
                 x_0_pos = x_0
                 x_0_cfg = x_0
-                reduce_dims = list(range(1, x_0.ndim))
-                n = 1
-                for d in reduce_dims:
-                    n *= x_0.shape[d]
-                bessel = n / (n - 1)
-                std_pos = mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True) * bessel)
+                std_pos = _cfg_rescale_std(x_0, sparse_tokens=sparse_token_rescale)
                 std_cfg = std_pos
                 ratio_raw = mx.ones_like(std_pos)
                 std_ratio = ratio_raw
@@ -202,3 +192,17 @@ def _pred_to_xstart(x_t, t, pred, sigma_min):
 def _xstart_to_pred(x_t, t, x_0, sigma_min):
     """Convert x_0 estimate back to velocity prediction."""
     return ((1 - sigma_min) * x_t - x_0) / (sigma_min + (1 - sigma_min) * t)
+
+
+def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:
+    """Match source CFG-rescale std axes for dense grids versus SparseTensor tokens."""
+    if sparse_tokens:
+        return mx.sqrt(mx.var(x_0))
+
+    reduce_dims = list(range(1, x_0.ndim))
+    n = 1
+    for d in reduce_dims:
+        n *= x_0.shape[d]
+    # Match PyTorch torch.std() Bessel correction (correction=1) for dense tensors.
+    bessel = n / (n - 1)
+    return mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True) * bessel)
