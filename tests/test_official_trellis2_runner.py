@@ -238,17 +238,35 @@ def test_official_runner_exposes_sparse_flow_block_trace_stage():
     assert "--save-sparse-flow-block-trace" in text
     assert "--stop-after-sparse-flow-block-trace" in text
     assert "sparse_flow_block_trace.npz" in text
+    assert 'f"pos_{name}"' in text
+    assert 'f"neg_{name}"' in text
     for key in (
-        "pos_input_projected=",
-        "pos_block0_q_pre_norm=",
-        "pos_block0_q_post_rope=",
-        "pos_block0_attention_raw=",
-        "pos_block0_self_attn=",
-        "pos_block0_cross_attn=",
-        "pos_block0_mlp=",
-        "neg_input_projected=",
-        "neg_block0_k_post_norm=",
-        "neg_block0_after_mlp=",
+        '"input_projected"',
+        '_q_pre_norm"]',
+        '_q_post_rope"]',
+        '_attention_raw"]',
+        '_self_attn"]',
+        '_cross_attn"]',
+        '_mlp"]',
+        '_k_post_norm"]',
+        '_after_mlp"]',
+    ):
+        assert key in text
+
+
+def test_official_runner_exposes_sparse_flow_mlp_subtrace_stage():
+    runner_path = importlib.import_module("scripts.run_official_trellis2").__file__
+    text = open(runner_path).read()
+
+    for key in (
+        '_mlp_input"]',
+        '_mlp_fc1"]',
+        '_mlp_gelu"]',
+        '_mlp_fc2"]',
+        '_mlp_gated"]',
+        "block.mlp.mlp[0]",
+        "block.mlp.mlp[1]",
+        "block.mlp.mlp[2]",
     ):
         assert key in text
 

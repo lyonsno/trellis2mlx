@@ -880,10 +880,20 @@ def _install_sparse_flow_block_trace_hook(
 
             block_h = block.norm3(h_local)
             block_h = block_h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-            block_h = block.mlp(block_h)
             if capture:
+                trace[f"{prefix}_mlp_input"] = block_h
+                block_h = block.mlp.mlp[0](block_h)
+                trace[f"{prefix}_mlp_fc1"] = block_h
+                block_h = block.mlp.mlp[1](block_h)
+                trace[f"{prefix}_mlp_gelu"] = block_h
+                block_h = block.mlp.mlp[2](block_h)
+                trace[f"{prefix}_mlp_fc2"] = block_h
                 trace[f"{prefix}_mlp"] = block_h
+            else:
+                block_h = block.mlp(block_h)
             block_h = block_h * gate_mlp.unsqueeze(1)
+            if capture:
+                trace[f"{prefix}_mlp_gated"] = block_h
             h_local = h_local + block_h
             if capture:
                 trace[f"{prefix}_after_mlp"] = h_local
