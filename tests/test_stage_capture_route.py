@@ -85,6 +85,56 @@ def test_stage_capture_wrapper_builds_generate_stop_route(tmp_path):
     assert "--no-rembg" in command
 
 
+def test_stage_capture_source_quality_profile_sets_measured_500k_budget(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "mesh_uv",
+            "--smoke-profile",
+            "source-quality",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--target-faces") + 1] == "500000"
+    assert route_identity["route"]["target_faces"] == 500_000
+    assert route_identity["route"]["smoke_profile"] == "source-quality"
+
+
+def test_stage_capture_source_quality_profile_preserves_explicit_target_override(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "mesh_uv",
+            "--smoke-profile",
+            "source-quality",
+            "--target-faces",
+            "650000",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--target-faces") + 1] == "650000"
+    assert route_identity["route"]["target_faces"] == 650_000
+    assert route_identity["route"]["smoke_profile"] == "source-quality"
+
+
 def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 

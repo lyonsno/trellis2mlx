@@ -15,6 +15,10 @@ from typing import Any
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
+    "standard": 350_000,
+    "source-quality": 500_000,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,7 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--no-cascade", action="store_true")
-    parser.add_argument("--target-faces", type=int, default=350000)
+    parser.add_argument("--target-faces", type=int)
+    parser.add_argument(
+        "--smoke-profile",
+        choices=sorted(STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES),
+        default="standard",
+        help=(
+            "Named stage-capture budget profile; source-quality expands to the "
+            "measured 500k detail route."
+        ),
+    )
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--shared-noise")
@@ -53,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[str, Any]:
     image_path = str(Path(args.image))
     output_dir = str(Path(args.output_dir))
+    target_faces = _resolve_target_faces(args)
     return {
         "schema": SCHEMA,
         "route": {
@@ -63,7 +77,8 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "steps": args.steps,
             "resolution": args.resolution,
             "cascade": not args.no_cascade,
-            "target_faces": args.target_faces,
+            "target_faces": target_faces,
+            "smoke_profile": args.smoke_profile,
             "texture_size": args.texture_size,
             "preprocess_rembg": not args.no_rembg,
             "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
@@ -187,7 +202,7 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         "--steps",
         str(args.steps),
         "--target-faces",
-        str(args.target_faces),
+        str(_resolve_target_faces(args)),
         "--texture-size",
         str(args.texture_size),
         "--save-checkpoints",
@@ -206,6 +221,12 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         if args.sparse_flow_trace_no_kv_cache:
             command.append("--sparse-flow-trace-no-kv-cache")
     return command
+
+
+def _resolve_target_faces(args: argparse.Namespace) -> int:
+    if args.target_faces is not None:
+        return int(args.target_faces)
+    return STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES[args.smoke_profile]
 
 
 def _artifact_status(checkpoint_dir: Path, stage: str) -> dict[str, str]:
