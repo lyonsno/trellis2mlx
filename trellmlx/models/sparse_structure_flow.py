@@ -478,6 +478,7 @@ class SparseStructureFlowModel(nn.Module):
         if block_index < 0 or block_index >= len(self.blocks):
             raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
 
+        input_dtype = x.dtype
         B = x.shape[0]
         R = x.shape[2]
 
@@ -512,6 +513,15 @@ class SparseStructureFlowModel(nn.Module):
                     trace_prefix=trace_prefix,
                 )
                 trace.update(block_trace)
+                if i == len(self.blocks) - 1:
+                    x = _x_after
+                    trace["final_input"] = x
+                    x = x.astype(input_dtype)
+                    x = _layernorm_noaffine(x, eps=1e-5)
+                    trace["final_norm"] = x
+                    x = self.out_layer(x)
+                    trace["final_out_flat"] = x
+                    trace["final_output"] = x.reshape(B, R, R, R, self.out_channels).transpose(0, 4, 1, 2, 3)
                 break
             x = block(
                 x,

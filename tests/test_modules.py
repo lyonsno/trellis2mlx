@@ -242,9 +242,15 @@ class TestSparseStructureFlowModel:
             "block1_mlp_gelu",
             "block1_mlp_fc2",
             "block1_mlp_gated",
+            "final_input",
+            "final_norm",
+            "final_out_flat",
+            "final_output",
         ):
             assert name in block1
         assert block1["block1_after_mlp"].shape == (8, 12)
+        assert block1["final_out_flat"].shape == (8, 2)
+        assert block1["final_output"].shape == (1, 2, 2, 2, 2)
 
 
 class TestSLatFlowModelSourceContracts:
