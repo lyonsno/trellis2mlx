@@ -16,6 +16,7 @@ def test_generate_exposes_stage_capture_cli_contracts():
         "sparse_flow_step",
         "sparse_flow_block_trace",
         "sparse_internals",
+        "shape_flow_step",
         "shape_slat",
         "decoder_output",
     ):
@@ -160,6 +161,54 @@ def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
     command = _build_generate_command(args, tmp_path / "checkpoints")
 
     assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_step"
+
+
+def test_generate_shared_noise_feeds_shape_slat_noise_pool():
+    source = GENERATE_SOURCE.read_text()
+
+    sparse_noise = source.index('shared_noise["ss_noise"]')
+    shape_noise = source.index('shared_noise["slat_noise_pool"]')
+    broadcast = source.index("np.broadcast_to", shape_noise)
+    lr_shape_noise = source.index("Shared shape SLat noise", shape_noise)
+
+    assert sparse_noise < shape_noise
+    assert shape_noise < broadcast
+    assert broadcast < lr_shape_noise
+
+
+def test_generate_exposes_shape_flow_step_capture():
+    source = GENERATE_SOURCE.read_text()
+
+    assert '"shape_flow_step"' in source
+    assert 'save_checkpoint(\n            args.save_checkpoints,\n            "shape_flow_step"' in source
+    assert 'args.stop_after_stage == "shape_flow_step"' in source
+
+
+def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--shared-noise",
+            "noise.npz",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "shape_flow_step"
 
 
 def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):

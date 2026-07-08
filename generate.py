@@ -556,6 +556,7 @@ def main():
             "sparse_flow_step",
             "sparse_flow_block_trace",
             "sparse_internals",
+            "shape_flow_step",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -1011,17 +1012,68 @@ def main():
         lr_slat_flow.compile()
 
     N_lr = len(lr_coords)
-    lr_noise = mx.random.normal((N_lr, 32))
+    if shared_noise is not None and "slat_noise_pool" in shared_noise:
+        shared_shape_noise = shared_noise["slat_noise_pool"]
+        if shared_shape_noise.shape[0] == 1 and N_lr != 1:
+            shared_shape_noise = np.broadcast_to(shared_shape_noise, (N_lr, shared_shape_noise.shape[1]))
+        elif shared_shape_noise.shape[0] < N_lr:
+            raise ValueError(
+                "shared slat_noise_pool has fewer rows than LR shape coords: "
+                f"{shared_shape_noise.shape[0]} < {N_lr}"
+            )
+        lr_noise = mx.array(shared_shape_noise[:N_lr]).astype(mx.float32)
+        print(f"  Shared shape SLat noise: {args.shared_noise} {lr_noise.shape}", flush=True)
+    else:
+        lr_noise = mx.random.normal((N_lr, 32))
 
     t0 = time.perf_counter()
+    shape_step_capture = {} if args.stop_after_stage == "shape_flow_step" else None
     lr_slat = flow_euler_sample(
         lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
         verbose=False,
         coords=mx.array(lr_coords),
+        capture_first_step=shape_step_capture,
+        stop_after_first_step=args.stop_after_stage == "shape_flow_step",
         **SHAPE_SAMPLER,
     )
     mx.eval(lr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N_lr} tokens)", flush=True)
+
+    if args.save_checkpoints and args.stop_after_stage == "shape_flow_step":
+        from trellmlx.checkpoint import save_checkpoint
+
+        save_checkpoint(
+            args.save_checkpoints,
+            "shape_flow_step",
+            noise=np.array(lr_noise).astype(np.float32, copy=False),
+            sample_feats=np.array(lr_noise).astype(np.float32, copy=False),
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            coords_3d=lr_coords.astype(np.int32, copy=False),
+            pred_pos=np.array(shape_step_capture["pred_pos"]).astype(np.float32, copy=False),
+            pred_neg=np.array(shape_step_capture["pred_neg"]).astype(np.float32, copy=False),
+            pred_cfg=np.array(shape_step_capture["pred_cfg"]).astype(np.float32, copy=False),
+            x0_pos=np.array(shape_step_capture["x0_pos"]).astype(np.float32, copy=False),
+            x0_cfg=np.array(shape_step_capture["x0_cfg"]).astype(np.float32, copy=False),
+            std_pos=np.array(shape_step_capture["std_pos"]).astype(np.float32, copy=False),
+            std_cfg=np.array(shape_step_capture["std_cfg"]).astype(np.float32, copy=False),
+            ratio_raw=np.array(shape_step_capture["ratio_raw"]).astype(np.float32, copy=False),
+            std_ratio=np.array(shape_step_capture["std_ratio"]).astype(np.float32, copy=False),
+            ratio_effective=np.array(shape_step_capture["ratio_effective"]).astype(np.float32, copy=False),
+            x0_rescaled=np.array(shape_step_capture["x0_rescaled"]).astype(np.float32, copy=False),
+            x0_after_rescale=np.array(shape_step_capture["x0_after_rescale"]).astype(np.float32, copy=False),
+            pred_final=np.array(shape_step_capture["pred_final"]).astype(np.float32, copy=False),
+            pred_v_feats=np.array(shape_step_capture["pred_final"]).astype(np.float32, copy=False),
+            sample_next=np.array(shape_step_capture["sample_next"]).astype(np.float32, copy=False),
+            t=np.array(shape_step_capture["t"]).astype(np.float32, copy=False),
+            t_prev=np.array(shape_step_capture["t_prev"]).astype(np.float32, copy=False),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(SHAPE_SAMPLER["guidance_strength"], dtype=np.float32),
+            guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
+            guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
+            rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+        )
+        print("  Stop after stage: shape_flow_step", flush=True)
+        return
 
     lr_slat = _denormalize_slat(lr_slat)
     mx.eval(lr_slat)

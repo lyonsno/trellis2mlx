@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sparse_flow_step",
             "sparse_flow_block_trace",
             "sparse_internals",
+            "shape_flow_step",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -87,6 +88,14 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
             report["arrays"] = {
                 name: _array_delta(ref[name], cand[name])
                 for name in sorted(set(ref.files) & set(cand.files))
+            }
+            return report
+        if stage == "shape_flow_step":
+            coords_report, _ref_order, _cand_order = _coord_overlap(ref["coords"], cand["coords"])
+            report["coords"] = coords_report
+            report["arrays"] = {
+                name: _array_delta(ref[name], cand[name])
+                for name in sorted(set(ref.files) & set(cand.files) - {"coords", "coords_3d"})
             }
             return report
         if stage == "sparse_internals":
