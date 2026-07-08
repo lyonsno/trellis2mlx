@@ -35,6 +35,10 @@ class _StopAfterSparseFlowStep(Exception):
     """Internal control-flow sentinel for first-step sparse-flow diagnostic runs."""
 
 
+class _StopAfterSparseFlowSteps(Exception):
+    """Internal control-flow sentinel for all-step sparse-flow diagnostic runs."""
+
+
 class _StopAfterSparseFlowBlockTrace(Exception):
     """Internal control-flow sentinel for first-block sparse-flow diagnostic runs."""
 
@@ -99,6 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-sparse", action="store_true")
     parser.add_argument("--save-sparse-flow-step", action="store_true")
     parser.add_argument("--stop-after-sparse-flow-step", action="store_true")
+    parser.add_argument("--save-sparse-flow-steps", action="store_true")
+    parser.add_argument("--stop-after-sparse-flow-steps", action="store_true")
     parser.add_argument("--save-sparse-flow-block-trace", action="store_true")
     parser.add_argument("--stop-after-sparse-flow-block-trace", action="store_true")
     parser.add_argument("--save-sparse-internals", action="store_true")
@@ -127,6 +133,7 @@ def build_route_identity(
         "conditioning": bool(args.stop_after_conditioning),
         "sparse": bool(args.stop_after_sparse),
         "sparse_flow_step": bool(args.stop_after_sparse_flow_step),
+        "sparse_flow_steps": bool(args.stop_after_sparse_flow_steps),
         "sparse_flow_block_trace": bool(args.stop_after_sparse_flow_block_trace),
         "sparse_internals": bool(args.stop_after_sparse_internals),
         "shape_slat": bool(args.stop_after_shape_slat),
@@ -157,6 +164,7 @@ def build_route_identity(
             "conditioning": bool(args.save_conditioning or args.stop_after_conditioning),
             "sparse_coords": bool(args.save_sparse_coords or args.stop_after_sparse),
             "sparse_flow_step": bool(args.save_sparse_flow_step or args.stop_after_sparse_flow_step),
+            "sparse_flow_steps": bool(args.save_sparse_flow_steps or args.stop_after_sparse_flow_steps),
             "sparse_flow_block_trace": bool(
                 args.save_sparse_flow_block_trace or args.stop_after_sparse_flow_block_trace
             ),
@@ -233,6 +241,10 @@ def main(argv: list[str] | None = None) -> int:
         _install_sparse_flow_step_capture_hook(
             pipeline, output_dir, stop_after_sparse_flow_step=args.stop_after_sparse_flow_step
         )
+    if args.save_sparse_flow_steps or args.stop_after_sparse_flow_steps:
+        _install_sparse_flow_steps_capture_hook(
+            pipeline, output_dir, stop_after_sparse_flow_steps=args.stop_after_sparse_flow_steps
+        )
     if args.save_sparse_flow_block_trace or args.stop_after_sparse_flow_block_trace:
         _install_sparse_flow_block_trace_hook(
             pipeline, output_dir, stop_after_sparse_flow_block_trace=args.stop_after_sparse_flow_block_trace
@@ -276,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         return _finish_stage_only(output_dir, route_identity, "sparse", run_start)
     except _StopAfterSparseFlowStep:
         return _finish_stage_only(output_dir, route_identity, "sparse_flow_step", run_start)
+    except _StopAfterSparseFlowSteps:
+        return _finish_stage_only(output_dir, route_identity, "sparse_flow_steps", run_start)
     except _StopAfterSparseFlowBlockTrace:
         return _finish_stage_only(output_dir, route_identity, "sparse_flow_block_trace", run_start)
     except _StopAfterSparseInternals:
@@ -622,6 +636,139 @@ def _install_sparse_flow_step_capture_hook(
             flow_model.cpu()
         if stop_after_sparse_flow_step:
             raise _StopAfterSparseFlowStep()
+        torch.random.set_rng_state(rng_state)
+        return original(cond, resolution, num_samples, sampler_params)
+
+    pipeline.sample_sparse_structure = _hooked_sample_sparse_structure
+
+
+def _install_sparse_flow_steps_capture_hook(
+    pipeline: Any, output_dir: Path, *, stop_after_sparse_flow_steps: bool = False
+) -> None:
+    import torch
+
+    original = pipeline.sample_sparse_structure
+
+    def _hooked_sample_sparse_structure(cond, resolution, num_samples=1, sampler_params=None):
+        sampler_params = sampler_params or {}
+        flow_model = pipeline.models["sparse_structure_flow_model"]
+        reso = flow_model.resolution
+        in_channels = flow_model.in_channels
+        rng_state = torch.random.get_rng_state()
+        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(pipeline.device)
+        sampler_params_merged = {**pipeline.sparse_structure_sampler_params, **sampler_params}
+        if pipeline.low_vram:
+            flow_model.to(pipeline.device)
+
+        sampler = pipeline.sparse_structure_sampler
+        steps = sampler_params_merged.get("steps", 50)
+        rescale_t = sampler_params_merged.get("rescale_t", 1.0)
+        guidance_strength = sampler_params_merged.get("guidance_strength", 3.0)
+        guidance_rescale = sampler_params_merged.get("guidance_rescale", 0.0)
+        guidance_interval = sampler_params_merged.get("guidance_interval", (0.0, 1.0))
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+
+        records = []
+        sample = noise
+        with torch.no_grad():
+            for t, t_prev in ((float(t_seq[i]), float(t_seq[i + 1])) for i in range(steps)):
+                t_tensor = torch.tensor([1000 * t] * sample.shape[0], device=sample.device, dtype=torch.float32)
+                sample_in = sample
+                apply_guidance = guidance_strength != 1 and guidance_interval[0] <= t <= guidance_interval[1]
+                if apply_guidance:
+                    pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+                    pred_neg = flow_model(sample_in, t_tensor, cond["neg_cond"])
+                    pred_cfg = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+                    x0_pos = sampler._pred_to_xstart(sample_in, t, pred_pos)
+                    x0_cfg = sampler._pred_to_xstart(sample_in, t, pred_cfg)
+                    reduce_dims = list(range(1, x0_pos.ndim))
+                    std_pos = x0_pos.std(dim=reduce_dims, keepdim=True)
+                    std_cfg = x0_cfg.std(dim=reduce_dims, keepdim=True)
+                    ratio_raw = std_pos / std_cfg
+                    std_ratio = ratio_raw
+                    x0_rescaled = x0_cfg * std_ratio
+                    x0_after_rescale = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+                    pred_final = sampler._xstart_to_pred(sample_in, t, x0_after_rescale)
+                else:
+                    pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+                    pred_neg = pred_pos
+                    pred_cfg = pred_pos
+                    x0_pos = sampler._pred_to_xstart(sample_in, t, pred_pos)
+                    x0_cfg = x0_pos
+                    std_pos = torch.ones((1, 1, 1, 1, 1), device=sample_in.device, dtype=sample_in.dtype)
+                    std_cfg = std_pos
+                    ratio_raw = std_pos
+                    std_ratio = std_pos
+                    x0_rescaled = x0_pos
+                    x0_after_rescale = x0_pos
+                    pred_final = pred_pos
+                sample_next = sample_in - (t - t_prev) * pred_final
+                records.append(
+                    {
+                        "sample_in": sample_in,
+                        "pred_pos": pred_pos,
+                        "pred_neg": pred_neg,
+                        "pred_cfg": pred_cfg,
+                        "x0_pos": x0_pos,
+                        "x0_cfg": x0_cfg,
+                        "std_pos": std_pos,
+                        "std_cfg": std_cfg,
+                        "ratio_raw": ratio_raw,
+                        "std_ratio": std_ratio,
+                        "ratio_effective": std_ratio,
+                        "x0_rescaled": x0_rescaled,
+                        "x0_after_rescale": x0_after_rescale,
+                        "pred_final": pred_final,
+                        "sample_next": sample_next,
+                        "t": t,
+                        "t_prev": t_prev,
+                        "apply_guidance": apply_guidance,
+                    }
+                )
+                sample = sample_next
+
+        def stack_tensor(name: str) -> np.ndarray:
+            return np.stack(
+                [_to_numpy(record[name]).astype(np.float32, copy=False) for record in records],
+                axis=0,
+            )
+
+        steps_path = output_dir / "sparse_flow_steps.npz"
+        np.savez(
+            steps_path,
+            noise=_to_numpy(noise).astype(np.float32, copy=False),
+            sample_in=stack_tensor("sample_in"),
+            pred_pos=stack_tensor("pred_pos"),
+            pred_neg=stack_tensor("pred_neg"),
+            pred_cfg=stack_tensor("pred_cfg"),
+            x0_pos=stack_tensor("x0_pos"),
+            x0_cfg=stack_tensor("x0_cfg"),
+            std_pos=stack_tensor("std_pos"),
+            std_cfg=stack_tensor("std_cfg"),
+            ratio_raw=stack_tensor("ratio_raw"),
+            std_ratio=stack_tensor("std_ratio"),
+            ratio_effective=stack_tensor("ratio_effective"),
+            x0_rescaled=stack_tensor("x0_rescaled"),
+            x0_after_rescale=stack_tensor("x0_after_rescale"),
+            pred_final=stack_tensor("pred_final"),
+            sample_next=stack_tensor("sample_next"),
+            t=np.array([record["t"] for record in records], dtype=np.float32),
+            t_prev=np.array([record["t_prev"] for record in records], dtype=np.float32),
+            t_tensor=np.array([1000 * record["t"] for record in records], dtype=np.float32),
+            steps=np.array(steps, dtype=np.int32),
+            guidance_strength=np.array(guidance_strength, dtype=np.float32),
+            guidance_rescale=np.array(guidance_rescale, dtype=np.float32),
+            guidance_interval=np.array(guidance_interval, dtype=np.float32),
+            rescale_t=np.array(rescale_t, dtype=np.float32),
+            sigma_min=np.array(sampler.sigma_min, dtype=np.float32),
+            apply_guidance=np.array([record["apply_guidance"] for record in records], dtype=np.bool_),
+        )
+        print(f"Saved sparse-flow steps: {steps_path}", flush=True)
+        if pipeline.low_vram:
+            flow_model.cpu()
+        if stop_after_sparse_flow_steps:
+            raise _StopAfterSparseFlowSteps()
         torch.random.set_rng_state(rng_state)
         return original(cond, resolution, num_samples, sampler_params)
 
