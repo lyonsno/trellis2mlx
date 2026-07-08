@@ -792,6 +792,7 @@ def _install_sparse_flow_block_trace_hook(
     stop_after_sparse_flow_block_trace: bool = False,
 ) -> None:
     import torch
+    import torch.nn.functional as F
     from trellis2.modules.attention import RotaryPositionEmbedder, scaled_dot_product_attention
     from trellis2.modules.utils import manual_cast
 
@@ -909,6 +910,18 @@ def _install_sparse_flow_block_trace_hook(
         for block_index, block in enumerate(flow_model.blocks):
             h = run_block(block, h, block_index, capture=block_index == trace_block_index)
             if block_index == trace_block_index:
+                if block_index == len(flow_model.blocks) - 1:
+                    trace["final_input"] = h
+                    block_h = manual_cast(h, sample_in.dtype)
+                    block_h = F.layer_norm(block_h, block_h.shape[-1:])
+                    trace["final_norm"] = block_h
+                    block_h = flow_model.out_layer(block_h)
+                    trace["final_out_flat"] = block_h
+                    trace["final_output"] = block_h.permute(0, 2, 1).view(
+                        block_h.shape[0],
+                        block_h.shape[2],
+                        *[flow_model.resolution] * 3,
+                    ).contiguous()
                 return trace
 
         return trace
