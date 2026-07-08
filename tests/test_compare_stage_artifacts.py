@@ -213,6 +213,7 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
     ref_payload = {
         "pos_input_projected": base + 1,
         "pos_block0_norm1": base + 2,
+        "pos_block0_gate_mlp": base + 2.5,
         "pos_block0_modulated_self_input": base + 3,
         "pos_block0_q_pre_norm": base + 4,
         "pos_block0_k_pre_norm": base + 5,
@@ -230,6 +231,7 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
         "pos_block0_after_mlp": base + 17,
         "neg_input_projected": base + 18,
         "neg_block0_norm1": base + 19,
+        "neg_block0_gate_mlp": base + 19.5,
         "neg_block0_modulated_self_input": base + 20,
         "neg_block0_q_pre_norm": base + 21,
         "neg_block0_k_pre_norm": base + 22,
@@ -247,6 +249,7 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
         "neg_block0_after_mlp": base + 34,
     }
     cand_payload = dict(ref_payload)
+    cand_payload["pos_block0_gate_mlp"] = base + 2.75
     cand_payload["pos_block0_q_post_rope"] = base + 9.75
     cand_payload["pos_block0_self_attn"] = base + 12.5
     cand_payload["neg_block0_after_mlp"] = base + 36
@@ -274,6 +277,7 @@ def test_compare_sparse_flow_block_trace_reports_internal_tensor_deltas(tmp_path
     assert result.returncode == 0, result.stderr
     report = json.loads(out.read_text())
     assert report["stage"] == "sparse_flow_block_trace"
+    assert report["arrays"]["pos_block0_gate_mlp"]["mean_abs_diff"] == 0.25
     assert report["arrays"]["pos_block0_q_post_rope"]["mean_abs_diff"] == 0.75
     assert report["arrays"]["pos_block0_self_attn"]["mean_abs_diff"] == 0.5
     assert report["arrays"]["neg_block0_after_mlp"]["mean_abs_diff"] == 2.0

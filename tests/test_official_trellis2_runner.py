@@ -242,6 +242,12 @@ def test_official_runner_exposes_sparse_flow_block_trace_stage():
     assert 'f"neg_{name}"' in text
     for key in (
         '"input_projected"',
+        '_shift_msa"]',
+        '_scale_msa"]',
+        '_gate_msa"]',
+        '_shift_mlp"]',
+        '_scale_mlp"]',
+        '_gate_mlp"]',
         '_q_pre_norm"]',
         '_q_post_rope"]',
         '_attention_raw"]',

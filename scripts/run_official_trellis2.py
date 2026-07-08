@@ -831,6 +831,13 @@ def _install_sparse_flow_block_trace_hook(
                 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                     block.adaLN_modulation(t_emb).chunk(6, dim=1)
                 )
+            if capture:
+                trace[f"{prefix}_shift_msa"] = shift_msa
+                trace[f"{prefix}_scale_msa"] = scale_msa
+                trace[f"{prefix}_gate_msa"] = gate_msa
+                trace[f"{prefix}_shift_mlp"] = shift_mlp
+                trace[f"{prefix}_scale_mlp"] = scale_mlp
+                trace[f"{prefix}_gate_mlp"] = gate_mlp
 
             block_h = block.norm1(h_local)
             if capture:
