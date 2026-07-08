@@ -372,6 +372,40 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_sample(tmp_path):
     assert route_identity["route"]["sparse_flow_trace_sample_sha256"] is not None
 
 
+def test_stage_capture_wrapper_forwards_conditioning_sample(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    conditioning_path = tmp_path / "reference_conditioning.npz"
+    conditioning_path.write_bytes(b"conditioning")
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--conditioning-sample",
+            str(conditioning_path),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--conditioning-sample" in command
+    assert command[command.index("--conditioning-sample") + 1] == str(conditioning_path)
+    assert route_identity["route"]["conditioning_sample_path"] == str(conditioning_path)
+    assert route_identity["route"]["conditioning_sample_sha256"] is not None
+
+
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():
     source = GENERATE_SOURCE.read_text()
 
@@ -386,6 +420,15 @@ def test_generate_sparse_flow_block_trace_can_load_trace_sample():
     assert "--sparse-flow-trace-sample" in source
     assert "trace_sample_npz = np.load(args.sparse_flow_trace_sample)" in source
     assert "trace_sample = mx.array(trace_sample_np)" in source
+
+
+def test_generate_can_load_conditioning_sample():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--conditioning-sample" in source
+    assert "conditioning_sample_npz = np.load(args.conditioning_sample)" in source
+    assert 'cond = mx.array(conditioning_sample_npz["cond"])' in source
+    assert 'neg_cond = mx.array(conditioning_sample_npz["neg_cond"])' in source
 
 
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_no_kv_cache(tmp_path):

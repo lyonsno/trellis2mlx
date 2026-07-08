@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
+    parser.add_argument("--conditioning-sample")
     parser.add_argument("--shared-noise")
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0)
@@ -85,6 +86,12 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "smoke_profile": args.smoke_profile,
             "texture_size": args.texture_size,
             "preprocess_rembg": not args.no_rembg,
+            "conditioning_sample_path": (
+                str(Path(args.conditioning_sample)) if args.conditioning_sample else None
+            ),
+            "conditioning_sample_sha256": (
+                _sha256_file(args.conditioning_sample) if args.conditioning_sample else None
+            ),
             "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
             "shared_noise_sha256": _sha256_file(args.shared_noise) if args.shared_noise else None,
             "sparse_flow_trace_block_index": args.sparse_flow_trace_block_index,
@@ -227,6 +234,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--no-cascade")
     if args.no_rembg:
         command.append("--no-rembg")
+    if args.conditioning_sample:
+        command.extend(["--conditioning-sample", str(Path(args.conditioning_sample))])
     if args.shared_noise:
         command.extend(["--shared-noise", str(Path(args.shared_noise))])
     if args.stop_after_stage == "sparse_flow_block_trace":

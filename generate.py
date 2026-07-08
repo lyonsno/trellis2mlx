@@ -569,6 +569,8 @@ def main():
     )
     parser.add_argument("--shared-noise", metavar="NPZ",
                         help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
+    parser.add_argument("--conditioning-sample", metavar="NPZ",
+                        help="Diagnostic: load image conditioning from an NPZ containing cond and neg_cond.")
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
@@ -751,7 +753,22 @@ def main():
         from trellmlx.quantize import quantize_model
 
     # === Image conditioning ===
-    if args.image:
+    if args.conditioning_sample:
+        conditioning_sample_npz = np.load(args.conditioning_sample)
+        missing = {"cond", "neg_cond"} - set(conditioning_sample_npz.files)
+        if missing:
+            raise ValueError(
+                "--conditioning-sample NPZ must contain cond and neg_cond arrays; "
+                f"missing {sorted(missing)}"
+            )
+        cond = mx.array(conditioning_sample_npz["cond"])
+        neg_cond = mx.array(conditioning_sample_npz["neg_cond"])
+        print(
+            f"  Conditioning sample: {args.conditioning_sample} "
+            f"cond={cond.shape} neg_cond={neg_cond.shape}",
+            flush=True,
+        )
+    elif args.image:
         # Preprocess: background removal + center crop
         image_paths = args.image
         if not args.no_rembg:
@@ -779,7 +796,7 @@ def main():
     else:
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
-    neg_cond = mx.zeros_like(cond)
+        neg_cond = mx.zeros_like(cond)
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(
