@@ -10,19 +10,15 @@ sparse occupancy coordinates — the model itself operates on a dense grid.
 """
 
 import math
-from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
-import numpy as np
 
 from ..modules.norm import LayerNorm32
 from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
 from ..modules.rope import apply_rope, build_rope_phases
-
-_MPS_BF16_GELU_TANH_TABLE: mx.array | None = None
 
 
 class TimestepEmbedder(nn.Module):
@@ -187,22 +183,9 @@ class FeedForward(nn.Module):
 def _gelu_tanh(x: mx.array) -> mx.array:
     """PyTorch nn.GELU(approximate="tanh") with source dtype restoration."""
     orig_dtype = x.dtype
-    if orig_dtype == mx.bfloat16:
-        table = _mps_bf16_gelu_tanh_table()
-        indices = mx.view(x, mx.uint16).astype(mx.uint32)
-        return mx.view(mx.take(table, indices), mx.bfloat16)
     x = x.astype(mx.float32)
     x = 0.5 * x * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
     return x.astype(orig_dtype)
-
-
-def _mps_bf16_gelu_tanh_table() -> mx.array:
-    global _MPS_BF16_GELU_TANH_TABLE
-    if _MPS_BF16_GELU_TANH_TABLE is None:
-        table_path = Path(__file__).with_name("mps_bf16_gelu_tanh_table.npy")
-        _MPS_BF16_GELU_TANH_TABLE = mx.array(np.load(table_path))
-        mx.eval(_MPS_BF16_GELU_TANH_TABLE)
-    return _MPS_BF16_GELU_TANH_TABLE
 
 
 class ModulatedBlock(nn.Module):

@@ -27,9 +27,6 @@ image = ["torch", "torchvision", "transformers"]
 [tool.setuptools.packages.find]
 include = ["trellmlx*"]
 
-[tool.setuptools.package-data]
-trellmlx = ["models/*.npy"]
-
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
