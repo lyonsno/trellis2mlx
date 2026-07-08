@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-sparse-flow-steps", action="store_true")
     parser.add_argument("--save-sparse-flow-block-trace", action="store_true")
     parser.add_argument("--stop-after-sparse-flow-block-trace", action="store_true")
+    parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--save-sparse-internals", action="store_true")
     parser.add_argument("--stop-after-sparse-internals", action="store_true")
@@ -156,6 +157,7 @@ def build_route_identity(
             "shared_noise_path": shared_noise or None,
             "shared_noise_sha256": _sha256_file(shared_noise) if shared_noise else None,
             "shared_noise_mode": args.shared_noise_mode if shared_noise else None,
+            "sparse_flow_trace_block_index": args.sparse_flow_trace_block_index,
             "sparse_flow_trace_step_index": args.sparse_flow_trace_step_index,
         },
         "source": {
@@ -251,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
         _install_sparse_flow_block_trace_hook(
             pipeline,
             output_dir,
+            trace_block_index=args.sparse_flow_trace_block_index,
             trace_step_index=args.sparse_flow_trace_step_index,
             stop_after_sparse_flow_block_trace=args.stop_after_sparse_flow_block_trace,
         )
@@ -784,6 +787,7 @@ def _install_sparse_flow_block_trace_hook(
     pipeline: Any,
     output_dir: Path,
     *,
+    trace_block_index: int = 0,
     trace_step_index: int = 0,
     stop_after_sparse_flow_block_trace: bool = False,
 ) -> None:
@@ -793,7 +797,12 @@ def _install_sparse_flow_block_trace_hook(
 
     original = pipeline.sample_sparse_structure
 
-    def _trace_first_block(flow_model, sample_in, t_tensor, context):
+    def _trace_block(flow_model, sample_in, t_tensor, context):
+        if trace_block_index < 0 or trace_block_index >= len(flow_model.blocks):
+            raise ValueError(
+                f"--sparse-flow-trace-block-index must be in [0, {len(flow_model.blocks) - 1}], "
+                f"got {trace_block_index}"
+            )
         assert sample_in.shape[0] == 1, f"Only B=1 trace supported, got {sample_in.shape[0]}"
         h = sample_in.view(*sample_in.shape[:2], -1).permute(0, 2, 1).contiguous()
         h = flow_model.input_layer(h)
@@ -806,61 +815,84 @@ def _install_sparse_flow_block_trace_hook(
         h = manual_cast(h, flow_model.dtype)
         context = manual_cast(context, flow_model.dtype)
 
-        block = flow_model.blocks[0]
-        if block.share_mod:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                block.modulation + t_emb
-            ).type(t_emb.dtype).chunk(6, dim=1)
-        else:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                block.adaLN_modulation(t_emb).chunk(6, dim=1)
-            )
-
         trace = {"input_projected": h}
 
-        block_h = block.norm1(h)
-        trace["block0_norm1"] = block_h
-        block_h = block_h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        trace["block0_modulated_self_input"] = block_h
+        def run_block(block, block_input, block_index, *, capture):
+            prefix = f"block{block_index}"
+            if capture:
+                trace[f"{prefix}_input"] = block_input
 
-        qkv = block.self_attn.to_qkv(block_h)
-        qkv = qkv.reshape(block_h.shape[0], block_h.shape[1], 3, block.self_attn.num_heads, -1)
-        q, k, v = qkv.unbind(dim=2)
-        trace["block0_q_pre_norm"] = q
-        trace["block0_k_pre_norm"] = k
-        trace["block0_v"] = v
-        if block.self_attn.qk_rms_norm:
-            q = block.self_attn.q_rms_norm(q)
-            k = block.self_attn.k_rms_norm(k)
-        trace["block0_q_post_norm"] = q
-        trace["block0_k_post_norm"] = k
-        if block.self_attn.use_rope:
-            q = RotaryPositionEmbedder.apply_rotary_embedding(q, flow_model.rope_phases)
-            k = RotaryPositionEmbedder.apply_rotary_embedding(k, flow_model.rope_phases)
-        trace["block0_q_post_rope"] = q
-        trace["block0_k_post_rope"] = k
-        block_h = scaled_dot_product_attention(q, k, v)
-        block_h = block_h.reshape(block_h.shape[0], block_h.shape[1], -1)
-        trace["block0_attention_raw"] = block_h
-        block_h = block.self_attn.to_out(block_h)
-        trace["block0_self_attn"] = block_h
-        block_h = block_h * gate_msa.unsqueeze(1)
-        h = h + block_h
-        trace["block0_after_self"] = h
+            h_local = block_input
+            if block.share_mod:
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    block.modulation + t_emb
+                ).type(t_emb.dtype).chunk(6, dim=1)
+            else:
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    block.adaLN_modulation(t_emb).chunk(6, dim=1)
+                )
 
-        block_h = block.norm2(h)
-        block_h = block.cross_attn(block_h, context)
-        trace["block0_cross_attn"] = block_h
-        h = h + block_h
-        trace["block0_after_cross"] = h
+            block_h = block.norm1(h_local)
+            if capture:
+                trace[f"{prefix}_norm1"] = block_h
+            block_h = block_h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+            if capture:
+                trace[f"{prefix}_modulated_self_input"] = block_h
 
-        block_h = block.norm3(h)
-        block_h = block_h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        block_h = block.mlp(block_h)
-        trace["block0_mlp"] = block_h
-        block_h = block_h * gate_mlp.unsqueeze(1)
-        h = h + block_h
-        trace["block0_after_mlp"] = h
+            qkv = block.self_attn.to_qkv(block_h)
+            qkv = qkv.reshape(block_h.shape[0], block_h.shape[1], 3, block.self_attn.num_heads, -1)
+            q, k, v = qkv.unbind(dim=2)
+            if capture:
+                trace[f"{prefix}_q_pre_norm"] = q
+                trace[f"{prefix}_k_pre_norm"] = k
+                trace[f"{prefix}_v"] = v
+            if block.self_attn.qk_rms_norm:
+                q = block.self_attn.q_rms_norm(q)
+                k = block.self_attn.k_rms_norm(k)
+            if capture:
+                trace[f"{prefix}_q_post_norm"] = q
+                trace[f"{prefix}_k_post_norm"] = k
+            if block.self_attn.use_rope:
+                q = RotaryPositionEmbedder.apply_rotary_embedding(q, flow_model.rope_phases)
+                k = RotaryPositionEmbedder.apply_rotary_embedding(k, flow_model.rope_phases)
+            if capture:
+                trace[f"{prefix}_q_post_rope"] = q
+                trace[f"{prefix}_k_post_rope"] = k
+            block_h = scaled_dot_product_attention(q, k, v)
+            block_h = block_h.reshape(block_h.shape[0], block_h.shape[1], -1)
+            if capture:
+                trace[f"{prefix}_attention_raw"] = block_h
+            block_h = block.self_attn.to_out(block_h)
+            if capture:
+                trace[f"{prefix}_self_attn"] = block_h
+            block_h = block_h * gate_msa.unsqueeze(1)
+            h_local = h_local + block_h
+            if capture:
+                trace[f"{prefix}_after_self"] = h_local
+
+            block_h = block.norm2(h_local)
+            block_h = block.cross_attn(block_h, context)
+            if capture:
+                trace[f"{prefix}_cross_attn"] = block_h
+            h_local = h_local + block_h
+            if capture:
+                trace[f"{prefix}_after_cross"] = h_local
+
+            block_h = block.norm3(h_local)
+            block_h = block_h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+            block_h = block.mlp(block_h)
+            if capture:
+                trace[f"{prefix}_mlp"] = block_h
+            block_h = block_h * gate_mlp.unsqueeze(1)
+            h_local = h_local + block_h
+            if capture:
+                trace[f"{prefix}_after_mlp"] = h_local
+            return h_local
+
+        for block_index, block in enumerate(flow_model.blocks):
+            h = run_block(block, h, block_index, capture=block_index == trace_block_index)
+            if block_index == trace_block_index:
+                return trace
 
         return trace
 
@@ -923,54 +955,31 @@ def _install_sparse_flow_block_trace_hook(
         t_tensor = torch.tensor([1000 * t] * noise.shape[0], device=noise.device, dtype=torch.float32)
 
         with torch.no_grad():
-            pos_trace = _trace_first_block(flow_model, trace_sample, t_tensor, cond["cond"])
-            neg_trace = _trace_first_block(flow_model, trace_sample, t_tensor, cond["neg_cond"])
+            pos_trace = _trace_block(flow_model, trace_sample, t_tensor, cond["cond"])
+            neg_trace = _trace_block(flow_model, trace_sample, t_tensor, cond["neg_cond"])
 
         trace_path = output_dir / "sparse_flow_block_trace.npz"
+        trace_payload = {
+            f"pos_{name}": _to_numpy_float32(value)
+            for name, value in pos_trace.items()
+        }
+        trace_payload.update(
+            {
+                f"neg_{name}": _to_numpy_float32(value)
+                for name, value in neg_trace.items()
+            }
+        )
         np.savez(
             trace_path,
-            pos_input_projected=_to_numpy_float32(pos_trace["input_projected"]),
-            pos_block0_norm1=_to_numpy_float32(pos_trace["block0_norm1"]),
-            pos_block0_modulated_self_input=_to_numpy_float32(pos_trace["block0_modulated_self_input"]),
-            pos_block0_q_pre_norm=_to_numpy_float32(pos_trace["block0_q_pre_norm"]),
-            pos_block0_k_pre_norm=_to_numpy_float32(pos_trace["block0_k_pre_norm"]),
-            pos_block0_v=_to_numpy_float32(pos_trace["block0_v"]),
-            pos_block0_q_post_norm=_to_numpy_float32(pos_trace["block0_q_post_norm"]),
-            pos_block0_k_post_norm=_to_numpy_float32(pos_trace["block0_k_post_norm"]),
-            pos_block0_q_post_rope=_to_numpy_float32(pos_trace["block0_q_post_rope"]),
-            pos_block0_k_post_rope=_to_numpy_float32(pos_trace["block0_k_post_rope"]),
-            pos_block0_attention_raw=_to_numpy_float32(pos_trace["block0_attention_raw"]),
-            pos_block0_self_attn=_to_numpy_float32(pos_trace["block0_self_attn"]),
-            pos_block0_after_self=_to_numpy_float32(pos_trace["block0_after_self"]),
-            pos_block0_cross_attn=_to_numpy_float32(pos_trace["block0_cross_attn"]),
-            pos_block0_after_cross=_to_numpy_float32(pos_trace["block0_after_cross"]),
-            pos_block0_mlp=_to_numpy_float32(pos_trace["block0_mlp"]),
-            pos_block0_after_mlp=_to_numpy_float32(pos_trace["block0_after_mlp"]),
-            neg_input_projected=_to_numpy_float32(neg_trace["input_projected"]),
-            neg_block0_norm1=_to_numpy_float32(neg_trace["block0_norm1"]),
-            neg_block0_modulated_self_input=_to_numpy_float32(neg_trace["block0_modulated_self_input"]),
-            neg_block0_q_pre_norm=_to_numpy_float32(neg_trace["block0_q_pre_norm"]),
-            neg_block0_k_pre_norm=_to_numpy_float32(neg_trace["block0_k_pre_norm"]),
-            neg_block0_v=_to_numpy_float32(neg_trace["block0_v"]),
-            neg_block0_q_post_norm=_to_numpy_float32(neg_trace["block0_q_post_norm"]),
-            neg_block0_k_post_norm=_to_numpy_float32(neg_trace["block0_k_post_norm"]),
-            neg_block0_q_post_rope=_to_numpy_float32(neg_trace["block0_q_post_rope"]),
-            neg_block0_k_post_rope=_to_numpy_float32(neg_trace["block0_k_post_rope"]),
-            neg_block0_attention_raw=_to_numpy_float32(neg_trace["block0_attention_raw"]),
-            neg_block0_self_attn=_to_numpy_float32(neg_trace["block0_self_attn"]),
-            neg_block0_after_self=_to_numpy_float32(neg_trace["block0_after_self"]),
-            neg_block0_cross_attn=_to_numpy_float32(neg_trace["block0_cross_attn"]),
-            neg_block0_after_cross=_to_numpy_float32(neg_trace["block0_after_cross"]),
-            neg_block0_mlp=_to_numpy_float32(neg_trace["block0_mlp"]),
-            neg_block0_after_mlp=_to_numpy_float32(neg_trace["block0_after_mlp"]),
-            trace_block_index=np.array(0, dtype=np.int32),
+            **trace_payload,
+            trace_block_index=np.array(trace_block_index, dtype=np.int32),
             sparse_flow_trace_step_index=np.array(trace_step_index, dtype=np.int32),
             t=np.array(1000 * t, dtype=np.float32),
             steps=np.array(steps, dtype=np.int32),
             rescale_t=np.array(rescale_t, dtype=np.float32),
         )
         print(
-            f"Saved sparse-flow block0 trace: {trace_path} step={trace_step_index}",
+            f"Saved sparse-flow block{trace_block_index} trace: {trace_path} step={trace_step_index}",
             flush=True,
         )
         if pipeline.low_vram:
