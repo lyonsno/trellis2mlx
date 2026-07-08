@@ -793,6 +793,7 @@ def main():
                 view_features.append(feat)
             cond = mx.concatenate(view_features, axis=1)
             print(f"  Multi-view: {len(image_paths)} views → {cond.shape[1]} context tokens", flush=True)
+        neg_cond = mx.zeros_like(cond)
     else:
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
