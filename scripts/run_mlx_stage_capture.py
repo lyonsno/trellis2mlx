@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--shared-noise")
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0)
+    parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
     return parser
 
@@ -86,6 +87,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "shared_noise_path": str(Path(args.shared_noise)) if args.shared_noise else None,
             "shared_noise_sha256": _sha256_file(args.shared_noise) if args.shared_noise else None,
             "sparse_flow_trace_block_index": args.sparse_flow_trace_block_index,
+            "sparse_flow_trace_step_index": args.sparse_flow_trace_step_index,
             "sparse_flow_trace_uses_kv_cache": not args.sparse_flow_trace_no_kv_cache,
         },
         "source": {
@@ -222,6 +224,7 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.extend(["--shared-noise", str(Path(args.shared_noise))])
     if args.stop_after_stage == "sparse_flow_block_trace":
         command.extend(["--sparse-flow-trace-block-index", str(args.sparse_flow_trace_block_index)])
+        command.extend(["--sparse-flow-trace-step-index", str(args.sparse_flow_trace_step_index)])
         if args.sparse_flow_trace_no_kv_cache:
             command.append("--sparse-flow-trace-no-kv-cache")
     return command

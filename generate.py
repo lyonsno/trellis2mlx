@@ -572,6 +572,9 @@ def main():
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
+    parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0,
+                        help="Diagnostic: sparse flow sampler step index to trace with --stop-after-stage "
+                             "sparse_flow_block_trace (default: 0).")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
                         help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
                              "to match direct reference trace hooks.")
@@ -866,17 +869,44 @@ def main():
             use_kv_cache = not args.sparse_flow_trace_no_kv_cache
             pos_kv_cache = ss_flow.build_cross_kv_cache(pos_cond) if use_kv_cache else None
             neg_kv_cache = ss_flow.build_cross_kv_cache(neg_cond_fp32) if use_kv_cache else None
-            t_tensor = mx.array([1000.0], dtype=mx.float32)
+            trace_step_index = args.sparse_flow_trace_step_index
+            if trace_step_index < 0 or trace_step_index >= n_steps:
+                raise ValueError(
+                    f"--sparse-flow-trace-step-index must be in [0, {n_steps - 1}], "
+                    f"got {trace_step_index}"
+                )
+            if trace_step_index == 0:
+                trace_sample = noise
+                trace_t = 1.0
+            else:
+                trace_steps = []
+                _ = flow_euler_sample(
+                    ss_flow,
+                    noise,
+                    pos_cond,
+                    neg_cond_fp32,
+                    steps=n_steps,
+                    verbose=False,
+                    capture_steps=trace_steps,
+                )
+                if trace_step_index >= len(trace_steps):
+                    raise ValueError(
+                        f"sparse flow captured {len(trace_steps)} steps, cannot trace step "
+                        f"{trace_step_index}"
+                    )
+                trace_sample = trace_steps[trace_step_index]["sample_in"]
+                trace_t = float(np.array(trace_steps[trace_step_index]["t"]))
+            t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
             trace_block_index = args.sparse_flow_trace_block_index
             pos_trace = ss_flow.trace_block(
-                noise,
+                trace_sample,
                 t_tensor,
                 pos_cond,
                 block_index=trace_block_index,
                 cross_kv_cache=pos_kv_cache,
             )
             neg_trace = ss_flow.trace_block(
-                noise,
+                trace_sample,
                 t_tensor,
                 neg_cond_fp32,
                 block_index=trace_block_index,
@@ -901,12 +931,17 @@ def main():
                 "sparse_flow_block_trace",
                 **trace_payload,
                 trace_block_index=np.array(trace_block_index, dtype=np.int32),
+                sparse_flow_trace_step_index=np.array(trace_step_index, dtype=np.int32),
                 sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
-                t=np.array(1000.0, dtype=np.float32),
+                t=np.array(1000.0 * trace_t, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),
                 rescale_t=np.array(5.0, dtype=np.float32),
             )
-            print(f"  Stop after stage: sparse_flow_block_trace block={trace_block_index}", flush=True)
+            print(
+                "  Stop after stage: "
+                f"sparse_flow_block_trace step={trace_step_index} block={trace_block_index}",
+                flush=True,
+            )
             return
 
         step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None

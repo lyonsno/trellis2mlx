@@ -304,6 +304,46 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_block_index(tmp_path):
     assert route_identity["route"]["sparse_flow_trace_block_index"] == 5
 
 
+def test_stage_capture_wrapper_forwards_sparse_flow_trace_step_index(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--shared-noise",
+            "noise.npz",
+            "--sparse-flow-trace-step-index",
+            "5",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-trace-step-index" in command
+    assert command[command.index("--sparse-flow-trace-step-index") + 1] == "5"
+    assert route_identity["route"]["sparse_flow_trace_step_index"] == 5
+
+
+def test_generate_sparse_flow_block_trace_can_target_sampler_step():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--sparse-flow-trace-step-index" in source
+    assert "sparse_flow_trace_step_index=np.array(trace_step_index" in source
+    assert "trace_step_index = args.sparse_flow_trace_step_index" in source
+
+
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_no_kv_cache(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
