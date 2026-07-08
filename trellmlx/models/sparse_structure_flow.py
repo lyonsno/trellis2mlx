@@ -181,16 +181,10 @@ class FeedForward(nn.Module):
 
 
 def _gelu_tanh(x: mx.array) -> mx.array:
-    """PyTorch MPS bf16 nn.GELU(approximate="tanh") with source dtype restoration."""
+    """PyTorch nn.GELU(approximate="tanh") with source dtype restoration."""
     orig_dtype = x.dtype
     x = x.astype(mx.float32)
-    if orig_dtype == mx.bfloat16:
-        tanh_scale = 0.7976
-        cubic_scale = 0.04454
-    else:
-        tanh_scale = math.sqrt(2.0 / math.pi)
-        cubic_scale = 0.044715
-    x = 0.5 * x * (1.0 + mx.tanh(tanh_scale * (x + cubic_scale * x * x * x)))
+    x = 0.5 * x * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
     return x.astype(orig_dtype)
 
 
