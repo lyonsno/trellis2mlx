@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after-sparse-flow-steps", action="store_true")
     parser.add_argument("--save-sparse-flow-block-trace", action="store_true")
     parser.add_argument("--stop-after-sparse-flow-block-trace", action="store_true")
+    parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--save-sparse-internals", action="store_true")
     parser.add_argument("--stop-after-sparse-internals", action="store_true")
     parser.add_argument("--save-shape-slat", action="store_true")
@@ -155,6 +156,7 @@ def build_route_identity(
             "shared_noise_path": shared_noise or None,
             "shared_noise_sha256": _sha256_file(shared_noise) if shared_noise else None,
             "shared_noise_mode": args.shared_noise_mode if shared_noise else None,
+            "sparse_flow_trace_step_index": args.sparse_flow_trace_step_index,
         },
         "source": {
             "image_path": image_path,
@@ -247,7 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.save_sparse_flow_block_trace or args.stop_after_sparse_flow_block_trace:
         _install_sparse_flow_block_trace_hook(
-            pipeline, output_dir, stop_after_sparse_flow_block_trace=args.stop_after_sparse_flow_block_trace
+            pipeline,
+            output_dir,
+            trace_step_index=args.sparse_flow_trace_step_index,
+            stop_after_sparse_flow_block_trace=args.stop_after_sparse_flow_block_trace,
         )
     if args.save_sparse_internals or args.stop_after_sparse_internals:
         _install_sparse_internals_capture_hook(
@@ -776,7 +781,11 @@ def _install_sparse_flow_steps_capture_hook(
 
 
 def _install_sparse_flow_block_trace_hook(
-    pipeline: Any, output_dir: Path, *, stop_after_sparse_flow_block_trace: bool = False
+    pipeline: Any,
+    output_dir: Path,
+    *,
+    trace_step_index: int = 0,
+    stop_after_sparse_flow_block_trace: bool = False,
 ) -> None:
     import torch
     from trellis2.modules.attention import RotaryPositionEmbedder, scaled_dot_product_attention
@@ -867,15 +876,55 @@ def _install_sparse_flow_block_trace_hook(
             flow_model.to(pipeline.device)
 
         steps = sampler_params_merged.get("steps", 50)
+        if trace_step_index < 0 or trace_step_index >= steps:
+            raise ValueError(
+                f"--sparse-flow-trace-step-index must be in [0, {steps - 1}], "
+                f"got {trace_step_index}"
+            )
         t_seq = np.linspace(1, 0, steps + 1)
         rescale_t = sampler_params_merged.get("rescale_t", 1.0)
         t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
-        t = float(t_seq[0])
+        guidance_strength = sampler_params_merged.get("guidance_strength", 3.0)
+        guidance_rescale = sampler_params_merged.get("guidance_rescale", 0.0)
+        guidance_interval = sampler_params_merged.get("guidance_interval", (0.0, 1.0))
+        sampler = pipeline.sparse_structure_sampler
+
+        trace_sample = noise
+        with torch.no_grad():
+            for step_idx in range(trace_step_index):
+                t = float(t_seq[step_idx])
+                t_prev = float(t_seq[step_idx + 1])
+                t_tensor = torch.tensor(
+                    [1000 * t] * trace_sample.shape[0],
+                    device=trace_sample.device,
+                    dtype=torch.float32,
+                )
+                apply_guidance = (
+                    guidance_strength != 1
+                    and guidance_interval[0] <= t <= guidance_interval[1]
+                )
+                if apply_guidance:
+                    pred_pos = flow_model(trace_sample, t_tensor, cond["cond"])
+                    pred_neg = flow_model(trace_sample, t_tensor, cond["neg_cond"])
+                    pred_cfg = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+                    x0_pos = sampler._pred_to_xstart(trace_sample, t, pred_pos)
+                    x0_cfg = sampler._pred_to_xstart(trace_sample, t, pred_cfg)
+                    reduce_dims = list(range(1, x0_pos.ndim))
+                    std_pos = x0_pos.std(dim=reduce_dims, keepdim=True)
+                    std_cfg = x0_cfg.std(dim=reduce_dims, keepdim=True)
+                    x0_rescaled = x0_cfg * (std_pos / std_cfg)
+                    x0_after_rescale = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+                    pred_final = sampler._xstart_to_pred(trace_sample, t, x0_after_rescale)
+                else:
+                    pred_final = flow_model(trace_sample, t_tensor, cond["cond"])
+                trace_sample = trace_sample - (t - t_prev) * pred_final
+
+        t = float(t_seq[trace_step_index])
         t_tensor = torch.tensor([1000 * t] * noise.shape[0], device=noise.device, dtype=torch.float32)
 
         with torch.no_grad():
-            pos_trace = _trace_first_block(flow_model, noise, t_tensor, cond["cond"])
-            neg_trace = _trace_first_block(flow_model, noise, t_tensor, cond["neg_cond"])
+            pos_trace = _trace_first_block(flow_model, trace_sample, t_tensor, cond["cond"])
+            neg_trace = _trace_first_block(flow_model, trace_sample, t_tensor, cond["neg_cond"])
 
         trace_path = output_dir / "sparse_flow_block_trace.npz"
         np.savez(
@@ -914,11 +963,16 @@ def _install_sparse_flow_block_trace_hook(
             neg_block0_after_cross=_to_numpy_float32(neg_trace["block0_after_cross"]),
             neg_block0_mlp=_to_numpy_float32(neg_trace["block0_mlp"]),
             neg_block0_after_mlp=_to_numpy_float32(neg_trace["block0_after_mlp"]),
+            trace_block_index=np.array(0, dtype=np.int32),
+            sparse_flow_trace_step_index=np.array(trace_step_index, dtype=np.int32),
             t=np.array(1000 * t, dtype=np.float32),
             steps=np.array(steps, dtype=np.int32),
             rescale_t=np.array(rescale_t, dtype=np.float32),
         )
-        print(f"Saved sparse-flow first-block trace: {trace_path}", flush=True)
+        print(
+            f"Saved sparse-flow block0 trace: {trace_path} step={trace_step_index}",
+            flush=True,
+        )
         if pipeline.low_vram:
             flow_model.cpu()
         if stop_after_sparse_flow_block_trace:
