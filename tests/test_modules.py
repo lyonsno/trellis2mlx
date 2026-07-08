@@ -231,6 +231,12 @@ class TestSparseStructureFlowModel:
         assert "block1_after_mlp" in block1
         assert "block0_after_mlp" not in block1
         for name in (
+            "block1_shift_msa",
+            "block1_scale_msa",
+            "block1_gate_msa",
+            "block1_shift_mlp",
+            "block1_scale_mlp",
+            "block1_gate_mlp",
             "block1_mlp_input",
             "block1_mlp_fc1",
             "block1_mlp_gelu",

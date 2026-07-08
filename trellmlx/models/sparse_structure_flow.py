@@ -291,7 +291,14 @@ class ModulatedBlock(nn.Module):
         scale_mlp = mod[4*C:5*C]
         gate_mlp  = mod[5*C:6*C]
 
-        trace: dict[str, mx.array] = {}
+        trace: dict[str, mx.array] = {
+            f"{trace_prefix}_shift_msa": shift_msa,
+            f"{trace_prefix}_scale_msa": scale_msa,
+            f"{trace_prefix}_gate_msa": gate_msa,
+            f"{trace_prefix}_shift_mlp": shift_mlp,
+            f"{trace_prefix}_scale_mlp": scale_mlp,
+            f"{trace_prefix}_gate_mlp": gate_mlp,
+        }
 
         h = _layernorm_noaffine(x)
         trace[f"{trace_prefix}_norm1"] = h
