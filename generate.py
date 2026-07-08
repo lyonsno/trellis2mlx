@@ -575,6 +575,9 @@ def main():
     parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0,
                         help="Diagnostic: sparse flow sampler step index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
+    parser.add_argument("--sparse-flow-trace-sample", metavar="NPZ",
+                        help="Diagnostic: load sparse-flow trace sample from an NPZ containing sample_in. "
+                             "If sample_in is stacked by step, --sparse-flow-trace-step-index selects the row.")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
                         help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
                              "to match direct reference trace hooks.")
@@ -875,7 +878,35 @@ def main():
                     f"--sparse-flow-trace-step-index must be in [0, {n_steps - 1}], "
                     f"got {trace_step_index}"
                 )
-            if trace_step_index == 0:
+            if args.sparse_flow_trace_sample:
+                trace_sample_npz = np.load(args.sparse_flow_trace_sample)
+                if "sample_in" not in trace_sample_npz:
+                    raise ValueError(
+                        "--sparse-flow-trace-sample NPZ must contain a sample_in array"
+                    )
+                trace_sample_np = trace_sample_npz["sample_in"]
+                if trace_sample_np.ndim == 6:
+                    if trace_step_index >= trace_sample_np.shape[0]:
+                        raise ValueError(
+                            f"trace sample contains {trace_sample_np.shape[0]} steps, "
+                            f"cannot select step {trace_step_index}"
+                        )
+                    trace_sample_np = trace_sample_np[trace_step_index]
+                elif trace_sample_np.ndim != 5:
+                    raise ValueError(
+                        "sample_in must have shape [B,C,R,R,R] or [steps,B,C,R,R,R], "
+                        f"got {trace_sample_np.shape}"
+                    )
+                trace_sample = mx.array(trace_sample_np).astype(mx.float32)
+                if "t" in trace_sample_npz and np.ndim(trace_sample_npz["t"]) > 0:
+                    trace_t = float(trace_sample_npz["t"][trace_step_index])
+                elif "t" in trace_sample_npz:
+                    trace_t = float(trace_sample_npz["t"])
+                else:
+                    t_seq = np.linspace(1, 0, n_steps + 1)
+                    t_seq = 5.0 * t_seq / (1 + (5.0 - 1) * t_seq)
+                    trace_t = float(t_seq[trace_step_index])
+            elif trace_step_index == 0:
                 trace_sample = noise
                 trace_t = 1.0
             else:
@@ -932,6 +963,7 @@ def main():
                 **trace_payload,
                 trace_block_index=np.array(trace_block_index, dtype=np.int32),
                 sparse_flow_trace_step_index=np.array(trace_step_index, dtype=np.int32),
+                sparse_flow_trace_sample_path=np.array(args.sparse_flow_trace_sample or ""),
                 sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
                 t=np.array(1000.0 * trace_t, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),

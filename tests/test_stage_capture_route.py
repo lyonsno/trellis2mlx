@@ -336,12 +336,56 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_step_index(tmp_path):
     assert route_identity["route"]["sparse_flow_trace_step_index"] == 5
 
 
+def test_stage_capture_wrapper_forwards_sparse_flow_trace_sample(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    sample_path = tmp_path / "reference_sparse_flow_steps.npz"
+    sample_path.write_bytes(b"sample")
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--sparse-flow-trace-step-index",
+            "5",
+            "--sparse-flow-trace-sample",
+            str(sample_path),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-trace-sample" in command
+    assert command[command.index("--sparse-flow-trace-sample") + 1] == str(sample_path)
+    assert route_identity["route"]["sparse_flow_trace_sample_path"] == str(sample_path)
+    assert route_identity["route"]["sparse_flow_trace_sample_sha256"] is not None
+
+
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():
     source = GENERATE_SOURCE.read_text()
 
     assert "--sparse-flow-trace-step-index" in source
     assert "sparse_flow_trace_step_index=np.array(trace_step_index" in source
     assert "trace_step_index = args.sparse_flow_trace_step_index" in source
+
+
+def test_generate_sparse_flow_block_trace_can_load_trace_sample():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--sparse-flow-trace-sample" in source
+    assert "trace_sample_npz = np.load(args.sparse_flow_trace_sample)" in source
+    assert "trace_sample = mx.array(trace_sample_np)" in source
 
 
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_no_kv_cache(tmp_path):
