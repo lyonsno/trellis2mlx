@@ -92,3 +92,31 @@ def test_sparse_flow_block_trace_comparison_reports_dynamic_block_arrays(tmp_pat
     assert report["arrays"]["trace_block_index"]["max_abs_diff"] == 0.0
     assert report["arrays"]["pos_block5_after_mlp"]["max_abs_diff"] == 1.0
     assert report["arrays"]["neg_block5_after_mlp"]["max_abs_diff"] == 3.0
+
+
+def test_sparse_flow_steps_comparison_reports_step_arrays(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        reference,
+        sample_in=np.zeros((2, 1, 1), dtype=np.float32),
+        pred_final=np.ones((2, 1, 1), dtype=np.float32),
+        sample_next=np.array([[[1.0]], [[2.0]]], dtype=np.float32),
+        t=np.array([1.0, 0.5], dtype=np.float32),
+    )
+    np.savez(
+        candidate,
+        sample_in=np.ones((2, 1, 1), dtype=np.float32),
+        pred_final=np.array([[[1.5]], [[0.5]]], dtype=np.float32),
+        sample_next=np.array([[[2.0]], [[2.0]]], dtype=np.float32),
+        t=np.array([1.0, 0.25], dtype=np.float32),
+    )
+
+    report = compare_stage("sparse_flow_steps", reference, candidate)
+
+    assert report["arrays"]["sample_in"]["max_abs_diff"] == 1.0
+    assert report["arrays"]["pred_final"]["max_abs_diff"] == 0.5
+    assert report["arrays"]["sample_next"]["mean_abs_diff"] == 0.5
+    assert report["arrays"]["t"]["max_abs_diff"] == 0.25

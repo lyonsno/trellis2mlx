@@ -14,6 +14,7 @@ def test_generate_exposes_stage_capture_cli_contracts():
         "conditioning",
         "sparse_coords",
         "sparse_flow_step",
+        "sparse_flow_steps",
         "sparse_flow_block_trace",
         "sparse_internals",
         "shape_flow_step",
@@ -161,6 +162,41 @@ def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
     command = _build_generate_command(args, tmp_path / "checkpoints")
 
     assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_step"
+
+
+def test_generate_exposes_sparse_flow_steps_capture():
+    source = GENERATE_SOURCE.read_text()
+
+    assert '"sparse_flow_steps"' in source
+    assert "capture_steps=step_captures" in source
+    assert 'save_checkpoint(\n            args.save_checkpoints,\n            "sparse_flow_steps"' in source
+
+
+def test_stage_capture_wrapper_exposes_sparse_flow_steps_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--shared-noise",
+            "noise.npz",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_steps"
 
 
 def test_generate_shared_noise_feeds_shape_slat_noise_pool():

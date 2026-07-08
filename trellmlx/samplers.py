@@ -24,6 +24,7 @@ def flow_euler_sample(
     verbose: bool = True,
     concat_cond: mx.array = None,
     capture_first_step: dict | None = None,
+    capture_steps: list[dict] | None = None,
     stop_after_first_step: bool = False,
     **model_kwargs,
 ):
@@ -77,7 +78,10 @@ def flow_euler_sample(
             guidance_strength != 1.0
             and guidance_interval[0] <= t <= guidance_interval[1]
         )
-        capture_this_step = capture_first_step is not None and step_idx == 0
+        capture_this_step = (
+            (capture_first_step is not None and step_idx == 0)
+            or capture_steps is not None
+        )
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
@@ -151,28 +155,32 @@ def flow_euler_sample(
 
         # Euler step
         sample_next = sample - (t - t_prev) * pred
-        if capture_first_step is not None and step_idx == 0:
-            capture_first_step.update(
-                {
-                    "pred_pos": pred_pos,
-                    "pred_neg": pred_neg,
-                    "pred_cfg": pred_cfg,
-                    "x0_pos": x_0_pos,
-                    "x0_cfg": x_0_cfg,
-                    "std_pos": std_pos,
-                    "std_cfg": std_cfg,
-                    "ratio_raw": ratio_raw,
-                    "std_ratio": std_ratio,
-                    "ratio_effective": std_ratio,
-                    "x0_rescaled": x_0_rescaled,
-                    "x0_after_rescale": x_0,
-                    "pred_final": pred,
-                    "sample_next": sample_next,
-                    "t": mx.array(t, dtype=mx.float32),
-                    "t_prev": mx.array(t_prev, dtype=mx.float32),
-                }
-            )
-            mx.eval(*[value for value in capture_first_step.values() if value is not None])
+        if capture_this_step:
+            step_payload = {
+                "pred_pos": pred_pos,
+                "pred_neg": pred_neg,
+                "pred_cfg": pred_cfg,
+                "x0_pos": x_0_pos,
+                "x0_cfg": x_0_cfg,
+                "std_pos": std_pos,
+                "std_cfg": std_cfg,
+                "ratio_raw": ratio_raw,
+                "std_ratio": std_ratio,
+                "ratio_effective": std_ratio,
+                "x0_rescaled": x_0_rescaled,
+                "x0_after_rescale": x_0,
+                "pred_final": pred,
+                "sample_next": sample_next,
+                "t": mx.array(t, dtype=mx.float32),
+                "t_prev": mx.array(t_prev, dtype=mx.float32),
+            }
+            if capture_first_step is not None and step_idx == 0:
+                capture_first_step.update(step_payload)
+                mx.eval(*[value for value in capture_first_step.values() if value is not None])
+            if capture_steps is not None:
+                step_payload = {"sample_in": sample, **step_payload}
+                capture_steps.append(step_payload)
+                mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
         mx.eval(sample)
 

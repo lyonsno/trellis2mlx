@@ -554,6 +554,7 @@ def main():
             "conditioning",
             "sparse_coords",
             "sparse_flow_step",
+            "sparse_flow_steps",
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
@@ -909,10 +910,12 @@ def main():
             return
 
         step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None
+        step_captures = [] if args.stop_after_stage == "sparse_flow_steps" else None
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
                                 steps=n_steps, verbose=False,
                                 capture_first_step=step_capture,
+                                capture_steps=step_captures,
                                 stop_after_first_step=args.stop_after_stage == "sparse_flow_step")
         mx.eval(z_s)
 
@@ -948,6 +951,46 @@ def main():
             sigma_min=np.array(1e-5, dtype=np.float32),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
+        return
+
+    if args.save_checkpoints and args.stop_after_stage == "sparse_flow_steps":
+        from trellmlx.checkpoint import save_checkpoint
+
+        def stack_step(name: str) -> np.ndarray:
+            return np.stack(
+                [np.array(step[name]).astype(np.float32, copy=False) for step in step_captures],
+                axis=0,
+            )
+
+        save_checkpoint(
+            args.save_checkpoints,
+            "sparse_flow_steps",
+            noise=np.array(noise).astype(np.float32, copy=False),
+            sample_in=stack_step("sample_in"),
+            pred_pos=stack_step("pred_pos"),
+            pred_neg=stack_step("pred_neg"),
+            pred_cfg=stack_step("pred_cfg"),
+            x0_pos=stack_step("x0_pos"),
+            x0_cfg=stack_step("x0_cfg"),
+            std_pos=stack_step("std_pos"),
+            std_cfg=stack_step("std_cfg"),
+            ratio_raw=stack_step("ratio_raw"),
+            std_ratio=stack_step("std_ratio"),
+            ratio_effective=stack_step("ratio_effective"),
+            x0_rescaled=stack_step("x0_rescaled"),
+            x0_after_rescale=stack_step("x0_after_rescale"),
+            pred_final=stack_step("pred_final"),
+            sample_next=stack_step("sample_next"),
+            t=np.array([np.array(step["t"]).item() for step in step_captures], dtype=np.float32),
+            t_prev=np.array([np.array(step["t_prev"]).item() for step in step_captures], dtype=np.float32),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(7.5, dtype=np.float32),
+            guidance_rescale=np.array(0.7, dtype=np.float32),
+            guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
+            rescale_t=np.array(5.0, dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
+        )
+        print("  Stop after stage: sparse_flow_steps", flush=True)
         return
 
     logits = ss_dec(z_s.astype(mx.float32))

@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
             "conditioning",
             "sparse_coords",
             "sparse_flow_step",
+            "sparse_flow_steps",
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
@@ -59,11 +60,12 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
                 for name in ("cond", "neg_cond")
             }
             return report
-        if stage == "sparse_flow_step":
+        if stage in {"sparse_flow_step", "sparse_flow_steps"}:
             report["arrays"] = {
                 name: _array_delta(ref[name], cand[name])
                 for name in (
                     "noise",
+                    "sample_in",
                     "pred_pos",
                     "pred_neg",
                     "pred_cfg",

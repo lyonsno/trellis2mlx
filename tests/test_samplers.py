@@ -172,3 +172,37 @@ def test_flow_euler_uses_sequence_level_cfg_rescale_for_sparse_tokens():
     assert not np.allclose(np.array(sequence_ratio), np.array(per_row_ratio))
     np.testing.assert_allclose(np.array(capture["std_ratio"]), np.array(sequence_ratio), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(np.array(out), np.array(expected), rtol=1e-6, atol=1e-6)
+
+
+def test_flow_euler_can_capture_every_step():
+    from trellmlx.samplers import flow_euler_sample
+
+    noise = mx.zeros((1, 2), dtype=mx.float32)
+    cond = mx.ones((1, 1), dtype=mx.float32)
+    neg_cond = mx.zeros((1, 1), dtype=mx.float32)
+    captures = []
+
+    class ConstantModel:
+        def __call__(self, sample, t, conditioning):
+            return mx.ones_like(sample)
+
+    out = flow_euler_sample(
+        ConstantModel(),
+        noise,
+        cond,
+        neg_cond,
+        steps=2,
+        guidance_strength=1.0,
+        guidance_rescale=0.0,
+        guidance_interval=(0.0, 1.0),
+        rescale_t=1.0,
+        verbose=False,
+        capture_steps=captures,
+    )
+
+    assert len(captures) == 2
+    np.testing.assert_allclose(np.array(captures[0]["sample_in"]), np.zeros((1, 2), dtype=np.float32))
+    np.testing.assert_allclose(np.array(captures[0]["sample_next"]), -0.5 * np.ones((1, 2), dtype=np.float32))
+    np.testing.assert_allclose(np.array(captures[1]["sample_in"]), -0.5 * np.ones((1, 2), dtype=np.float32))
+    np.testing.assert_allclose(np.array(captures[1]["sample_next"]), -1.0 * np.ones((1, 2), dtype=np.float32))
+    np.testing.assert_allclose(np.array(out), -1.0 * np.ones((1, 2), dtype=np.float32))
