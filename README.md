@@ -92,7 +92,8 @@ benchmark; Apple Silicon timing is sensitive to thermal state and other GPU work
 | Recommended preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 512` | ~187s | Default search/triage mode; good objectness/cost balance in the measured matrix. |
 | Premium preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 4096` | texture bake +~22-24s measured; wall-clock noisy | Same geometry as preview, better shaded viewport/readback. Use after shape passes. |
 | No-cascade higher step | `--steps 10/12 --no-cascade --target-faces 100000 --texture-size 512` | ~296-347s in matrix | More expensive; not clearly better than 8-step for preview on the measured input. |
-| Full/final | default cascade, `--target-faces 200000 --texture-size 4096` | ~6-9 min on M4 Max-class runs | Final-quality smoke; best objectness and texture read, not a cheap search mode. |
+| Full/final | default cascade, `--target-faces 200000 --texture-size 4096` | ~6-9 min on M4 Max-class runs | Standard final-quality smoke; best objectness and texture read, not a cheap search mode or detail-parity ceiling. |
+| Source-detail check | explicit Greenroom `--smoke-profile source-quality` or `--target-faces 500000` | 2026-07-07 checkpoint resume: 129s, xatlas 21.5s on a hard-surface object | Use for reference/detail-retention comparison when 200k postprocess would hide retained raw geometry. |
 
 Texture-size note: in the 8-step no-cascade comparison, `texture-size=512` and
 `texture-size=4096` produced identical geometry (120,947 vertices / 107,216

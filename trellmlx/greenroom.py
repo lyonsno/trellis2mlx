@@ -19,6 +19,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 SCHEMA = "trellis2mlx.greenroom_report.v1"
+SMOKE_PROFILE_TARGET_FACES = {
+    "standard": 200_000,
+    "source-quality": 500_000,
+}
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -36,15 +40,23 @@ class GreenroomRequest:
     repo_root: Path | str
     seed: int = 42
     resolution: int = 512
-    target_faces: int = 200_000
+    target_faces: int | None = None
     texture_size: int = 1024
     job_type: str = "trellis2mlx"
+    smoke_profile: str = "standard"
 
     def __post_init__(self) -> None:
         if not self.job_type:
             raise ValueError("job_type is required")
+        if self.smoke_profile not in SMOKE_PROFILE_TARGET_FACES:
+            valid = ", ".join(sorted(SMOKE_PROFILE_TARGET_FACES))
+            raise ValueError(f"smoke_profile must be one of: {valid}")
         if self.resolution < 1:
             raise ValueError("resolution must be >= 1")
+        target_faces = self.target_faces
+        if target_faces is None:
+            target_faces = SMOKE_PROFILE_TARGET_FACES[self.smoke_profile]
+            object.__setattr__(self, "target_faces", target_faces)
         if self.target_faces < 1:
             raise ValueError("target_faces must be >= 1")
         if self.texture_size < 1:
@@ -72,6 +84,7 @@ class GreenroomRequest:
             "resolution": self.resolution,
             "target_faces": self.target_faces,
             "texture_size": self.texture_size,
+            "smoke_profile": self.smoke_profile,
             "expected_output_path": str(self.expected_output_path),
         }
 
@@ -296,6 +309,7 @@ def _request_from_args(args: argparse.Namespace) -> GreenroomRequest:
         resolution=args.resolution,
         target_faces=args.target_faces,
         texture_size=args.texture_size,
+        smoke_profile=args.smoke_profile,
     )
 
 
@@ -311,8 +325,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     submit.add_argument("--greenroom", default="gpu-greenroom")
     submit.add_argument("--seed", type=int, default=42)
     submit.add_argument("--resolution", type=int, default=512)
-    submit.add_argument("--target-faces", type=int, default=200_000)
+    submit.add_argument("--target-faces", type=int)
     submit.add_argument("--texture-size", type=int, default=1024)
+    submit.add_argument(
+        "--smoke-profile",
+        choices=sorted(SMOKE_PROFILE_TARGET_FACES),
+        default="standard",
+        help="Named smoke budget profile; source-quality expands to the measured 500k detail route.",
+    )
     submit.add_argument("--dry-run", action="store_true")
 
     report = sub.add_parser("report", help="Validate a completed receipt and write smoke evidence.")
@@ -323,8 +343,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     report.add_argument("--report", required=True, type=Path)
     report.add_argument("--seed", type=int, default=42)
     report.add_argument("--resolution", type=int, default=512)
-    report.add_argument("--target-faces", type=int, default=200_000)
+    report.add_argument("--target-faces", type=int)
     report.add_argument("--texture-size", type=int, default=1024)
+    report.add_argument(
+        "--smoke-profile",
+        choices=sorted(SMOKE_PROFILE_TARGET_FACES),
+        default="standard",
+        help="Named smoke budget profile; source-quality expands to the measured 500k detail route.",
+    )
 
     raw_argv = list(argv) if argv is not None else None
     args = parser.parse_args(raw_argv)

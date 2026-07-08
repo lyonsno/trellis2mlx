@@ -43,6 +43,43 @@ def test_build_submit_command_preserves_branch_cwd_and_params(tmp_path):
     ]
 
 
+def test_source_quality_smoke_profile_expands_to_measured_500k_budget(tmp_path):
+    from trellmlx.greenroom import GreenroomRequest, build_submit_command
+
+    request = GreenroomRequest(
+        input_path=tmp_path / "subject.png",
+        output_dir=tmp_path / "out",
+        repo_root=tmp_path / "branch-worktree",
+        smoke_profile="source-quality",
+    )
+
+    cmd = build_submit_command(request, executable="gpu-greenroom-test")
+
+    assert request.target_faces == 500_000
+    assert request.to_dict()["smoke_profile"] == "source-quality"
+    assert "target_faces=500000" in cmd
+    assert "target_faces=200000" not in cmd
+
+
+def test_source_quality_smoke_profile_preserves_explicit_target_override(tmp_path):
+    from trellmlx.greenroom import GreenroomRequest, build_submit_command
+
+    request = GreenroomRequest(
+        input_path=tmp_path / "subject.png",
+        output_dir=tmp_path / "out",
+        repo_root=tmp_path / "branch-worktree",
+        smoke_profile="source-quality",
+        target_faces=650_000,
+    )
+
+    cmd = build_submit_command(request, executable="gpu-greenroom-test")
+
+    assert request.target_faces == 650_000
+    assert request.to_dict()["smoke_profile"] == "source-quality"
+    assert "target_faces=650000" in cmd
+    assert "target_faces=500000" not in cmd
+
+
 def test_submit_greenroom_request_parses_job_id_and_dir(tmp_path):
     from trellmlx.greenroom import GreenroomRequest, submit_greenroom_request
 
