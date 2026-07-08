@@ -66,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Load shared noise tensors from .npz for matched comparison",
     )
+    parser.add_argument(
+        "--shared-noise-mode",
+        choices=("all", "shape-only"),
+        default="all",
+        help=(
+            "Shared-noise injection mode. 'all' preserves legacy sparse, shape, "
+            "and texture injection; 'shape-only' injects sparse plus the first "
+            "shape SLat call and leaves later SLat calls random."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--steps",
@@ -137,6 +147,7 @@ def build_route_identity(
             "texture_size": args.texture_size,
             "shared_noise_path": shared_noise or None,
             "shared_noise_sha256": _sha256_file(shared_noise) if shared_noise else None,
+            "shared_noise_mode": args.shared_noise_mode if shared_noise else None,
         },
         "source": {
             "image_path": image_path,
@@ -247,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Image: {args.image} ({image.size})", flush=True)
 
     if args.shared_noise:
-        _install_shared_noise(torch, args.shared_noise)
+        _install_shared_noise(torch, args.shared_noise, mode=args.shared_noise_mode)
 
     run_kwargs = _build_run_kwargs(args)
     print(
@@ -891,33 +902,110 @@ def _install_shape_slat_capture_hook(
 def _install_shape_flow_step_capture_hook(
     pipeline: Any, output_dir: Path, *, stop_after_shape_flow_step: bool = False
 ) -> None:
-    sampler = pipeline.shape_slat_sampler
-    original = sampler._get_model_prediction
-    captured = {"done": False}
+    import torch
+    from trellis2.modules.sparse import SparseTensor
 
-    def _hooked_get_model_prediction(model, x_t, t, cond=None, **kwargs):
-        pred_x0, pred_eps, pred_v = original(model, x_t, t, cond, **kwargs)
-        if not captured["done"]:
-            captured["done"] = True
-            step_path = output_dir / "shape_flow_step0.npz"
-            np.savez(
-                step_path,
-                sample_feats=_to_numpy(x_t.feats).astype(np.float32, copy=False),
-                coords=_to_numpy(x_t.coords).astype(np.int32, copy=False),
-                pred_x0_feats=_to_numpy(pred_x0.feats).astype(np.float32, copy=False),
-                pred_eps_feats=_to_numpy(pred_eps.feats).astype(np.float32, copy=False),
-                pred_v_feats=_to_numpy(pred_v.feats).astype(np.float32, copy=False),
-                t=np.array(t, dtype=np.float32),
-            )
-            print(f"Saved first shape-flow step: {step_path}", flush=True)
-            if stop_after_shape_flow_step:
-                raise _StopAfterShapeFlowStep()
-        return pred_x0, pred_eps, pred_v
+    original = pipeline.sample_shape_slat
 
-    sampler._get_model_prediction = _hooked_get_model_prediction
+    def _hooked_sample_shape_slat(cond, flow_model, coords, sampler_params=None):
+        sampler_params = sampler_params or {}
+        rng_state = torch.random.get_rng_state()
+        sample_in = SparseTensor(
+            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(pipeline.device),
+            coords=coords,
+        )
+        sampler_params_merged = {**pipeline.shape_slat_sampler_params, **sampler_params}
+        if pipeline.low_vram:
+            flow_model.to(pipeline.device)
+
+        sampler = pipeline.shape_slat_sampler
+        steps = sampler_params_merged.get("steps", 50)
+        rescale_t = sampler_params_merged.get("rescale_t", 1.0)
+        guidance_strength = sampler_params_merged.get("guidance_strength", 3.0)
+        guidance_rescale = sampler_params_merged.get("guidance_rescale", 0.0)
+        guidance_interval = sampler_params_merged.get("guidance_interval", (0.0, 1.0))
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t = float(t_seq[0])
+        t_prev = float(t_seq[1])
+        t_tensor = torch.tensor([1000 * t] * sample_in.shape[0], device=sample_in.device, dtype=torch.float32)
+
+        apply_guidance = guidance_strength != 1 and guidance_interval[0] <= t <= guidance_interval[1]
+        if apply_guidance:
+            pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+            pred_neg = flow_model(sample_in, t_tensor, cond["neg_cond"])
+            pred_cfg = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+            x0_pos = sampler._pred_to_xstart(sample_in, t, pred_pos)
+            x0_cfg = sampler._pred_to_xstart(sample_in, t, pred_cfg)
+            reduce_dims = list(range(1, x0_pos.ndim))
+            std_pos = x0_pos.std(dim=reduce_dims, keepdim=True)
+            std_cfg = x0_cfg.std(dim=reduce_dims, keepdim=True)
+            ratio_raw = std_pos / std_cfg
+            std_ratio = ratio_raw
+            x0_rescaled = x0_cfg * std_ratio
+            x0_after_rescale = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+            pred_final = sampler._xstart_to_pred(sample_in, t, x0_after_rescale)
+        else:
+            pred_pos = flow_model(sample_in, t_tensor, cond["cond"])
+            pred_neg = pred_pos
+            pred_cfg = pred_pos
+            x0_pos = sampler._pred_to_xstart(sample_in, t, pred_pos)
+            x0_cfg = x0_pos
+            std_pos = torch.ones((1, 1), device=sample_in.device, dtype=sample_in.dtype)
+            std_cfg = std_pos
+            ratio_raw = std_pos
+            std_ratio = std_pos
+            x0_rescaled = x0_pos
+            x0_after_rescale = x0_pos
+            pred_final = pred_pos
+        pred_x0, pred_eps = sampler._v_to_xstart_eps(x_t=sample_in, t=t, v=pred_final)
+        sample_next = sample_in - (t - t_prev) * pred_final
+
+        step_path = output_dir / "shape_flow_step0.npz"
+        np.savez(
+            step_path,
+            sample_feats=_to_numpy(sample_in.feats).astype(np.float32, copy=False),
+            coords=_to_numpy(sample_in.coords).astype(np.int32, copy=False),
+            pred_pos=_to_numpy(pred_pos.feats).astype(np.float32, copy=False),
+            pred_neg=_to_numpy(pred_neg.feats).astype(np.float32, copy=False),
+            pred_cfg=_to_numpy(pred_cfg.feats).astype(np.float32, copy=False),
+            x0_pos=_to_numpy(x0_pos.feats).astype(np.float32, copy=False),
+            x0_cfg=_to_numpy(x0_cfg.feats).astype(np.float32, copy=False),
+            std_pos=_to_numpy(std_pos).astype(np.float32, copy=False),
+            std_cfg=_to_numpy(std_cfg).astype(np.float32, copy=False),
+            ratio_raw=_to_numpy(ratio_raw).astype(np.float32, copy=False),
+            std_ratio=_to_numpy(std_ratio).astype(np.float32, copy=False),
+            ratio_effective=_to_numpy(std_ratio).astype(np.float32, copy=False),
+            x0_rescaled=_to_numpy(x0_rescaled.feats).astype(np.float32, copy=False),
+            x0_after_rescale=_to_numpy(x0_after_rescale.feats).astype(np.float32, copy=False),
+            pred_final=_to_numpy(pred_final.feats).astype(np.float32, copy=False),
+            sample_next=_to_numpy(sample_next.feats).astype(np.float32, copy=False),
+            pred_x0_feats=_to_numpy(pred_x0.feats).astype(np.float32, copy=False),
+            pred_eps_feats=_to_numpy(pred_eps.feats).astype(np.float32, copy=False),
+            pred_v_feats=_to_numpy(pred_final.feats).astype(np.float32, copy=False),
+            t=np.array(t, dtype=np.float32),
+            t_prev=np.array(t_prev, dtype=np.float32),
+            t_tensor=_to_numpy(t_tensor).astype(np.float32, copy=False),
+            steps=np.array(steps, dtype=np.int32),
+            guidance_strength=np.array(guidance_strength, dtype=np.float32),
+            guidance_rescale=np.array(guidance_rescale, dtype=np.float32),
+            guidance_interval=np.array(guidance_interval, dtype=np.float32),
+            rescale_t=np.array(rescale_t, dtype=np.float32),
+            sigma_min=np.array(sampler.sigma_min, dtype=np.float32),
+            apply_guidance=np.array(apply_guidance, dtype=np.bool_),
+        )
+        print(f"Saved first shape-flow step: {step_path}", flush=True)
+        if pipeline.low_vram:
+            flow_model.cpu()
+        if stop_after_shape_flow_step:
+            raise _StopAfterShapeFlowStep()
+        torch.random.set_rng_state(rng_state)
+        return original(cond, flow_model, coords, sampler_params)
+
+    pipeline.sample_shape_slat = _hooked_sample_shape_slat
 
 
-def _install_shared_noise(torch: Any, shared_noise_path: str) -> None:
+def _install_shared_noise(torch: Any, shared_noise_path: str, *, mode: str = "all") -> None:
     shared = np.load(shared_noise_path)
     noise_calls = [0]
     noise_map = {
@@ -944,6 +1032,13 @@ def _install_shared_noise(torch: Any, shared_noise_path: str) -> None:
         if isinstance(shape, tuple) and len(shape) == 2 and shape[1] == 32:
             n = shape[0]
             noise_calls[0] += 1
+            if mode == "shape-only" and noise_calls[0] > 1:
+                print(
+                    f"  [shared noise] Leaving SLat {shape} random "
+                    f"(call #{noise_calls[0]}, mode=shape-only)",
+                    flush=True,
+                )
+                return original_randn(*args_t, **kwargs)
             pool = slat_pool[:n] if noise_calls[0] <= 1 else tex_pool[:n]
             result = pool.clone()
             if "device" in kwargs:
@@ -954,7 +1049,7 @@ def _install_shared_noise(torch: Any, shared_noise_path: str) -> None:
         return original_randn(*args_t, **kwargs)
 
     torch.randn = _patched_randn
-    print(f"Shared noise loaded from {shared_noise_path}", flush=True)
+    print(f"Shared noise loaded from {shared_noise_path} (mode={mode})", flush=True)
 
 
 def _record_effective_backend_identity(route_identity: dict[str, Any], output_dir: Path) -> None:
