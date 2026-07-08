@@ -431,6 +431,17 @@ def test_generate_can_load_conditioning_sample():
     assert 'neg_cond = mx.array(conditioning_sample_npz["neg_cond"])' in source
 
 
+def test_generate_default_image_conditioning_binds_negative_conditioning():
+    source = GENERATE_SOURCE.read_text()
+    image_branch_start = source.index("elif args.image:")
+
+    image_branch = source[
+        image_branch_start:source.index('    else:\n        print("No image', image_branch_start)
+    ]
+
+    assert "neg_cond = mx.zeros_like(cond)" in image_branch
+
+
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_no_kv_cache(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
