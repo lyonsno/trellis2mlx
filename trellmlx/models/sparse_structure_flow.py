@@ -184,7 +184,13 @@ def _gelu_tanh(x: mx.array) -> mx.array:
     """PyTorch nn.GELU(approximate="tanh") with source dtype restoration."""
     orig_dtype = x.dtype
     x = x.astype(mx.float32)
-    x = 0.5 * x * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+    if orig_dtype == mx.bfloat16:
+        tanh_scale = mx.array(math.sqrt(2.0 / math.pi), dtype=mx.bfloat16).astype(mx.float32)
+        cubic_scale = mx.array(0.044715, dtype=mx.bfloat16).astype(mx.float32)
+    else:
+        tanh_scale = math.sqrt(2.0 / math.pi)
+        cubic_scale = 0.044715
+    x = 0.5 * x * (1.0 + mx.tanh(tanh_scale * (x + cubic_scale * x * x * x)))
     return x.astype(orig_dtype)
 
 
