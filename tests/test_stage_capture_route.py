@@ -539,6 +539,35 @@ def test_stage_capture_wrapper_forwards_shape_slat_sample(tmp_path):
     assert route_identity["route"]["shape_slat_sample_sha256"] is not None
 
 
+def test_stage_capture_wrapper_forwards_shape_slat_support_sample(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    support_path = tmp_path / "reference_shape_slat.npz"
+    support_path.write_bytes(b"shape-slat-support")
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_slat",
+            "--no-cascade",
+            "--shape-slat-support-sample",
+            str(support_path),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--shape-slat-support-sample" in command
+    assert command[command.index("--shape-slat-support-sample") + 1] == str(support_path)
+    assert route_identity["route"]["shape_slat_support_sample_path"] == str(support_path)
+    assert route_identity["route"]["shape_slat_support_sample_sha256"] is not None
+
+
 def test_generate_exposes_shape_slat_sample_decoder_replay():
     source = GENERATE_SOURCE.read_text()
 
@@ -546,6 +575,16 @@ def test_generate_exposes_shape_slat_sample_decoder_replay():
     assert "shape_slat_sample_npz = np.load(args.shape_slat_sample)" in source
     assert "--shape-slat-sample requires --stop-after-stage decoder_output" in source
     assert "Shape SLat replay" in source
+
+
+def test_generate_exposes_shape_slat_support_replay():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--shape-slat-support-sample" in source
+    assert "shape_slat_support_sample_npz = np.load(args.shape_slat_support_sample)" in source
+    assert "--shape-slat-support-sample requires --no-cascade" in source
+    assert "Shape SLat support replay" in source
+    assert "lr_coords_4d = support_coords.astype(np.int32, copy=False)" in source
 
 
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():

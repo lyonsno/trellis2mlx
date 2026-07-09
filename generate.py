@@ -576,6 +576,9 @@ def main():
     parser.add_argument("--shape-slat-sample", metavar="NPZ",
                         help="Diagnostic: load shape_slat NPZ containing feats and coords, then run "
                              "only the shape decoder to decoder_output.")
+    parser.add_argument("--shape-slat-support-sample", metavar="NPZ",
+                        help="Diagnostic: load shape_slat NPZ coords as no-cascade shape-flow support "
+                             "while still sampling MLX shape features.")
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
@@ -621,6 +624,10 @@ def main():
         parser.error("--save-checkpoints is required when --stop-after-stage is set")
     if args.shape_slat_sample and args.stop_after_stage != "decoder_output":
         parser.error("--shape-slat-sample requires --stop-after-stage decoder_output")
+    if args.shape_slat_support_sample and not args.no_cascade:
+        parser.error("--shape-slat-support-sample requires --no-cascade")
+    if args.shape_slat_sample and args.shape_slat_support_sample:
+        parser.error("--shape-slat-sample and --shape-slat-support-sample are mutually exclusive")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1329,6 +1336,32 @@ def main():
             print("  Stop after stage: sparse_coords", flush=True)
             return
 
+    shape_slat_support_mesh_grid_size = None
+    if args.shape_slat_support_sample:
+        shape_slat_support_sample_npz = np.load(args.shape_slat_support_sample)
+        if "coords" not in shape_slat_support_sample_npz.files:
+            raise ValueError("--shape-slat-support-sample NPZ must contain coords array")
+        support_coords = np.asarray(shape_slat_support_sample_npz["coords"], dtype=np.int32)
+        if support_coords.ndim != 2 or support_coords.shape[1] != 4:
+            raise ValueError(
+                "--shape-slat-support-sample coords must have shape [N, 4], "
+                f"got {support_coords.shape}"
+            )
+        if support_coords.shape[0] == 0:
+            raise ValueError("--shape-slat-support-sample coords must not be empty")
+        support_meta_path = Path(args.shape_slat_support_sample).with_suffix(".json")
+        if support_meta_path.exists():
+            with support_meta_path.open() as f:
+                support_meta = json.load(f)
+            shape_slat_support_mesh_grid_size = int(support_meta.get("mesh_grid_size", 0)) or None
+        lr_coords_4d = support_coords.astype(np.int32, copy=False)
+        lr_coords = lr_coords_4d[:, 1:4].astype(np.int32, copy=False)
+        print(
+            "  Shape SLat support replay: "
+            f"{args.shape_slat_support_sample} ({len(lr_coords):,} coords)",
+            flush=True,
+        )
+
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
     from trellmlx.models.slat_flow import SLatFlowModel
@@ -1425,7 +1458,7 @@ def main():
         hr_slat = lr_slat
         quant_coords = lr_coords_4d
         num_tokens = N_lr
-        hr_resolution = lr_resolution * 16  # 512 mesh grid for 32 LR coords
+        hr_resolution = shape_slat_support_mesh_grid_size or lr_resolution * 16
         hr_coords_3d = quant_coords[:, 1:4]
         print(f"  No-cascade: using LR SLat directly ({num_tokens:,} tokens, "
               f"grid_size={hr_resolution})", flush=True)
