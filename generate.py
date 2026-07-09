@@ -12,7 +12,9 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
+from pathlib import Path
 import time
 
 import mlx.core as mx
@@ -571,6 +573,9 @@ def main():
                         help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
     parser.add_argument("--conditioning-sample", metavar="NPZ",
                         help="Diagnostic: load image conditioning from an NPZ containing cond and neg_cond.")
+    parser.add_argument("--shape-slat-sample", metavar="NPZ",
+                        help="Diagnostic: load shape_slat NPZ containing feats and coords, then run "
+                             "only the shape decoder to decoder_output.")
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: sparse flow block index to trace with --stop-after-stage "
                              "sparse_flow_block_trace (default: 0).")
@@ -614,6 +619,8 @@ def main():
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
     if args.stop_after_stage and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --stop-after-stage is set")
+    if args.shape_slat_sample and args.stop_after_stage != "decoder_output":
+        parser.error("--shape-slat-sample requires --stop-after-stage decoder_output")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -746,6 +753,75 @@ def main():
     from trellmlx.weight_loader import load_weights
     from trellmlx.samplers import flow_euler_sample
     from trellmlx.cleanup import cleanup_model, cleanup
+
+    if args.shape_slat_sample:
+        print("=== Shape SLat replay: Decode Shape ===", flush=True)
+        shape_slat_sample_npz = np.load(args.shape_slat_sample)
+        missing = {"feats", "coords"} - set(shape_slat_sample_npz.files)
+        if missing:
+            raise ValueError(
+                "--shape-slat-sample NPZ must contain feats and coords arrays; "
+                f"missing {sorted(missing)}"
+            )
+        shape_feats_np = np.asarray(shape_slat_sample_npz["feats"], dtype=np.float32)
+        quant_coords = np.asarray(shape_slat_sample_npz["coords"], dtype=np.int32)
+        if shape_feats_np.ndim != 2 or shape_feats_np.shape[1] != 32:
+            raise ValueError(
+                "--shape-slat-sample feats must have shape [N, 32], "
+                f"got {shape_feats_np.shape}"
+            )
+        if quant_coords.ndim != 2 or quant_coords.shape[1] != 4:
+            raise ValueError(
+                "--shape-slat-sample coords must have shape [N, 4], "
+                f"got {quant_coords.shape}"
+            )
+        if quant_coords.shape[0] != shape_feats_np.shape[0]:
+            raise ValueError(
+                "--shape-slat-sample feats and coords row counts must match, "
+                f"got {shape_feats_np.shape[0]} and {quant_coords.shape[0]}"
+            )
+
+        mesh_grid_size = args.resolution
+        sample_meta_path = Path(args.shape_slat_sample).with_suffix(".json")
+        if sample_meta_path.exists():
+            with sample_meta_path.open() as f:
+                sample_meta = json.load(f)
+            mesh_grid_size = int(sample_meta.get("mesh_grid_size", mesh_grid_size))
+
+        from trellmlx.models.shape_slat_decoder import SLatDecoder
+
+        shape_decoder = SLatDecoder(out_channels=7, pred_subdiv=True)
+        load_weights(shape_decoder, HF_4B + "shape_dec_next_dc_f16c32_fp16.safetensors", verbose=False)
+
+        t0 = time.perf_counter()
+        dec_out, dec_coords, shape_subs = shape_decoder(
+            mx.array(shape_feats_np),
+            mx.array(quant_coords),
+            return_subs=True,
+        )
+        mx.eval(dec_out)
+        print(
+            f"  Shape SLat replay decoded: {time.perf_counter()-t0:.1f}s "
+            f"({dec_out.shape[0]:,} voxels)",
+            flush=True,
+        )
+
+        cleanup_model(shape_decoder)
+        del shape_decoder
+        gc.collect()
+
+        from trellmlx.checkpoint import save_checkpoint
+
+        save_checkpoint(
+            args.save_checkpoints,
+            "decoder_output",
+            feats=np.array(dec_out).astype(np.float32, copy=False),
+            coords=np.array(dec_coords).astype(np.int32, copy=False),
+            shape_subs=[np.array(mask) for mask in shape_subs],
+            mesh_grid_size=mesh_grid_size,
+        )
+        print("  Stop after stage: decoder_output", flush=True)
+        return
 
     vs3d_mode = bool(args.edit_target)
     if vs3d_mode and not os.path.exists(args.edit_target):
