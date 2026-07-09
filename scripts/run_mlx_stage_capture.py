@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-sample")
+    parser.add_argument("--sparse-flow-trace-block-input-sample")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
     return parser
 
@@ -101,6 +102,14 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             ),
             "sparse_flow_trace_sample_sha256": (
                 _sha256_file(args.sparse_flow_trace_sample) if args.sparse_flow_trace_sample else None
+            ),
+            "sparse_flow_trace_block_input_sample_path": (
+                str(Path(args.sparse_flow_trace_block_input_sample))
+                if args.sparse_flow_trace_block_input_sample else None
+            ),
+            "sparse_flow_trace_block_input_sample_sha256": (
+                _sha256_file(args.sparse_flow_trace_block_input_sample)
+                if args.sparse_flow_trace_block_input_sample else None
             ),
             "sparse_flow_trace_uses_kv_cache": not args.sparse_flow_trace_no_kv_cache,
         },
@@ -243,6 +252,11 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.extend(["--sparse-flow-trace-step-index", str(args.sparse_flow_trace_step_index)])
         if args.sparse_flow_trace_sample:
             command.extend(["--sparse-flow-trace-sample", str(Path(args.sparse_flow_trace_sample))])
+        if args.sparse_flow_trace_block_input_sample:
+            command.extend([
+                "--sparse-flow-trace-block-input-sample",
+                str(Path(args.sparse_flow_trace_block_input_sample)),
+            ])
         if args.sparse_flow_trace_no_kv_cache:
             command.append("--sparse-flow-trace-no-kv-cache")
     return command

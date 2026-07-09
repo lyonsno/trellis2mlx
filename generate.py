@@ -580,6 +580,9 @@ def main():
     parser.add_argument("--sparse-flow-trace-sample", metavar="NPZ",
                         help="Diagnostic: load sparse-flow trace sample from an NPZ containing sample_in. "
                              "If sample_in is stacked by step, --sparse-flow-trace-step-index selects the row.")
+    parser.add_argument("--sparse-flow-trace-block-input-sample", metavar="NPZ",
+                        help="Diagnostic: replay projected block inputs from a block trace NPZ containing "
+                             "pos_blockN_input and neg_blockN_input arrays.")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
                         help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
                              "to match direct reference trace hooks.")
@@ -896,7 +899,75 @@ def main():
                     f"--sparse-flow-trace-step-index must be in [0, {n_steps - 1}], "
                     f"got {trace_step_index}"
                 )
-            if args.sparse_flow_trace_sample:
+            trace_block_index = args.sparse_flow_trace_block_index
+            trace_input_mode = "sampler_sample"
+            pos_block_input_key = ""
+            neg_block_input_key = ""
+
+            def schedule_trace_t():
+                t_seq = np.linspace(1, 0, n_steps + 1)
+                t_seq = 5.0 * t_seq / (1 + (5.0 - 1) * t_seq)
+                return float(t_seq[trace_step_index])
+
+            def trace_t_from_npz(trace_npz):
+                if "t" in trace_npz and np.ndim(trace_npz["t"]) > 0:
+                    t_value = float(trace_npz["t"][trace_step_index])
+                elif "t" in trace_npz:
+                    t_value = float(trace_npz["t"])
+                else:
+                    return schedule_trace_t()
+                return t_value / 1000.0 if t_value > 1.0 else t_value
+
+            def load_projected_block_input(block_input_npz, label):
+                if label == "pos":
+                    candidate_keys = [
+                        f"pos_block{trace_block_index}_input",
+                        "pos_block_input",
+                        f"block{trace_block_index}_input",
+                        "block_input",
+                    ]
+                else:
+                    candidate_keys = [
+                        f"neg_block{trace_block_index}_input",
+                        "neg_block_input",
+                        f"block{trace_block_index}_input",
+                        "block_input",
+                    ]
+                for key in candidate_keys:
+                    if key in block_input_npz:
+                        return key, mx.array(block_input_npz[key]).astype(mx.float32)
+                raise ValueError(
+                    "--sparse-flow-trace-block-input-sample NPZ must contain "
+                    f"one of {candidate_keys}; available keys: {block_input_npz.files}"
+                )
+
+            if args.sparse_flow_trace_block_input_sample:
+                if args.sparse_flow_trace_sample:
+                    raise ValueError(
+                        "--sparse-flow-trace-block-input-sample and --sparse-flow-trace-sample "
+                        "are mutually exclusive"
+                    )
+                block_input_npz = np.load(args.sparse_flow_trace_block_input_sample)
+                pos_block_input_key, pos_block_input = load_projected_block_input(block_input_npz, "pos")
+                neg_block_input_key, neg_block_input = load_projected_block_input(block_input_npz, "neg")
+                trace_t = trace_t_from_npz(block_input_npz)
+                t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
+                pos_trace = ss_flow.trace_projected_block_input(
+                    pos_block_input,
+                    t_tensor,
+                    pos_cond,
+                    block_index=trace_block_index,
+                    cross_kv_cache=pos_kv_cache,
+                )
+                neg_trace = ss_flow.trace_projected_block_input(
+                    neg_block_input,
+                    t_tensor,
+                    neg_cond_fp32,
+                    block_index=trace_block_index,
+                    cross_kv_cache=neg_kv_cache,
+                )
+                trace_input_mode = "projected_block_input"
+            elif args.sparse_flow_trace_sample:
                 trace_sample_npz = np.load(args.sparse_flow_trace_sample)
                 if "sample_in" not in trace_sample_npz:
                     raise ValueError(
@@ -916,17 +987,40 @@ def main():
                         f"got {trace_sample_np.shape}"
                     )
                 trace_sample = mx.array(trace_sample_np).astype(mx.float32)
-                if "t" in trace_sample_npz and np.ndim(trace_sample_npz["t"]) > 0:
-                    trace_t = float(trace_sample_npz["t"][trace_step_index])
-                elif "t" in trace_sample_npz:
-                    trace_t = float(trace_sample_npz["t"])
-                else:
-                    t_seq = np.linspace(1, 0, n_steps + 1)
-                    t_seq = 5.0 * t_seq / (1 + (5.0 - 1) * t_seq)
-                    trace_t = float(t_seq[trace_step_index])
+                trace_t = trace_t_from_npz(trace_sample_npz)
+                t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
+                pos_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    pos_cond,
+                    block_index=trace_block_index,
+                    cross_kv_cache=pos_kv_cache,
+                )
+                neg_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    neg_cond_fp32,
+                    block_index=trace_block_index,
+                    cross_kv_cache=neg_kv_cache,
+                )
             elif trace_step_index == 0:
                 trace_sample = noise
                 trace_t = 1.0
+                t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
+                pos_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    pos_cond,
+                    block_index=trace_block_index,
+                    cross_kv_cache=pos_kv_cache,
+                )
+                neg_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    neg_cond_fp32,
+                    block_index=trace_block_index,
+                    cross_kv_cache=neg_kv_cache,
+                )
             else:
                 trace_steps = []
                 _ = flow_euler_sample(
@@ -945,22 +1039,21 @@ def main():
                     )
                 trace_sample = trace_steps[trace_step_index]["sample_in"]
                 trace_t = float(np.array(trace_steps[trace_step_index]["t"]))
-            t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
-            trace_block_index = args.sparse_flow_trace_block_index
-            pos_trace = ss_flow.trace_block(
-                trace_sample,
-                t_tensor,
-                pos_cond,
-                block_index=trace_block_index,
-                cross_kv_cache=pos_kv_cache,
-            )
-            neg_trace = ss_flow.trace_block(
-                trace_sample,
-                t_tensor,
-                neg_cond_fp32,
-                block_index=trace_block_index,
-                cross_kv_cache=neg_kv_cache,
-            )
+                t_tensor = mx.array([1000.0 * trace_t], dtype=mx.float32)
+                pos_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    pos_cond,
+                    block_index=trace_block_index,
+                    cross_kv_cache=pos_kv_cache,
+                )
+                neg_trace = ss_flow.trace_block(
+                    trace_sample,
+                    t_tensor,
+                    neg_cond_fp32,
+                    block_index=trace_block_index,
+                    cross_kv_cache=neg_kv_cache,
+                )
             def trace_np(value):
                 return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
 
@@ -982,6 +1075,12 @@ def main():
                 trace_block_index=np.array(trace_block_index, dtype=np.int32),
                 sparse_flow_trace_step_index=np.array(trace_step_index, dtype=np.int32),
                 sparse_flow_trace_sample_path=np.array(args.sparse_flow_trace_sample or ""),
+                sparse_flow_trace_block_input_sample_path=np.array(
+                    args.sparse_flow_trace_block_input_sample or ""
+                ),
+                sparse_flow_trace_input_mode=np.array(trace_input_mode),
+                sparse_flow_trace_pos_block_input_key=np.array(pos_block_input_key),
+                sparse_flow_trace_neg_block_input_key=np.array(neg_block_input_key),
                 sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
                 t=np.array(1000.0 * trace_t, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),

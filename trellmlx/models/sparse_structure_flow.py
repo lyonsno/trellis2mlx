@@ -535,6 +535,94 @@ class SparseStructureFlowModel(nn.Module):
         mx.eval(*trace.values())
         return trace
 
+    def trace_projected_block_input(
+        self,
+        block_input: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        block_index: int = 0,
+        resolution: int | None = None,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        """Trace one block starting from a saved projected block input.
+
+        `trace_block` replays the whole dense sparse-flow prefix before the
+        selected block. This diagnostic helper is for same-input local parity:
+        feed a reference block input directly through the corresponding MLX
+        block under the requested timestep/conditioning route.
+        """
+        if block_index < 0 or block_index >= len(self.blocks):
+            raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
+        if block_input.ndim == 3:
+            if block_input.shape[0] != 1:
+                raise ValueError(
+                    "projected block input with a batch dimension must have B=1, "
+                    f"got {block_input.shape}"
+                )
+            block_input = block_input[0]
+        elif block_input.ndim != 2:
+            raise ValueError(
+                "projected block input must have shape [T,C] or [1,T,C], "
+                f"got {block_input.shape}"
+            )
+        if block_input.shape[1] != self.model_channels:
+            raise ValueError(
+                "projected block input channel dimension must match model_channels "
+                f"{self.model_channels}, got {block_input.shape}"
+            )
+
+        token_count = block_input.shape[0]
+        if resolution is None:
+            inferred_resolution = round(token_count ** (1.0 / 3.0))
+            if inferred_resolution ** 3 != token_count:
+                raise ValueError(
+                    "projected block input token count must be a perfect cube when "
+                    f"resolution is omitted, got {token_count}"
+                )
+            resolution = inferred_resolution
+        elif resolution ** 3 != token_count:
+            raise ValueError(
+                f"resolution {resolution} implies {resolution ** 3} tokens, "
+                f"got projected block input with {token_count}"
+            )
+
+        input_dtype = block_input.dtype
+        t_emb = self.t_embedder(t)
+        mod = self.adaLN_modulation(t_emb)
+        compute_dtype = _infer_compute_dtype(self)
+        x = block_input.astype(compute_dtype)
+        mod = mod.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
+
+        head_dim = self.model_channels // self.num_heads
+        rope_phases = build_rope_phases(resolution, head_dim)
+        block_kv = cross_kv_cache[block_index] if cross_kv_cache is not None else None
+
+        trace_prefix = f"block{block_index}"
+        trace: dict[str, mx.array] = {f"{trace_prefix}_input": x}
+        x_after, block_trace = self.blocks[block_index].trace(
+            x,
+            mod[0],
+            cond,
+            rope_phases=rope_phases,
+            cross_kv_cache=block_kv,
+            trace_prefix=trace_prefix,
+        )
+        trace.update(block_trace)
+        if block_index == len(self.blocks) - 1:
+            trace["final_input"] = x_after
+            x_final = x_after.astype(input_dtype)
+            x_final = _layernorm_noaffine(x_final, eps=1e-5)
+            trace["final_norm"] = x_final
+            x_final = self.out_layer(x_final)
+            trace["final_out_flat"] = x_final
+            trace["final_output"] = (
+                x_final.reshape(1, resolution, resolution, resolution, self.out_channels)
+                .transpose(0, 4, 1, 2, 3)
+            )
+        mx.eval(*trace.values())
+        return trace
+
     def __call__(
         self,
         x: mx.array,           # [B, in_channels, R, R, R]

@@ -252,6 +252,46 @@ class TestSparseStructureFlowModel:
         assert block1["final_out_flat"].shape == (8, 2)
         assert block1["final_output"].shape == (1, 2, 2, 2, 2)
 
+    def test_trace_projected_block_input_replays_captured_block_state(self):
+        from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
+
+        model = SparseStructureFlowModel(
+            in_channels=2, out_channels=2, model_channels=12,
+            num_heads=3, num_blocks=2, mlp_hidden=16,
+            context_channels=4, resolution=2,
+        )
+        x = mx.random.normal((1, 2, 2, 2, 2), dtype=mx.float32)
+        t = mx.array([1000.0], dtype=mx.float32)
+        cond = mx.random.normal((1, 5, 4), dtype=mx.float32)
+
+        full_trace = model.trace_block(x, t, cond, block_index=1)
+        replay_trace = model.trace_projected_block_input(
+            full_trace["block1_input"].astype(mx.float32)[None],
+            t,
+            cond,
+            block_index=1,
+            resolution=2,
+        )
+        mx.eval(*full_trace.values(), *replay_trace.values())
+
+        for name in (
+            "block1_input",
+            "block1_norm1",
+            "block1_q_pre_norm",
+            "block1_k_pre_norm",
+            "block1_v",
+            "block1_attention_raw",
+            "block1_after_self",
+            "block1_cross_attn",
+            "block1_mlp_fc1",
+            "block1_mlp_gelu",
+            "block1_after_mlp",
+            "final_out_flat",
+            "final_output",
+        ):
+            assert name in replay_trace
+            assert mx.allclose(full_trace[name], replay_trace[name], rtol=1e-5, atol=1e-5).item()
+
 
 class TestSLatFlowModelSourceContracts:
     def test_final_layernorm_uses_reference_epsilon(self, monkeypatch):

@@ -372,6 +372,44 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_sample(tmp_path):
     assert route_identity["route"]["sparse_flow_trace_sample_sha256"] is not None
 
 
+def test_stage_capture_wrapper_forwards_sparse_flow_trace_block_input_sample(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    block_input_path = tmp_path / "reference_block8_trace.npz"
+    block_input_path.write_bytes(b"block-input")
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--sparse-flow-trace-step-index",
+            "5",
+            "--sparse-flow-trace-block-index",
+            "8",
+            "--sparse-flow-trace-block-input-sample",
+            str(block_input_path),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-trace-block-input-sample" in command
+    assert command[command.index("--sparse-flow-trace-block-input-sample") + 1] == str(block_input_path)
+    assert route_identity["route"]["sparse_flow_trace_block_input_sample_path"] == str(block_input_path)
+    assert route_identity["route"]["sparse_flow_trace_block_input_sample_sha256"] is not None
+
+
 def test_stage_capture_wrapper_forwards_conditioning_sample(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
@@ -420,6 +458,16 @@ def test_generate_sparse_flow_block_trace_can_load_trace_sample():
     assert "--sparse-flow-trace-sample" in source
     assert "trace_sample_npz = np.load(args.sparse_flow_trace_sample)" in source
     assert "trace_sample = mx.array(trace_sample_np)" in source
+
+
+def test_generate_sparse_flow_block_trace_can_replay_projected_block_input():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--sparse-flow-trace-block-input-sample" in source
+    assert "block_input_npz = np.load(args.sparse_flow_trace_block_input_sample)" in source
+    assert "trace_projected_block_input" in source
+    assert 'f"pos_block{trace_block_index}_input"' in source
+    assert 'f"neg_block{trace_block_index}_input"' in source
 
 
 def test_generate_can_load_conditioning_sample():
