@@ -347,6 +347,55 @@ class TestSLatFlowModelSourceContracts:
 
         assert seen_eps == [1e-5]
 
+    def test_trace_block_emits_selected_sparse_token_namespace(self):
+        from trellmlx.models.slat_flow import SLatFlowModel
+
+        model = SLatFlowModel(
+            in_channels=4,
+            out_channels=4,
+            model_channels=12,
+            num_heads=3,
+            num_blocks=2,
+            mlp_hidden=16,
+            context_channels=4,
+        )
+        x = mx.random.normal((6, 4), dtype=mx.float32)
+        coords = mx.array(
+            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 1, 1], [2, 2, 2]],
+            dtype=mx.int32,
+        )
+        t = mx.array([1000.0], dtype=mx.float32)
+        cond = mx.random.normal((1, 5, 4), dtype=mx.float32)
+
+        block0 = model.trace_first_block(x, t, cond, coords=coords)
+        block1 = model.trace_block(x, t, cond, coords=coords, block_index=1)
+        mx.eval(*block0.values(), *block1.values())
+
+        assert "block0_after_mlp" in block0
+        assert "block1_input" in block1
+        assert "block1_after_mlp" in block1
+        assert "block0_after_mlp" not in block1
+        for name in (
+            "block1_shift_msa",
+            "block1_scale_msa",
+            "block1_gate_msa",
+            "block1_q_pre_norm",
+            "block1_q_post_rope",
+            "block1_attention_raw",
+            "block1_cross_attn",
+            "block1_mlp_fc1",
+            "block1_mlp_gelu",
+            "block1_after_mlp",
+            "final_input",
+            "final_norm",
+            "final_out_flat",
+            "final_output",
+        ):
+            assert name in block1
+        assert block1["block1_after_mlp"].shape == (6, 12)
+        assert block1["final_out_flat"].shape == (6, 4)
+        assert block1["final_output"].shape == (6, 4)
+
     def test_parameter_count_small(self):
         """Small model parameter count should be predictable."""
         import mlx.utils

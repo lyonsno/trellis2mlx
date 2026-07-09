@@ -560,6 +560,7 @@ def main():
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -594,6 +595,12 @@ def main():
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
                         help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
                              "to match direct reference trace hooks.")
+    parser.add_argument("--shape-flow-trace-block-index", type=int, default=0,
+                        help="Diagnostic: shape SLat flow block index to trace with "
+                             "--stop-after-stage shape_flow_block_trace (default: 0).")
+    parser.add_argument("--shape-flow-trace-step-index", type=int, default=0,
+                        help="Diagnostic: shape SLat flow sampler step index to trace with "
+                             "--stop-after-stage shape_flow_block_trace (default: 0).")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -628,6 +635,8 @@ def main():
         parser.error("--shape-slat-support-sample requires --no-cascade")
     if args.shape_slat_sample and args.shape_slat_support_sample:
         parser.error("--shape-slat-sample and --shape-slat-support-sample are mutually exclusive")
+    if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
+        parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1396,6 +1405,108 @@ def main():
 
     t0 = time.perf_counter()
     shape_step_capture = {} if args.stop_after_stage == "shape_flow_step" else None
+    if args.stop_after_stage == "shape_flow_block_trace":
+        shape_trace_step_index = args.shape_flow_trace_step_index
+        if shape_trace_step_index < 0 or shape_trace_step_index >= n_steps:
+            raise ValueError(
+                f"--shape-flow-trace-step-index must be in [0, {n_steps - 1}], "
+                f"got {shape_trace_step_index}"
+            )
+        shape_trace_block_index = args.shape_flow_trace_block_index
+        shape_cond = cond_tgt if vs3d_mode else cond
+        shape_neg_cond = neg_cond
+        shape_pos_kv_cache = lr_slat_flow.build_cross_kv_cache(shape_cond)
+        shape_neg_kv_cache = lr_slat_flow.build_cross_kv_cache(shape_neg_cond)
+
+        def shape_schedule_trace_t():
+            t_seq = np.linspace(1, 0, n_steps + 1)
+            t_seq = (
+                SHAPE_SAMPLER["rescale_t"]
+                * t_seq
+                / (1 + (SHAPE_SAMPLER["rescale_t"] - 1) * t_seq)
+            )
+            return float(t_seq[shape_trace_step_index])
+
+        if shape_trace_step_index == 0:
+            shape_trace_sample = lr_noise
+            shape_trace_t = shape_schedule_trace_t()
+        else:
+            shape_trace_steps = []
+            _ = flow_euler_sample(
+                lr_slat_flow,
+                lr_noise,
+                shape_cond,
+                shape_neg_cond,
+                verbose=False,
+                coords=mx.array(lr_coords),
+                capture_steps=shape_trace_steps,
+                **SHAPE_SAMPLER,
+            )
+            if shape_trace_step_index >= len(shape_trace_steps):
+                raise ValueError(
+                    f"shape flow captured {len(shape_trace_steps)} steps, cannot trace step "
+                    f"{shape_trace_step_index}"
+                )
+            shape_trace_sample = shape_trace_steps[shape_trace_step_index]["sample_in"]
+            shape_trace_t = float(np.array(shape_trace_steps[shape_trace_step_index]["t"]))
+            shape_trace_t = shape_trace_t / 1000.0 if shape_trace_t > 1.0 else shape_trace_t
+
+        shape_t_tensor = mx.array([1000.0 * shape_trace_t], dtype=mx.float32)
+        pos_trace = lr_slat_flow.trace_block(
+            shape_trace_sample,
+            shape_t_tensor,
+            shape_cond,
+            coords=mx.array(lr_coords),
+            block_index=shape_trace_block_index,
+            cross_kv_cache=shape_pos_kv_cache,
+        )
+        neg_trace = lr_slat_flow.trace_block(
+            shape_trace_sample,
+            shape_t_tensor,
+            shape_neg_cond,
+            coords=mx.array(lr_coords),
+            block_index=shape_trace_block_index,
+            cross_kv_cache=shape_neg_kv_cache,
+        )
+
+        def trace_np(value):
+            return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
+
+        from trellmlx.checkpoint import save_checkpoint
+
+        trace_payload = {
+            f"pos_{name}": trace_np(value)
+            for name, value in pos_trace.items()
+        }
+        trace_payload.update(
+            {
+                f"neg_{name}": trace_np(value)
+                for name, value in neg_trace.items()
+            }
+        )
+        save_checkpoint(
+            args.save_checkpoints,
+            "shape_flow_block_trace",
+            **trace_payload,
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            coords_3d=lr_coords.astype(np.int32, copy=False),
+            trace_block_index=np.array(shape_trace_block_index, dtype=np.int32),
+            shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
+            shape_slat_support_sample_path=np.array(args.shape_slat_support_sample or ""),
+            t=np.array(1000.0 * shape_trace_t, dtype=np.float32),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(SHAPE_SAMPLER["guidance_strength"], dtype=np.float32),
+            guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
+            guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
+            rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+        )
+        print(
+            f"  Stop after stage: shape_flow_block_trace step={shape_trace_step_index} "
+            f"block={shape_trace_block_index}",
+            flush=True,
+        )
+        return
+
     lr_slat = flow_euler_sample(
         lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
         verbose=False,

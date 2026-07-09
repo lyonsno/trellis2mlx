@@ -18,6 +18,7 @@ def test_generate_exposes_stage_capture_cli_contracts():
         "sparse_flow_block_trace",
         "sparse_internals",
         "shape_flow_step",
+        "shape_flow_block_trace",
         "shape_slat",
         "decoder_output",
     ):
@@ -267,6 +268,68 @@ def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
     command = _build_generate_command(args, tmp_path / "checkpoints")
 
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_step"
+
+
+def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    support_path = tmp_path / "reference_shape_slat.npz"
+    support_path.write_bytes(b"shape-slat-support")
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-slat-support-sample",
+            str(support_path),
+            "--shape-flow-trace-block-index",
+            "7",
+            "--shape-flow-trace-step-index",
+            "3",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "shape_flow_block_trace"
+    assert "--shape-flow-trace-block-index" in command
+    assert command[command.index("--shape-flow-trace-block-index") + 1] == "7"
+    assert "--shape-flow-trace-step-index" in command
+    assert command[command.index("--shape-flow-trace-step-index") + 1] == "3"
+
+
+def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    support_path = tmp_path / "reference_shape_slat.npz"
+    support_path.write_bytes(b"shape-slat-support")
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-slat-support-sample",
+            str(support_path),
+            "--shape-flow-trace-block-index",
+            "11",
+            "--shape-flow-trace-step-index",
+            "4",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert route_identity["route"]["shape_flow_trace_block_index"] == 11
+    assert route_identity["route"]["shape_flow_trace_step_index"] == 4
 
 
 def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
@@ -585,6 +648,16 @@ def test_generate_exposes_shape_slat_support_replay():
     assert "--shape-slat-support-sample requires --no-cascade" in source
     assert "Shape SLat support replay" in source
     assert "lr_coords_4d = support_coords.astype(np.int32, copy=False)" in source
+
+
+def test_generate_exposes_shape_flow_block_trace():
+    source = GENERATE_SOURCE.read_text()
+
+    assert '"shape_flow_block_trace"' in source
+    assert "--shape-flow-trace-block-index" in source
+    assert "--shape-flow-trace-step-index" in source
+    assert "lr_slat_flow.trace_block" in source
+    assert 'save_checkpoint(\n            args.save_checkpoints,\n            "shape_flow_block_trace"' in source
 
 
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():

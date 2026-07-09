@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -68,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse-flow-trace-sample")
     parser.add_argument("--sparse-flow-trace-block-input-sample")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
+    parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
+    parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     return parser
 
 
@@ -129,6 +132,8 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
                 if args.sparse_flow_trace_block_input_sample else None
             ),
             "sparse_flow_trace_uses_kv_cache": not args.sparse_flow_trace_no_kv_cache,
+            "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
+            "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
         },
         "source": {
             "image_path": image_path,
@@ -145,6 +150,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
                 "sparse_flow_block_trace",
                 "sparse_internals",
                 "shape_flow_step",
+                "shape_flow_block_trace",
                 "shape_slat",
                 "decoder_output",
                 "mesh_raw",
@@ -285,6 +291,13 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             ])
         if args.sparse_flow_trace_no_kv_cache:
             command.append("--sparse-flow-trace-no-kv-cache")
+    if args.stop_after_stage == "shape_flow_block_trace":
+        command.extend([
+            "--shape-flow-trace-block-index",
+            str(args.shape_flow_trace_block_index),
+            "--shape-flow-trace-step-index",
+            str(args.shape_flow_trace_step_index),
+        ])
     return command
 
 

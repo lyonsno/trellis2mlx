@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -86,7 +87,7 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
                 if name in ref and name in cand
             }
             return report
-        if stage == "sparse_flow_block_trace":
+        if stage in {"sparse_flow_block_trace", "shape_flow_block_trace"}:
             report["arrays"] = {
                 name: _array_delta(ref[name], cand[name])
                 for name in sorted(set(ref.files) & set(cand.files))

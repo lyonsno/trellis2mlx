@@ -168,6 +168,92 @@ class SLatFlowModel(nn.Module):
             x = block(x, mod, cond, rope_phases=rope_phases)
         return x
 
+    def trace_first_block(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        coords: mx.array = None,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        return self.trace_block(
+            x,
+            t,
+            cond,
+            coords=coords,
+            block_index=0,
+            cross_kv_cache=cross_kv_cache,
+        )
+
+    def trace_block(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        coords: mx.array = None,
+        block_index: int = 0,
+        cross_kv_cache: list = None,
+    ) -> dict[str, mx.array]:
+        if block_index < 0 or block_index >= len(self.blocks):
+            raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
+
+        input_dtype = x.dtype
+        B = t.shape[0] if len(t.shape) else 1
+        cond_B = cond.shape[0] if cond is not None and len(cond.shape) else B
+        if B != 1 or cond_B != 1:
+            raise ValueError(
+                f"Only B=1 supported for SLatFlowModel trace, got t B={B}, cond B={cond_B}"
+            )
+
+        t_emb = self.t_embedder(t)
+        mod = self.adaLN_modulation(t_emb)
+
+        x = self.input_layer(x)
+        compute_dtype = _infer_compute_dtype(self)
+        x = x.astype(compute_dtype)
+        mod = mod.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
+
+        rope_phases = None
+        if coords is not None:
+            rope_phases = self._coords_to_rope_phases(coords)
+
+        trace: dict[str, mx.array] = {"input_projected": x}
+        for i, block in enumerate(self.blocks):
+            block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+            if i == block_index:
+                trace_prefix = f"block{block_index}"
+                trace[f"{trace_prefix}_input"] = x
+                x_after, block_trace = block.trace(
+                    x,
+                    mod[0],
+                    cond,
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                    trace_prefix=trace_prefix,
+                )
+                trace.update(block_trace)
+                if i == len(self.blocks) - 1:
+                    trace["final_input"] = x_after
+                    x_final = x_after.astype(input_dtype)
+                    x_final = _layernorm_noaffine(x_final, eps=1e-5)
+                    trace["final_norm"] = x_final
+                    x_final = self.out_layer(x_final)
+                    trace["final_out_flat"] = x_final
+                    trace["final_output"] = x_final
+                break
+            x = block(
+                x,
+                mod[0],
+                cond,
+                rope_phases=rope_phases,
+                cross_kv_cache=block_kv,
+            )
+            if (i + 1) % 6 == 0:
+                mx.eval(x)
+        mx.eval(*trace.values())
+        return trace
+
     def compile(self):
         """Enable mx.compile for the transformer block loop."""
         self._compiled = True
