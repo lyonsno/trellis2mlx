@@ -5,9 +5,35 @@ and variable-length attention (for SLatFlowModel on sparse tokens).
 """
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+def _manual_scaled_dot_product_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    mask: mx.array = None,
+) -> mx.array:
+    """Chunked MLX matmul/softmax attention for source-parity diagnostics."""
+    out_chunks = []
+    chunk_size = int(os.environ.get("TRELLIS2MLX_ATTENTION_CHUNK_SIZE", "512"))
+    if chunk_size <= 0:
+        raise ValueError("TRELLIS2MLX_ATTENTION_CHUNK_SIZE must be positive")
+
+    for start in range(0, q.shape[2], chunk_size):
+        stop = min(start + chunk_size, q.shape[2])
+        q_chunk = q[:, :, start:stop, :]
+        scores = (q_chunk.astype(mx.float32) @ k.astype(mx.float32).transpose(0, 1, 3, 2)) * scale
+        if mask is not None:
+            scores = scores + mask[:, :, start:stop, :].astype(mx.float32)
+        probs = mx.softmax(scores, axis=-1)
+        out = probs @ v.astype(mx.float32)
+        out_chunks.append(out.astype(q.dtype))
+    return mx.concatenate(out_chunks, axis=2)
 
 
 def scaled_dot_product_attention(
@@ -22,7 +48,15 @@ def scaled_dot_product_attention(
     and never materializes the full N×N attention matrix (O(N) memory).
     """
     scale = 1.0 / math.sqrt(q.shape[-1])
-    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    backend = os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND", "fast").lower()
+    if backend in {"fast", "mlx-fast"}:
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    if backend in {"manual", "mlx-manual"}:
+        return _manual_scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    raise ValueError(
+        "TRELLIS2MLX_ATTENTION_BACKEND must be one of 'fast' or 'manual', "
+        f"got {backend!r}"
+    )
 
 
 def varlen_attention_padded(

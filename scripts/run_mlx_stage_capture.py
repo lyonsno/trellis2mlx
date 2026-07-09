@@ -78,6 +78,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
         "route": {
             "family": "trellis2mlx/mlx",
             "backend": "mlx-metal",
+            "attention_backend": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND", "fast"),
             "repo_root": str(REPO_ROOT),
             "seed": args.seed,
             "steps": args.steps,
@@ -139,6 +140,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
         "env": {
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
             "MLX_METAL_PATH": os.environ.get("MLX_METAL_PATH"),
+            "TRELLIS2MLX_ATTENTION_BACKEND": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND"),
         },
         "command": command,
         "script_path": str(Path(__file__).resolve()),

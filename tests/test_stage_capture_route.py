@@ -137,6 +137,28 @@ def test_stage_capture_source_quality_profile_preserves_explicit_target_override
     assert route_identity["route"]["smoke_profile"] == "source-quality"
 
 
+def test_stage_capture_route_identity_records_attention_backend(tmp_path, monkeypatch):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_step",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert route_identity["route"]["attention_backend"] == "manual"
+    assert route_identity["env"]["TRELLIS2MLX_ATTENTION_BACKEND"] == "manual"
+
+
 def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 

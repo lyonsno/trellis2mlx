@@ -127,6 +127,30 @@ class TestScaledDotProductAttention:
             mx.eval(diff)
             assert mx.all(diff < 1e-5).item(), f"Query {ti} didn't attend to key 0"
 
+    def test_manual_backend_bypasses_fast_attention(self, monkeypatch):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        def explode(*args, **kwargs):
+            raise AssertionError("fast attention path should not be used")
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", explode)
+        q = mx.random.normal((1, 2, 4, 8)).astype(mx.bfloat16)
+        k = mx.random.normal((1, 2, 4, 8)).astype(mx.bfloat16)
+        v = mx.random.normal((1, 2, 4, 8)).astype(mx.bfloat16)
+        out = scaled_dot_product_attention(q, k, v)
+        mx.eval(out)
+        assert out.shape == q.shape
+        assert out.dtype == mx.bfloat16
+
+    def test_invalid_attention_backend_fails_loud(self, monkeypatch):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "bogus")
+        q = mx.random.normal((1, 1, 2, 4))
+        with pytest.raises(ValueError, match="TRELLIS2MLX_ATTENTION_BACKEND"):
+            scaled_dot_product_attention(q, q, q)
+
 
 class TestVarLenAttention:
     def test_single_sequence(self):
