@@ -25,6 +25,7 @@ from .sparse_structure_flow import (
     _layernorm_noaffine,
     _infer_compute_dtype,
     _cast_block_linears,
+    _source_shared_modulation,
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
@@ -127,15 +128,11 @@ class SLatFlowModel(nn.Module):
         if concat_cond is not None:
             x = mx.concatenate([x, concat_cond], axis=-1)
 
-        # Timestep → shared modulation
-        t_emb = self.t_embedder(t)
-        mod = self.adaLN_modulation(t_emb)
-
         # Project to model channels
         x = self.input_layer(x)  # [N, C]
         compute_dtype = _infer_compute_dtype(self)
+        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
         x = x.astype(compute_dtype)
-        mod = mod.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
         # Build RoPE phases from coordinates if provided
@@ -205,13 +202,10 @@ class SLatFlowModel(nn.Module):
                 f"Only B=1 supported for SLatFlowModel trace, got t B={B}, cond B={cond_B}"
             )
 
-        t_emb = self.t_embedder(t)
-        mod = self.adaLN_modulation(t_emb)
-
         x = self.input_layer(x)
         compute_dtype = _infer_compute_dtype(self)
+        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
         x = x.astype(compute_dtype)
-        mod = mod.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
         rope_phases = None

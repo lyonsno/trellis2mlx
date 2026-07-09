@@ -15,6 +15,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
+import numpy as np
 
 from ..modules.norm import LayerNorm32
 from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
@@ -36,6 +37,51 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None].astype(mx.float32) * freqs[None, :]
         emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
         return self.mlp_2(nn.silu(self.mlp_0(emb)))
+
+
+def _source_shared_modulation(
+    t: mx.array,
+    t_embedder: TimestepEmbedder,
+    adaLN_modulation: nn.Sequential,
+    dtype: mx.Dtype,
+) -> mx.array:
+    """Source-compatible shared timestep modulation.
+
+    The reference keeps this small MLP in float32 and only casts its output to
+    the transformer torso dtype. MLX's float32 matmul can round a few entries
+    differently from PyTorch; numpy's float32 path matches the reference for
+    this control-surface-sized computation.
+    """
+    t_np = np.array(t, dtype=np.float32)
+    if t_np.ndim == 0:
+        t_np = t_np.reshape(1)
+    half = t_embedder.freq_dim // 2
+    freqs = np.exp(
+        -math.log(10000) * np.arange(half, dtype=np.float32) / half
+    ).astype(np.float32)
+    args = t_np[:, None].astype(np.float32) * freqs[None, :]
+    emb = np.concatenate([np.cos(args), np.sin(args)], axis=-1).astype(np.float32)
+    t0 = _source_linear(emb, t_embedder.mlp_0)
+    t1 = _source_linear(_source_silu(t0), t_embedder.mlp_2)
+    mod = _source_linear(_source_silu(t1), adaLN_modulation.layers[1])
+    return mx.array(mod).astype(dtype)
+
+
+def _source_linear(x: np.ndarray, linear: nn.Linear) -> np.ndarray:
+    weight = _mx_to_float32_np(linear.weight)
+    bias = _mx_to_float32_np(linear.bias) if linear.bias is not None else None
+    y = x @ weight.T
+    if bias is not None:
+        y = y + bias
+    return y.astype(np.float32)
+
+
+def _mx_to_float32_np(value: mx.array) -> np.ndarray:
+    return np.array(value.astype(mx.float32), dtype=np.float32)
+
+
+def _source_silu(x: np.ndarray) -> np.ndarray:
+    return (x / (1.0 + np.exp(-x))).astype(np.float32)
 
 
 class MultiHeadAttention(nn.Module):
@@ -243,7 +289,7 @@ class ModulatedBlock(nn.Module):
         cross_kv_cache: tuple = None,  # precomputed (K, V) for cross-attention
     ) -> mx.array:
         # Add per-block learned bias
-        mod = (mod + self.modulation).astype(mod.dtype)
+        mod = (self.modulation + mod).astype(mod.dtype)
 
         # Split into 6 modulation params
         C = self.channels
@@ -287,7 +333,7 @@ class ModulatedBlock(nn.Module):
         cross_kv_cache: tuple = None,
         trace_prefix: str = "block0",
     ) -> tuple[mx.array, dict[str, mx.array]]:
-        mod = (mod + self.modulation).astype(mod.dtype)
+        mod = (self.modulation + mod).astype(mod.dtype)
 
         C = self.channels
         shift_msa = mod[0*C:1*C]
@@ -350,6 +396,12 @@ class ModulatedBlock(nn.Module):
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     """LayerNorm without learnable affine (controlled by adaLN)."""
+    if x.dtype in (mx.bfloat16, mx.float16):
+        input_dtype = x.dtype
+        xf = x.astype(mx.float32)
+        mean = mx.mean(xf, axis=-1, keepdims=True)
+        var = mx.mean((xf - mean) * (xf - mean), axis=-1, keepdims=True)
+        return ((xf - mean) * mx.rsqrt(var + eps)).astype(input_dtype)
     return mx.fast.layer_norm(x, None, None, eps)
 
 
@@ -362,6 +414,7 @@ def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:
 
 
 def _cast_block_linears(block: ModulatedBlock, dtype: mx.Dtype) -> None:
+    block.modulation = block.modulation.astype(dtype)
     linears = (
         block.self_attn.to_qkv,
         block.self_attn.to_out,
@@ -488,16 +541,14 @@ class SparseStructureFlowModel(nn.Module):
         B = x.shape[0]
         R = x.shape[2]
 
-        t_emb = self.t_embedder(t)
-        mod = self.adaLN_modulation(t_emb)
+        compute_dtype = _infer_compute_dtype(self)
+        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
 
         x = x.reshape(B, self.in_channels, -1)
         x = x.transpose(0, 2, 1)
         x = x.reshape(B * R * R * R, self.in_channels)
         x = self.input_layer(x)
-        compute_dtype = _infer_compute_dtype(self)
         x = x.astype(compute_dtype)
-        mod = mod.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
         head_dim = self.model_channels // self.num_heads
@@ -593,11 +644,9 @@ class SparseStructureFlowModel(nn.Module):
             )
 
         input_dtype = block_input.dtype
-        t_emb = self.t_embedder(t)
-        mod = self.adaLN_modulation(t_emb)
         compute_dtype = _infer_compute_dtype(self)
+        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
         x = block_input.astype(compute_dtype)
-        mod = mod.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
         head_dim = self.model_channels // self.num_heads
@@ -640,10 +689,6 @@ class SparseStructureFlowModel(nn.Module):
         B = x.shape[0]
         R = x.shape[2]
 
-        # Timestep embedding → shared modulation
-        t_emb = self.t_embedder(t)
-        mod = self.adaLN_modulation(t_emb)
-
         # Flatten 3D grid to token sequence
         x = x.reshape(B, self.in_channels, -1)
         x = x.transpose(0, 2, 1)
@@ -652,8 +697,8 @@ class SparseStructureFlowModel(nn.Module):
         # Project to model channels
         x = self.input_layer(x)
         compute_dtype = _infer_compute_dtype(self)
+        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
         x = x.astype(compute_dtype)
-        mod = mod.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
         # Compute 3D RoPE phases from actual input resolution

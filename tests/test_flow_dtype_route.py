@@ -88,7 +88,7 @@ def test_sparse_structure_flow_uses_source_mixed_dtype_boundary():
     assert model.blocks[0].self_attn.to_qkv.weight.dtype == mx.bfloat16
     assert model.blocks[0].cross_attn.to_kv.weight.dtype == mx.bfloat16
     assert model.blocks[0].mlp.mlp_0.weight.dtype == mx.bfloat16
-    assert model.blocks[0].modulation.dtype == mx.float32
+    assert model.blocks[0].modulation.dtype == mx.bfloat16
     assert model.blocks[0].self_attn.q_rms_norm.gamma.dtype == mx.float32
 
 
@@ -112,7 +112,7 @@ def test_slat_flow_uses_source_mixed_dtype_boundary():
     assert model.blocks[0].self_attn.to_qkv.weight.dtype == mx.bfloat16
     assert model.blocks[0].cross_attn.to_kv.weight.dtype == mx.bfloat16
     assert model.blocks[0].mlp.mlp_0.weight.dtype == mx.bfloat16
-    assert model.blocks[0].modulation.dtype == mx.float32
+    assert model.blocks[0].modulation.dtype == mx.bfloat16
     assert model.blocks[0].self_attn.q_rms_norm.gamma.dtype == mx.float32
 
 
@@ -159,6 +159,23 @@ def test_layernorm32_affine_preserves_input_dtype():
     mx.eval(out)
 
     assert out.dtype == mx.bfloat16
+
+
+def test_noaffine_layernorm_uses_source_explicit_bfloat16_rounding():
+    from trellmlx.models.sparse_structure_flow import _layernorm_noaffine
+
+    mx.random.seed(35)
+    x = mx.random.normal((4, 1536), dtype=mx.float32).astype(mx.bfloat16)
+
+    out = _layernorm_noaffine(x)
+    xf = x.astype(mx.float32)
+    mean = mx.mean(xf, axis=-1, keepdims=True)
+    var = mx.mean((xf - mean) * (xf - mean), axis=-1, keepdims=True)
+    expected = ((xf - mean) * mx.rsqrt(var + 1e-6)).astype(mx.bfloat16)
+    mx.eval(out, expected)
+
+    assert out.dtype == mx.bfloat16
+    assert mx.allclose(out, expected, atol=0.0, rtol=0.0).item()
 
 
 def test_feedforward_uses_source_tanh_gelu_for_bfloat16_torso():
