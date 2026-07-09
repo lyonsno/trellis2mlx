@@ -1095,12 +1095,43 @@ def main():
 
         step_capture = {} if args.stop_after_stage == "sparse_flow_step" else None
         step_captures = [] if args.stop_after_stage == "sparse_flow_steps" else None
-        z_s = flow_euler_sample(ss_flow, noise,
+        sparse_flow_start_sample = noise
+        sparse_flow_start_step_index = 0
+        if args.stop_after_stage == "sparse_flow_step" and args.sparse_flow_trace_sample:
+            trace_step_index = args.sparse_flow_trace_step_index
+            if trace_step_index < 0 or trace_step_index >= n_steps:
+                raise ValueError(
+                    f"--sparse-flow-trace-step-index must be in [0, {n_steps - 1}], "
+                    f"got {trace_step_index}"
+                )
+            step_sample_npz = np.load(args.sparse_flow_trace_sample)
+            if "sample_in" not in step_sample_npz:
+                raise ValueError(
+                    "--sparse-flow-trace-sample NPZ must contain a sample_in array"
+                )
+            step_sample_np = step_sample_npz["sample_in"]
+            if step_sample_np.ndim == 6:
+                if trace_step_index >= step_sample_np.shape[0]:
+                    raise ValueError(
+                        f"trace sample contains {step_sample_np.shape[0]} steps, "
+                        f"cannot select step {trace_step_index}"
+                    )
+                step_sample_np = step_sample_np[trace_step_index]
+            elif step_sample_np.ndim != 5:
+                raise ValueError(
+                    "sample_in must have shape [B,C,R,R,R] or [steps,B,C,R,R,R], "
+                    f"got {step_sample_np.shape}"
+                )
+            sparse_flow_start_sample = mx.array(step_sample_np).astype(mx.float32)
+            sparse_flow_start_step_index = trace_step_index
+
+        z_s = flow_euler_sample(ss_flow, sparse_flow_start_sample,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
                                 steps=n_steps, verbose=False,
                                 capture_first_step=step_capture,
                                 capture_steps=step_captures,
-                                stop_after_first_step=args.stop_after_stage == "sparse_flow_step")
+                                stop_after_first_step=args.stop_after_stage == "sparse_flow_step",
+                                start_step_index=sparse_flow_start_step_index)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
@@ -1111,6 +1142,7 @@ def main():
             args.save_checkpoints,
             "sparse_flow_step",
             noise=np.array(noise).astype(np.float32, copy=False),
+            sample_in=np.array(step_capture["sample_in"]).astype(np.float32, copy=False),
             pred_pos=np.array(step_capture["pred_pos"]).astype(np.float32, copy=False),
             pred_neg=np.array(step_capture["pred_neg"]).astype(np.float32, copy=False),
             pred_cfg=np.array(step_capture["pred_cfg"]).astype(np.float32, copy=False),

@@ -100,6 +100,7 @@ def test_flow_euler_can_capture_first_sparse_step_and_stop():
         "x0_rescaled",
         "x0_after_rescale",
         "pred_final",
+        "sample_in",
         "sample_next",
         "t",
         "t_prev",
@@ -206,3 +207,40 @@ def test_flow_euler_can_capture_every_step():
     np.testing.assert_allclose(np.array(captures[1]["sample_in"]), -0.5 * np.ones((1, 2), dtype=np.float32))
     np.testing.assert_allclose(np.array(captures[1]["sample_next"]), -1.0 * np.ones((1, 2), dtype=np.float32))
     np.testing.assert_allclose(np.array(out), -1.0 * np.ones((1, 2), dtype=np.float32))
+
+
+def test_flow_euler_can_start_from_selected_step():
+    from trellmlx.samplers import flow_euler_sample
+
+    noise = mx.full((1, 2), 10.0, dtype=mx.float32)
+    cond = mx.ones((1, 1), dtype=mx.float32)
+    neg_cond = mx.zeros((1, 1), dtype=mx.float32)
+    capture = {}
+    seen_t = []
+
+    class ConstantModel:
+        def __call__(self, sample, t, conditioning):
+            seen_t.append(float(np.array(t)[0]))
+            return mx.ones_like(sample)
+
+    out = flow_euler_sample(
+        ConstantModel(),
+        noise,
+        cond,
+        neg_cond,
+        steps=4,
+        guidance_strength=1.0,
+        guidance_rescale=0.0,
+        guidance_interval=(0.0, 1.0),
+        rescale_t=1.0,
+        verbose=False,
+        capture_first_step=capture,
+        stop_after_first_step=True,
+        start_step_index=2,
+    )
+
+    assert seen_t == [500.0]
+    np.testing.assert_allclose(np.array(capture["t"]), np.array(0.5, dtype=np.float32))
+    np.testing.assert_allclose(np.array(capture["t_prev"]), np.array(0.25, dtype=np.float32))
+    np.testing.assert_allclose(np.array(capture["sample_in"]), np.full((1, 2), 10.0, dtype=np.float32))
+    np.testing.assert_allclose(np.array(out), np.full((1, 2), 9.75, dtype=np.float32))

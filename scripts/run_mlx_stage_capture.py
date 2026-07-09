@@ -247,11 +247,12 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.extend(["--conditioning-sample", str(Path(args.conditioning_sample))])
     if args.shared_noise:
         command.extend(["--shared-noise", str(Path(args.shared_noise))])
-    if args.stop_after_stage == "sparse_flow_block_trace":
-        command.extend(["--sparse-flow-trace-block-index", str(args.sparse_flow_trace_block_index)])
+    if args.stop_after_stage in {"sparse_flow_block_trace", "sparse_flow_step"}:
         command.extend(["--sparse-flow-trace-step-index", str(args.sparse_flow_trace_step_index)])
         if args.sparse_flow_trace_sample:
             command.extend(["--sparse-flow-trace-sample", str(Path(args.sparse_flow_trace_sample))])
+    if args.stop_after_stage == "sparse_flow_block_trace":
+        command.extend(["--sparse-flow-trace-block-index", str(args.sparse_flow_trace_block_index)])
         if args.sparse_flow_trace_block_input_sample:
             command.extend([
                 "--sparse-flow-trace-block-input-sample",

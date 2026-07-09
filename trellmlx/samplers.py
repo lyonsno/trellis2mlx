@@ -26,6 +26,7 @@ def flow_euler_sample(
     capture_first_step: dict | None = None,
     capture_steps: list[dict] | None = None,
     stop_after_first_step: bool = False,
+    start_step_index: int = 0,
     **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
@@ -66,8 +67,12 @@ def flow_euler_sample(
     t_seq = np.linspace(1, 0, steps + 1)
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
     t_pairs = [(t_seq[i], t_seq[i + 1]) for i in range(steps)]
+    if start_step_index < 0 or start_step_index >= len(t_pairs):
+        raise ValueError(
+            f"start_step_index must be in [0, {len(t_pairs) - 1}], got {start_step_index}"
+        )
 
-    for step_idx, (t, t_prev) in enumerate(t_pairs):
+    for step_idx, (t, t_prev) in enumerate(t_pairs[start_step_index:], start=start_step_index):
         if verbose:
             print(f"  Step {step_idx + 1}/{steps} (t={t:.4f}→{t_prev:.4f})", end="", flush=True)
 
@@ -79,7 +84,7 @@ def flow_euler_sample(
             and guidance_interval[0] <= t <= guidance_interval[1]
         )
         capture_this_step = (
-            (capture_first_step is not None and step_idx == 0)
+            (capture_first_step is not None and step_idx == start_step_index)
             or capture_steps is not None
         )
 
@@ -157,6 +162,7 @@ def flow_euler_sample(
         sample_next = sample - (t - t_prev) * pred
         if capture_this_step:
             step_payload = {
+                "sample_in": sample,
                 "pred_pos": pred_pos,
                 "pred_neg": pred_neg,
                 "pred_cfg": pred_cfg,
@@ -174,11 +180,10 @@ def flow_euler_sample(
                 "t": mx.array(t, dtype=mx.float32),
                 "t_prev": mx.array(t_prev, dtype=mx.float32),
             }
-            if capture_first_step is not None and step_idx == 0:
+            if capture_first_step is not None and step_idx == start_step_index:
                 capture_first_step.update(step_payload)
                 mx.eval(*[value for value in capture_first_step.values() if value is not None])
             if capture_steps is not None:
-                step_payload = {"sample_in": sample, **step_payload}
                 capture_steps.append(step_payload)
                 mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
