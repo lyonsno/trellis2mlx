@@ -1,0 +1,526 @@
+"""Kaggle CUDA witness packet helpers.
+
+The packet uses a private Kaggle dataset for immutable witness inputs and a
+private Kaggle script kernel for the CUDA run. Keeping the two surfaces separate
+lets agents update data and execution independently while preserving route
+identity in metadata and receipts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable, Sequence
+
+
+class WitnessPacketError(ValueError):
+    """Raised when a witness packet would be incomplete or misleading."""
+
+
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class KaggleCudaWitnessPacket:
+    capsule_dir: Path
+    output_dir: Path
+    dataset_id: str
+    kernel_id: str
+    title: str
+    entrypoint: str
+    inputs: tuple[str, ...]
+    accelerator: str = "NvidiaTeslaT4"
+    output_json: str = "cuda_result.json"
+    output_npz: str = "cuda_result.npz"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
+        object.__setattr__(self, "output_dir", Path(self.output_dir))
+        object.__setattr__(self, "inputs", tuple(self.inputs))
+
+    @property
+    def dataset_dir(self) -> Path:
+        return self.output_dir / "dataset"
+
+    @property
+    def kernel_dir(self) -> Path:
+        return self.output_dir / "kernel"
+
+    @property
+    def dataset_slug(self) -> str:
+        return _slug_from_ref(self.dataset_id)
+
+    @property
+    def outputs(self) -> tuple[str, str]:
+        return (self.output_json, self.output_npz)
+
+
+def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
+    """Create a Kaggle dataset/kernel packet for a CUDA witness capsule."""
+
+    _validate_refs(packet)
+    file_sources = _validate_inputs(packet)
+    if packet.output_dir.exists():
+        shutil.rmtree(packet.output_dir)
+    packet.dataset_dir.mkdir(parents=True)
+    packet.kernel_dir.mkdir(parents=True)
+
+    file_records: dict[str, dict[str, str | int]] = {}
+    for relative_name, source in file_sources.items():
+        destination = packet.dataset_dir / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        file_records[relative_name] = {
+            "sha256": sha256_file(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+
+    manifest = {
+        "schema": "trellis2mlx.kaggle_cuda_witness.inputs.v1",
+        "dataset_id": packet.dataset_id,
+        "kernel_id": packet.kernel_id,
+        "title": packet.title,
+        "entrypoint": packet.entrypoint,
+        "accelerator": packet.accelerator,
+        "outputs": list(packet.outputs),
+        "files": file_records,
+    }
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    file_records["witness-manifest.json"] = {
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+
+    _write_json(packet.dataset_dir / "dataset-metadata.json", _dataset_metadata(packet, file_records))
+    _write_json(packet.kernel_dir / "kernel-metadata.json", _kernel_metadata(packet))
+    (packet.kernel_dir / "run_kaggle_cuda_witness.py").write_text(_runner_script(packet))
+    return packet
+
+
+def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "dataset" / "witness-manifest.json"
+    kernel_metadata_path = output_dir / "kernel" / "kernel-metadata.json"
+    if not manifest_path.is_file():
+        raise WitnessPacketError(f"missing prepared manifest: {manifest_path}")
+    if not kernel_metadata_path.is_file():
+        raise WitnessPacketError(f"missing kernel metadata: {kernel_metadata_path}")
+    manifest = json.loads(manifest_path.read_text())
+    kernel_metadata = json.loads(kernel_metadata_path.read_text())
+    inputs = tuple(path for path in manifest["files"] if path != "witness-manifest.json")
+    outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
+    if len(outputs) != 2:
+        raise WitnessPacketError(f"expected exactly two outputs in manifest, got {outputs}")
+    return KaggleCudaWitnessPacket(
+        capsule_dir=output_dir / "dataset",
+        output_dir=output_dir,
+        dataset_id=manifest["dataset_id"],
+        kernel_id=kernel_metadata["id"],
+        title=kernel_metadata["title"],
+        entrypoint=manifest["entrypoint"],
+        inputs=inputs,
+        accelerator=kernel_metadata.get("machine_shape", manifest.get("accelerator", "NvidiaTeslaT4")),
+        output_json=outputs[0],
+        output_npz=outputs[1],
+    )
+
+
+def build_dataset_command(packet: KaggleCudaWitnessPacket, *, version: bool = False) -> list[str]:
+    if version:
+        return [
+            "kaggle",
+            "datasets",
+            "version",
+            "-p",
+            str(packet.dataset_dir),
+            "-m",
+            "update CUDA witness inputs",
+            "-q",
+            "-t",
+            "-r",
+            "skip",
+        ]
+    return [
+        "kaggle",
+        "datasets",
+        "create",
+        "-p",
+        str(packet.dataset_dir),
+        "-q",
+        "-t",
+        "-r",
+        "skip",
+    ]
+
+
+def build_kernel_push_command(packet: KaggleCudaWitnessPacket, *, timeout_seconds: int | None = None) -> list[str]:
+    cmd = [
+        "kaggle",
+        "kernels",
+        "push",
+        "-p",
+        str(packet.kernel_dir),
+        "--accelerator",
+        packet.accelerator,
+    ]
+    if timeout_seconds is not None:
+        cmd += ["--timeout", str(timeout_seconds)]
+    return cmd
+
+
+def build_kernel_status_command(packet: KaggleCudaWitnessPacket) -> list[str]:
+    return ["kaggle", "kernels", "status", packet.kernel_id]
+
+
+def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Path) -> list[str]:
+    return [
+        "kaggle",
+        "kernels",
+        "output",
+        packet.kernel_id,
+        "-p",
+        str(output_dir),
+        "-o",
+        "--file-pattern",
+        ".*(cuda_result|kaggle_cuda_witness_receipt).*",
+    ]
+
+
+def run_command(
+    cmd: Sequence[str],
+    *,
+    phase: str,
+    report_path: Path,
+    runner: Runner = subprocess.run,
+) -> dict[str, object]:
+    try:
+        completed = runner(list(cmd), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        report = {
+            "schema": "trellis2mlx.kaggle_cuda_witness.command_report.v1",
+            "phase": phase,
+            "command": list(cmd),
+            "status": "failed",
+            "failure_phase": f"{phase}_launch",
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+        }
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        return report
+    report = {
+        "schema": "trellis2mlx.kaggle_cuda_witness.command_report.v1",
+        "phase": phase,
+        "command": list(cmd),
+        "status": "done" if completed.returncode == 0 else "failed",
+        "failure_phase": None if completed.returncode == 0 else phase,
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(report_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Prepare and drive Kaggle CUDA witness packets.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare = subparsers.add_parser("prepare")
+    prepare.add_argument("--capsule-dir", type=Path, required=True)
+    prepare.add_argument("--output-dir", type=Path, required=True)
+    prepare.add_argument("--dataset-id", required=True)
+    prepare.add_argument("--kernel-id", required=True)
+    prepare.add_argument("--title", required=True)
+    prepare.add_argument("--entrypoint", required=True)
+    prepare.add_argument("--input", action="append", dest="inputs", required=True)
+    prepare.add_argument("--accelerator", default="NvidiaTeslaT4")
+    prepare.add_argument("--output-json", default="cuda_result.json")
+    prepare.add_argument("--output-npz", default="cuda_result.npz")
+
+    for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
+        drive = subparsers.add_parser(name)
+        drive.add_argument("--packet-dir", type=Path, required=True)
+        drive.add_argument("--report-dir", type=Path)
+        if name == "kernel-push":
+            drive.add_argument("--timeout-seconds", type=int)
+        if name == "kernel-output":
+            drive.add_argument("--output-dir", type=Path)
+
+    args = parser.parse_args(argv)
+    if args.command == "prepare":
+        packet = prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=args.capsule_dir,
+                output_dir=args.output_dir,
+                dataset_id=args.dataset_id,
+                kernel_id=args.kernel_id,
+                title=args.title,
+                entrypoint=args.entrypoint,
+                inputs=tuple(args.inputs),
+                accelerator=args.accelerator,
+                output_json=args.output_json,
+                output_npz=args.output_npz,
+            )
+        )
+        print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
+        return 0
+    if args.command == "print-commands":
+        packet = load_prepared_packet(args.packet_dir)
+        print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
+        return 0
+    if args.command == "dataset-create":
+        packet = load_prepared_packet(args.packet_dir)
+        return _run_cli_command(build_dataset_command(packet), "dataset_create", args)
+    if args.command == "dataset-version":
+        packet = load_prepared_packet(args.packet_dir)
+        return _run_cli_command(build_dataset_command(packet, version=True), "dataset_version", args)
+    if args.command == "kernel-push":
+        packet = load_prepared_packet(args.packet_dir)
+        return _run_cli_command(
+            build_kernel_push_command(packet, timeout_seconds=args.timeout_seconds),
+            "kernel_push",
+            args,
+        )
+    if args.command == "kernel-status":
+        packet = load_prepared_packet(args.packet_dir)
+        return _run_cli_command(build_kernel_status_command(packet), "kernel_status", args)
+    if args.command == "kernel-output":
+        packet = load_prepared_packet(args.packet_dir)
+        output_dir = args.output_dir or packet.output_dir / "outputs"
+        return _run_cli_command(build_kernel_output_command(packet, output_dir), "kernel_output", args)
+    raise AssertionError(f"unhandled command {args.command}")
+
+
+def _run_cli_command(cmd: Sequence[str], phase: str, args: argparse.Namespace) -> int:
+    report_dir = args.report_dir or Path(args.packet_dir) / "reports"
+    report = run_command(cmd, phase=phase, report_path=report_dir / f"{phase}.json")
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["status"] == "done" else int(report["exit_code"] or 1)
+
+
+def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
+    return {
+        "schema": "trellis2mlx.kaggle_cuda_witness.prepared.v1",
+        "dataset_id": packet.dataset_id,
+        "kernel_id": packet.kernel_id,
+        "accelerator": packet.accelerator,
+        "dataset_dir": str(packet.dataset_dir),
+        "kernel_dir": str(packet.kernel_dir),
+        "commands": {
+            "dataset_create": build_dataset_command(packet),
+            "dataset_version": build_dataset_command(packet, version=True),
+            "kernel_push": build_kernel_push_command(packet),
+            "kernel_status": build_kernel_status_command(packet),
+            "kernel_output": build_kernel_output_command(packet, packet.output_dir / "outputs"),
+        },
+    }
+
+
+def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
+    for field, value in (("dataset_id", packet.dataset_id), ("kernel_id", packet.kernel_id)):
+        if len(value.split("/")) != 2 or not all(value.split("/")):
+            raise WitnessPacketError(f"{field} must be a Kaggle ref like owner/slug")
+    if packet.accelerator not in {"NvidiaTeslaT4", "NvidiaTeslaT4Highmem", "NvidiaTeslaP100"}:
+        raise WitnessPacketError(f"unsupported accelerator for this witness bridge: {packet.accelerator}")
+    if packet.entrypoint not in packet.inputs:
+        raise WitnessPacketError("entrypoint must be one of the staged inputs")
+
+
+def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
+    if not packet.capsule_dir.is_dir():
+        raise WitnessPacketError(f"capsule_dir does not exist: {packet.capsule_dir}")
+    if not packet.inputs:
+        raise WitnessPacketError("at least one input is required")
+
+    sources: dict[str, Path] = {}
+    for relative_name in packet.inputs:
+        relative_path = Path(relative_name)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise WitnessPacketError(f"input must be relative inside capsule_dir: {relative_name}")
+        source = packet.capsule_dir / relative_path
+        if not source.is_file():
+            raise WitnessPacketError(f"missing input: {relative_name}")
+        sources[relative_name] = source
+    return sources
+
+
+def _dataset_metadata(
+    packet: KaggleCudaWitnessPacket,
+    file_records: dict[str, dict[str, str | int]],
+) -> dict[str, object]:
+    return {
+        "title": packet.title[:50],
+        "id": packet.dataset_id,
+        "licenses": [{"name": "unknown"}],
+        "resources": [
+            {"path": path, "description": f"CUDA witness input, sha256={record['sha256']}"}
+            for path, record in sorted(file_records.items())
+        ],
+    }
+
+
+def _kernel_metadata(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
+    return {
+        "id": packet.kernel_id,
+        "title": packet.title,
+        "code_file": "run_kaggle_cuda_witness.py",
+        "language": "python",
+        "kernel_type": "script",
+        "is_private": "true",
+        "enable_gpu": "true",
+        "enable_internet": "false",
+        "machine_shape": packet.accelerator,
+        "dataset_sources": [packet.dataset_id],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+    }
+
+
+def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
+    config = {
+        "schema": "trellis2mlx.kaggle_cuda_witness.runner_config.v1",
+        "dataset_id": packet.dataset_id,
+        "dataset_slug": packet.dataset_slug,
+        "kernel_id": packet.kernel_id,
+        "accelerator": packet.accelerator,
+        "entrypoint": packet.entrypoint,
+        "outputs": list(packet.outputs),
+    }
+    return f"""#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG = {json.dumps(config, sort_keys=True)}
+RECEIPT = Path("kaggle_cuda_witness_receipt.json")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_receipt(status: str, *, phase: str, message: str | None, extra: dict | None = None) -> None:
+    cuda_available = None
+    cuda_device = None
+    torch_version = None
+    try:
+        import torch
+
+        torch_version = torch.__version__
+        cuda_available = bool(torch.cuda.is_available())
+        if cuda_available:
+            cuda_device = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        torch_version = f"unavailable: {{type(exc).__name__}}: {{exc}}"
+    payload = {{
+        "schema": "trellis2mlx.kaggle_cuda_witness.receipt.v1",
+        "status": status,
+        "failure_phase": None if status == "done" else phase,
+        "message": message,
+        "requested_dataset_id": CONFIG["dataset_id"],
+        "requested_kernel_id": CONFIG["kernel_id"],
+        "requested_accelerator": CONFIG["accelerator"],
+        "cuda_available": cuda_available,
+        "cuda_device": cuda_device,
+        "torch": torch_version,
+        "timestamp": time.time(),
+    }}
+    if extra:
+        payload.update(extra)
+    RECEIPT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")
+
+
+def main() -> int:
+    dataset_dir = Path("/kaggle/input") / CONFIG["dataset_slug"]
+    manifest_path = dataset_dir / "witness-manifest.json"
+    if not manifest_path.exists():
+        write_receipt("failed", phase="input_mount", message=f"missing {{manifest_path}}")
+        return 2
+    manifest = json.loads(manifest_path.read_text())
+    copied = {{}}
+    for relative_name, record in manifest["files"].items():
+        if relative_name == "witness-manifest.json":
+            continue
+        source = dataset_dir / relative_name
+        if not source.exists():
+            write_receipt("failed", phase="input_mount", message=f"missing input {{source}}", extra={{"manifest": manifest}})
+            return 3
+        actual_sha = sha256_file(source)
+        if actual_sha != record["sha256"]:
+            write_receipt(
+                "failed",
+                phase="input_digest",
+                message=f"sha256 mismatch for {{relative_name}}",
+                extra={{"expected_sha256": record["sha256"], "actual_sha256": actual_sha, "manifest": manifest}},
+            )
+            return 4
+        destination = Path(relative_name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
+
+    command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["outputs"][0], "--output-npz", CONFIG["outputs"][1]]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    extra = {{
+        "effective_dataset_dir": str(dataset_dir),
+        "effective_command": command,
+        "inputs": copied,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "exit_code": completed.returncode,
+        "outputs": {{name: Path(name).exists() for name in CONFIG["outputs"]}},
+    }}
+    if completed.returncode != 0:
+        write_receipt("failed", phase="execution", message="probe exited non-zero", extra=extra)
+        return completed.returncode
+    missing = [name for name in CONFIG["outputs"] if not Path(name).exists()]
+    if missing:
+        write_receipt("failed", phase="output", message=f"missing outputs: {{missing}}", extra=extra)
+        return 5
+    write_receipt("done", phase="done", message=None, extra=extra)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+def _slug_from_ref(kaggle_ref: str) -> str:
+    return kaggle_ref.split("/", 1)[1]
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
