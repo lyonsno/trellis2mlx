@@ -75,6 +75,20 @@ def test_trace_payload_extracts_selected_branch_block(tmp_path):
     assert payload["t"] == 1000.0
 
 
+def test_source_compare_names_include_cross_attention_subtrace():
+    from scripts.source_shape_block_replay import SOURCE_COMPARE_NAMES
+
+    assert "cross_q_pre_norm" in SOURCE_COMPARE_NAMES
+    assert "cross_q_post_norm" in SOURCE_COMPARE_NAMES
+    assert "cross_attention_raw" in SOURCE_COMPARE_NAMES
+    assert SOURCE_COMPARE_NAMES.index("cross_q_pre_norm") < SOURCE_COMPARE_NAMES.index(
+        "cross_attention_raw"
+    )
+    assert SOURCE_COMPARE_NAMES.index("cross_attention_raw") < SOURCE_COMPARE_NAMES.index(
+        "cross_attn"
+    )
+
+
 def test_cli_writes_failure_report_when_trace_missing(tmp_path):
     output = tmp_path / "report.json"
 

@@ -22,6 +22,25 @@ import numpy as np
 
 SCHEMA = "trellis2mlx.source_shape_block_replay.v1"
 REQUESTED_ROUTE = "source-shape-block-replay"
+SOURCE_COMPARE_NAMES = [
+    "norm1",
+    "modulated_self_input",
+    "self_attn",
+    "after_self",
+    "norm2",
+    "cross_q_pre_norm",
+    "cross_q_post_norm",
+    "cross_attention_raw",
+    "cross_attn",
+    "after_cross",
+    "mlp_input",
+    "mlp_fc1",
+    "mlp_gelu",
+    "mlp_fc2",
+    "mlp",
+    "mlp_gated",
+    "after_mlp",
+]
 
 
 def _sha256(path: Path) -> str | None:
@@ -145,22 +164,7 @@ def load_trace_payload(trace_path: Path, *, branch: str, block_index: int) -> di
                 name: _squeeze_leading_ones(_require_key(trace, f"{prefix}_{name}")).astype(
                     np.float32
                 )
-                for name in (
-                    "norm1",
-                    "modulated_self_input",
-                    "self_attn",
-                    "after_self",
-                    "norm2",
-                    "cross_attn",
-                    "after_cross",
-                    "mlp_input",
-                    "mlp_fc1",
-                    "mlp_gelu",
-                    "mlp_fc2",
-                    "mlp",
-                    "mlp_gated",
-                    "after_mlp",
-                )
+                for name in SOURCE_COMPARE_NAMES
                 if f"{prefix}_{name}" in trace
             },
             "captured_final": {
@@ -257,12 +261,15 @@ def _source_block_replay(torch: Any, model: Any, payload: dict[str, Any], *, blo
     attn = block.cross_attn
     q = attn._linear(attn.to_q, h)
     q = attn._reshape_chs(q, (attn.num_heads, -1))
+    source["cross_q_pre_norm"] = q.feats.float().cpu().numpy()
     if attn.qk_rms_norm:
         q = attn.q_rms_norm(q)
+    source["cross_q_post_norm"] = q.feats.float().cpu().numpy()
     k = torch.from_numpy(payload["cross_k"]).to(dtype=compute_dtype).unsqueeze(0)
     v = torch.from_numpy(payload["cross_v"]).to(dtype=compute_dtype).unsqueeze(0)
     h = sparse_scaled_dot_product_attention(q, k, v)
     h = attn._reshape_chs(h, (-1,))
+    source["cross_attention_raw"] = h.feats.float().cpu().numpy()
     h = attn._linear(attn.to_out, h)
     source["cross_attn"] = h.feats.float().cpu().numpy()
     x = x + h
@@ -357,7 +364,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     phase = "compare"
     metrics = {
         name: _diff_metrics(payload["captured"][name], source[name])
-        for name in sorted(payload["captured"].keys() & source.keys())
+        for name in SOURCE_COMPARE_NAMES
+        if name in payload["captured"] and name in source
     }
     final_metrics = {
         name: _diff_metrics(payload["captured_final"][name], source[name])
