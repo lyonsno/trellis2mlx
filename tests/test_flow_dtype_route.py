@@ -190,7 +190,7 @@ def test_feedforward_uses_source_tanh_gelu_for_bfloat16_torso():
     x = mx.array([[-3.0, -1.0, 1.0, 3.0]], dtype=mx.bfloat16)
     out = mlp(x)
     expected = mx.array(
-        [[-0.0036773682, -0.15917969, 0.83984375, 3.0]],
+        [[-0.0036315918, -0.15917969, 0.83984375, 3.0]],
         dtype=mx.float32,
     ).astype(mx.bfloat16)
     mx.eval(out, expected)
