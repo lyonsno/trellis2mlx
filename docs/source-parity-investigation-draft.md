@@ -99,16 +99,63 @@ This means the remaining block2 residual is not explained by a different input,
 different modulation vector, or ordinary CPU-vs-MLX BF16 math. The live split is
 PyTorch MPS BF16 LayerNorm versus PyTorch CPU BF16 / MLX BF16.
 
+## PyTorch Source Inspection
+
+Trellis-Mac's installed Torch build reports:
+
+- Version: `2.12.1`
+- Git commit: `7269437d655783a26cba32aa88195b741ff496aa`
+
+The exact PyTorch source at that commit strongly supports treating the block2
+LayerNorm split as an MPS route artifact unless runtime CUDA contradicts it.
+
+CUDA forward LayerNorm:
+
+- File: `aten/src/ATen/native/cuda/layer_norm_kernel.cu`
+- BF16 dispatch uses `acc_type<scalar_t, true>`.
+- The vectorized path checks `N % vec_size == 0`, with `vec_size = 4`; this
+  witness has normalized width `1536`, so the width predicate is satisfied.
+- The vectorized path computes row stats with `cuWelfordOnlineSum`, Welford
+  partial combination, `sigma2 / float(N)`, then `rsqrt(sigma2 + eps)`.
+- The output is computed in the accumulator type and stored back to BF16.
+- The non-vectorized fallback also runs a rowwise moments kernel before the
+  forward kernel.
+
+CPU BF16 LayerNorm:
+
+- Files: `aten/src/ATen/native/cpu/moments_utils.h` and
+  `aten/src/ATen/native/cpu/layer_norm_kernel.cpp`
+- Reduced-float CPU LayerNorm calls `RowwiseMoments`.
+- `RowwiseMomentsImpl` is explicitly Welford plus cascade summation.
+- BF16 vectors are converted to float for the math and converted back on store.
+
+MPS BF16 LayerNorm:
+
+- Files: `aten/src/ATen/native/mps/operations/Normalization.mm` and
+  `aten/src/ATen/native/mps/kernels/LayerNorm.metal`
+- The MPS operation dispatches custom Metal kernels, selecting the single-row
+  kernel when `axis_size <= 1024 * 4` and the looped kernel otherwise.
+- Both Metal kernels compute variance as `sum_sq / axis_size - mean * mean`.
+- Both clamp `var < 1e-6` to zero before `metal::precise::rsqrt`.
+
+This source split matches the local witness census: CPU and MLX agree, while
+MPS is the odd route. The correct posture is therefore not to port MPS behavior
+into trellis2mlx for source parity. The CUDA capsule is still valuable as a
+runtime receipt, but the implementation direction is now constrained by exact
+source: keep the MLX/CPU/Welford behavior unless CUDA runtime evidence
+contradicts the source read.
+
 ## CUDA Budget Question
 
-The remaining source-authority question is tiny:
+The remaining runtime-confirmation question is tiny:
 
 Run the compact witness through PyTorch CUDA BF16 `F.layer_norm`, apply the same
 shift/scale modulation, and compare against the two known outputs.
 
 Expected interpretations:
 
-- CUDA matches MPS: implement/source-match the MPS-style rounding behavior.
+- CUDA matches MPS: re-open the source read; this would be surprising and would
+  require finding the missing route difference before changing trellis2mlx.
 - CUDA matches CPU/MLX: stop chasing MPS parity at this op and record
   Trellis-Mac as route-specific here.
 - CUDA is third behavior: target CUDA and record all three route behaviors.
