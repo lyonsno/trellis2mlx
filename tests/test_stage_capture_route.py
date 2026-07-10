@@ -88,6 +88,41 @@ def test_stage_capture_wrapper_builds_generate_stop_route(tmp_path):
     assert "--no-rembg" in command
 
 
+def test_stage_capture_wrapper_records_sparse_only_shared_noise(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_slat",
+            "--no-cascade",
+            "--shared-noise",
+            "noise.npz",
+            "--shared-noise-sparse-only",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--shared-noise" in command
+    assert command[command.index("--shared-noise") + 1] == "noise.npz"
+    assert "--shared-noise-sparse-only" in command
+    assert route_identity["route"]["shared_noise_sparse_only"] is True
+
+
+def test_generate_exposes_sparse_only_shared_noise_contract():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--shared-noise-sparse-only" in source
+    assert "--shared-noise-sparse-only requires --shared-noise" in source
+    assert "Ignoring shared slat_noise_pool" in source
+
+
 def test_stage_capture_source_quality_profile_sets_measured_500k_budget(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 

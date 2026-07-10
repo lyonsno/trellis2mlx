@@ -572,6 +572,9 @@ def main():
     )
     parser.add_argument("--shared-noise", metavar="NPZ",
                         help="Diagnostic: load sparse-structure noise from an NPZ containing ss_noise.")
+    parser.add_argument("--shared-noise-sparse-only", action="store_true",
+                        help="Diagnostic: with --shared-noise, use ss_noise for sparse structure but ignore "
+                             "slat_noise_pool so shape SLat keeps the route's normal random noise.")
     parser.add_argument("--conditioning-sample", metavar="NPZ",
                         help="Diagnostic: load image conditioning from an NPZ containing cond and neg_cond.")
     parser.add_argument("--shape-slat-sample", metavar="NPZ",
@@ -635,6 +638,8 @@ def main():
         parser.error("--shape-slat-support-sample requires --no-cascade")
     if args.shape_slat_sample and args.shape_slat_support_sample:
         parser.error("--shape-slat-sample and --shape-slat-support-sample are mutually exclusive")
+    if args.shared_noise_sparse_only and not args.shared_noise:
+        parser.error("--shared-noise-sparse-only requires --shared-noise")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1389,7 +1394,10 @@ def main():
         lr_slat_flow.compile()
 
     N_lr = len(lr_coords)
-    if shared_noise is not None and "slat_noise_pool" in shared_noise:
+    if shared_noise is not None and args.shared_noise_sparse_only:
+        print("  Ignoring shared slat_noise_pool; using route-local random shape SLat noise", flush=True)
+        lr_noise = mx.random.normal((N_lr, 32))
+    elif shared_noise is not None and "slat_noise_pool" in shared_noise:
         shared_shape_noise = shared_noise["slat_noise_pool"]
         if shared_shape_noise.shape[0] == 1 and N_lr != 1:
             shared_shape_noise = np.broadcast_to(shared_shape_noise, (N_lr, shared_shape_noise.shape[1]))
