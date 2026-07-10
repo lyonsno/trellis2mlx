@@ -528,6 +528,44 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_sample_for_step_captur
     assert route_identity["route"]["sparse_flow_trace_sample_path"] == str(sample_path)
 
 
+def test_stage_capture_wrapper_forwards_sparse_flow_start_sample_for_continuation(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    sample_path = tmp_path / "reference_sparse_flow_steps.npz"
+    sample_path.write_bytes(b"sample")
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--sparse-flow-start-step-index",
+            "5",
+            "--sparse-flow-start-sample",
+            str(sample_path),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-start-sample" in command
+    assert command[command.index("--sparse-flow-start-sample") + 1] == str(sample_path)
+    assert command[command.index("--sparse-flow-start-step-index") + 1] == "5"
+    assert route_identity["route"]["sparse_flow_start_sample_path"] == str(sample_path)
+    assert route_identity["route"]["sparse_flow_start_sample_sha256"] is not None
+    assert route_identity["route"]["sparse_flow_start_step_index"] == 5
+
+
 def test_generate_sparse_flow_step_can_load_trace_sample():
     source = GENERATE_SOURCE.read_text()
 
@@ -535,6 +573,17 @@ def test_generate_sparse_flow_step_can_load_trace_sample():
     assert "step_sample_npz = np.load(args.sparse_flow_trace_sample)" in source
     assert "start_step_index=sparse_flow_start_step_index" in source
     assert 'sample_in=np.array(step_capture["sample_in"])' in source
+
+
+def test_generate_sparse_flow_can_continue_from_start_sample():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--sparse-flow-start-sample" in source
+    assert "--sparse-flow-start-step-index" in source
+    assert "start_sample_npz = np.load(args.sparse_flow_start_sample)" in source
+    assert "sparse_flow_start_step_index = args.sparse_flow_start_step_index" in source
+    assert "start_step_index=sparse_flow_start_step_index" in source
+    assert "sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path)" in source
 
 
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_block_input_sample(tmp_path):

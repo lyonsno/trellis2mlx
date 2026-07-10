@@ -592,6 +592,12 @@ def main():
     parser.add_argument("--sparse-flow-trace-sample", metavar="NPZ",
                         help="Diagnostic: load sparse-flow trace sample from an NPZ containing sample_in. "
                              "If sample_in is stacked by step, --sparse-flow-trace-step-index selects the row.")
+    parser.add_argument("--sparse-flow-start-sample", metavar="NPZ",
+                        help="Diagnostic: continue sparse-flow sampling from an NPZ containing sample_in. "
+                             "If sample_in is stacked by step, --sparse-flow-start-step-index selects the row.")
+    parser.add_argument("--sparse-flow-start-step-index", type=int, default=0,
+                        help="Diagnostic: sampler step index corresponding to --sparse-flow-start-sample "
+                             "(default: 0).")
     parser.add_argument("--sparse-flow-trace-block-input-sample", metavar="NPZ",
                         help="Diagnostic: replay projected block inputs from a block trace NPZ containing "
                              "pos_blockN_input and neg_blockN_input arrays.")
@@ -640,6 +646,13 @@ def main():
         parser.error("--shape-slat-sample and --shape-slat-support-sample are mutually exclusive")
     if args.shared_noise_sparse_only and not args.shared_noise:
         parser.error("--shared-noise-sparse-only requires --shared-noise")
+    if args.sparse_flow_start_sample and args.sparse_flow_trace_sample:
+        parser.error("--sparse-flow-start-sample and --sparse-flow-trace-sample are mutually exclusive")
+    if args.sparse_flow_start_sample and args.stop_after_stage == "sparse_flow_block_trace":
+        parser.error(
+            "--sparse-flow-start-sample does not apply to sparse_flow_block_trace; "
+            "use --sparse-flow-trace-sample"
+        )
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1194,7 +1207,40 @@ def main():
         step_captures = [] if args.stop_after_stage == "sparse_flow_steps" else None
         sparse_flow_start_sample = noise
         sparse_flow_start_step_index = 0
-        if args.stop_after_stage == "sparse_flow_step" and args.sparse_flow_trace_sample:
+        sparse_flow_start_sample_path = ""
+        if args.sparse_flow_start_sample:
+            sparse_flow_start_step_index = args.sparse_flow_start_step_index
+            if sparse_flow_start_step_index < 0 or sparse_flow_start_step_index >= n_steps:
+                raise ValueError(
+                    f"--sparse-flow-start-step-index must be in [0, {n_steps - 1}], "
+                    f"got {sparse_flow_start_step_index}"
+                )
+            start_sample_npz = np.load(args.sparse_flow_start_sample)
+            if "sample_in" not in start_sample_npz:
+                raise ValueError(
+                    "--sparse-flow-start-sample NPZ must contain a sample_in array"
+                )
+            start_sample_np = start_sample_npz["sample_in"]
+            if start_sample_np.ndim == 6:
+                if sparse_flow_start_step_index >= start_sample_np.shape[0]:
+                    raise ValueError(
+                        f"start sample contains {start_sample_np.shape[0]} steps, "
+                        f"cannot select step {sparse_flow_start_step_index}"
+                    )
+                start_sample_np = start_sample_np[sparse_flow_start_step_index]
+            elif start_sample_np.ndim != 5:
+                raise ValueError(
+                    "sample_in must have shape [B,C,R,R,R] or [steps,B,C,R,R,R], "
+                    f"got {start_sample_np.shape}"
+                )
+            sparse_flow_start_sample = mx.array(start_sample_np).astype(mx.float32)
+            sparse_flow_start_sample_path = args.sparse_flow_start_sample
+            print(
+                "  Continuing sparse flow from "
+                f"{args.sparse_flow_start_sample} step {sparse_flow_start_step_index}",
+                flush=True,
+            )
+        elif args.stop_after_stage == "sparse_flow_step" and args.sparse_flow_trace_sample:
             trace_step_index = args.sparse_flow_trace_step_index
             if trace_step_index < 0 or trace_step_index >= n_steps:
                 raise ValueError(
@@ -1262,6 +1308,8 @@ def main():
             guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
             rescale_t=np.array(5.0, dtype=np.float32),
             sigma_min=np.array(1e-5, dtype=np.float32),
+            sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
+            sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
         return
@@ -1302,6 +1350,8 @@ def main():
             guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
             rescale_t=np.array(5.0, dtype=np.float32),
             sigma_min=np.array(1e-5, dtype=np.float32),
+            sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
+            sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
         )
         print("  Stop after stage: sparse_flow_steps", flush=True)
         return
