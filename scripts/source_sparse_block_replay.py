@@ -50,6 +50,13 @@ SOURCE_COMPARE_NAMES = [
     "mlp_gated",
     "after_mlp",
 ]
+ATTENTION_WITNESS_NAMES = (
+    "q_post_rope",
+    "k_post_rope",
+    "v",
+    "attention_raw",
+    "self_attn",
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -220,6 +227,40 @@ def _diff_metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any
         "max_abs": float(abs_delta.max(initial=0.0)),
         "nonzero": int(np.count_nonzero(abs_delta)),
     }
+
+
+def _require_array(mapping: dict[str, np.ndarray], name: str, *, label: str) -> np.ndarray:
+    if name not in mapping:
+        raise KeyError(f"{label} missing required attention witness array {name!r}")
+    return np.asarray(mapping[name], dtype=np.float32)
+
+
+def build_attention_witness_arrays(
+    *,
+    source: dict[str, np.ndarray],
+    captured: dict[str, np.ndarray],
+    to_out_weight: np.ndarray,
+    to_out_bias: np.ndarray | None,
+    route_identity: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {
+        "route_identity_json": np.asarray(json.dumps(route_identity, sort_keys=True)),
+        "source_to_out_weight": np.asarray(to_out_weight, dtype=np.float32),
+    }
+    if to_out_bias is not None:
+        arrays["source_to_out_bias"] = np.asarray(to_out_bias, dtype=np.float32)
+    for name in ATTENTION_WITNESS_NAMES:
+        arrays[f"source_{name}"] = _require_array(source, name, label="source")
+        arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
+    return arrays
+
+
+def _linear_weight_bias(linear: Any) -> tuple[np.ndarray, np.ndarray | None]:
+    weight = linear.weight.detach().float().cpu().numpy()
+    bias = None
+    if getattr(linear, "bias", None) is not None:
+        bias = linear.bias.detach().float().cpu().numpy()
+    return weight, bias
 
 
 def _load_source_model(source_root: Path, checkpoint: Path):
@@ -476,6 +517,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         name: _diff_metrics(payload["captured_final"][name], source[name])
         for name in sorted(payload["captured_final"].keys() & source.keys())
     }
+    attention_witness_status = None
+    if args.attention_witness_output is not None:
+        phase = "write_attention_witness"
+        to_out_weight, to_out_bias = _linear_weight_bias(model.blocks[args.block_index].self_attn.to_out)
+        arrays = build_attention_witness_arrays(
+            source=source,
+            captured=payload["captured"],
+            to_out_weight=to_out_weight,
+            to_out_bias=to_out_bias,
+            route_identity=route_identity,
+        )
+        args.attention_witness_output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.attention_witness_output, **arrays)
+        attention_witness_status = {
+            "path": _jsonable_path(args.attention_witness_output),
+            "sha256": _sha256(args.attention_witness_output),
+            "arrays": {key: list(value.shape) for key, value in arrays.items()},
+        }
     return {
         "schema": SCHEMA,
         "status": "ok",
@@ -486,6 +545,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "elapsed_seconds": time.perf_counter() - started,
         "metrics": metrics,
         "final_metrics": final_metrics,
+        "attention_witness": attention_witness_status,
     }
 
 
@@ -495,6 +555,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--attention-witness-output", type=Path)
     parser.add_argument("--branch", choices=("pos", "neg"), required=True)
     parser.add_argument("--block-index", required=True, type=int)
     return parser.parse_args(argv)

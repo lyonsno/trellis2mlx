@@ -92,6 +92,54 @@ def test_source_compare_names_cover_sparse_boundary_ops():
         assert name in SOURCE_COMPARE_NAMES
 
 
+def test_attention_witness_arrays_include_source_captured_and_projection_weights():
+    from scripts.source_sparse_block_replay import build_attention_witness_arrays
+
+    source = {
+        "q_post_rope": np.ones((2, 3, 4), dtype=np.float32),
+        "k_post_rope": np.ones((2, 3, 4), dtype=np.float32) * 2,
+        "v": np.ones((2, 3, 4), dtype=np.float32) * 3,
+        "attention_raw": np.ones((2, 12), dtype=np.float32) * 4,
+        "self_attn": np.ones((2, 12), dtype=np.float32) * 5,
+    }
+    captured = {
+        "q_post_rope": np.ones((2, 3, 4), dtype=np.float32) * 6,
+        "k_post_rope": np.ones((2, 3, 4), dtype=np.float32) * 7,
+        "v": np.ones((2, 3, 4), dtype=np.float32) * 8,
+        "attention_raw": np.ones((2, 12), dtype=np.float32) * 9,
+        "self_attn": np.ones((2, 12), dtype=np.float32) * 10,
+    }
+    arrays = build_attention_witness_arrays(
+        source=source,
+        captured=captured,
+        to_out_weight=np.eye(12, dtype=np.float32),
+        to_out_bias=np.arange(12, dtype=np.float32),
+        route_identity={"effective_route": "official-trellis2-source-cpu-selected-sparse-block"},
+    )
+
+    assert arrays["source_q_post_rope"].shape == (2, 3, 4)
+    assert arrays["captured_q_post_rope"][0, 0, 0] == 6
+    assert arrays["source_to_out_weight"].shape == (12, 12)
+    assert arrays["source_to_out_bias"].shape == (12,)
+    assert arrays["route_identity_json"].shape == ()
+    assert "official-trellis2-source-cpu" in str(arrays["route_identity_json"].item())
+
+
+def test_cuda_sparse_attention_metric_reports_exact_and_delta():
+    from scripts.cuda_sparse_attention_witness import metric_np
+
+    report = metric_np(
+        np.array([[1.0, 2.0]], dtype=np.float32),
+        np.array([[1.0, 2.5]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["exact"] is False
+    assert report["nonzero"] == 1
+    assert report["mean_abs"] == 0.25
+    assert report["max_abs"] == 0.5
+
+
 def test_cli_writes_failure_report_when_trace_missing(tmp_path):
     output = tmp_path / "report.json"
 
