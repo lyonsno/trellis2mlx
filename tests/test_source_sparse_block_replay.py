@@ -140,6 +140,19 @@ def test_cuda_sparse_attention_metric_reports_exact_and_delta():
     assert report["max_abs"] == 0.5
 
 
+def test_module_parameter_dtype_prefers_first_parameter_dtype():
+    from scripts.source_sparse_block_replay import module_parameter_dtype
+
+    class Param:
+        dtype = "float32"
+
+    class Module:
+        def parameters(self):
+            return iter([Param()])
+
+    assert module_parameter_dtype(Module(), fallback="bfloat16") == "float32"
+
+
 def test_cli_writes_failure_report_when_trace_missing(tmp_path):
     output = tmp_path / "report.json"
 

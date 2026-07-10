@@ -263,6 +263,13 @@ def _linear_weight_bias(linear: Any) -> tuple[np.ndarray, np.ndarray | None]:
     return weight, bias
 
 
+def module_parameter_dtype(module: Any, *, fallback: Any) -> Any:
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return fallback
+
+
 def _load_source_model(source_root: Path, checkpoint: Path):
     os.environ["SPARSE_CONV_BACKEND"] = "none"
     os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
@@ -419,7 +426,8 @@ def _source_block_replay(torch: Any, model: Any, payload: dict[str, Any], *, blo
     if block_index == len(model.blocks) - 1:
         final = torch.nn.functional.layer_norm(x.float(), x.shape[-1:])
         source["final_norm"] = final.squeeze(0).cpu().numpy()
-        final_out = model.out_layer(final.to(dtype=compute_dtype))
+        out_dtype = module_parameter_dtype(model.out_layer, fallback=compute_dtype)
+        final_out = model.out_layer(final.to(dtype=out_dtype))
         source["final_out_flat"] = final_out.squeeze(0).float().cpu().numpy()
         resolution = payload["resolution"]
         source["final_output"] = (
