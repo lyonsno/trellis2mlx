@@ -213,6 +213,56 @@ class MultiHeadAttention(nn.Module):
 
         return self.to_out(out), trace
 
+    def trace_cross_attention(
+        self,
+        x: mx.array,
+        context: mx.array,
+        cached_kv: tuple = None,
+        trace_prefix: str = "block0",
+    ) -> tuple[mx.array, dict[str, mx.array]]:
+        B_T = x.shape[0]
+        q = self.to_q(x).reshape(B_T, self.num_heads, self.head_dim)
+        kv = self.to_kv(context)
+        if kv.ndim == 3:
+            S = kv.shape[1]
+            kv = kv.reshape(-1, S, 2, self.num_heads, self.head_dim)
+            k_pre = kv[:, :, 0]
+            v_pre = kv[:, :, 1]
+        else:
+            kv = kv.reshape(B_T, 2, self.num_heads, self.head_dim)
+            k_pre, v_pre = kv[:, 0], kv[:, 1]
+
+        trace = {
+            f"{trace_prefix}_cross_q_pre_norm": q,
+            f"{trace_prefix}_cross_k_pre_norm": k_pre,
+            f"{trace_prefix}_cross_v": v_pre,
+        }
+
+        q = self.q_rms_norm(q)
+        k_norm = self.k_rms_norm(k_pre)
+        trace[f"{trace_prefix}_cross_q_post_norm"] = q
+        trace[f"{trace_prefix}_cross_k_post_norm"] = k_norm
+
+        if cached_kv is not None:
+            k, v = cached_kv
+            trace[f"{trace_prefix}_cross_k_cached_post_norm"] = k
+            trace[f"{trace_prefix}_cross_v_cached"] = v
+        else:
+            k, v = k_norm, v_pre
+
+        q_b = q[None].transpose(0, 2, 1, 3)
+        if k.ndim == 4:
+            k_b = k.transpose(0, 2, 1, 3)
+            v_b = v.transpose(0, 2, 1, 3)
+        else:
+            k_b = k[None].transpose(0, 2, 1, 3)
+            v_b = v[None].transpose(0, 2, 1, 3)
+        out = scaled_dot_product_attention(q_b, k_b, v_b)
+        out = out.transpose(0, 2, 1, 3).reshape(B_T, self.channels)
+        trace[f"{trace_prefix}_cross_attention_raw"] = out
+
+        return self.to_out(out), trace
+
 
 class FeedForward(nn.Module):
     """MLP with GELU. Matches TRELLIS weight layout: mlp.0 and mlp.2."""
@@ -368,10 +418,14 @@ class ModulatedBlock(nn.Module):
         trace[f"{trace_prefix}_after_self"] = x
 
         h = self.norm2(x)
-        if cross_kv_cache is not None:
-            h = self.cross_attn(h, cached_kv=cross_kv_cache)
-        else:
-            h = self.cross_attn(h, context)
+        trace[f"{trace_prefix}_norm2"] = h
+        h, cross_trace = self.cross_attn.trace_cross_attention(
+            h,
+            context,
+            cached_kv=cross_kv_cache,
+            trace_prefix=trace_prefix,
+        )
+        trace.update(cross_trace)
         trace[f"{trace_prefix}_cross_attn"] = h
         x = x + h
         trace[f"{trace_prefix}_after_cross"] = x
