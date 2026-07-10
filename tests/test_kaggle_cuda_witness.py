@@ -17,7 +17,7 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
             capsule_dir=capsule,
             output_dir=tmp_path / "packet",
             dataset_id="operator/trellis2mlx-block7-rmsnorm-inputs",
-            kernel_id="operator/trellis2mlx-block7-rmsnorm-cuda",
+            kernel_id="operator/trellis2mlx-block7-rmsnorm-cuda-witness",
             title="Trellis2MLX Block7 RMSNorm CUDA Witness",
             entrypoint="cuda_probe.py",
             inputs=("cuda_probe.py", "witness.npz"),
@@ -38,7 +38,7 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
         "witness.npz",
     ]
     assert kernel_metadata == {
-        "id": "operator/trellis2mlx-block7-rmsnorm-cuda",
+        "id": "operator/trellis2mlx-block7-rmsnorm-cuda-witness",
         "title": "Trellis2MLX Block7 RMSNorm CUDA Witness",
         "code_file": "run_kaggle_cuda_witness.py",
         "language": "python",
@@ -60,6 +60,9 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
     assert manifest["files"]["witness.npz"]["size_bytes"] == len(b"npz bytes")
     assert "kaggle_cuda_witness_receipt.json" in runner
     assert "torch.cuda.is_available()" in runner
+    assert "find_manifest()" in runner
+    assert "rglob(\"witness-manifest.json\")" in runner
+    assert "mounted_input_files" in runner
 
 
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
@@ -74,7 +77,7 @@ def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
                 capsule_dir=capsule,
                 output_dir=tmp_path / "packet",
                 dataset_id="operator/missing-inputs",
-                kernel_id="operator/missing-cuda",
+                kernel_id="operator/missing-inputs",
                 title="Missing Inputs",
                 entrypoint="cuda_probe.py",
                 inputs=("cuda_probe.py",),
@@ -82,6 +85,27 @@ def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
         )
 
     assert not (tmp_path / "packet").exists()
+
+
+def test_prepare_packet_rejects_kernel_slug_title_mismatch(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    with pytest.raises(WitnessPacketError, match="kernel_id slug"):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/capsule-inputs",
+                kernel_id="operator/capsule-cuda",
+                title="Capsule CUDA Witness",
+                entrypoint="cuda_probe.py",
+                inputs=("cuda_probe.py",),
+            )
+        )
 
 
 def test_build_commands_preserve_dataset_kernel_and_accelerator(tmp_path):
@@ -195,6 +219,27 @@ def test_run_command_writes_report_with_failure_phase(tmp_path):
     assert report["exit_code"] == 9
     assert report["stderr"] == "bad auth"
     assert json.loads(report_path.read_text()) == report
+
+
+def test_run_command_treats_kaggle_textual_error_as_failed(tmp_path):
+    from trellmlx.kaggle_cuda_witness import run_command
+
+    report_path = tmp_path / "kaggle-text-error.json"
+
+    def textual_error_runner(cmd, capture_output, text, check):
+        return subprocess.CompletedProcess(cmd, 0, stdout="Dataset creation error: Invalid Owner Id\n", stderr="")
+
+    report = run_command(
+        ["kaggle", "datasets", "create"],
+        phase="dataset_create",
+        report_path=report_path,
+        runner=textual_error_runner,
+    )
+
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "dataset_create"
+    assert report["exit_code"] == 0
+    assert report["stdout"] == "Dataset creation error: Invalid Owner Id\n"
 
 
 def test_run_command_writes_report_when_executable_is_missing(tmp_path):

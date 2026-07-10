@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -215,12 +216,14 @@ def run_command(
         Path(report_path).parent.mkdir(parents=True, exist_ok=True)
         Path(report_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         return report
+    textual_error = _kaggle_textual_error(completed.stdout) or _kaggle_textual_error(completed.stderr)
+    failed = completed.returncode != 0 or textual_error
     report = {
         "schema": "trellis2mlx.kaggle_cuda_witness.command_report.v1",
         "phase": phase,
         "command": list(cmd),
-        "status": "done" if completed.returncode == 0 else "failed",
-        "failure_phase": None if completed.returncode == 0 else phase,
+        "status": "failed" if failed else "done",
+        "failure_phase": phase if failed else None,
         "exit_code": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
@@ -236,6 +239,14 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _kaggle_textual_error(output: str) -> bool:
+    for line in output.splitlines():
+        lower = line.strip().lower()
+        if lower.endswith(" error") or " error:" in lower or lower.startswith("error:"):
+            return True
+    return False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -337,6 +348,13 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
     for field, value in (("dataset_id", packet.dataset_id), ("kernel_id", packet.kernel_id)):
         if len(value.split("/")) != 2 or not all(value.split("/")):
             raise WitnessPacketError(f"{field} must be a Kaggle ref like owner/slug")
+    kernel_slug = _slug_from_ref(packet.kernel_id)
+    title_slug = _kaggle_slug(packet.title)
+    if kernel_slug != title_slug:
+        raise WitnessPacketError(
+            f"kernel_id slug {kernel_slug!r} must match Kaggle title slug {title_slug!r}; "
+            "otherwise Kaggle creates a different route than the packet records"
+        )
     if packet.accelerator not in {"NvidiaTeslaT4", "NvidiaTeslaT4Highmem", "NvidiaTeslaP100"}:
         raise WitnessPacketError(f"unsupported accelerator for this witness bridge: {packet.accelerator}")
     if packet.entrypoint not in packet.inputs:
@@ -458,12 +476,32 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
     RECEIPT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")
 
 
+def mounted_input_snapshot() -> dict:
+    root = Path("/kaggle/input")
+    if not root.exists():
+        return {{"mounted_input_root_exists": False, "mounted_input_dirs": [], "mounted_input_files": []}}
+    dirs = [str(path) for path in sorted(root.rglob("*")) if path.is_dir()]
+    files = [str(path) for path in sorted(root.rglob("*")) if path.is_file()]
+    return {{"mounted_input_root_exists": True, "mounted_input_dirs": dirs, "mounted_input_files": files[:200]}}
+
+
+def find_manifest() -> Path | None:
+    preferred = Path("/kaggle/input") / CONFIG["dataset_slug"] / "witness-manifest.json"
+    if preferred.exists():
+        return preferred
+    candidates = sorted(Path("/kaggle/input").rglob("witness-manifest.json"))
+    if candidates:
+        return candidates[0]
+    return None
+
+
 def main() -> int:
-    dataset_dir = Path("/kaggle/input") / CONFIG["dataset_slug"]
-    manifest_path = dataset_dir / "witness-manifest.json"
-    if not manifest_path.exists():
-        write_receipt("failed", phase="input_mount", message=f"missing {{manifest_path}}")
+    manifest_path = find_manifest()
+    if manifest_path is None:
+        expected = Path("/kaggle/input") / CONFIG["dataset_slug"] / "witness-manifest.json"
+        write_receipt("failed", phase="input_mount", message=f"missing {{expected}}", extra=mounted_input_snapshot())
         return 2
+    dataset_dir = manifest_path.parent
     manifest = json.loads(manifest_path.read_text())
     copied = {{}}
     for relative_name, record in manifest["files"].items():
@@ -516,6 +554,11 @@ if __name__ == "__main__":
 
 def _slug_from_ref(kaggle_ref: str) -> str:
     return kaggle_ref.split("/", 1)[1]
+
+
+def _kaggle_slug(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return slug
 
 
 def _write_json(path: Path, payload: object) -> None:
