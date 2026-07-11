@@ -39,6 +39,7 @@ class KaggleCudaWitnessPacket:
     enable_internet: bool = False
     output_json: str = "cuda_result.json"
     output_npz: str = "cuda_result.npz"
+    output_ply: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -58,8 +59,11 @@ class KaggleCudaWitnessPacket:
         return _slug_from_ref(self.dataset_id)
 
     @property
-    def outputs(self) -> tuple[str, str]:
-        return (self.output_json, self.output_npz)
+    def outputs(self) -> tuple[str, ...]:
+        outputs = [self.output_json, self.output_npz]
+        if self.output_ply:
+            outputs.append(self.output_ply)
+        return tuple(outputs)
 
 
 def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
@@ -118,8 +122,8 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
     kernel_metadata = json.loads(kernel_metadata_path.read_text())
     inputs = tuple(path for path in manifest["files"] if path != "witness-manifest.json")
     outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
-    if len(outputs) != 2:
-        raise WitnessPacketError(f"expected exactly two outputs in manifest, got {outputs}")
+    if len(outputs) not in (2, 3):
+        raise WitnessPacketError(f"expected two or three outputs in manifest, got {outputs}")
     return KaggleCudaWitnessPacket(
         capsule_dir=output_dir / "dataset",
         output_dir=output_dir,
@@ -134,6 +138,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         ),
         output_json=outputs[0],
         output_npz=outputs[1],
+        output_ply=outputs[2] if len(outputs) == 3 else None,
     )
 
 
@@ -272,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--enable-internet", action="store_true")
     prepare.add_argument("--output-json", default="cuda_result.json")
     prepare.add_argument("--output-npz", default="cuda_result.npz")
+    prepare.add_argument("--output-ply")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
         drive = subparsers.add_parser(name)
@@ -297,6 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 enable_internet=args.enable_internet,
                 output_json=args.output_json,
                 output_npz=args.output_npz,
+                output_ply=args.output_ply,
             )
         )
         print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
@@ -545,6 +552,8 @@ def main() -> int:
         copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
 
     command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["outputs"][0], "--output-npz", CONFIG["outputs"][1]]
+    if len(CONFIG["outputs"]) > 2:
+        command += ["--output-ply", CONFIG["outputs"][2]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     extra = {{
         "effective_dataset_dir": str(dataset_dir),
