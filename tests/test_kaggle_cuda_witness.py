@@ -67,6 +67,35 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
     assert "mounted_input_snapshot()" in runner
 
 
+def test_prepare_packet_can_enable_kernel_internet_explicitly(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/internet-inputs",
+            kernel_id="operator/internet-cuda",
+            title="Internet CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            enable_internet=True,
+        )
+    )
+
+    kernel_metadata = json.loads((packet.kernel_dir / "kernel-metadata.json").read_text())
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert kernel_metadata["enable_internet"] == "true"
+    assert manifest["enable_internet"] is True
+    assert loaded.enable_internet is True
+
+
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError, prepare_packet
 

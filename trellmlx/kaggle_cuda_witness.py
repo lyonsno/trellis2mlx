@@ -36,6 +36,7 @@ class KaggleCudaWitnessPacket:
     entrypoint: str
     inputs: tuple[str, ...]
     accelerator: str = "NvidiaTeslaT4"
+    enable_internet: bool = False
     output_json: str = "cuda_result.json"
     output_npz: str = "cuda_result.npz"
 
@@ -88,6 +89,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "title": packet.title,
         "entrypoint": packet.entrypoint,
         "accelerator": packet.accelerator,
+        "enable_internet": packet.enable_internet,
         "outputs": list(packet.outputs),
         "files": file_records,
     }
@@ -127,6 +129,9 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         entrypoint=manifest["entrypoint"],
         inputs=inputs,
         accelerator=kernel_metadata.get("machine_shape", manifest.get("accelerator", "NvidiaTeslaT4")),
+        enable_internet=_bool_metadata(
+            kernel_metadata.get("enable_internet", manifest.get("enable_internet", False))
+        ),
         output_json=outputs[0],
         output_npz=outputs[1],
     )
@@ -264,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--entrypoint", required=True)
     prepare.add_argument("--input", action="append", dest="inputs", required=True)
     prepare.add_argument("--accelerator", default="NvidiaTeslaT4")
+    prepare.add_argument("--enable-internet", action="store_true")
     prepare.add_argument("--output-json", default="cuda_result.json")
     prepare.add_argument("--output-npz", default="cuda_result.npz")
 
@@ -288,6 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 entrypoint=args.entrypoint,
                 inputs=tuple(args.inputs),
                 accelerator=args.accelerator,
+                enable_internet=args.enable_internet,
                 output_json=args.output_json,
                 output_npz=args.output_npz,
             )
@@ -334,6 +341,7 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "dataset_id": packet.dataset_id,
         "kernel_id": packet.kernel_id,
         "accelerator": packet.accelerator,
+        "enable_internet": packet.enable_internet,
         "dataset_dir": str(packet.dataset_dir),
         "kernel_dir": str(packet.kernel_dir),
         "commands": {
@@ -412,7 +420,7 @@ def _kernel_metadata(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "kernel_type": "script",
         "is_private": "true",
         "enable_gpu": "true",
-        "enable_internet": "false",
+        "enable_internet": "true" if packet.enable_internet else "false",
         "machine_shape": packet.accelerator,
         "dataset_sources": [packet.dataset_id],
         "competition_sources": [],
@@ -561,6 +569,14 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 """
+
+
+def _bool_metadata(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
 
 
 def _slug_from_ref(kaggle_ref: str) -> str:
