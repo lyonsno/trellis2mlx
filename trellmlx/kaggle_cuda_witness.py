@@ -511,7 +511,9 @@ def main() -> int:
             continue
         source = dataset_dir / relative_name
         if not source.exists():
-            write_receipt("failed", phase="input_mount", message=f"missing input {{source}}", extra={{"manifest": manifest}})
+            extra = {{"manifest": manifest, "missing_input": str(source)}}
+            extra.update(mounted_input_snapshot())
+            write_receipt("failed", phase="input_mount", message=f"missing input {{source}}", extra=extra)
             return 3
         actual_sha = sha256_file(source)
         if actual_sha != record["sha256"]:

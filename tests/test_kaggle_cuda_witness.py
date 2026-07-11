@@ -63,6 +63,8 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
     assert "find_manifest()" in runner
     assert "rglob(\"witness-manifest.json\")" in runner
     assert "mounted_input_files" in runner
+    assert '"missing_input": str(source)' in runner
+    assert "mounted_input_snapshot()" in runner
 
 
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
