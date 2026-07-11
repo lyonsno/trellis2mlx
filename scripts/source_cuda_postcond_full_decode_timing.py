@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
@@ -52,6 +53,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", default=8, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--max-num-tokens", default=49152, type=int)
+    parser.add_argument(
+        "--sparse-conv-backend",
+        default="none",
+        choices=("none", "spconv", "torchsparse", "flex_gemm"),
+        help=(
+            "Official source sparse convolution backend. The default avoids "
+            "Kaggle's missing flex_gemm extension while preserving source code."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-attn-backend",
+        default="flash_attn",
+        choices=("xformers", "flash_attn", "flash_attn_3", "sdpa", "naive"),
+        help="Official source sparse attention backend.",
+    )
     return parser
 
 
@@ -67,6 +83,15 @@ def resolve_model_ref(model_repo: str, model_spec: str) -> str:
     if model_spec.startswith("ckpts/"):
         return f"{model_repo}/{model_spec}"
     return model_spec
+
+
+def apply_sparse_backend_env(conv_backend: str, attn_backend: str) -> dict[str, str]:
+    os.environ["SPARSE_CONV_BACKEND"] = conv_backend
+    os.environ["SPARSE_ATTN_BACKEND"] = attn_backend
+    return {
+        "SPARSE_CONV_BACKEND": conv_backend,
+        "SPARSE_ATTN_BACKEND": attn_backend,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.pipeline_type != "512" and args.conditioning_1024 is None:
             raise ValueError(f"--conditioning-1024 is required for pipeline_type={args.pipeline_type}")
         report["required_model_names"] = list(model_names)
+        report["requested_sparse_backend"] = apply_sparse_backend_env(
+            args.sparse_conv_backend,
+            args.sparse_attn_backend,
+        )
 
         phase = "extract_source"
         phase_started = time.perf_counter()

@@ -46,3 +46,12 @@ def test_resolve_model_ref_uses_pipeline_repo_for_relative_models():
         resolve_model_ref("microsoft/TRELLIS.2-4B", "microsoft/TRELLIS-image-large/ckpts/ss_dec")
         == "microsoft/TRELLIS-image-large/ckpts/ss_dec"
     )
+
+
+def test_postcond_decode_runner_defaults_to_dependency_free_sparse_conv_backend():
+    from scripts.source_cuda_postcond_full_decode_timing import build_parser
+
+    args = build_parser().parse_args(["--output-json", "out.json", "--output-npz", "out.npz"])
+
+    assert args.sparse_conv_backend == "none"
+    assert args.sparse_attn_backend == "flash_attn"
