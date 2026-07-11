@@ -54,4 +54,4 @@ def test_postcond_decode_runner_defaults_to_dependency_free_sparse_conv_backend(
     args = build_parser().parse_args(["--output-json", "out.json", "--output-npz", "out.npz"])
 
     assert args.sparse_conv_backend == "none"
-    assert args.sparse_attn_backend == "flash_attn"
+    assert args.sparse_attn_backend == "sdpa"

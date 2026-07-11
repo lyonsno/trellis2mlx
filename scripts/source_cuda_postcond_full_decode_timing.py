@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sparse-attn-backend",
-        default="flash_attn",
+        default="sdpa",
         choices=("xformers", "flash_attn", "flash_attn_3", "sdpa", "naive"),
         help="Official source sparse attention backend.",
     )
