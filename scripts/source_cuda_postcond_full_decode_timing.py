@@ -88,9 +88,11 @@ def resolve_model_ref(model_repo: str, model_spec: str) -> str:
 def apply_sparse_backend_env(conv_backend: str, attn_backend: str) -> dict[str, str]:
     os.environ["SPARSE_CONV_BACKEND"] = conv_backend
     os.environ["SPARSE_ATTN_BACKEND"] = attn_backend
+    os.environ["ATTN_BACKEND"] = attn_backend
     return {
         "SPARSE_CONV_BACKEND": conv_backend,
         "SPARSE_ATTN_BACKEND": attn_backend,
+        "ATTN_BACKEND": attn_backend,
     }
 
 

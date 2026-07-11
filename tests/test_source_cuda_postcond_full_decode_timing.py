@@ -55,3 +55,16 @@ def test_postcond_decode_runner_defaults_to_dependency_free_sparse_conv_backend(
 
     assert args.sparse_conv_backend == "none"
     assert args.sparse_attn_backend == "sdpa"
+
+
+def test_apply_sparse_backend_env_sets_dense_attention_alias(monkeypatch):
+    from scripts.source_cuda_postcond_full_decode_timing import apply_sparse_backend_env
+
+    applied = apply_sparse_backend_env("none", "sdpa")
+
+    assert applied == {
+        "SPARSE_CONV_BACKEND": "none",
+        "SPARSE_ATTN_BACKEND": "sdpa",
+        "ATTN_BACKEND": "sdpa",
+    }
+    assert applied["ATTN_BACKEND"] == "sdpa"
