@@ -78,6 +78,7 @@ def test_postcond_decode_runner_defaults_mesh_override_input():
     args = build_parser().parse_args(["--output-json", "out.json", "--output-npz", "out.npz"])
 
     assert args.mesh_override == Path("o_voxel_override_convert.py")
+    assert args.output_mesh_state is None
 
 
 def test_install_mesh_override_copies_into_source_stubs(tmp_path):
@@ -130,3 +131,46 @@ def test_write_binary_mesh_ply_preserves_vertices_and_faces(tmp_path):
     np.testing.assert_allclose(vertices, Mesh.vertices)
     assert faces["count"].tolist() == [3]
     assert faces["indices"].tolist() == [[0, 1, 2]]
+
+
+def test_write_mesh_state_npz_preserves_voxel_payload(tmp_path):
+    import json
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_mesh_state_npz
+
+    class Mesh:
+        vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+        faces = np.array([[0, 1, 1]], dtype=np.int64)
+        attrs = np.array([[0.2, 0.3, 0.4, 0.5, 0.6, 0.7]], dtype=np.float32)
+        coords = np.array([[3, 4, 5]], dtype=np.int64)
+        origin = np.array([-0.5, -0.5, -0.5], dtype=np.float32)
+        voxel_size = 1 / 512
+        voxel_shape = (1, 64, 64, 64)
+        layout = {
+            "base_color": slice(0, 3),
+            "metallic": slice(3, 4),
+            "roughness": slice(4, 5),
+            "alpha": slice(5, 6),
+        }
+
+    output = tmp_path / "mesh_state.npz"
+
+    write_mesh_state_npz(output, Mesh())
+
+    with np.load(output) as data:
+        np.testing.assert_allclose(data["vertices"], Mesh.vertices)
+        np.testing.assert_array_equal(data["faces"], Mesh.faces.astype(np.int32))
+        np.testing.assert_allclose(data["attrs"], Mesh.attrs)
+        np.testing.assert_array_equal(data["coords"], Mesh.coords.astype(np.int32))
+        np.testing.assert_allclose(data["origin"], Mesh.origin)
+        assert float(data["voxel_size"]) == Mesh.voxel_size
+        np.testing.assert_array_equal(data["voxel_shape"], np.array(Mesh.voxel_shape, dtype=np.int64))
+        layout = json.loads(str(data["layout_json"]))
+
+    assert layout == {
+        "base_color": [0, 3, None],
+        "metallic": [3, 4, None],
+        "roughness": [4, 5, None],
+        "alpha": [5, 6, None],
+    }

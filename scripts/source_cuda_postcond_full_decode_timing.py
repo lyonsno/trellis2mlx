@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
     parser.add_argument("--output-ply", default=Path("cuda_result_mesh.ply"), type=Path)
+    parser.add_argument("--output-mesh-state", type=Path)
     parser.add_argument("--conditioning", default="conditioning.npz", type=Path)
     parser.add_argument("--conditioning-1024", type=Path)
     parser.add_argument("--source-tar", default="trellis2_source_tarball.bin", type=Path)
@@ -143,9 +144,12 @@ def main(argv: list[str] | None = None) -> int:
         output_json = Path(args.output_json)
         output_npz = Path(args.output_npz)
         output_ply = Path(args.output_ply)
+        output_mesh_state = Path(args.output_mesh_state) if args.output_mesh_state is not None else None
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         output_ply.parent.mkdir(parents=True, exist_ok=True)
+        if output_mesh_state is not None:
+            output_mesh_state.parent.mkdir(parents=True, exist_ok=True)
 
         phase = "validate_args"
         if args.steps <= 0:
@@ -359,6 +363,19 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             report["output_ply"] = str(output_ply)
+            if output_mesh_state is not None:
+                write_mesh_state_npz(output_mesh_state, meshes[0])
+                mesh_artifacts.append(
+                    {
+                        "path": str(output_mesh_state),
+                        "sha256": sha256_file(output_mesh_state),
+                        "size_bytes": output_mesh_state.stat().st_size,
+                        "format": "mesh_with_voxel_state_npz",
+                        "mesh_index": 0,
+                        "artifact_scope": "post_decode_mesh_with_voxel_state_for_source_finalization",
+                    }
+                )
+                report["output_mesh_state"] = str(output_mesh_state)
         report["mesh_artifacts"] = mesh_artifacts
 
         np.savez(
@@ -507,6 +524,45 @@ def write_binary_mesh_ply(path: Path, mesh: Any) -> None:
         handle.write(header)
         handle.write(np.ascontiguousarray(vertices).tobytes())
         handle.write(face_records.tobytes())
+
+
+def write_mesh_state_npz(path: Path, mesh: Any) -> None:
+    vertices = tensor_to_numpy(mesh.vertices).astype(np.float32, copy=False)
+    faces = tensor_to_numpy(mesh.faces).astype(np.int32, copy=False)
+    attrs = getattr(mesh, "attrs", None)
+    coords = getattr(mesh, "coords", None)
+    if attrs is None:
+        raise ValueError("mesh state export requires mesh.attrs")
+    if coords is None:
+        raise ValueError("mesh state export requires mesh.coords")
+    attrs_array = tensor_to_numpy(attrs).astype(np.float32, copy=False)
+    coords_array = tensor_to_numpy(coords).astype(np.int32, copy=False)
+    origin = tensor_to_numpy(getattr(mesh, "origin")).astype(np.float32, copy=False)
+    voxel_size = np.asarray(getattr(mesh, "voxel_size"), dtype=np.float64)
+    voxel_shape = np.asarray(list(getattr(mesh, "voxel_shape")), dtype=np.int64)
+    layout_json = json.dumps(serialize_layout(getattr(mesh, "layout", {})), sort_keys=True)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        vertices=np.ascontiguousarray(vertices),
+        faces=np.ascontiguousarray(faces),
+        attrs=np.ascontiguousarray(attrs_array),
+        coords=np.ascontiguousarray(coords_array),
+        origin=np.ascontiguousarray(origin),
+        voxel_size=voxel_size,
+        voxel_shape=voxel_shape,
+        layout_json=np.asarray(layout_json),
+    )
+
+
+def serialize_layout(layout: dict[str, Any]) -> dict[str, list[int | None]]:
+    serialized: dict[str, list[int | None]] = {}
+    for key, value in layout.items():
+        if not isinstance(value, slice):
+            raise ValueError(f"mesh layout entry {key!r} must be a slice, got {type(value).__name__}")
+        serialized[str(key)] = [value.start, value.stop, value.step]
+    return serialized
 
 
 def tensor_to_numpy(value: Any) -> np.ndarray:

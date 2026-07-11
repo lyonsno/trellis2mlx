@@ -122,7 +122,45 @@ def test_prepare_packet_can_declare_mesh_ply_output(tmp_path):
 
     assert manifest["outputs"] == ["cuda_result.json", "cuda_result.npz", "cuda_result_mesh.ply"]
     assert loaded.output_ply == "cuda_result_mesh.ply"
-    assert '"--output-ply", CONFIG["outputs"][2]' in runner
+    assert '"output_ply": "cuda_result_mesh.ply"' in runner
+    assert 'command += ["--output-ply", CONFIG["output_ply"]]' in runner
+
+
+def test_prepare_packet_can_declare_full_mesh_state_output(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/mesh-state-inputs",
+            kernel_id="operator/mesh-state-cuda",
+            title="Mesh State CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            output_ply="cuda_result_mesh.ply",
+            output_mesh_state="cuda_result_mesh_state.npz",
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["outputs"] == [
+        "cuda_result.json",
+        "cuda_result.npz",
+        "cuda_result_mesh.ply",
+        "cuda_result_mesh_state.npz",
+    ]
+    assert loaded.output_ply == "cuda_result_mesh.ply"
+    assert loaded.output_mesh_state == "cuda_result_mesh_state.npz"
+    assert '"output_mesh_state": "cuda_result_mesh_state.npz"' in runner
+    assert 'command += ["--output-mesh-state", CONFIG["output_mesh_state"]]' in runner
 
 
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):

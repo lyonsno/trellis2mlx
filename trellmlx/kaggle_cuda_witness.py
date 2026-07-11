@@ -40,6 +40,7 @@ class KaggleCudaWitnessPacket:
     output_json: str = "cuda_result.json"
     output_npz: str = "cuda_result.npz"
     output_ply: str | None = None
+    output_mesh_state: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -63,6 +64,8 @@ class KaggleCudaWitnessPacket:
         outputs = [self.output_json, self.output_npz]
         if self.output_ply:
             outputs.append(self.output_ply)
+        if self.output_mesh_state:
+            outputs.append(self.output_mesh_state)
         return tuple(outputs)
 
 
@@ -95,6 +98,12 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "outputs": list(packet.outputs),
+        "output_roles": {
+            "json": packet.output_json,
+            "npz": packet.output_npz,
+            "ply": packet.output_ply,
+            "mesh_state": packet.output_mesh_state,
+        },
         "files": file_records,
     }
     manifest_path = packet.dataset_dir / "witness-manifest.json"
@@ -122,8 +131,9 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
     kernel_metadata = json.loads(kernel_metadata_path.read_text())
     inputs = tuple(path for path in manifest["files"] if path != "witness-manifest.json")
     outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
-    if len(outputs) not in (2, 3):
-        raise WitnessPacketError(f"expected two or three outputs in manifest, got {outputs}")
+    output_roles = manifest.get("output_roles") or {}
+    if len(outputs) < 2:
+        raise WitnessPacketError(f"expected at least two outputs in manifest, got {outputs}")
     return KaggleCudaWitnessPacket(
         capsule_dir=output_dir / "dataset",
         output_dir=output_dir,
@@ -136,9 +146,10 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         enable_internet=_bool_metadata(
             kernel_metadata.get("enable_internet", manifest.get("enable_internet", False))
         ),
-        output_json=outputs[0],
-        output_npz=outputs[1],
-        output_ply=outputs[2] if len(outputs) == 3 else None,
+        output_json=output_roles.get("json") or outputs[0],
+        output_npz=output_roles.get("npz") or outputs[1],
+        output_ply=output_roles.get("ply") or _legacy_output_by_suffix(outputs[2:], ".ply"),
+        output_mesh_state=output_roles.get("mesh_state") or _legacy_output_by_suffix(outputs[2:], "_mesh_state.npz"),
     )
 
 
@@ -278,6 +289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--output-json", default="cuda_result.json")
     prepare.add_argument("--output-npz", default="cuda_result.npz")
     prepare.add_argument("--output-ply")
+    prepare.add_argument("--output-mesh-state")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
         drive = subparsers.add_parser(name)
@@ -304,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_json=args.output_json,
                 output_npz=args.output_npz,
                 output_ply=args.output_ply,
+                output_mesh_state=args.output_mesh_state,
             )
         )
         print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
@@ -445,6 +458,8 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "accelerator": packet.accelerator,
         "entrypoint": packet.entrypoint,
         "outputs": list(packet.outputs),
+        "output_ply": packet.output_ply,
+        "output_mesh_state": packet.output_mesh_state,
     }
     return f"""#!/usr/bin/env python3
 from __future__ import annotations
@@ -552,8 +567,10 @@ def main() -> int:
         copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
 
     command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["outputs"][0], "--output-npz", CONFIG["outputs"][1]]
-    if len(CONFIG["outputs"]) > 2:
-        command += ["--output-ply", CONFIG["outputs"][2]]
+    if CONFIG["output_ply"]:
+        command += ["--output-ply", CONFIG["output_ply"]]
+    if CONFIG["output_mesh_state"]:
+        command += ["--output-mesh-state", CONFIG["output_mesh_state"]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     extra = {{
         "effective_dataset_dir": str(dataset_dir),
@@ -586,6 +603,13 @@ def _bool_metadata(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() == "true"
     return bool(value)
+
+
+def _legacy_output_by_suffix(outputs: Sequence[str], suffix: str) -> str | None:
+    for output in outputs:
+        if output.endswith(suffix):
+            return output
+    return None
 
 
 def _slug_from_ref(kaggle_ref: str) -> str:
