@@ -68,3 +68,29 @@ def test_apply_sparse_backend_env_sets_dense_attention_alias(monkeypatch):
         "ATTN_BACKEND": "sdpa",
     }
     assert applied["ATTN_BACKEND"] == "sdpa"
+
+
+def test_postcond_decode_runner_defaults_mesh_override_input():
+    from pathlib import Path
+
+    from scripts.source_cuda_postcond_full_decode_timing import build_parser
+
+    args = build_parser().parse_args(["--output-json", "out.json", "--output-npz", "out.npz"])
+
+    assert args.mesh_override == Path("o_voxel_override_convert.py")
+
+
+def test_install_mesh_override_copies_into_source_stubs(tmp_path):
+    from scripts.source_cuda_postcond_full_decode_timing import install_mesh_override
+
+    source_root = tmp_path / "source"
+    override = tmp_path / "o_voxel_override_convert.py"
+    override.write_text("SENTINEL = 1\n")
+
+    result = install_mesh_override(source_root, override)
+
+    installed = source_root / "stubs" / "o_voxel_override_convert.py"
+    assert installed.read_text() == "SENTINEL = 1\n"
+    assert result["status"] == "installed"
+    assert result["path"] == str(installed)
+    assert result["source"] == str(override)

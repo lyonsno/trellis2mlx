@@ -8,9 +8,11 @@ diagnostic surface already has durable conditioning tensors.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tarfile
 import time
@@ -47,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conditioning", default="conditioning.npz", type=Path)
     parser.add_argument("--conditioning-1024", type=Path)
     parser.add_argument("--source-tar", default="trellis2_source_tarball.bin", type=Path)
+    parser.add_argument("--mesh-override", default=Path("o_voxel_override_convert.py"), type=Path)
     parser.add_argument("--model-repo", default="microsoft/TRELLIS.2-4B")
     parser.add_argument("--pipeline-config", default="pipeline.json")
     parser.add_argument("--pipeline-type", default="512")
@@ -96,9 +99,26 @@ def apply_sparse_backend_env(conv_backend: str, attn_backend: str) -> dict[str, 
     }
 
 
+def install_mesh_override(source_root: Path, override_path: Path) -> dict[str, Any]:
+    override_path = Path(override_path)
+    if not override_path.is_file():
+        return {"status": "missing", "source": str(override_path)}
+    destination = Path(source_root) / "stubs" / "o_voxel_override_convert.py"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(override_path, destination)
+    return {
+        "status": "installed",
+        "source": str(override_path),
+        "path": str(destination),
+        "sha256": sha256_file(destination),
+        "size_bytes": destination.stat().st_size,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     started = time.perf_counter()
+    decode_started: float | None = None
     report: dict[str, Any] = {
         "schema": "trellis2mlx.source_cuda_postcond_full_decode_timing.v1",
         "status": "failed",
@@ -140,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_started = time.perf_counter()
         source_root = extract_source(Path(args.source_tar), Path.cwd())
         sys.path.insert(0, str(source_root))
+        report["mesh_override"] = install_mesh_override(source_root, Path(args.mesh_override))
         report["phase_timings"][phase] = elapsed(phase_started)
         report["source_root"] = str(source_root)
 
@@ -241,7 +262,8 @@ def main(argv: list[str] | None = None) -> int:
         phase = "post_conditioning_decode"
         decode_started = time.perf_counter()
         torch.manual_seed(args.seed)
-        stage_timings: dict[str, float] = {}
+        report["stage_timings"] = {}
+        stage_timings = report["stage_timings"]
 
         stage_started = time.perf_counter()
         coords = pipeline.sample_sparse_structure(
@@ -252,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         sync_cuda(torch)
         stage_timings["sample_sparse_structure_elapsed_seconds"] = elapsed(stage_started)
+        report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
 
         if args.pipeline_type == "512":
             stage_started = time.perf_counter()
@@ -263,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             sync_cuda(torch)
             stage_timings["sample_shape_slat_elapsed_seconds"] = elapsed(stage_started)
+            report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
 
             stage_started = time.perf_counter()
             tex_slat = pipeline.sample_tex_slat(
@@ -273,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             sync_cuda(torch)
             stage_timings["sample_tex_slat_elapsed_seconds"] = elapsed(stage_started)
+            report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
             resolution = 512
         elif args.pipeline_type == "1024_cascade":
             assert cond_1024 is not None
@@ -290,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             sync_cuda(torch)
             stage_timings["sample_shape_slat_elapsed_seconds"] = elapsed(stage_started)
+            report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
 
             stage_started = time.perf_counter()
             tex_slat = pipeline.sample_tex_slat(
@@ -300,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             sync_cuda(torch)
             stage_timings["sample_tex_slat_elapsed_seconds"] = elapsed(stage_started)
+            report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
         else:  # pragma: no cover - guarded by required_model_names
             raise AssertionError(args.pipeline_type)
 
@@ -308,7 +335,6 @@ def main(argv: list[str] | None = None) -> int:
         sync_cuda(torch)
         stage_timings["decode_latent_elapsed_seconds"] = elapsed(stage_started)
 
-        report["stage_timings"] = stage_timings
         report["post_conditioning_decode_elapsed_seconds"] = elapsed(decode_started)
         report["mesh_summary"] = [mesh_summary(mesh) for mesh in meshes]
         report["sparse_coords_count"] = int(coords.shape[0])
@@ -354,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
                 "elapsed_seconds": elapsed(started),
             }
         )
+        if decode_started is not None:
+            report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         return 1
@@ -398,6 +426,14 @@ def conditioning_identity(path: Path, cond: dict[str, Any]) -> dict[str, Any]:
 
 def parameter_count(model: Any) -> int:
     return int(sum(parameter.numel() for parameter in model.parameters()))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def sparse_tensor_summary(value: Any) -> dict[str, Any]:
