@@ -57,6 +57,11 @@ ATTENTION_WITNESS_NAMES = (
     "attention_raw",
     "self_attn",
 )
+CROSS_ATTENTION_WITNESS_NAMES = (
+    "cross_q_post_norm",
+    "cross_attention_raw",
+    "cross_attn",
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -250,6 +255,30 @@ def build_attention_witness_arrays(
     if to_out_bias is not None:
         arrays["source_to_out_bias"] = np.asarray(to_out_bias, dtype=np.float32)
     for name in ATTENTION_WITNESS_NAMES:
+        arrays[f"source_{name}"] = _require_array(source, name, label="source")
+        arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
+    return arrays
+
+
+def build_cross_attention_witness_arrays(
+    *,
+    source: dict[str, np.ndarray],
+    captured: dict[str, np.ndarray],
+    cross_k: np.ndarray,
+    cross_v: np.ndarray,
+    to_out_weight: np.ndarray,
+    to_out_bias: np.ndarray | None,
+    route_identity: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {
+        "route_identity_json": np.asarray(json.dumps(route_identity, sort_keys=True)),
+        "cross_k": np.asarray(cross_k, dtype=np.float32),
+        "cross_v": np.asarray(cross_v, dtype=np.float32),
+        "source_to_out_weight": np.asarray(to_out_weight, dtype=np.float32),
+    }
+    if to_out_bias is not None:
+        arrays["source_to_out_bias"] = np.asarray(to_out_bias, dtype=np.float32)
+    for name in CROSS_ATTENTION_WITNESS_NAMES:
         arrays[f"source_{name}"] = _require_array(source, name, label="source")
         arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
     return arrays
@@ -543,6 +572,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sha256": _sha256(args.attention_witness_output),
             "arrays": {key: list(value.shape) for key, value in arrays.items()},
         }
+    cross_attention_witness_status = None
+    if args.cross_attention_witness_output is not None:
+        phase = "write_cross_attention_witness"
+        to_out_weight, to_out_bias = _linear_weight_bias(model.blocks[args.block_index].cross_attn.to_out)
+        arrays = build_cross_attention_witness_arrays(
+            source=source,
+            captured=payload["captured"],
+            cross_k=payload["cross_k"],
+            cross_v=payload["cross_v"],
+            to_out_weight=to_out_weight,
+            to_out_bias=to_out_bias,
+            route_identity=route_identity,
+        )
+        args.cross_attention_witness_output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.cross_attention_witness_output, **arrays)
+        cross_attention_witness_status = {
+            "path": _jsonable_path(args.cross_attention_witness_output),
+            "sha256": _sha256(args.cross_attention_witness_output),
+            "arrays": {key: list(value.shape) for key, value in arrays.items()},
+        }
     return {
         "schema": SCHEMA,
         "status": "ok",
@@ -554,6 +603,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": metrics,
         "final_metrics": final_metrics,
         "attention_witness": attention_witness_status,
+        "cross_attention_witness": cross_attention_witness_status,
     }
 
 
@@ -564,6 +614,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--attention-witness-output", type=Path)
+    parser.add_argument("--cross-attention-witness-output", type=Path)
     parser.add_argument("--branch", choices=("pos", "neg"), required=True)
     parser.add_argument("--block-index", required=True, type=int)
     return parser.parse_args(argv)

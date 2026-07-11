@@ -125,12 +125,59 @@ def test_attention_witness_arrays_include_source_captured_and_projection_weights
     assert "official-trellis2-source-cpu" in str(arrays["route_identity_json"].item())
 
 
+def test_cross_attention_witness_arrays_include_cached_kv_and_projection_weights():
+    from scripts.source_sparse_block_replay import build_cross_attention_witness_arrays
+
+    source = {
+        "cross_q_post_norm": np.ones((2, 3, 4), dtype=np.float32),
+        "cross_attention_raw": np.ones((2, 12), dtype=np.float32) * 2,
+        "cross_attn": np.ones((2, 12), dtype=np.float32) * 3,
+    }
+    captured = {
+        "cross_q_post_norm": np.ones((2, 3, 4), dtype=np.float32) * 4,
+        "cross_attention_raw": np.ones((2, 12), dtype=np.float32) * 5,
+        "cross_attn": np.ones((2, 12), dtype=np.float32) * 6,
+    }
+    arrays = build_cross_attention_witness_arrays(
+        source=source,
+        captured=captured,
+        cross_k=np.ones((5, 3, 4), dtype=np.float32) * 7,
+        cross_v=np.ones((5, 3, 4), dtype=np.float32) * 8,
+        to_out_weight=np.eye(12, dtype=np.float32),
+        to_out_bias=np.arange(12, dtype=np.float32),
+        route_identity={"effective_route": "official-trellis2-source-cpu-selected-sparse-block"},
+    )
+
+    assert arrays["source_cross_q_post_norm"].shape == (2, 3, 4)
+    assert arrays["captured_cross_q_post_norm"][0, 0, 0] == 4
+    assert arrays["cross_k"].shape == (5, 3, 4)
+    assert arrays["cross_v"][0, 0, 0] == 8
+    assert arrays["source_to_out_weight"].shape == (12, 12)
+    assert arrays["source_to_out_bias"].shape == (12,)
+    assert arrays["route_identity_json"].shape == ()
+
+
 def test_cuda_sparse_attention_metric_reports_exact_and_delta():
     from scripts.cuda_sparse_attention_witness import metric_np
 
     report = metric_np(
         np.array([[1.0, 2.0]], dtype=np.float32),
         np.array([[1.0, 2.5]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["exact"] is False
+    assert report["nonzero"] == 1
+    assert report["mean_abs"] == 0.25
+    assert report["max_abs"] == 0.5
+
+
+def test_cuda_sparse_cross_attention_metric_reports_exact_and_delta():
+    from scripts.cuda_sparse_cross_attention_witness import metric_np
+
+    report = metric_np(
+        np.array([[1.0, 2.0]], dtype=np.float32),
+        np.array([[1.5, 2.0]], dtype=np.float32),
     )
 
     assert report["shape"] == [1, 2]
