@@ -242,6 +242,35 @@ def test_run_command_treats_kaggle_textual_error_as_failed(tmp_path):
     assert report["stdout"] == "Dataset creation error: Invalid Owner Id\n"
 
 
+def test_run_command_treats_invalid_dataset_source_as_failed(tmp_path):
+    from trellmlx.kaggle_cuda_witness import run_command
+
+    report_path = tmp_path / "kaggle-invalid-source.json"
+
+    def invalid_source_runner(cmd, capture_output, text, check):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                "The following are not valid dataset sources and could not be added to the kernel: "
+                "['operator/missing-dataset']\n"
+                "Kernel version 1 successfully pushed.\n"
+            ),
+            stderr="",
+        )
+
+    report = run_command(
+        ["kaggle", "kernels", "push"],
+        phase="kernel_push",
+        report_path=report_path,
+        runner=invalid_source_runner,
+    )
+
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "kernel_push"
+    assert report["exit_code"] == 0
+
+
 def test_run_command_writes_report_when_executable_is_missing(tmp_path):
     from trellmlx.kaggle_cuda_witness import run_command
 

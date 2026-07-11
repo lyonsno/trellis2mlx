@@ -246,6 +246,8 @@ def _kaggle_textual_error(output: str) -> bool:
         lower = line.strip().lower()
         if lower.endswith(" error") or " error:" in lower or lower.startswith("error:"):
             return True
+        if "not valid dataset sources" in lower and "could not be added to the kernel" in lower:
+            return True
     return False
 
 
