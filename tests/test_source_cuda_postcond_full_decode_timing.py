@@ -94,3 +94,39 @@ def test_install_mesh_override_copies_into_source_stubs(tmp_path):
     assert result["status"] == "installed"
     assert result["path"] == str(installed)
     assert result["source"] == str(override)
+
+
+def test_write_binary_mesh_ply_preserves_vertices_and_faces(tmp_path):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_binary_mesh_ply
+
+    class Mesh:
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 1, 2]], dtype=np.int64)
+
+    output = tmp_path / "mesh.ply"
+
+    write_binary_mesh_ply(output, Mesh())
+
+    payload = output.read_bytes()
+    header, body = payload.split(b"end_header\n", 1)
+    assert b"format binary_little_endian 1.0" in header
+    assert b"element vertex 3" in header
+    assert b"element face 1" in header
+
+    vertices = np.frombuffer(body[: 3 * 3 * 4], dtype="<f4").reshape(3, 3)
+    faces = np.frombuffer(
+        body[3 * 3 * 4 :],
+        dtype=np.dtype([("count", "u1"), ("indices", "<i4", (3,))]),
+    )
+    np.testing.assert_allclose(vertices, Mesh.vertices)
+    assert faces["count"].tolist() == [3]
+    assert faces["indices"].tolist() == [[0, 1, 2]]

@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
+    parser.add_argument("--output-ply", default=Path("cuda_result_mesh.ply"), type=Path)
     parser.add_argument("--conditioning", default="conditioning.npz", type=Path)
     parser.add_argument("--conditioning-1024", type=Path)
     parser.add_argument("--source-tar", default="trellis2_source_tarball.bin", type=Path)
@@ -141,8 +142,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         output_json = Path(args.output_json)
         output_npz = Path(args.output_npz)
+        output_ply = Path(args.output_ply)
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_npz.parent.mkdir(parents=True, exist_ok=True)
+        output_ply.parent.mkdir(parents=True, exist_ok=True)
 
         phase = "validate_args"
         if args.steps <= 0:
@@ -343,6 +346,21 @@ def main(argv: list[str] | None = None) -> int:
         report["resolution"] = int(resolution)
 
         phase = "write_outputs"
+        mesh_artifacts = []
+        if meshes:
+            write_binary_mesh_ply(output_ply, meshes[0])
+            mesh_artifacts.append(
+                {
+                    "path": str(output_ply),
+                    "sha256": sha256_file(output_ply),
+                    "size_bytes": output_ply.stat().st_size,
+                    "format": "binary_little_endian_ply",
+                    "mesh_index": 0,
+                }
+            )
+            report["output_ply"] = str(output_ply)
+        report["mesh_artifacts"] = mesh_artifacts
+
         np.savez(
             output_npz,
             sparse_coords_count=np.asarray(report["sparse_coords_count"], dtype=np.int64),
@@ -456,6 +474,47 @@ def mesh_summary(mesh: Any) -> dict[str, Any]:
         "attrs": int(attrs.shape[0]) if attrs is not None else None,
         "coords": int(coords.shape[0]) if coords is not None else None,
     }
+
+
+def write_binary_mesh_ply(path: Path, mesh: Any) -> None:
+    vertices = tensor_to_numpy(mesh.vertices).astype("<f4", copy=False)
+    faces = tensor_to_numpy(mesh.faces).astype("<i4", copy=False)
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"mesh vertices must have shape [N, 3], got {vertices.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"mesh faces must have shape [F, 3], got {faces.shape}")
+
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {vertices.shape[0]}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        f"element face {faces.shape[0]}\n"
+        "property list uchar int vertex_indices\n"
+        "end_header\n"
+    ).encode("ascii")
+    face_records = np.empty(
+        faces.shape[0],
+        dtype=np.dtype([("count", "u1"), ("indices", "<i4", (3,))]),
+    )
+    face_records["count"] = 3
+    face_records["indices"] = faces
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(np.ascontiguousarray(vertices).tobytes())
+        handle.write(face_records.tobytes())
+
+
+def tensor_to_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value)
 
 
 def sync_cuda(torch_module: Any) -> None:
