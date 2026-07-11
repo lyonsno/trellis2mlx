@@ -17,31 +17,58 @@ from typing import Any
 
 import numpy as np
 
-from scripts.source_cuda_postcond_full_decode_timing import (
-    apply_sparse_backend_env,
-    conditioning_identity,
-    elapsed,
-    extract_source,
-    install_mesh_override,
-    load_conditioning,
-    mesh_summary,
-    parameter_count,
-    required_model_names,
-    resolve_model_ref,
-    sha256_file,
-    sparse_tensor_summary,
-    sync_cuda,
-    write_binary_mesh_ply,
-    write_mesh_state_npz,
-)
-from scripts.source_cuda_sparse_flow_basin_map import (
-    _guided_pred,
-    _parse_guidance_interval,
-    _schedule_pairs,
-    _select_candidate_post,
-    compare_arrays,
-    remaining_step_indices,
-)
+try:
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        apply_sparse_backend_env,
+        conditioning_identity,
+        elapsed,
+        extract_source,
+        install_mesh_override,
+        load_conditioning,
+        mesh_summary,
+        parameter_count,
+        required_model_names,
+        resolve_model_ref,
+        sha256_file,
+        sparse_tensor_summary,
+        sync_cuda,
+        write_binary_mesh_ply,
+        write_mesh_state_npz,
+    )
+    from scripts.source_cuda_sparse_flow_basin_map import (
+        _guided_pred,
+        _parse_guidance_interval,
+        _schedule_pairs,
+        _select_candidate_post,
+        compare_arrays,
+        remaining_step_indices,
+    )
+except ModuleNotFoundError:
+    from source_cuda_postcond_full_decode_timing import (
+        apply_sparse_backend_env,
+        conditioning_identity,
+        elapsed,
+        extract_source,
+        install_mesh_override,
+        load_conditioning,
+        mesh_summary,
+        parameter_count,
+        required_model_names,
+        resolve_model_ref,
+        sha256_file,
+        sparse_tensor_summary,
+        sync_cuda,
+        write_binary_mesh_ply,
+        write_mesh_state_npz,
+    )
+    from source_cuda_sparse_flow_basin_map import (
+        _guided_pred,
+        _parse_guidance_interval,
+        _schedule_pairs,
+        _select_candidate_post,
+        compare_arrays,
+        remaining_step_indices,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
