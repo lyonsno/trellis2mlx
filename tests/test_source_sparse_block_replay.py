@@ -250,6 +250,8 @@ def test_cuda_sparse_cross_q_witness_schema_and_failure_phase_are_stable():
     assert 'SCHEMA = "trellis2mlx.cuda_sparse_cross_q.v1"' in source
     assert '"failure_phase": "cuda_sparse_cross_q"' in source
     assert "cuda_captured_after_self_vs_captured_cross_q_post_norm" in source
+    assert "--save-full-output-npz" in source
+    assert "full_outputs_omitted" in source
 
 
 def test_cuda_sparse_attention_metric_reports_exact_and_delta():

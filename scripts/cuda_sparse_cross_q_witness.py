@@ -295,6 +295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--witness", type=Path, default=Path("source_sparse_cross_q_witness.npz"))
     parser.add_argument("--output-json", type=Path, default=Path("cuda_result.json"))
     parser.add_argument("--output-npz", type=Path, default=Path("cuda_result.npz"))
+    parser.add_argument(
+        "--save-full-output-npz",
+        action="store_true",
+        help="write full CUDA intermediate arrays instead of a compact output manifest",
+    )
     return parser.parse_args()
 
 
@@ -302,7 +307,16 @@ def main() -> int:
     args = parse_args()
     try:
         report, outputs = _run(args)
-        np.savez_compressed(args.output_npz, **outputs)
+        args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        if args.save_full_output_npz:
+            np.savez(args.output_npz, **outputs)
+        else:
+            np.savez_compressed(
+                args.output_npz,
+                schema=np.asarray(SCHEMA),
+                full_outputs_omitted=np.asarray(True),
+                output_names=np.asarray(sorted(outputs)),
+            )
     except Exception as exc:
         report = {
             "schema": SCHEMA,
@@ -315,7 +329,6 @@ def main() -> int:
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         print(json.dumps(report, sort_keys=True))
         return 1
-    args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True))
     return 0
 
