@@ -27,6 +27,7 @@ def flow_euler_sample(
     capture_steps: list[dict] | None = None,
     stop_after_first_step: bool = False,
     start_step_index: int = 0,
+    sparse_block_injection=None,
     **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
@@ -90,11 +91,21 @@ def flow_euler_sample(
 
         if apply_guidance:
             # Two forward passes: conditioned and unconditioned
-            kw = dict(**model_kwargs)
+            kw = _branch_model_kwargs(
+                model_kwargs,
+                sparse_block_injection=sparse_block_injection,
+                step_index=step_idx,
+                branch="pos",
+            )
             if pos_kv_cache is not None:
                 kw['cross_kv_cache'] = pos_kv_cache
             pred_pos = model(sample, t_tensor, cond, **kw)
-            kw_neg = dict(**model_kwargs)
+            kw_neg = _branch_model_kwargs(
+                model_kwargs,
+                sparse_block_injection=sparse_block_injection,
+                step_index=step_idx,
+                branch="neg",
+            )
             if neg_kv_cache is not None:
                 kw_neg['cross_kv_cache'] = neg_kv_cache
             pred_neg = model(sample, t_tensor, neg_cond, **kw_neg)
@@ -132,7 +143,12 @@ def flow_euler_sample(
                     x_0 = x_0_cfg
         else:
             # Single forward pass with positive conditioning
-            kw = dict(**model_kwargs)
+            kw = _branch_model_kwargs(
+                model_kwargs,
+                sparse_block_injection=sparse_block_injection,
+                step_index=step_idx,
+                branch="pos",
+            )
             if pos_kv_cache is not None:
                 kw['cross_kv_cache'] = pos_kv_cache
             pred = model(sample, t_tensor, cond, **kw)
@@ -195,6 +211,24 @@ def flow_euler_sample(
             break
 
     return sample
+
+
+def _branch_model_kwargs(
+    model_kwargs: dict,
+    *,
+    sparse_block_injection,
+    step_index: int,
+    branch: str,
+) -> dict:
+    kw = dict(**model_kwargs)
+    if sparse_block_injection is not None:
+        kw["sparse_block_injection_branch"] = branch
+        kw["sparse_block_injection"] = (
+            sparse_block_injection
+            if sparse_block_injection.applies(step_index=step_index, branch=branch)
+            else None
+        )
+    return kw
 
 
 def _pred_to_xstart(x_t, t, pred, sigma_min):

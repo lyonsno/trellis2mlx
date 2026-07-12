@@ -82,6 +82,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse-flow-trace-block-input-sample")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
     parser.add_argument("--sparse-flow-trace-keys")
+    parser.add_argument("--sparse-flow-block-injection-trace")
+    parser.add_argument("--sparse-flow-block-injection-step-index", type=int, default=2)
+    parser.add_argument("--sparse-flow-block-injection-block-index", type=int, default=0)
+    parser.add_argument(
+        "--sparse-flow-block-injection-branch",
+        choices=["pos", "neg", "both"],
+        default="both",
+    )
+    parser.add_argument(
+        "--sparse-flow-block-injection-stage",
+        choices=["norm1", "modulated_self_input", "after_self"],
+        default="modulated_self_input",
+    )
+    parser.add_argument("--sparse-flow-block-injection-array-key")
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     return parser
@@ -154,6 +168,19 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             ),
             "sparse_flow_trace_uses_kv_cache": not args.sparse_flow_trace_no_kv_cache,
             "sparse_flow_trace_keys": _parse_sparse_flow_trace_keys(args.sparse_flow_trace_keys),
+            "sparse_flow_block_injection_trace_path": (
+                str(Path(args.sparse_flow_block_injection_trace))
+                if args.sparse_flow_block_injection_trace else None
+            ),
+            "sparse_flow_block_injection_trace_sha256": (
+                _sha256_file(args.sparse_flow_block_injection_trace)
+                if args.sparse_flow_block_injection_trace else None
+            ),
+            "sparse_flow_block_injection_step_index": args.sparse_flow_block_injection_step_index,
+            "sparse_flow_block_injection_block_index": args.sparse_flow_block_injection_block_index,
+            "sparse_flow_block_injection_branch": args.sparse_flow_block_injection_branch,
+            "sparse_flow_block_injection_stage": args.sparse_flow_block_injection_stage,
+            "sparse_flow_block_injection_array_key": args.sparse_flow_block_injection_array_key,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
         },
@@ -324,6 +351,24 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             command.append("--sparse-flow-trace-no-kv-cache")
         if args.sparse_flow_trace_keys:
             command.extend(["--sparse-flow-trace-keys", args.sparse_flow_trace_keys])
+    if args.sparse_flow_block_injection_trace:
+        command.extend([
+            "--sparse-flow-block-injection-trace",
+            str(Path(args.sparse_flow_block_injection_trace)),
+            "--sparse-flow-block-injection-step-index",
+            str(args.sparse_flow_block_injection_step_index),
+            "--sparse-flow-block-injection-block-index",
+            str(args.sparse_flow_block_injection_block_index),
+            "--sparse-flow-block-injection-branch",
+            args.sparse_flow_block_injection_branch,
+            "--sparse-flow-block-injection-stage",
+            args.sparse_flow_block_injection_stage,
+        ])
+        if args.sparse_flow_block_injection_array_key:
+            command.extend([
+                "--sparse-flow-block-injection-array-key",
+                args.sparse_flow_block_injection_array_key,
+            ])
     if args.stop_after_stage == "shape_flow_block_trace":
         command.extend([
             "--shape-flow-trace-block-index",

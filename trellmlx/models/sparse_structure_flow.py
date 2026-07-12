@@ -370,6 +370,52 @@ class ModulatedBlock(nn.Module):
 
         return x
 
+    def forward_with_injection(
+        self,
+        x: mx.array,
+        mod: mx.array,
+        context: mx.array,
+        *,
+        injection,
+        branch: str,
+        rope_phases: mx.array = None,
+        cross_kv_cache: tuple = None,
+    ) -> mx.array:
+        mod = (self.modulation + mod).astype(mod.dtype)
+
+        C = self.channels
+        shift_msa = mod[0*C:1*C]
+        scale_msa = mod[1*C:2*C]
+        gate_msa = mod[2*C:3*C]
+        shift_mlp = mod[3*C:4*C]
+        scale_mlp = mod[4*C:5*C]
+        gate_mlp = mod[5*C:6*C]
+
+        h = _layernorm_noaffine(x)
+        if injection.stage == "norm1":
+            h = _injected_tensor_like(injection, h, branch=branch)
+        h = h * (1 + scale_msa) + shift_msa
+        if injection.stage == "modulated_self_input":
+            h = _injected_tensor_like(injection, h, branch=branch)
+        h = self.self_attn(h, rope_phases=rope_phases)
+        h = h * gate_msa
+        x = x + h
+        if injection.stage == "after_self":
+            x = _injected_tensor_like(injection, x, branch=branch)
+
+        h = self.norm2(x)
+        if cross_kv_cache is not None:
+            h = self.cross_attn(h, cached_kv=cross_kv_cache)
+        else:
+            h = self.cross_attn(h, context)
+        x = x + h
+
+        h = _layernorm_noaffine(x)
+        h = h * (1 + scale_mlp) + shift_mlp
+        h = self.mlp(h)
+        h = h * gate_mlp
+        return x + h
+
     def trace(
         self,
         x: mx.array,
@@ -453,6 +499,19 @@ def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
         var = mx.mean((xf - mean) * (xf - mean), axis=-1, keepdims=True)
         return ((xf - mean) * mx.rsqrt(var + eps)).astype(input_dtype)
     return mx.fast.layer_norm(x, None, None, eps)
+
+
+def _injected_tensor_like(injection, reference: mx.array, *, branch: str) -> mx.array:
+    array = injection.array_for_branch(branch)
+    injected = mx.array(array).astype(reference.dtype)
+    if injected.ndim == reference.ndim + 1 and injected.shape[0] == 1:
+        injected = injected[0]
+    if injected.shape != reference.shape:
+        raise ValueError(
+            "sparse block injection shape mismatch for "
+            f"{branch} {injection.stage}: expected {reference.shape}, got {injected.shape}"
+        )
+    return injected
 
 
 def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:
@@ -734,6 +793,8 @@ class SparseStructureFlowModel(nn.Module):
         t: mx.array,           # [B] timestep (scalar per batch)
         cond: mx.array,        # [B, L, context_channels] image conditioning
         cross_kv_cache: list = None,
+        sparse_block_injection=None,
+        sparse_block_injection_branch: str | None = None,
     ) -> mx.array:
         input_dtype = x.dtype
         B = x.shape[0]
@@ -757,13 +818,24 @@ class SparseStructureFlowModel(nn.Module):
 
         # Run through DiT blocks (B=1 only for inference)
         assert B == 1, f"Only B=1 supported for inference, got B={B}"
-        if self._compiled and cross_kv_cache is None:
+        if self._compiled and cross_kv_cache is None and sparse_block_injection is None:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
-                x = block(x, mod[0], cond, rope_phases=rope_phases,
-                          cross_kv_cache=block_kv)
+                if sparse_block_injection is not None and i == sparse_block_injection.block_index:
+                    x = block.forward_with_injection(
+                        x,
+                        mod[0],
+                        cond,
+                        injection=sparse_block_injection,
+                        branch=sparse_block_injection_branch or "pos",
+                        rope_phases=rope_phases,
+                        cross_kv_cache=block_kv,
+                    )
+                else:
+                    x = block(x, mod[0], cond, rope_phases=rope_phases,
+                              cross_kv_cache=block_kv)
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 

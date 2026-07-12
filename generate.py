@@ -629,6 +629,21 @@ def main():
     parser.add_argument("--sparse-flow-trace-keys",
                         help="Diagnostic: comma-separated final sparse-flow block-trace payload keys to save. "
                              "Omit to save the full block trace.")
+    parser.add_argument("--sparse-flow-block-injection-trace", metavar="NPZ",
+                        help="Diagnostic: inject named sparse-flow block tensors from an NPZ trace.")
+    parser.add_argument("--sparse-flow-block-injection-step-index", type=int, default=2,
+                        help="Diagnostic: sampler step index where --sparse-flow-block-injection-trace applies.")
+    parser.add_argument("--sparse-flow-block-injection-block-index", type=int, default=0,
+                        help="Diagnostic: sparse-flow block index where block injection applies.")
+    parser.add_argument("--sparse-flow-block-injection-branch",
+                        choices=["pos", "neg", "both"], default="both",
+                        help="Diagnostic: CFG branch where block injection applies.")
+    parser.add_argument("--sparse-flow-block-injection-stage",
+                        choices=["norm1", "modulated_self_input", "after_self"],
+                        default="modulated_self_input",
+                        help="Diagnostic: block tensor stage to replace.")
+    parser.add_argument("--sparse-flow-block-injection-array-key",
+                        help="Diagnostic: explicit trace array key for block injection.")
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow block index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
@@ -678,6 +693,8 @@ def main():
             "--sparse-flow-start-sample does not apply to sparse_flow_block_trace; "
             "use --sparse-flow-trace-sample"
         )
+    if args.sparse_flow_block_injection_trace and args.compile:
+        parser.error("--compile is not supported with --sparse-flow-block-injection-trace")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1021,6 +1038,23 @@ def main():
         mx.eval(z_s)
         print(f"  VS3D editing pass: {time.perf_counter()-t1:.1f}s", flush=True)
     else:
+        sparse_block_injection = None
+        sparse_block_injection_json = ""
+        if args.sparse_flow_block_injection_trace:
+            from trellmlx.sparse_block_injection import load_sparse_block_injection
+
+            sparse_block_injection = load_sparse_block_injection(
+                args.sparse_flow_block_injection_trace,
+                branch=args.sparse_flow_block_injection_branch,
+                step_index=args.sparse_flow_block_injection_step_index,
+                block_index=args.sparse_flow_block_injection_block_index,
+                stage=args.sparse_flow_block_injection_stage,
+                array_key=args.sparse_flow_block_injection_array_key,
+            )
+            sparse_block_injection_json = json.dumps(
+                sparse_block_injection.report_identity(),
+                sort_keys=True,
+            )
         # Cast conditioning to fp32 to match the fp32 sparse structure model
         if args.stop_after_stage == "sparse_flow_block_trace":
             pos_cond = cond.astype(mx.float32)
@@ -1302,7 +1336,8 @@ def main():
                                 capture_first_step=step_capture,
                                 capture_steps=step_captures,
                                 stop_after_first_step=args.stop_after_stage == "sparse_flow_step",
-                                start_step_index=sparse_flow_start_step_index)
+                                start_step_index=sparse_flow_start_step_index,
+                                sparse_block_injection=sparse_block_injection)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
@@ -1338,6 +1373,7 @@ def main():
             sigma_min=np.array(1e-5, dtype=np.float32),
             sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
+            sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
         return
@@ -1380,6 +1416,7 @@ def main():
             sigma_min=np.array(1e-5, dtype=np.float32),
             sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
+            sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
         )
         print("  Stop after stage: sparse_flow_steps", flush=True)
         return

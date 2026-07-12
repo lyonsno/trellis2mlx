@@ -862,3 +862,47 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_keys(tmp_path):
         "pos_block5_after_self",
         "pos_block5_after_mlp",
     ]
+
+
+def test_stage_capture_wrapper_forwards_sparse_block_injection_route(tmp_path):
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    trace = tmp_path / "source_block0_trace.npz"
+    np.savez(trace, pos_block0_norm1=np.zeros((1, 2, 1), dtype=np.float32))
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--sparse-flow-block-injection-trace",
+            str(trace),
+            "--sparse-flow-block-injection-step-index",
+            "2",
+            "--sparse-flow-block-injection-block-index",
+            "0",
+            "--sparse-flow-block-injection-branch",
+            "both",
+            "--sparse-flow-block-injection-stage",
+            "norm1",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-block-injection-trace" in command
+    assert command[command.index("--sparse-flow-block-injection-trace") + 1] == str(trace)
+    assert "--sparse-flow-block-injection-stage" in command
+    assert command[command.index("--sparse-flow-block-injection-stage") + 1] == "norm1"
+    assert route_identity["route"]["sparse_flow_block_injection_trace_path"] == str(trace)
+    assert route_identity["route"]["sparse_flow_block_injection_trace_sha256"] is not None
+    assert route_identity["route"]["sparse_flow_block_injection_step_index"] == 2
+    assert route_identity["route"]["sparse_flow_block_injection_block_index"] == 0
+    assert route_identity["route"]["sparse_flow_block_injection_branch"] == "both"
+    assert route_identity["route"]["sparse_flow_block_injection_stage"] == "norm1"
