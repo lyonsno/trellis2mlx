@@ -210,6 +210,12 @@ def _linear_weight_bias(linear: Any) -> tuple[np.ndarray, np.ndarray | None]:
     return weight.astype(np.float32, copy=False), None if bias is None else bias.astype(np.float32, copy=False)
 
 
+def split_block_modulation(block: Any, mod: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+    if getattr(block, "share_mod", False):
+        return (block.modulation + mod).type(mod.dtype).chunk(6, dim=1)
+    return block.adaLN_modulation(mod).chunk(6, dim=1)
+
+
 def _source_mlp_linears(mlp: Any) -> tuple[Any, Any]:
     if hasattr(mlp, "mlp"):
         return mlp.mlp[0], mlp.mlp[2]
@@ -220,7 +226,7 @@ def _trace_block(torch: Any, model: Any, block: Any, x: Any, mod: Any, context: 
     from trellis2.modules.attention import RotaryPositionEmbedder
     from trellis2.modules.attention.full_attn import scaled_dot_product_attention
 
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = split_block_modulation(block, mod)
     source: dict[str, np.ndarray] = {
         "input": _to_numpy(x),
         "shift_msa": _to_numpy(shift_msa),
