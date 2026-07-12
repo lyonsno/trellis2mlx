@@ -348,8 +348,6 @@ def build_mlp_witness_arrays(
         arrays[f"source_{name}"] = _require_array(source, name, label="source")
         arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
     for name in MLP_WITNESS_OPTIONAL_NAMES:
-        if name in source:
-            arrays[f"source_{name}"] = _require_array(source, name, label="source")
         if name in captured:
             arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
     return arrays

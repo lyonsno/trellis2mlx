@@ -232,6 +232,8 @@ def test_mlp_witness_arrays_include_inputs_outputs_and_weights():
     assert arrays["captured_mlp"][0, 0] == 10
     assert arrays["captured_mlp_fc1"].shape == (2, 20)
     assert arrays["captured_mlp_gelu"][0, 0] == 9
+    assert "source_mlp_fc1" not in arrays
+    assert "source_mlp_gelu" not in arrays
     assert arrays["source_mlp_fc1_weight"].shape == (20, 12)
     assert arrays["source_mlp_fc1_bias"].shape == (20,)
     assert arrays["source_mlp_fc2_weight"].shape == (12, 20)
