@@ -906,3 +906,48 @@ def test_stage_capture_wrapper_forwards_sparse_block_injection_route(tmp_path):
     assert route_identity["route"]["sparse_flow_block_injection_block_index"] == 0
     assert route_identity["route"]["sparse_flow_block_injection_branch"] == "both"
     assert route_identity["route"]["sparse_flow_block_injection_stage"] == "norm1"
+
+
+def test_stage_capture_wrapper_forwards_layernorm_correction_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    report = tmp_path / "block0_norm1_boundary_probe.json"
+    report.write_text('{"schema":"trellis2mlx.noaffine_layernorm_boundary_probe.v1"}')
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--sparse-flow-layernorm-correction-report",
+            str(report),
+            "--sparse-flow-layernorm-correction-step-index",
+            "2",
+            "--sparse-flow-layernorm-correction-block-index",
+            "0",
+            "--sparse-flow-layernorm-correction-branch",
+            "pos",
+            "--sparse-flow-layernorm-correction-mode",
+            "scale",
+            "--sparse-flow-layernorm-correction-include",
+            "improved",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-layernorm-correction-report" in command
+    assert command[command.index("--sparse-flow-layernorm-correction-report") + 1] == str(report)
+    assert "--sparse-flow-layernorm-correction-mode" in command
+    assert command[command.index("--sparse-flow-layernorm-correction-mode") + 1] == "scale"
+    assert route_identity["route"]["sparse_flow_layernorm_correction_report_path"] == str(report)
+    assert route_identity["route"]["sparse_flow_layernorm_correction_report_sha256"] is not None
+    assert route_identity["route"]["sparse_flow_layernorm_correction_step_index"] == 2
+    assert route_identity["route"]["sparse_flow_layernorm_correction_block_index"] == 0
+    assert route_identity["route"]["sparse_flow_layernorm_correction_branch"] == "pos"
+    assert route_identity["route"]["sparse_flow_layernorm_correction_mode"] == "scale"
+    assert route_identity["route"]["sparse_flow_layernorm_correction_include"] == "improved"

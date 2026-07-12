@@ -97,6 +97,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="modulated_self_input",
     )
     parser.add_argument("--sparse-flow-block-injection-array-key")
+    parser.add_argument("--sparse-flow-layernorm-correction-report")
+    parser.add_argument("--sparse-flow-layernorm-correction-step-index", type=int, default=2)
+    parser.add_argument("--sparse-flow-layernorm-correction-block-index", type=int, default=0)
+    parser.add_argument(
+        "--sparse-flow-layernorm-correction-branch",
+        choices=["pos", "neg", "both"],
+        default="pos",
+    )
+    parser.add_argument(
+        "--sparse-flow-layernorm-correction-mode",
+        choices=["scale", "bias"],
+        default="scale",
+    )
+    parser.add_argument(
+        "--sparse-flow-layernorm-correction-include",
+        choices=["improved", "solved", "all"],
+        default="improved",
+    )
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     return parser
@@ -190,6 +208,19 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_block_injection_branch": args.sparse_flow_block_injection_branch,
             "sparse_flow_block_injection_stage": args.sparse_flow_block_injection_stage,
             "sparse_flow_block_injection_array_key": args.sparse_flow_block_injection_array_key,
+            "sparse_flow_layernorm_correction_report_path": (
+                str(Path(args.sparse_flow_layernorm_correction_report))
+                if args.sparse_flow_layernorm_correction_report else None
+            ),
+            "sparse_flow_layernorm_correction_report_sha256": (
+                _sha256_file(args.sparse_flow_layernorm_correction_report)
+                if args.sparse_flow_layernorm_correction_report else None
+            ),
+            "sparse_flow_layernorm_correction_step_index": args.sparse_flow_layernorm_correction_step_index,
+            "sparse_flow_layernorm_correction_block_index": args.sparse_flow_layernorm_correction_block_index,
+            "sparse_flow_layernorm_correction_branch": args.sparse_flow_layernorm_correction_branch,
+            "sparse_flow_layernorm_correction_mode": args.sparse_flow_layernorm_correction_mode,
+            "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
         },
@@ -382,6 +413,21 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.extend([
             "--sparse-flow-block-injection-manifest",
             str(Path(args.sparse_flow_block_injection_manifest)),
+        ])
+    if args.sparse_flow_layernorm_correction_report:
+        command.extend([
+            "--sparse-flow-layernorm-correction-report",
+            str(Path(args.sparse_flow_layernorm_correction_report)),
+            "--sparse-flow-layernorm-correction-step-index",
+            str(args.sparse_flow_layernorm_correction_step_index),
+            "--sparse-flow-layernorm-correction-block-index",
+            str(args.sparse_flow_layernorm_correction_block_index),
+            "--sparse-flow-layernorm-correction-branch",
+            args.sparse_flow_layernorm_correction_branch,
+            "--sparse-flow-layernorm-correction-mode",
+            args.sparse_flow_layernorm_correction_mode,
+            "--sparse-flow-layernorm-correction-include",
+            args.sparse_flow_layernorm_correction_include,
         ])
     if args.stop_after_stage == "shape_flow_block_trace":
         command.extend([
