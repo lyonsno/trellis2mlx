@@ -187,6 +187,51 @@ def test_cuda_sparse_cross_attention_metric_reports_exact_and_delta():
     assert report["max_abs"] == 0.5
 
 
+def test_cuda_sparse_mlp_metric_reports_exact_and_delta():
+    from scripts.cuda_sparse_mlp_witness import metric_np
+
+    report = metric_np(
+        np.array([[1.0, 2.0]], dtype=np.float32),
+        np.array([[1.0, 1.5]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["exact"] is False
+    assert report["nonzero"] == 1
+    assert report["mean_abs"] == 0.25
+    assert report["max_abs"] == 0.5
+    assert report["normalized_singleton_batch"] is False
+
+
+def test_cuda_sparse_mlp_metric_aligns_only_extra_singleton_batch():
+    from scripts.cuda_sparse_mlp_witness import metric_np
+
+    report = metric_np(
+        np.array([[[1.0, 2.0]]], dtype=np.float32),
+        np.array([[1.0, 1.5]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["normalized_singleton_batch"] is True
+    assert report["nonzero"] == 1
+    assert report["max_abs"] == 0.5
+
+
+def test_cuda_sparse_mlp_witness_requires_named_arrays():
+    from scripts.cuda_sparse_mlp_witness import _require
+
+    with pytest.raises(KeyError, match="captured_mlp_input"):
+        _require({}, "captured_mlp_input")
+
+
+def test_cuda_sparse_mlp_witness_schema_and_failure_phase_are_stable():
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "cuda_sparse_mlp_witness.py").read_text()
+
+    assert 'SCHEMA = "trellis2mlx.cuda_sparse_mlp.v1"' in source
+    assert '"failure_phase": "cuda_sparse_mlp"' in source
+    assert "cuda_vs_captured_after_mlp" in source
+
+
 def test_module_parameter_dtype_prefers_first_parameter_dtype():
     from scripts.source_sparse_block_replay import module_parameter_dtype
 

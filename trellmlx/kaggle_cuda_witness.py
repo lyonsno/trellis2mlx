@@ -472,7 +472,7 @@ import sys
 import time
 from pathlib import Path
 
-CONFIG = {json.dumps(config, sort_keys=True)}
+CONFIG = json.loads({json.dumps(json.dumps(config, sort_keys=True))})
 RECEIPT = Path("kaggle_cuda_witness_receipt.json")
 
 
