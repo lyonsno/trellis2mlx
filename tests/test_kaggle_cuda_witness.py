@@ -123,6 +123,36 @@ def test_prepare_packet_runner_config_compiles_with_default_optional_outputs(tmp
     assert not config_line.startswith("CONFIG = {")
 
 
+def test_prepare_packet_preserves_entrypoint_args_in_runner(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/args-inputs",
+            kernel_id="operator/args-cuda",
+            title="Args CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            entrypoint_args=("--branch", "neg", "--block-indices", "0"),
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["entrypoint_args"] == ["--branch", "neg", "--block-indices", "0"]
+    assert loaded.entrypoint_args == ("--branch", "neg", "--block-indices", "0")
+    assert '\\"entrypoint_args\\": [\\"--branch\\", \\"neg\\", \\"--block-indices\\", \\"0\\"]' in runner
+    assert "command += CONFIG.get(\"entrypoint_args\", [])" in runner
+
+
 def test_prepare_packet_can_declare_mesh_ply_output(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
 

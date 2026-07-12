@@ -35,6 +35,7 @@ class KaggleCudaWitnessPacket:
     title: str
     entrypoint: str
     inputs: tuple[str, ...]
+    entrypoint_args: tuple[str, ...] = ()
     accelerator: str = "NvidiaTeslaT4"
     enable_internet: bool = False
     output_json: str = "cuda_result.json"
@@ -46,6 +47,7 @@ class KaggleCudaWitnessPacket:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         object.__setattr__(self, "inputs", tuple(self.inputs))
+        object.__setattr__(self, "entrypoint_args", tuple(self.entrypoint_args))
 
     @property
     def dataset_dir(self) -> Path:
@@ -95,6 +97,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "kernel_id": packet.kernel_id,
         "title": packet.title,
         "entrypoint": packet.entrypoint,
+        "entrypoint_args": list(packet.entrypoint_args),
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "outputs": list(packet.outputs),
@@ -142,6 +145,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         title=kernel_metadata["title"],
         entrypoint=manifest["entrypoint"],
         inputs=inputs,
+        entrypoint_args=tuple(manifest.get("entrypoint_args", ())),
         accelerator=kernel_metadata.get("machine_shape", manifest.get("accelerator", "NvidiaTeslaT4")),
         enable_internet=_bool_metadata(
             kernel_metadata.get("enable_internet", manifest.get("enable_internet", False))
@@ -283,6 +287,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--kernel-id", required=True)
     prepare.add_argument("--title", required=True)
     prepare.add_argument("--entrypoint", required=True)
+    prepare.add_argument("--entrypoint-arg", action="append", dest="entrypoint_args", default=[])
     prepare.add_argument("--input", action="append", dest="inputs", required=True)
     prepare.add_argument("--accelerator", default="NvidiaTeslaT4")
     prepare.add_argument("--enable-internet", action="store_true")
@@ -311,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 title=args.title,
                 entrypoint=args.entrypoint,
                 inputs=tuple(args.inputs),
+                entrypoint_args=tuple(args.entrypoint_args),
                 accelerator=args.accelerator,
                 enable_internet=args.enable_internet,
                 output_json=args.output_json,
@@ -362,6 +368,7 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "kernel_id": packet.kernel_id,
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
+        "entrypoint_args": list(packet.entrypoint_args),
         "dataset_dir": str(packet.dataset_dir),
         "kernel_dir": str(packet.kernel_dir),
         "commands": {
@@ -457,6 +464,7 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "kernel_id": packet.kernel_id,
         "accelerator": packet.accelerator,
         "entrypoint": packet.entrypoint,
+        "entrypoint_args": list(packet.entrypoint_args),
         "outputs": list(packet.outputs),
         "output_ply": packet.output_ply,
         "output_mesh_state": packet.output_mesh_state,
@@ -567,6 +575,7 @@ def main() -> int:
         copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
 
     command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["outputs"][0], "--output-npz", CONFIG["outputs"][1]]
+    command += CONFIG.get("entrypoint_args", [])
     if CONFIG["output_ply"]:
         command += ["--output-ply", CONFIG["output_ply"]]
     if CONFIG["output_mesh_state"]:
