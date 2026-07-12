@@ -770,6 +770,15 @@ def test_generate_sparse_flow_block_trace_can_replay_projected_block_input():
     assert 'f"neg_block{trace_block_index}_input"' in source
 
 
+def test_generate_sparse_flow_block_trace_can_save_selected_trace_keys():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--sparse-flow-trace-keys" in source
+    assert "selected_trace_keys = _parse_sparse_flow_trace_keys" in source
+    assert "trace_payload = _filter_sparse_flow_trace_payload(" in source
+    assert "sparse_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str)" in source
+
+
 def test_generate_can_load_conditioning_sample():
     source = GENERATE_SOURCE.read_text()
 
@@ -816,3 +825,40 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_no_kv_cache(tmp_path):
 
     assert "--sparse-flow-trace-no-kv-cache" in command
     assert route_identity["route"]["sparse_flow_trace_uses_kv_cache"] is False
+
+
+def test_stage_capture_wrapper_forwards_sparse_flow_trace_keys(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--sparse-flow-trace-keys",
+            "pos_block5_input,pos_block5_after_self,pos_block5_after_mlp",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert "--sparse-flow-trace-keys" in command
+    assert (
+        command[command.index("--sparse-flow-trace-keys") + 1]
+        == "pos_block5_input,pos_block5_after_self,pos_block5_after_mlp"
+    )
+    assert route_identity["route"]["sparse_flow_trace_keys"] == [
+        "pos_block5_input",
+        "pos_block5_after_self",
+        "pos_block5_after_mlp",
+    ]

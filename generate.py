@@ -68,6 +68,28 @@ def _normalize_slat(slat: mx.array, mean=SHAPE_SLAT_MEAN, std=SHAPE_SLAT_STD) ->
     return (slat - mx.array(mean)) / mx.array(std)
 
 
+def _parse_sparse_flow_trace_keys(value: str | None) -> list[str]:
+    if not value:
+        return []
+    keys = [key.strip() for key in value.split(",")]
+    if any(not key for key in keys):
+        raise ValueError("--sparse-flow-trace-keys must be a comma-separated list of non-empty keys")
+    return list(dict.fromkeys(keys))
+
+
+def _filter_sparse_flow_trace_payload(payload: dict[str, np.ndarray], selected_keys: list[str]) -> dict[str, np.ndarray]:
+    if not selected_keys:
+        return payload
+    missing = [key for key in selected_keys if key not in payload]
+    if missing:
+        available = ", ".join(sorted(payload))
+        raise ValueError(
+            "--sparse-flow-trace-keys selected missing key(s): "
+            f"{missing}; available keys: {available}"
+        )
+    return {key: payload[key] for key in selected_keys}
+
+
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
@@ -604,6 +626,9 @@ def main():
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true",
                         help="Diagnostic: disable sparse-flow block-trace cross-attention KV cache "
                              "to match direct reference trace hooks.")
+    parser.add_argument("--sparse-flow-trace-keys",
+                        help="Diagnostic: comma-separated final sparse-flow block-trace payload keys to save. "
+                             "Omit to save the full block trace.")
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow block index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
@@ -1168,6 +1193,7 @@ def main():
                 return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
 
             from trellmlx.checkpoint import save_checkpoint
+            selected_trace_keys = _parse_sparse_flow_trace_keys(args.sparse_flow_trace_keys)
             trace_payload = {
                 f"pos_{name}": trace_np(value)
                 for name, value in pos_trace.items()
@@ -1178,6 +1204,7 @@ def main():
                     for name, value in neg_trace.items()
                 }
             )
+            trace_payload = _filter_sparse_flow_trace_payload(trace_payload, selected_trace_keys)
             save_checkpoint(
                 args.save_checkpoints,
                 "sparse_flow_block_trace",
@@ -1192,6 +1219,7 @@ def main():
                 sparse_flow_trace_pos_block_input_key=np.array(pos_block_input_key),
                 sparse_flow_trace_neg_block_input_key=np.array(neg_block_input_key),
                 sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
+                sparse_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str),
                 t=np.array(1000.0 * trace_t, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),
                 rescale_t=np.array(5.0, dtype=np.float32),

@@ -21,6 +21,15 @@ STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
 }
 
 
+def _parse_sparse_flow_trace_keys(value: str | None) -> list[str]:
+    if not value:
+        return []
+    keys = [key.strip() for key in value.split(",")]
+    if any(not key for key in keys):
+        raise ValueError("--sparse-flow-trace-keys must be a comma-separated list of non-empty keys")
+    return list(dict.fromkeys(keys))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run trellis2mlx stage capture")
     parser.add_argument("--image", required=True)
@@ -72,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse-flow-start-step-index", type=int, default=0)
     parser.add_argument("--sparse-flow-trace-block-input-sample")
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
+    parser.add_argument("--sparse-flow-trace-keys")
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     return parser
@@ -143,6 +153,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
                 if args.sparse_flow_trace_block_input_sample else None
             ),
             "sparse_flow_trace_uses_kv_cache": not args.sparse_flow_trace_no_kv_cache,
+            "sparse_flow_trace_keys": _parse_sparse_flow_trace_keys(args.sparse_flow_trace_keys),
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
         },
@@ -311,6 +322,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             ])
         if args.sparse_flow_trace_no_kv_cache:
             command.append("--sparse-flow-trace-no-kv-cache")
+        if args.sparse_flow_trace_keys:
+            command.extend(["--sparse-flow-trace-keys", args.sparse_flow_trace_keys])
     if args.stop_after_stage == "shape_flow_block_trace":
         command.extend([
             "--shape-flow-trace-block-index",
