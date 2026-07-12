@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse-flow-trace-no-kv-cache", action="store_true")
     parser.add_argument("--sparse-flow-trace-keys")
     parser.add_argument("--sparse-flow-block-injection-trace")
+    parser.add_argument("--sparse-flow-block-injection-manifest")
     parser.add_argument("--sparse-flow-block-injection-step-index", type=int, default=2)
     parser.add_argument("--sparse-flow-block-injection-block-index", type=int, default=0)
     parser.add_argument(
@@ -175,6 +176,14 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_block_injection_trace_sha256": (
                 _sha256_file(args.sparse_flow_block_injection_trace)
                 if args.sparse_flow_block_injection_trace else None
+            ),
+            "sparse_flow_block_injection_manifest_path": (
+                str(Path(args.sparse_flow_block_injection_manifest))
+                if args.sparse_flow_block_injection_manifest else None
+            ),
+            "sparse_flow_block_injection_manifest_sha256": (
+                _sha256_file(args.sparse_flow_block_injection_manifest)
+                if args.sparse_flow_block_injection_manifest else None
             ),
             "sparse_flow_block_injection_step_index": args.sparse_flow_block_injection_step_index,
             "sparse_flow_block_injection_block_index": args.sparse_flow_block_injection_block_index,
@@ -369,6 +378,11 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
                 "--sparse-flow-block-injection-array-key",
                 args.sparse_flow_block_injection_array_key,
             ])
+    if args.sparse_flow_block_injection_manifest:
+        command.extend([
+            "--sparse-flow-block-injection-manifest",
+            str(Path(args.sparse_flow_block_injection_manifest)),
+        ])
     if args.stop_after_stage == "shape_flow_block_trace":
         command.extend([
             "--shape-flow-trace-block-index",

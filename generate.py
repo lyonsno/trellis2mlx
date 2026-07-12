@@ -631,6 +631,8 @@ def main():
                              "Omit to save the full block trace.")
     parser.add_argument("--sparse-flow-block-injection-trace", metavar="NPZ",
                         help="Diagnostic: inject named sparse-flow block tensors from an NPZ trace.")
+    parser.add_argument("--sparse-flow-block-injection-manifest", metavar="JSON",
+                        help="Diagnostic: inject multiple named sparse-flow block tensors from a JSON manifest.")
     parser.add_argument("--sparse-flow-block-injection-step-index", type=int, default=2,
                         help="Diagnostic: sampler step index where --sparse-flow-block-injection-trace applies.")
     parser.add_argument("--sparse-flow-block-injection-block-index", type=int, default=0,
@@ -693,8 +695,13 @@ def main():
             "--sparse-flow-start-sample does not apply to sparse_flow_block_trace; "
             "use --sparse-flow-trace-sample"
         )
-    if args.sparse_flow_block_injection_trace and args.compile:
-        parser.error("--compile is not supported with --sparse-flow-block-injection-trace")
+    if args.sparse_flow_block_injection_trace and args.sparse_flow_block_injection_manifest:
+        parser.error(
+            "--sparse-flow-block-injection-trace and "
+            "--sparse-flow-block-injection-manifest are mutually exclusive"
+        )
+    if (args.sparse_flow_block_injection_trace or args.sparse_flow_block_injection_manifest) and args.compile:
+        parser.error("--compile is not supported with sparse-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1040,7 +1047,22 @@ def main():
     else:
         sparse_block_injection = None
         sparse_block_injection_json = ""
-        if args.sparse_flow_block_injection_trace:
+        if args.sparse_flow_block_injection_trace and args.sparse_flow_block_injection_manifest:
+            raise ValueError(
+                "--sparse-flow-block-injection-trace and "
+                "--sparse-flow-block-injection-manifest are mutually exclusive"
+            )
+        if args.sparse_flow_block_injection_manifest:
+            from trellmlx.sparse_block_injection import load_sparse_block_injection_manifest
+
+            sparse_block_injection = load_sparse_block_injection_manifest(
+                args.sparse_flow_block_injection_manifest,
+            )
+            sparse_block_injection_json = json.dumps(
+                sparse_block_injection.report_identity(),
+                sort_keys=True,
+            )
+        elif args.sparse_flow_block_injection_trace:
             from trellmlx.sparse_block_injection import load_sparse_block_injection
 
             sparse_block_injection = load_sparse_block_injection(

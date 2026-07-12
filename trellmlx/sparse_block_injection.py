@@ -56,6 +56,48 @@ class SparseBlockInjection:
         return identity
 
 
+@dataclass(frozen=True)
+class SparseBlockInjectionSet:
+    trace_path: Path | None
+    sites: tuple[SparseBlockInjection, ...]
+    manifest_identity: dict[str, Any]
+
+    def applies(self, *, step_index: int, branch: str) -> bool:
+        return any(site.applies(step_index=step_index, branch=branch) for site in self.sites)
+
+    def active_for_step_branch(self, *, step_index: int, branch: str) -> "SparseBlockInjectionSet | None":
+        active = tuple(
+            site for site in self.sites if site.applies(step_index=step_index, branch=branch)
+        )
+        if not active:
+            return None
+        return SparseBlockInjectionSet(
+            trace_path=self.trace_path,
+            sites=active,
+            manifest_identity=self.manifest_identity,
+        )
+
+    def injection_for_block(self, block_index: int) -> SparseBlockInjection | None:
+        matches = [site for site in self.sites if site.block_index == block_index]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(
+                f"sparse block injection manifest has multiple active sites for block {block_index}"
+            )
+        return matches[0]
+
+    def report_identity(self) -> dict[str, Any]:
+        return {
+            "manifest_path": str(self.trace_path) if self.trace_path is not None else None,
+            "manifest_sha256": _sha256_file(self.trace_path) if self.trace_path else None,
+            "comparison_class": "mlx_sparse_flow_with_named_block_tensor_injection_set",
+            "route_identity_evidence": True,
+            "manifest_identity": self.manifest_identity,
+            "sites": [site.report_identity() for site in self.sites],
+        }
+
+
 def load_sparse_block_injection(
     trace_path: str | Path,
     *,
@@ -114,6 +156,48 @@ def load_sparse_block_injection(
         stage=stage,
         arrays_by_branch=arrays_by_branch,
         trace_identity=trace_identity,
+    )
+
+
+def load_sparse_block_injection_manifest(manifest_path: str | Path) -> SparseBlockInjectionSet:
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    sites_raw = manifest.get("sites")
+    if not isinstance(sites_raw, list) or not sites_raw:
+        raise ValueError("sparse block injection manifest must contain a non-empty 'sites' list")
+
+    sites: list[SparseBlockInjection] = []
+    for index, site in enumerate(sites_raw):
+        if not isinstance(site, dict):
+            raise ValueError(f"manifest site {index} must be an object")
+        try:
+            trace_path = Path(site["trace_path"])
+            branch = site["branch"]
+            step_index = site["step_index"]
+            block_index = site["block_index"]
+            stage = site["stage"]
+        except KeyError as exc:
+            raise KeyError(f"manifest site {index} missing required key {exc.args[0]!r}") from exc
+        if not trace_path.is_absolute():
+            trace_path = manifest_path.parent / trace_path
+        sites.append(
+            load_sparse_block_injection(
+                trace_path,
+                branch=branch,
+                step_index=int(step_index),
+                block_index=int(block_index),
+                stage=stage,
+                array_key=site.get("array_key"),
+            )
+        )
+
+    manifest_identity = {
+        key: value for key, value in manifest.items() if key != "sites"
+    }
+    return SparseBlockInjectionSet(
+        trace_path=manifest_path,
+        sites=tuple(sites),
+        manifest_identity=manifest_identity,
     )
 
 

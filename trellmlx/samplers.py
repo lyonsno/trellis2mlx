@@ -222,12 +222,19 @@ def _branch_model_kwargs(
 ) -> dict:
     kw = dict(**model_kwargs)
     if sparse_block_injection is not None:
+        if hasattr(sparse_block_injection, "active_for_step_branch"):
+            active_injection = sparse_block_injection.active_for_step_branch(
+                step_index=step_index,
+                branch=branch,
+            )
+        else:
+            active_injection = (
+                sparse_block_injection
+                if sparse_block_injection.applies(step_index=step_index, branch=branch)
+                else None
+            )
         kw["sparse_block_injection_branch"] = branch
-        kw["sparse_block_injection"] = (
-            sparse_block_injection
-            if sparse_block_injection.applies(step_index=step_index, branch=branch)
-            else None
-        )
+        kw["sparse_block_injection"] = active_injection
     return kw
 
 

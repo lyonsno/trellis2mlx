@@ -823,12 +823,18 @@ class SparseStructureFlowModel(nn.Module):
         else:
             for i, block in enumerate(self.blocks):
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
-                if sparse_block_injection is not None and i == sparse_block_injection.block_index:
+                block_injection = None
+                if sparse_block_injection is not None:
+                    if hasattr(sparse_block_injection, "injection_for_block"):
+                        block_injection = sparse_block_injection.injection_for_block(i)
+                    elif i == sparse_block_injection.block_index:
+                        block_injection = sparse_block_injection
+                if block_injection is not None:
                     x = block.forward_with_injection(
                         x,
                         mod[0],
                         cond,
-                        injection=sparse_block_injection,
+                        injection=block_injection,
                         branch=sparse_block_injection_branch or "pos",
                         rope_phases=rope_phases,
                         cross_kv_cache=block_kv,
