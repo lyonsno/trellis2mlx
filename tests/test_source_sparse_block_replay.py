@@ -382,6 +382,7 @@ def test_cuda_sparse_mlp_witness_schema_and_failure_phase_are_stable():
     assert 'SCHEMA = "trellis2mlx.cuda_sparse_mlp.v1"' in source
     assert '"failure_phase": "cuda_sparse_mlp"' in source
     assert "cuda_vs_captured_after_mlp" in source
+    assert "cuda_vs_source_after_mlp" in source
 
 
 def test_module_parameter_dtype_prefers_first_parameter_dtype():

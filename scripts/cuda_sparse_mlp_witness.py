@@ -163,6 +163,21 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, np.ndarray
                 _require(data, "captured_mlp_gelu"),
                 outputs["cuda_mlp_gelu"],
             )
+        if "source_mlp" in data:
+            report["cuda_vs_source_mlp"] = metric_np(
+                _require(data, "source_mlp"),
+                outputs["cuda_mlp"],
+            )
+        if "source_mlp_gated" in data:
+            report["cuda_vs_source_mlp_gated"] = metric_np(
+                _require(data, "source_mlp_gated"),
+                outputs["cuda_mlp_gated"],
+            )
+        if "source_after_mlp" in data:
+            report["cuda_vs_source_after_mlp"] = metric_np(
+                _require(data, "source_after_mlp"),
+                outputs["cuda_after_mlp"],
+            )
     return report, outputs
 
 
