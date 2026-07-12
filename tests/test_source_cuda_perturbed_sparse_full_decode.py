@@ -150,6 +150,32 @@ def test_load_block_injection_records_explicit_array_key_and_both_branch(tmp_pat
     assert not injection.applies(step_index=4, branch="pos", block_index=1)
 
 
+def test_load_block_injection_both_branch_defaults_to_branch_specific_keys(tmp_path):
+    from scripts.source_cuda_perturbed_sparse_full_decode import load_block_injection
+
+    trace = tmp_path / "trace.npz"
+    np.savez(
+        trace,
+        pos_block0_modulated_self_input=np.ones((1, 8, 4), dtype=np.float32),
+        neg_block0_modulated_self_input=np.ones((1, 8, 4), dtype=np.float32) * 2,
+    )
+
+    injection = load_block_injection(
+        trace,
+        branch="both",
+        step_index=2,
+        block_index=0,
+        stage="modulated_self_input",
+        array_key=None,
+    )
+
+    assert injection.array_key == "pos_block0_modulated_self_input,neg_block0_modulated_self_input"
+    np.testing.assert_allclose(injection.array_for_branch("pos"), 1.0)
+    np.testing.assert_allclose(injection.array_for_branch("neg"), 2.0)
+    identity = injection.report_identity()
+    assert identity["array_shape_by_branch"] == {"neg": [1, 8, 4], "pos": [1, 8, 4]}
+
+
 def test_load_block_injection_rejects_missing_array(tmp_path):
     from scripts.source_cuda_perturbed_sparse_full_decode import load_block_injection
 

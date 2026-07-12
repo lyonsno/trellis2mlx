@@ -142,7 +142,7 @@ class BlockInjection:
     step_index: int
     block_index: int
     stage: str
-    array: np.ndarray
+    array: np.ndarray | dict[str, np.ndarray]
     trace_identity: dict[str, Any]
 
     def applies(self, *, step_index: int, branch: str, block_index: int) -> bool:
@@ -152,20 +152,34 @@ class BlockInjection:
             and (self.branch == "both" or self.branch == branch)
         )
 
+    def array_for_branch(self, branch: str) -> np.ndarray:
+        if isinstance(self.array, dict):
+            return self.array[branch]
+        return self.array
+
     def report_identity(self) -> dict[str, Any]:
-        return {
+        identity = {
             "trace_path": str(self.trace_path),
             "array_key": self.array_key,
             "branch": self.branch,
             "step_index": self.step_index,
             "block_index": self.block_index,
             "stage": self.stage,
-            "array_shape": list(self.array.shape),
-            "array_dtype": str(self.array.dtype),
             "trace_identity": self.trace_identity,
             "comparison_class": "source_cuda_sparse_flow_with_named_block_tensor_injection",
             "route_identity_evidence": True,
         }
+        if isinstance(self.array, dict):
+            identity["array_shape_by_branch"] = {
+                key: list(value.shape) for key, value in sorted(self.array.items())
+            }
+            identity["array_dtype_by_branch"] = {
+                key: str(value.dtype) for key, value in sorted(self.array.items())
+            }
+        else:
+            identity["array_shape"] = list(self.array.shape)
+            identity["array_dtype"] = str(self.array.dtype)
+        return identity
 
 
 def load_block_injection(
@@ -178,11 +192,27 @@ def load_block_injection(
     array_key: str | None,
 ) -> BlockInjection:
     trace_path = Path(trace_path)
-    selected_key = array_key or f"{branch}_block{block_index}_{stage}"
     with np.load(trace_path) as trace:
-        if selected_key not in trace:
-            raise KeyError(f"block injection trace missing required array {selected_key!r}")
-        array = np.asarray(trace[selected_key], dtype=np.float32)
+        if branch == "both" and array_key is None:
+            branch_keys = {
+                name: f"{name}_block{block_index}_{stage}" for name in ("pos", "neg")
+            }
+            missing = [key for key in branch_keys.values() if key not in trace]
+            if missing:
+                raise KeyError(
+                    "block injection trace missing required array(s): "
+                    + ", ".join(repr(key) for key in missing)
+                )
+            selected_key = ",".join(branch_keys[name] for name in ("pos", "neg"))
+            array: np.ndarray | dict[str, np.ndarray] = {
+                name: np.asarray(trace[key], dtype=np.float32)
+                for name, key in branch_keys.items()
+            }
+        else:
+            selected_key = array_key or f"{branch}_block{block_index}_{stage}"
+            if selected_key not in trace:
+                raise KeyError(f"block injection trace missing required array {selected_key!r}")
+            array = np.asarray(trace[selected_key], dtype=np.float32)
         trace_identity: dict[str, Any] = {}
         if "route_identity_json" in trace:
             raw_identity = np.asarray(trace["route_identity_json"])
@@ -731,6 +761,7 @@ def _forward_sparse_flow_with_block_injection(
                 t_emb,
                 cond,
                 injection=injection,
+                branch=branch,
             )
         else:
             h = block(h, t_emb, cond, model.rope_phases)
@@ -755,6 +786,7 @@ def _block_forward_with_injection(
     context: Any,
     *,
     injection: BlockInjection,
+    branch: str,
 ):
     from trellis2.modules.attention import RotaryPositionEmbedder
     from trellis2.modules.attention.full_attn import scaled_dot_product_attention
@@ -766,10 +798,10 @@ def _block_forward_with_injection(
 
     h = block.norm1(x)
     if injection.stage == "norm1":
-        h = _injected_tensor_like(torch_module, injection, h)
+        h = _injected_tensor_like(torch_module, injection, h, branch=branch)
     h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
     if injection.stage == "modulated_self_input":
-        h = _injected_tensor_like(torch_module, injection, h)
+        h = _injected_tensor_like(torch_module, injection, h, branch=branch)
 
     attn = block.self_attn
     qkv = attn.to_qkv(h)
@@ -787,7 +819,7 @@ def _block_forward_with_injection(
     h = h * gate_msa.unsqueeze(1)
     x = x + h
     if injection.stage == "after_self":
-        x = _injected_tensor_like(torch_module, injection, x)
+        x = _injected_tensor_like(torch_module, injection, x, branch=branch)
 
     h = block.norm2(x)
     attn = block.cross_attn
@@ -830,8 +862,14 @@ def _source_gelu(torch_module: Any, mlp: Any, value: Any) -> Any:
     return torch_module.nn.functional.gelu(value, approximate="tanh")
 
 
-def _injected_tensor_like(torch_module: Any, injection: BlockInjection, target: Any) -> Any:
-    array = np.asarray(injection.array, dtype=np.float32)
+def _injected_tensor_like(
+    torch_module: Any,
+    injection: BlockInjection,
+    target: Any,
+    *,
+    branch: str,
+) -> Any:
+    array = np.asarray(injection.array_for_branch(branch), dtype=np.float32)
     if array.ndim == target.ndim - 1:
         array = array[None, ...]
     if tuple(array.shape) != tuple(target.shape):
