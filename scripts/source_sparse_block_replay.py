@@ -68,6 +68,16 @@ CROSS_Q_WITNESS_NAMES = (
     "cross_q_pre_norm",
     "cross_q_post_norm",
 )
+MLP_WITNESS_NAMES = (
+    "mlp_input",
+    "mlp",
+    "mlp_gated",
+    "after_mlp",
+)
+MLP_WITNESS_OPTIONAL_NAMES = (
+    "mlp_fc1",
+    "mlp_gelu",
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -315,12 +325,48 @@ def build_cross_q_witness_arrays(
     return arrays
 
 
+def build_mlp_witness_arrays(
+    *,
+    source: dict[str, np.ndarray],
+    captured: dict[str, np.ndarray],
+    fc1_weight: np.ndarray,
+    fc1_bias: np.ndarray,
+    fc2_weight: np.ndarray,
+    fc2_bias: np.ndarray,
+    route_identity: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {
+        "route_identity_json": np.asarray(json.dumps(route_identity, sort_keys=True)),
+        "captured_gate_mlp": _require_array(captured, "gate_mlp", label="captured"),
+        "captured_after_cross": _require_array(captured, "after_cross", label="captured"),
+        "source_mlp_fc1_weight": np.asarray(fc1_weight, dtype=np.float32),
+        "source_mlp_fc1_bias": np.asarray(fc1_bias, dtype=np.float32),
+        "source_mlp_fc2_weight": np.asarray(fc2_weight, dtype=np.float32),
+        "source_mlp_fc2_bias": np.asarray(fc2_bias, dtype=np.float32),
+    }
+    for name in MLP_WITNESS_NAMES:
+        arrays[f"source_{name}"] = _require_array(source, name, label="source")
+        arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
+    for name in MLP_WITNESS_OPTIONAL_NAMES:
+        if name in source:
+            arrays[f"source_{name}"] = _require_array(source, name, label="source")
+        if name in captured:
+            arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
+    return arrays
+
+
 def _linear_weight_bias(linear: Any) -> tuple[np.ndarray, np.ndarray | None]:
     weight = linear.weight.detach().float().cpu().numpy()
     bias = None
     if getattr(linear, "bias", None) is not None:
         bias = linear.bias.detach().float().cpu().numpy()
     return weight, bias
+
+
+def _source_mlp_linears(mlp: Any) -> tuple[Any, Any]:
+    if hasattr(mlp, "mlp"):
+        return mlp.mlp[0], mlp.mlp[2]
+    return mlp.mlp_0, mlp.mlp_2
 
 
 def _parameter_array(parameter: Any, *, name: str) -> np.ndarray:
@@ -656,6 +702,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sha256": _sha256(args.cross_q_witness_output),
             "arrays": {key: list(value.shape) for key, value in arrays.items()},
         }
+    mlp_witness_status = None
+    if args.mlp_witness_output is not None:
+        phase = "write_mlp_witness"
+        block = model.blocks[args.block_index]
+        fc1, fc2 = _source_mlp_linears(block.mlp)
+        fc1_weight, fc1_bias = _linear_weight_bias(fc1)
+        fc2_weight, fc2_bias = _linear_weight_bias(fc2)
+        if fc1_bias is None:
+            raise RuntimeError("source sparse block mlp fc1 bias is required")
+        if fc2_bias is None:
+            raise RuntimeError("source sparse block mlp fc2 bias is required")
+        captured_for_mlp = dict(payload["captured"])
+        captured_for_mlp["gate_mlp"] = payload["mod"][5]
+        arrays = build_mlp_witness_arrays(
+            source=source,
+            captured=captured_for_mlp,
+            fc1_weight=fc1_weight,
+            fc1_bias=fc1_bias,
+            fc2_weight=fc2_weight,
+            fc2_bias=fc2_bias,
+            route_identity=route_identity,
+        )
+        args.mlp_witness_output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.mlp_witness_output, **arrays)
+        mlp_witness_status = {
+            "path": _jsonable_path(args.mlp_witness_output),
+            "sha256": _sha256(args.mlp_witness_output),
+            "arrays": {key: list(value.shape) for key, value in arrays.items()},
+        }
     return {
         "schema": SCHEMA,
         "status": "ok",
@@ -669,6 +744,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "attention_witness": attention_witness_status,
         "cross_attention_witness": cross_attention_witness_status,
         "cross_q_witness": cross_q_witness_status,
+        "mlp_witness": mlp_witness_status,
     }
 
 
@@ -681,6 +757,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--attention-witness-output", type=Path)
     parser.add_argument("--cross-attention-witness-output", type=Path)
     parser.add_argument("--cross-q-witness-output", type=Path)
+    parser.add_argument("--mlp-witness-output", type=Path)
     parser.add_argument("--branch", choices=("pos", "neg"), required=True)
     parser.add_argument("--block-index", required=True, type=int)
     return parser.parse_args(argv)

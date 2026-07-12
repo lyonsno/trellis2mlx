@@ -193,6 +193,59 @@ def test_cross_q_witness_arrays_include_norm_q_and_projection_weights():
     assert arrays["route_identity_json"].shape == ()
 
 
+def test_mlp_witness_arrays_include_inputs_outputs_and_weights():
+    from scripts.source_sparse_block_replay import build_mlp_witness_arrays
+
+    source = {
+        "mlp_input": np.ones((2, 12), dtype=np.float32),
+        "mlp_fc1": np.ones((2, 20), dtype=np.float32) * 2,
+        "mlp_gelu": np.ones((2, 20), dtype=np.float32) * 3,
+        "mlp": np.ones((2, 12), dtype=np.float32) * 4,
+        "mlp_gated": np.ones((2, 12), dtype=np.float32) * 5,
+        "after_mlp": np.ones((2, 12), dtype=np.float32) * 6,
+    }
+    captured = {
+        "mlp_input": np.ones((2, 12), dtype=np.float32) * 7,
+        "mlp_fc1": np.ones((2, 20), dtype=np.float32) * 8,
+        "mlp_gelu": np.ones((2, 20), dtype=np.float32) * 9,
+        "mlp": np.ones((2, 12), dtype=np.float32) * 10,
+        "mlp_gated": np.ones((2, 12), dtype=np.float32) * 11,
+        "after_mlp": np.ones((2, 12), dtype=np.float32) * 12,
+        "after_cross": np.ones((2, 12), dtype=np.float32) * 13,
+        "gate_mlp": np.ones((12,), dtype=np.float32) * 14,
+    }
+
+    arrays = build_mlp_witness_arrays(
+        source=source,
+        captured=captured,
+        fc1_weight=np.ones((20, 12), dtype=np.float32),
+        fc1_bias=np.ones((20,), dtype=np.float32) * 2,
+        fc2_weight=np.ones((12, 20), dtype=np.float32) * 3,
+        fc2_bias=np.ones((12,), dtype=np.float32) * 4,
+        route_identity={"effective_route": "official-trellis2-source-cpu-selected-sparse-block"},
+    )
+
+    assert arrays["captured_mlp_input"][0, 0] == 7
+    assert arrays["captured_after_cross"][0, 0] == 13
+    assert arrays["captured_gate_mlp"][0] == 14
+    assert arrays["source_mlp"][0, 0] == 4
+    assert arrays["captured_mlp"][0, 0] == 10
+    assert arrays["captured_mlp_fc1"].shape == (2, 20)
+    assert arrays["captured_mlp_gelu"][0, 0] == 9
+    assert arrays["source_mlp_fc1_weight"].shape == (20, 12)
+    assert arrays["source_mlp_fc1_bias"].shape == (20,)
+    assert arrays["source_mlp_fc2_weight"].shape == (12, 20)
+    assert arrays["source_mlp_fc2_bias"].shape == (12,)
+    assert arrays["route_identity_json"].shape == ()
+
+
+def test_source_sparse_block_replay_declares_mlp_witness_output_arg():
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "source_sparse_block_replay.py").read_text()
+
+    assert "--mlp-witness-output" in source
+    assert "write_mlp_witness" in source
+
+
 def test_cuda_sparse_cross_q_metric_reports_exact_and_delta():
     from scripts.cuda_sparse_cross_q_witness import metric_np
 
