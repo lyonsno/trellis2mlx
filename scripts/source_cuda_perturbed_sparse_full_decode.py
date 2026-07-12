@@ -10,6 +10,7 @@ then runs source CUDA sparse decode, shape, texture, and mesh decode.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import time
 from pathlib import Path
@@ -97,6 +98,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rescale-t", type=float, default=5.0)
     parser.add_argument("--sigma-min", type=float, default=1e-5)
     parser.add_argument(
+        "--block-injection-trace",
+        type=Path,
+        help="NPZ trace containing a tensor to inject into a source-CUDA sparse-flow block.",
+    )
+    parser.add_argument("--block-injection-step-index", type=int, default=2)
+    parser.add_argument("--block-injection-block-index", type=int, default=0)
+    parser.add_argument(
+        "--block-injection-branch",
+        choices=("pos", "neg", "both"),
+        default="pos",
+        help="CFG branch that receives the injected block tensor.",
+    )
+    parser.add_argument(
+        "--block-injection-stage",
+        choices=("norm1", "modulated_self_input", "after_self"),
+        default="modulated_self_input",
+    )
+    parser.add_argument(
+        "--block-injection-array-key",
+        help="Override trace array key; default is <branch>_block<index>_<stage>.",
+    )
+    parser.add_argument(
         "--sparse-conv-backend",
         default="none",
         choices=("none", "spconv", "torchsparse", "flex_gemm"),
@@ -109,6 +132,72 @@ def build_parser() -> argparse.ArgumentParser:
         help="Official source sparse attention backend.",
     )
     return parser
+
+
+@dataclass(frozen=True)
+class BlockInjection:
+    trace_path: Path
+    array_key: str
+    branch: str
+    step_index: int
+    block_index: int
+    stage: str
+    array: np.ndarray
+    trace_identity: dict[str, Any]
+
+    def applies(self, *, step_index: int, branch: str, block_index: int) -> bool:
+        return (
+            int(step_index) == self.step_index
+            and int(block_index) == self.block_index
+            and (self.branch == "both" or self.branch == branch)
+        )
+
+    def report_identity(self) -> dict[str, Any]:
+        return {
+            "trace_path": str(self.trace_path),
+            "array_key": self.array_key,
+            "branch": self.branch,
+            "step_index": self.step_index,
+            "block_index": self.block_index,
+            "stage": self.stage,
+            "array_shape": list(self.array.shape),
+            "array_dtype": str(self.array.dtype),
+            "trace_identity": self.trace_identity,
+            "comparison_class": "source_cuda_sparse_flow_with_named_block_tensor_injection",
+            "route_identity_evidence": True,
+        }
+
+
+def load_block_injection(
+    trace_path: Path,
+    *,
+    branch: str,
+    step_index: int,
+    block_index: int,
+    stage: str,
+    array_key: str | None,
+) -> BlockInjection:
+    trace_path = Path(trace_path)
+    selected_key = array_key or f"{branch}_block{block_index}_{stage}"
+    with np.load(trace_path) as trace:
+        if selected_key not in trace:
+            raise KeyError(f"block injection trace missing required array {selected_key!r}")
+        array = np.asarray(trace[selected_key], dtype=np.float32)
+        trace_identity: dict[str, Any] = {}
+        if "route_identity_json" in trace:
+            raw_identity = np.asarray(trace["route_identity_json"])
+            if raw_identity.shape == ():
+                trace_identity = json.loads(str(raw_identity.item()))
+    return BlockInjection(
+        trace_path=trace_path,
+        array_key=selected_key,
+        branch=branch,
+        step_index=int(step_index),
+        block_index=int(block_index),
+        stage=stage,
+        array=array,
+        trace_identity=trace_identity,
+    )
 
 
 def build_single_perturbed_start(
@@ -186,6 +275,17 @@ def main(argv: list[str] | None = None) -> int:
             args.sparse_conv_backend,
             args.sparse_attn_backend,
         )
+        block_injection = None
+        if args.block_injection_trace is not None:
+            block_injection = load_block_injection(
+                args.block_injection_trace,
+                branch=args.block_injection_branch,
+                step_index=args.block_injection_step_index,
+                block_index=args.block_injection_block_index,
+                stage=args.block_injection_stage,
+                array_key=args.block_injection_array_key,
+            )
+            report["block_injection"] = block_injection.report_identity()
 
         phase = "extract_source"
         phase_started = time.perf_counter()
@@ -330,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             guidance_interval=guidance_interval,
             rescale_t=args.rescale_t,
             sigma_min=args.sigma_min,
+            block_injection=block_injection,
         )
         sync_cuda(torch)
         stage_timings["finish_sparse_flow_elapsed_seconds"] = elapsed(stage_started)
@@ -500,6 +601,7 @@ def finish_sparse_flow_on_source_cuda(
     guidance_interval: tuple[float, float],
     rescale_t: float,
     sigma_min: float,
+    block_injection: BlockInjection | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     t_pairs = _schedule_pairs(steps, rescale_t)
     sample = torch_module.from_numpy(np.asarray(start, dtype=np.float32)).to(device=device, dtype=torch_module.float32)
@@ -510,8 +612,26 @@ def finish_sparse_flow_on_source_cuda(
         t, t_prev = t_pairs[step_index]
         step_started = time.perf_counter()
         t_tensor = torch_module.tensor([1000 * t] * sample.shape[0], device=device, dtype=torch_module.float32)
-        pred_pos = model(sample, t_tensor, cond["cond"])
-        pred_neg = model(sample, t_tensor, cond["neg_cond"])
+        pred_pos = _predict_sparse_flow_branch(
+            model,
+            sample,
+            t_tensor,
+            cond["cond"],
+            torch_module=torch_module,
+            branch="pos",
+            step_index=step_index,
+            block_injection=block_injection,
+        )
+        pred_neg = _predict_sparse_flow_branch(
+            model,
+            sample,
+            t_tensor,
+            cond["neg_cond"],
+            torch_module=torch_module,
+            branch="neg",
+            step_index=step_index,
+            block_injection=block_injection,
+        )
         pred_final = _guided_pred(
             sample,
             pred_pos,
@@ -530,11 +650,196 @@ def finish_sparse_flow_on_source_cuda(
                 "t": float(t),
                 "t_prev": float(t_prev),
                 "elapsed_seconds": elapsed(step_started),
+                "block_injection_applied": bool(
+                    block_injection is not None
+                    and any(
+                        block_injection.applies(
+                            step_index=step_index,
+                            branch=branch,
+                            block_index=block_injection.block_index,
+                        )
+                        for branch in ("pos", "neg")
+                    )
+                ),
                 "mean": float(sample.detach().float().mean().cpu()),
                 "std": float(sample.detach().float().std().cpu()),
             }
         )
     return sample, {"remaining_sample_next": sample_next_summaries}
+
+
+def _predict_sparse_flow_branch(
+    model: Any,
+    sample: Any,
+    t_tensor: Any,
+    cond: Any,
+    *,
+    torch_module: Any,
+    branch: str,
+    step_index: int,
+    block_injection: BlockInjection | None,
+):
+    if block_injection is None:
+        return model(sample, t_tensor, cond)
+    if not any(
+        block_injection.applies(step_index=step_index, branch=branch, block_index=index)
+        for index in range(len(model.blocks))
+    ):
+        return model(sample, t_tensor, cond)
+    return _forward_sparse_flow_with_block_injection(
+        model,
+        sample,
+        t_tensor,
+        cond,
+        torch_module=torch_module,
+        branch=branch,
+        step_index=step_index,
+        injection=block_injection,
+    )
+
+
+def _forward_sparse_flow_with_block_injection(
+    model: Any,
+    sample: Any,
+    t_tensor: Any,
+    cond: Any,
+    *,
+    torch_module: Any,
+    branch: str,
+    step_index: int,
+    injection: BlockInjection,
+):
+    from trellis2.modules.utils import manual_cast
+
+    h = sample.view(*sample.shape[:2], -1).permute(0, 2, 1).contiguous()
+    h = model.input_layer(h)
+    if model.pe_mode == "ape":
+        h = h + model.pos_emb[None]
+    t_emb = model.t_embedder(t_tensor)
+    if model.share_mod:
+        t_emb = model.adaLN_modulation(t_emb)
+    t_emb = manual_cast(t_emb, model.dtype)
+    h = manual_cast(h, model.dtype)
+    cond = manual_cast(cond, model.dtype)
+    for block_index, block in enumerate(model.blocks):
+        if injection.applies(step_index=step_index, branch=branch, block_index=block_index):
+            h = _block_forward_with_injection(
+                torch_module,
+                model,
+                block,
+                h,
+                t_emb,
+                cond,
+                injection=injection,
+            )
+        else:
+            h = block(h, t_emb, cond, model.rope_phases)
+    h = manual_cast(h, sample.dtype)
+    final_norm = torch_module.nn.functional.layer_norm(h, h.shape[-1:])
+    final_flat = model.out_layer(final_norm)
+    return final_flat.permute(0, 2, 1).view(
+        sample.shape[0],
+        model.out_channels,
+        model.resolution,
+        model.resolution,
+        model.resolution,
+    )
+
+
+def _block_forward_with_injection(
+    torch_module: Any,
+    model: Any,
+    block: Any,
+    x: Any,
+    mod: Any,
+    context: Any,
+    *,
+    injection: BlockInjection,
+):
+    from trellis2.modules.attention import RotaryPositionEmbedder
+    from trellis2.modules.attention.full_attn import scaled_dot_product_attention
+
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = _split_block_modulation(
+        block,
+        mod,
+    )
+
+    h = block.norm1(x)
+    if injection.stage == "norm1":
+        h = _injected_tensor_like(torch_module, injection, h)
+    h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+    if injection.stage == "modulated_self_input":
+        h = _injected_tensor_like(torch_module, injection, h)
+
+    attn = block.self_attn
+    qkv = attn.to_qkv(h)
+    qkv = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, attn.num_heads, -1)
+    q, k, v = qkv.unbind(dim=2)
+    if getattr(attn, "qk_rms_norm", False):
+        q = attn.q_rms_norm(q)
+        k = attn.k_rms_norm(k)
+    if getattr(attn, "use_rope", False):
+        q = RotaryPositionEmbedder.apply_rotary_embedding(q, model.rope_phases)
+        k = RotaryPositionEmbedder.apply_rotary_embedding(k, model.rope_phases)
+    raw = scaled_dot_product_attention(q, k, v)
+    raw_flat = raw.reshape(h.shape[0], h.shape[1], -1)
+    h = attn.to_out(raw_flat)
+    h = h * gate_msa.unsqueeze(1)
+    x = x + h
+    if injection.stage == "after_self":
+        x = _injected_tensor_like(torch_module, injection, x)
+
+    h = block.norm2(x)
+    attn = block.cross_attn
+    q = attn.to_q(h)
+    kv = attn.to_kv(context)
+    q = q.reshape(q.shape[0], q.shape[1], attn.num_heads, -1)
+    kv = kv.reshape(kv.shape[0], kv.shape[1], 2, attn.num_heads, -1)
+    k, v = kv.unbind(dim=2)
+    if getattr(attn, "qk_rms_norm", False):
+        q = attn.q_rms_norm(q)
+        k = attn.k_rms_norm(k)
+    raw = scaled_dot_product_attention(q, k, v)
+    raw_flat = raw.reshape(h.shape[0], h.shape[1], -1)
+    h = attn.to_out(raw_flat)
+    x = x + h
+
+    h = block.norm3(x)
+    h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+    fc1, fc2 = _source_mlp_linears(block.mlp)
+    h = fc2(_source_gelu(torch_module, block.mlp, fc1(h)))
+    h = h * gate_mlp.unsqueeze(1)
+    return x + h
+
+
+def _split_block_modulation(block: Any, mod: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+    if getattr(block, "share_mod", False):
+        return (block.modulation + mod).type(mod.dtype).chunk(6, dim=1)
+    return block.adaLN_modulation(mod).chunk(6, dim=1)
+
+
+def _source_mlp_linears(mlp: Any) -> tuple[Any, Any]:
+    if hasattr(mlp, "mlp"):
+        return mlp.mlp[0], mlp.mlp[2]
+    return mlp.mlp_0, mlp.mlp_2
+
+
+def _source_gelu(torch_module: Any, mlp: Any, value: Any) -> Any:
+    if hasattr(mlp, "mlp"):
+        return mlp.mlp[1](value)
+    return torch_module.nn.functional.gelu(value, approximate="tanh")
+
+
+def _injected_tensor_like(torch_module: Any, injection: BlockInjection, target: Any) -> Any:
+    array = np.asarray(injection.array, dtype=np.float32)
+    if array.ndim == target.ndim - 1:
+        array = array[None, ...]
+    if tuple(array.shape) != tuple(target.shape):
+        raise ValueError(
+            f"block injection {injection.array_key!r} shape {array.shape} does not match "
+            f"target {injection.stage} shape {tuple(target.shape)}"
+        )
+    return torch_module.from_numpy(array).to(device=target.device, dtype=target.dtype)
 
 
 def decode_sparse_structure_latent(pipeline: Any, z_s: Any, *, resolution: int):
