@@ -96,6 +96,7 @@ def build_route_identity(
     source_root: Path,
     branch: str,
     step_index: int,
+    step_indices: tuple[int, ...] | None = None,
     block_indices: tuple[int, ...],
     sparse_conv_backend: str,
     sparse_attn_backend: str,
@@ -120,6 +121,7 @@ def build_route_identity(
         "branch": branch,
         "conditioning_key": select_branch_conditioning_key(branch),
         "step_index": int(step_index),
+        "step_indices": [int(v) for v in (step_indices or (step_index,))],
         "block_indices": [int(v) for v in block_indices],
         "trace_names": list(trace_names if trace_names is not None else TRACE_NAMES),
         "forced_env": {
@@ -148,6 +150,23 @@ def parse_block_indices(value: str) -> tuple[int, ...]:
     return indices
 
 
+def parse_step_indices(value: str | None, *, step_index: int, steps: int) -> tuple[int, ...]:
+    if steps <= 0:
+        raise ValueError("--steps must be positive")
+    if value is None or value.strip() == "":
+        indices = (int(step_index),)
+    else:
+        indices = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not indices:
+        raise ValueError("--step-indices must contain at least one integer")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"--step-indices contains duplicates: {value!r}")
+    for index in indices:
+        if index < 0 or index >= steps:
+            raise ValueError(f"step_index={index} outside steps={steps}")
+    return indices
+
+
 def parse_trace_names(value: str | None) -> tuple[str, ...]:
     if value is None or value.strip() == "" or value.strip() == "all":
         return TRACE_NAMES
@@ -166,6 +185,26 @@ def schedule_pairs(steps: int, rescale_t: float) -> list[tuple[float, float]]:
     t_seq = np.linspace(1, 0, steps + 1)
     t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
     return [(float(t_seq[i]), float(t_seq[i + 1])) for i in range(steps)]
+
+
+def trace_array_key(
+    branch: str,
+    *,
+    step_index: int,
+    block_index: int,
+    name: str,
+    multistep: bool,
+) -> str:
+    suffix = f"{branch}_block{block_index}_{name}"
+    if multistep:
+        return f"step{step_index}_{suffix}"
+    return suffix
+
+
+def trace_step_key(base: str, *, step_index: int, multistep: bool) -> str:
+    if multistep:
+        return f"step{step_index}_{base}"
+    return base
 
 
 def apply_sparse_backend_env(conv_backend: str, attn_backend: str) -> dict[str, str]:
@@ -451,6 +490,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-tar", default=Path("trellis2_source_tarball.bin"), type=Path)
     parser.add_argument("--branch", choices=("pos", "neg"), default="pos")
     parser.add_argument("--step-index", type=int, default=2)
+    parser.add_argument(
+        "--step-indices",
+        help=(
+            "comma-separated source sparse-flow steps to trace in one CUDA run; "
+            "defaults to --step-index"
+        ),
+    )
     parser.add_argument("--block-indices", default="4")
     parser.add_argument(
         "--trace-names",
@@ -501,24 +547,40 @@ def main(argv: list[str] | None = None) -> int:
         phase = "validate_args"
         block_indices = parse_block_indices(args.block_indices)
         trace_names = parse_trace_names(args.trace_names)
-        if args.steps <= 0:
-            raise ValueError("--steps must be positive")
-        if args.step_index < 0 or args.step_index >= args.steps:
-            raise ValueError(f"--step-index {args.step_index} outside --steps {args.steps}")
+        step_indices = parse_step_indices(
+            args.step_indices,
+            step_index=args.step_index,
+            steps=args.steps,
+        )
         forced_env = apply_sparse_backend_env(args.sparse_conv_backend, args.sparse_attn_backend)
-        t, t_prev = schedule_pairs(args.steps, args.rescale_t)[args.step_index]
+        t_pairs = schedule_pairs(args.steps, args.rescale_t)
         report["request"] = {
             "branch": args.branch,
             "step_index": int(args.step_index),
+            "step_indices": [int(v) for v in step_indices],
             "block_indices": [int(v) for v in block_indices],
             "trace_names": list(trace_names),
             "steps": int(args.steps),
             "rescale_t": float(args.rescale_t),
-            "t": float(t),
-            "t_prev": float(t_prev),
-            "t_model": float(1000 * t),
+            "step_schedule": {
+                str(step_index): {
+                    "t": float(t_pairs[step_index][0]),
+                    "t_prev": float(t_pairs[step_index][1]),
+                    "t_model": float(1000 * t_pairs[step_index][0]),
+                }
+                for step_index in step_indices
+            },
             "requested_sparse_backend": forced_env,
         }
+        if len(step_indices) == 1:
+            t, t_prev = t_pairs[step_indices[0]]
+            report["request"].update(
+                {
+                    "t": float(t),
+                    "t_prev": float(t_prev),
+                    "t_model": float(1000 * t),
+                }
+            )
         report["phases"].append(phase)
 
         phase = "extract_source"
@@ -550,15 +612,15 @@ def main(argv: list[str] | None = None) -> int:
         report["phases"].append(phase)
 
         phase = "load_inputs"
-        sample_in_np, source_arrays, optional_source = _load_step_input(
+        first_sample_in_np, source_arrays, optional_source = _load_step_input(
             args.source_steps,
-            step_index=args.step_index,
+            step_index=step_indices[0],
         )
         cond_np, conditioning_identity = _load_conditioning(args.conditioning, branch=args.branch)
         report["inputs"] = {
             "source_steps": str(args.source_steps),
             "source_arrays": source_arrays,
-            "source_sample_in_shape": list(sample_in_np.shape),
+            "first_source_sample_in_shape": list(first_sample_in_np.shape),
             "conditioning": conditioning_identity,
         }
         report["phases"].append(phase)
@@ -574,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
             source_root=source_root,
             branch=args.branch,
             step_index=args.step_index,
+            step_indices=step_indices,
             block_indices=block_indices,
             trace_names=trace_names,
             sparse_conv_backend=args.sparse_conv_backend,
@@ -589,59 +652,108 @@ def main(argv: list[str] | None = None) -> int:
             "route_identity_json": np.asarray(json.dumps(route_identity, sort_keys=True)),
             "trace_block_indices": np.asarray(block_indices, dtype=np.int32),
             "trace_step_index": np.asarray(args.step_index, dtype=np.int32),
-            "trace_t": np.asarray(t, dtype=np.float32),
-            "trace_t_model": np.asarray(1000 * t, dtype=np.float32),
-            "sample_in": sample_in_np.astype(np.float32, copy=False),
+            "trace_step_indices": np.asarray(step_indices, dtype=np.int32),
         }
-        sample = torch.from_numpy(sample_in_np).to(device=device, dtype=torch.float32)
+        multistep = len(step_indices) > 1
+        if not multistep:
+            t, _t_prev = t_pairs[step_indices[0]]
+            arrays["trace_t"] = np.asarray(t, dtype=np.float32)
+            arrays["trace_t_model"] = np.asarray(1000 * t, dtype=np.float32)
         cond = torch.from_numpy(cond_np).to(device=device, dtype=torch.float32)
-        t_tensor = torch.tensor([1000 * t] * sample.shape[0], device=device, dtype=torch.float32)
         with torch.inference_mode():
-            h = sample.view(*sample.shape[:2], -1).permute(0, 2, 1).contiguous()
-            h = model.input_layer(h)
-            if model.pe_mode == "ape":
-                h = h + model.pos_emb[None]
-            t_emb = model.t_embedder(t_tensor)
-            if model.share_mod:
-                t_emb = model.adaLN_modulation(t_emb)
-            t_emb = manual_cast(t_emb, model.dtype)
-            h = manual_cast(h, model.dtype)
-            cond = manual_cast(cond, model.dtype)
-            arrays["post_input_layer"] = _to_numpy(h)
-            arrays["t_emb"] = _to_numpy(t_emb)
-            for block_index, block in enumerate(model.blocks):
-                if block_index in block_indices:
-                    h, block_trace = _trace_block(torch, model, block, h, t_emb, cond)
-                    for name in trace_names:
-                        if name in block_trace:
-                            arrays[f"{args.branch}_block{block_index}_{name}"] = block_trace[name]
-                else:
-                    h = block(h, t_emb, cond, model.rope_phases)
-            h = manual_cast(h, sample.dtype)
-            final_norm = torch.nn.functional.layer_norm(h, h.shape[-1:])
-            final_flat = model.out_layer(final_norm)
-            final_output = final_flat.permute(0, 2, 1).view(
-                sample.shape[0],
-                model.out_channels,
-                model.resolution,
-                model.resolution,
-                model.resolution,
-            )
-        arrays[f"{args.branch}_final_norm"] = _to_numpy(final_norm)
-        arrays[f"{args.branch}_final_out_flat"] = _to_numpy(final_flat)
-        arrays[f"{args.branch}_final_output"] = final_output.detach().float().cpu().numpy().astype(np.float32)
+            for step_index in step_indices:
+                t, _t_prev = t_pairs[step_index]
+                sample_in_np, _source_arrays, _optional_source = _load_step_input(
+                    args.source_steps,
+                    step_index=step_index,
+                )
+                sample_key = f"step{step_index}_sample_in" if multistep else "sample_in"
+                arrays[sample_key] = sample_in_np.astype(np.float32, copy=False)
+                sample = torch.from_numpy(sample_in_np).to(device=device, dtype=torch.float32)
+                t_tensor = torch.tensor(
+                    [1000 * t] * sample.shape[0],
+                    device=device,
+                    dtype=torch.float32,
+                )
+                h = sample.view(*sample.shape[:2], -1).permute(0, 2, 1).contiguous()
+                h = model.input_layer(h)
+                if model.pe_mode == "ape":
+                    h = h + model.pos_emb[None]
+                t_emb = model.t_embedder(t_tensor)
+                if model.share_mod:
+                    t_emb = model.adaLN_modulation(t_emb)
+                t_emb = manual_cast(t_emb, model.dtype)
+                h = manual_cast(h, model.dtype)
+                cond_step = manual_cast(cond, model.dtype)
+                arrays[trace_step_key(
+                    "post_input_layer",
+                    step_index=step_index,
+                    multistep=multistep,
+                )] = _to_numpy(h)
+                arrays[trace_step_key(
+                    "t_emb",
+                    step_index=step_index,
+                    multistep=multistep,
+                )] = _to_numpy(t_emb)
+                for block_index, block in enumerate(model.blocks):
+                    if block_index in block_indices:
+                        h, block_trace = _trace_block(torch, model, block, h, t_emb, cond_step)
+                        for name in trace_names:
+                            if name in block_trace:
+                                arrays[trace_array_key(
+                                    args.branch,
+                                    step_index=step_index,
+                                    block_index=block_index,
+                                    name=name,
+                                    multistep=multistep,
+                                )] = block_trace[name]
+                    else:
+                        h = block(h, t_emb, cond_step, model.rope_phases)
+                h = manual_cast(h, sample.dtype)
+                final_norm = torch.nn.functional.layer_norm(h, h.shape[-1:])
+                final_flat = model.out_layer(final_norm)
+                final_output = final_flat.permute(0, 2, 1).view(
+                    sample.shape[0],
+                    model.out_channels,
+                    model.resolution,
+                    model.resolution,
+                    model.resolution,
+                )
+                arrays[trace_step_key(
+                    f"{args.branch}_final_norm",
+                    step_index=step_index,
+                    multistep=multistep,
+                )] = _to_numpy(final_norm)
+                arrays[trace_step_key(
+                    f"{args.branch}_final_out_flat",
+                    step_index=step_index,
+                    multistep=multistep,
+                )] = _to_numpy(final_flat)
+                arrays[trace_step_key(
+                    f"{args.branch}_final_output",
+                    step_index=step_index,
+                    multistep=multistep,
+                )] = final_output.detach().float().cpu().numpy().astype(np.float32)
         report["phases"].append(phase)
 
         phase = "compare_saved_source"
-        compare_report = compare_saved_source_outputs(
-            branch=args.branch,
-            arrays=arrays,
-            optional_source=optional_source,
-            step_index=args.step_index,
-            sample_in_np=sample_in_np,
-            t=t,
-            t_prev=t_prev,
-        )
+        if multistep:
+            compare_report = {
+                "comparison_class": "multi_step_trace_outputs_are_step_qualified",
+                "route_identity_evidence": True,
+                "step_indices": [int(v) for v in step_indices],
+            }
+        else:
+            t, t_prev = t_pairs[step_indices[0]]
+            compare_report = compare_saved_source_outputs(
+                branch=args.branch,
+                arrays=arrays,
+                optional_source=optional_source,
+                step_index=step_indices[0],
+                sample_in_np=first_sample_in_np,
+                t=t,
+                t_prev=t_prev,
+            )
         report["saved_source_comparison"] = compare_report
         report["phases"].append(phase)
 

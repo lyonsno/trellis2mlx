@@ -119,6 +119,51 @@ def test_parse_trace_names_supports_compact_alias_and_rejects_unknown_names():
         parse_trace_names("input,not_a_real_trace")
 
 
+def test_parse_step_indices_supports_csv_and_rejects_duplicates_or_bounds():
+    from scripts.source_cuda_sparse_block_trace import parse_step_indices
+
+    assert parse_step_indices(None, step_index=2, steps=8) == (2,)
+    assert parse_step_indices("0, 2,7", step_index=99, steps=8) == (0, 2, 7)
+    with pytest.raises(ValueError, match="duplicates"):
+        parse_step_indices("2,2", step_index=0, steps=8)
+    with pytest.raises(ValueError, match="outside"):
+        parse_step_indices("8", step_index=0, steps=8)
+
+
+def test_cuda_route_identity_records_multi_step_indices():
+    from scripts.source_cuda_sparse_block_trace import build_route_identity
+
+    identity = build_route_identity(
+        effective_device_type="cuda",
+        source_steps=Path("/inputs/source_cuda_steps.npz"),
+        conditioning=Path("/inputs/conditioning.npz"),
+        checkpoint=Path("/inputs/ss_flow_img_dit_1_3B_64_bf16.safetensors"),
+        source_root=Path("/work/source"),
+        branch="pos",
+        step_index=2,
+        step_indices=(0, 1, 2),
+        block_indices=(0,),
+        sparse_conv_backend="none",
+        sparse_attn_backend="sdpa",
+    )
+
+    assert identity["step_index"] == 2
+    assert identity["step_indices"] == [0, 1, 2]
+
+
+def test_trace_array_key_step_qualifies_multi_step_outputs_only():
+    from scripts.source_cuda_sparse_block_trace import trace_array_key
+
+    assert (
+        trace_array_key("pos", step_index=2, block_index=0, name="norm1", multistep=False)
+        == "pos_block0_norm1"
+    )
+    assert (
+        trace_array_key("pos", step_index=2, block_index=0, name="norm1", multistep=True)
+        == "step2_pos_block0_norm1"
+    )
+
+
 def test_saved_source_comparison_marks_branch_only_sample_next_as_non_route_identity():
     from scripts.source_cuda_sparse_block_trace import compare_saved_source_outputs
 
