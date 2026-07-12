@@ -106,3 +106,44 @@ def test_split_block_modulation_adds_share_mod_block_offset():
     assert len(pieces) == 6
     np.testing.assert_array_equal(pieces[0].array, np.array([[1.0, 2.0]], dtype=np.float32))
     np.testing.assert_array_equal(pieces[-1].array, np.array([[11.0, 12.0]], dtype=np.float32))
+
+
+def test_parse_trace_names_supports_compact_alias_and_rejects_unknown_names():
+    from scripts.source_cuda_sparse_block_trace import TRACE_NAMES, parse_trace_names
+
+    assert parse_trace_names(None) == TRACE_NAMES
+    assert parse_trace_names("all") == TRACE_NAMES
+    assert parse_trace_names("compact") == ("input", "after_self", "after_cross", "after_mlp")
+    assert parse_trace_names("input, after_self") == ("input", "after_self")
+    with pytest.raises(ValueError, match="unknown trace"):
+        parse_trace_names("input,not_a_real_trace")
+
+
+def test_saved_source_comparison_marks_branch_only_sample_next_as_non_route_identity():
+    from scripts.source_cuda_sparse_block_trace import compare_saved_source_outputs
+
+    arrays = {
+        "pos_final_output": np.array([[[[[2.0]]]]], dtype=np.float32),
+    }
+    optional_source = {
+        "pred_pos": np.array([[[[[[2.0]]]]]], dtype=np.float32),
+        "sample_next": np.array([[[[[[0.25]]]]]], dtype=np.float32),
+    }
+    sample_in = np.array([[[[[1.0]]]]], dtype=np.float32)
+
+    report = compare_saved_source_outputs(
+        branch="pos",
+        arrays=arrays,
+        optional_source=optional_source,
+        step_index=0,
+        sample_in_np=sample_in,
+        t=0.5,
+        t_prev=0.25,
+    )
+
+    assert "sample_next_from_pred_vs_source_steps_sample_next" not in report
+    assert "pos_branch_only_sample_next_from_pred" in arrays
+    branch_report = report["branch_only_sample_next_vs_source_steps_sample_next"]
+    assert branch_report["route_identity_evidence"] is False
+    assert branch_report["comparison_class"] == "branch_only_euler_vs_saved_cfg_or_scheduler_sample_next"
+    np.testing.assert_allclose(arrays["pos_branch_only_sample_next_from_pred"], 0.5)

@@ -61,6 +61,7 @@ TRACE_NAMES = (
     "mlp_gated",
     "after_mlp",
 )
+COMPACT_TRACE_NAMES = ("input", "after_self", "after_cross", "after_mlp")
 
 
 def _jsonable_path(path: Path) -> str:
@@ -98,6 +99,7 @@ def build_route_identity(
     block_indices: tuple[int, ...],
     sparse_conv_backend: str,
     sparse_attn_backend: str,
+    trace_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     if effective_device_type != "cuda":
         raise ValueError(
@@ -119,6 +121,7 @@ def build_route_identity(
         "conditioning_key": select_branch_conditioning_key(branch),
         "step_index": int(step_index),
         "block_indices": [int(v) for v in block_indices],
+        "trace_names": list(trace_names if trace_names is not None else TRACE_NAMES),
         "forced_env": {
             "SPARSE_CONV_BACKEND": sparse_conv_backend,
             "SPARSE_ATTN_BACKEND": sparse_attn_backend,
@@ -143,6 +146,20 @@ def parse_block_indices(value: str) -> tuple[int, ...]:
         if index < 0:
             raise ValueError(f"block index must be non-negative, got {index}")
     return indices
+
+
+def parse_trace_names(value: str | None) -> tuple[str, ...]:
+    if value is None or value.strip() == "" or value.strip() == "all":
+        return TRACE_NAMES
+    if value.strip() == "compact":
+        return COMPACT_TRACE_NAMES
+    names = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not names:
+        raise ValueError("--trace-names must contain at least one trace name")
+    unknown = sorted(set(names) - set(TRACE_NAMES))
+    if unknown:
+        raise ValueError(f"unknown trace name(s): {', '.join(unknown)}")
+    return names
 
 
 def schedule_pairs(steps: int, rescale_t: float) -> list[tuple[float, float]]:
@@ -193,6 +210,45 @@ def compare_arrays(a: np.ndarray, b: np.ndarray) -> dict[str, Any]:
         "max_abs": float(diff.max(initial=0.0)),
         "nonzero": int(np.count_nonzero(diff)),
     }
+
+
+def compare_saved_source_outputs(
+    *,
+    branch: str,
+    arrays: dict[str, np.ndarray],
+    optional_source: dict[str, np.ndarray],
+    step_index: int,
+    sample_in_np: np.ndarray,
+    t: float,
+    t_prev: float,
+) -> dict[str, Any]:
+    source_key = "pred_pos" if branch == "pos" else "pred_neg"
+    compare_report: dict[str, Any] = {}
+    if source_key in optional_source:
+        compare_report[f"final_output_vs_source_steps_{source_key}"] = compare_arrays(
+            arrays[f"{branch}_final_output"],
+            optional_source[source_key][step_index],
+        )
+    if "sample_next" in optional_source:
+        pred = arrays[f"{branch}_final_output"]
+        sample_next = sample_in_np - (t - t_prev) * pred
+        arrays[f"{branch}_branch_only_sample_next_from_pred"] = sample_next.astype(np.float32)
+        branch_only_report = compare_arrays(
+            arrays[f"{branch}_branch_only_sample_next_from_pred"],
+            optional_source["sample_next"][step_index],
+        )
+        branch_only_report.update(
+            {
+                "comparison_class": "branch_only_euler_vs_saved_cfg_or_scheduler_sample_next",
+                "route_identity_evidence": False,
+                "reason": (
+                    "The saved source sample_next may include CFG/rescale or scheduler state; "
+                    "a single branch pred output is not an equivalent route."
+                ),
+            }
+        )
+        compare_report["branch_only_sample_next_vs_source_steps_sample_next"] = branch_only_report
+    return compare_report
 
 
 def _to_numpy(tensor: Any, *, squeeze_batch: bool = True) -> np.ndarray:
@@ -396,6 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", choices=("pos", "neg"), default="pos")
     parser.add_argument("--step-index", type=int, default=2)
     parser.add_argument("--block-indices", default="4")
+    parser.add_argument(
+        "--trace-names",
+        default="all",
+        help="trace tensor names to write, or aliases: all, compact",
+    )
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--rescale-t", type=float, default=5.0)
     parser.add_argument(
@@ -439,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
 
         phase = "validate_args"
         block_indices = parse_block_indices(args.block_indices)
+        trace_names = parse_trace_names(args.trace_names)
         if args.steps <= 0:
             raise ValueError("--steps must be positive")
         if args.step_index < 0 or args.step_index >= args.steps:
@@ -449,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             "branch": args.branch,
             "step_index": int(args.step_index),
             "block_indices": [int(v) for v in block_indices],
+            "trace_names": list(trace_names),
             "steps": int(args.steps),
             "rescale_t": float(args.rescale_t),
             "t": float(t),
@@ -512,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
             branch=args.branch,
             step_index=args.step_index,
             block_indices=block_indices,
+            trace_names=trace_names,
             sparse_conv_backend=args.sparse_conv_backend,
             sparse_attn_backend=args.sparse_attn_backend,
         )
@@ -548,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
             for block_index, block in enumerate(model.blocks):
                 if block_index in block_indices:
                     h, block_trace = _trace_block(torch, model, block, h, t_emb, cond)
-                    for name in TRACE_NAMES:
+                    for name in trace_names:
                         if name in block_trace:
                             arrays[f"{args.branch}_block{block_index}_{name}"] = block_trace[name]
                 else:
@@ -569,21 +633,15 @@ def main(argv: list[str] | None = None) -> int:
         report["phases"].append(phase)
 
         phase = "compare_saved_source"
-        source_key = "pred_pos" if args.branch == "pos" else "pred_neg"
-        compare_report = {}
-        if source_key in optional_source:
-            compare_report[f"final_output_vs_source_steps_{source_key}"] = compare_arrays(
-                arrays[f"{args.branch}_final_output"],
-                optional_source[source_key][args.step_index],
-            )
-        if "sample_next" in optional_source:
-            pred = arrays[f"{args.branch}_final_output"]
-            sample_next = sample_in_np - (t - t_prev) * pred
-            arrays[f"{args.branch}_sample_next_from_pred"] = sample_next.astype(np.float32)
-            compare_report["sample_next_from_pred_vs_source_steps_sample_next"] = compare_arrays(
-                arrays[f"{args.branch}_sample_next_from_pred"],
-                optional_source["sample_next"][args.step_index],
-            )
+        compare_report = compare_saved_source_outputs(
+            branch=args.branch,
+            arrays=arrays,
+            optional_source=optional_source,
+            step_index=args.step_index,
+            sample_in_np=sample_in_np,
+            t=t,
+            t_prev=t_prev,
+        )
         report["saved_source_comparison"] = compare_report
         report["phases"].append(phase)
 
