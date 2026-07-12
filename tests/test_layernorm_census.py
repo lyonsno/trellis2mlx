@@ -206,3 +206,98 @@ def test_layernorm_census_cli_writes_failure_report_for_missing_trace(tmp_path):
     assert report["failure_phase"] == "load"
     assert report["requested_route"] == "layernorm-witness-census"
     assert "missing-reference.npz" in report["error"]
+
+
+def test_noaffine_layernorm_boundary_probe_records_rowwise_scale_explanation(tmp_path):
+    from trellmlx.layernorm_census import (
+        _round_float32_to_bf16,
+        build_noaffine_layernorm_boundary_report,
+    )
+
+    candidate = tmp_path / "candidate.npz"
+    reference = tmp_path / "reference.npz"
+    x = np.array(
+        [
+            [
+                [
+                    1.2301534e-03,
+                    2.9874554e-01,
+                    -2.7413785e-01,
+                    -8.9059186e-01,
+                    -4.5467079e-01,
+                    -9.9164653e-01,
+                    6.0143601e-02,
+                    1.3402152e00,
+                ]
+            ]
+        ],
+        dtype=np.float32,
+    )
+    mean = np.mean(x, axis=-1, keepdims=True, dtype=np.float32)
+    centered = x - mean
+    var = np.mean(centered * centered, axis=-1, keepdims=True, dtype=np.float32)
+    normalized = centered / np.sqrt(var + np.float32(1e-6), dtype=np.float32)
+    candidate_norm = _round_float32_to_bf16(normalized)
+    reference_norm = _round_float32_to_bf16(normalized * np.float32(1.0005))
+
+    np.savez_compressed(
+        candidate,
+        pos_block0_input=x,
+        pos_block0_norm1=candidate_norm,
+    )
+    np.savez_compressed(
+        reference,
+        pos_block0_norm1=reference_norm,
+    )
+
+    report = build_noaffine_layernorm_boundary_report(
+        reference_trace_path=reference,
+        candidate_trace_path=candidate,
+        input_key="pos_block0_input",
+        reference_norm_key="pos_block0_norm1",
+        candidate_norm_key="pos_block0_norm1",
+        requested_route="test-noaffine-boundary",
+    )
+
+    assert report["schema"] == "trellis2mlx.noaffine_layernorm_boundary_probe.v1"
+    assert report["requested_route"] == "test-noaffine-boundary"
+    assert report["effective_route"] == "local-noaffine-layernorm-boundary-probe"
+    assert report["norm_delta"]["nonzero_count"] == 1
+    assert report["coordinate_summary"]["affected_token_count"] == 1
+    assert report["coordinate_summary"]["affected_channel_count"] == 1
+    assert report["rowwise_perturbation_probe"]["scale"]["affected_token_count"] == 1
+    assert report["rowwise_perturbation_probe"]["scale"]["solved_token_count"] == 1
+    assert report["rowwise_perturbation_probe"]["bias"]["affected_token_count"] == 1
+    json.dumps(report, allow_nan=False)
+
+    output = tmp_path / "boundary-report.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--boundary-probe",
+            "--reference",
+            str(reference),
+            "--candidate",
+            str(candidate),
+            "--output",
+            str(output),
+            "--input-key",
+            "pos_block0_input",
+            "--reference-norm-key",
+            "pos_block0_norm1",
+            "--candidate-norm-key",
+            "pos_block0_norm1",
+            "--requested-route",
+            "test-noaffine-boundary-cli",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode == 0
+    cli_report = json.loads(output.read_text())
+    assert cli_report["schema"] == "trellis2mlx.noaffine_layernorm_boundary_probe.v1"
+    assert cli_report["requested_route"] == "test-noaffine-boundary-cli"
+    assert cli_report["status"] == "ok"

@@ -14,8 +14,10 @@ import numpy as np
 
 
 REPORT_SCHEMA = "trellis2mlx.layernorm_witness.v1"
+BOUNDARY_REPORT_SCHEMA = "trellis2mlx.noaffine_layernorm_boundary_probe.v1"
 DEFAULT_REQUESTED_ROUTE = "layernorm-witness-census"
 DEFAULT_EFFECTIVE_ROUTE = "local-layernorm-witness-census"
+BOUNDARY_EFFECTIVE_ROUTE = "local-noaffine-layernorm-boundary-probe"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,23 +32,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-route-label", default="candidate")
     parser.add_argument("--cuda-capsule", type=Path, help="Optional standalone CUDA partial script path")
     parser.add_argument("--witness-npz", type=Path, help="Optional compact witness npz path")
+    parser.add_argument("--boundary-probe", action="store_true", help="Run no-affine LayerNorm boundary probe mode")
+    parser.add_argument("--input-key", default="pos_block0_input", help="Boundary probe input array key")
+    parser.add_argument("--reference-norm-key", default="pos_block0_norm1", help="Boundary probe reference norm array key")
+    parser.add_argument("--candidate-norm-key", default="pos_block0_norm1", help="Boundary probe candidate norm array key")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        report = build_layernorm_witness_report(
-            reference_trace_path=args.reference,
-            candidate_trace_path=args.candidate,
-            trace_prefix=args.trace_prefix,
-            eps=args.eps,
-            requested_route=args.requested_route,
-            reference_route_label=args.reference_route_label,
-            candidate_route_label=args.candidate_route_label,
-            cuda_capsule_path=args.cuda_capsule,
-            witness_npz_path=args.witness_npz,
-        )
+        if args.boundary_probe:
+            report = build_noaffine_layernorm_boundary_report(
+                reference_trace_path=args.reference,
+                candidate_trace_path=args.candidate,
+                input_key=args.input_key,
+                reference_norm_key=args.reference_norm_key,
+                candidate_norm_key=args.candidate_norm_key,
+                eps=args.eps,
+                requested_route=args.requested_route,
+                reference_route_label=args.reference_route_label,
+                candidate_route_label=args.candidate_route_label,
+            )
+        else:
+            report = build_layernorm_witness_report(
+                reference_trace_path=args.reference,
+                candidate_trace_path=args.candidate,
+                trace_prefix=args.trace_prefix,
+                eps=args.eps,
+                requested_route=args.requested_route,
+                reference_route_label=args.reference_route_label,
+                candidate_route_label=args.candidate_route_label,
+                cuda_capsule_path=args.cuda_capsule,
+                witness_npz_path=args.witness_npz,
+            )
         _write_json(args.output, report)
         print(json.dumps(_compact_console_summary(report), sort_keys=True))
         return 0
@@ -62,6 +81,81 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(args.output, report)
         print(json.dumps(_compact_console_summary(report), sort_keys=True))
         return 1
+
+
+def build_noaffine_layernorm_boundary_report(
+    *,
+    reference_trace_path: Path,
+    candidate_trace_path: Path,
+    input_key: str,
+    reference_norm_key: str,
+    candidate_norm_key: str,
+    eps: float = 1e-6,
+    requested_route: str = "noaffine-layernorm-boundary-probe",
+    reference_route_label: str = "reference",
+    candidate_route_label: str = "candidate",
+) -> dict[str, Any]:
+    reference_trace_path = Path(reference_trace_path)
+    candidate_trace_path = Path(candidate_trace_path)
+    with np.load(reference_trace_path) as reference, np.load(candidate_trace_path) as candidate:
+        _require_keys(reference, (reference_norm_key,), "reference")
+        _require_keys(candidate, (input_key, candidate_norm_key), "candidate")
+        reference_norm = _as_batched_tokens(np.asarray(reference[reference_norm_key], dtype=np.float32), reference_norm_key)
+        candidate_norm = _as_batched_tokens(np.asarray(candidate[candidate_norm_key], dtype=np.float32), candidate_norm_key)
+        layernorm_input = _as_batched_tokens(np.asarray(candidate[input_key], dtype=np.float32), input_key)
+        if reference_norm.shape != candidate_norm.shape:
+            raise ValueError(
+                f"norm shape mismatch: reference {reference_norm.shape} vs candidate {candidate_norm.shape}"
+            )
+        if layernorm_input.shape != candidate_norm.shape:
+            raise ValueError(
+                f"input/norm shape mismatch: input {layernorm_input.shape} vs candidate norm {candidate_norm.shape}"
+            )
+
+        normalized = _noaffine_layernorm_two_pass_bf16(layernorm_input, eps=eps)
+        return {
+            "schema": BOUNDARY_REPORT_SCHEMA,
+            "status": "ok",
+            "requested_route": requested_route,
+            "effective_route": BOUNDARY_EFFECTIVE_ROUTE,
+            "eps": float(eps),
+            "keys": {
+                "input": input_key,
+                "reference_norm": reference_norm_key,
+                "candidate_norm": candidate_norm_key,
+            },
+            "known_routes": {
+                "reference": reference_route_label,
+                "candidate": candidate_route_label,
+            },
+            "artifacts": {
+                "reference_trace": _artifact_identity(reference_trace_path),
+                "candidate_trace": _artifact_identity(candidate_trace_path),
+            },
+            "runtime": _runtime_identity(),
+            "input_identity": {
+                "shape": list(layernorm_input.shape),
+                "dtype": str(layernorm_input.dtype),
+            },
+            "norm_delta": _array_delta(reference_norm, candidate_norm),
+            "candidate_formula_delta": _array_delta(candidate_norm, normalized),
+            "reference_formula_delta": _array_delta(reference_norm, normalized),
+            "coordinate_summary": _boundary_coordinate_summary(reference_norm, candidate_norm, layernorm_input),
+            "rowwise_perturbation_probe": _rowwise_perturbation_probe(
+                reference_norm=reference_norm,
+                candidate_norm=candidate_norm,
+                layernorm_input=layernorm_input,
+                eps=eps,
+            ),
+        }
+
+
+def _as_batched_tokens(array: np.ndarray, key: str) -> np.ndarray:
+    if array.ndim == 2:
+        return array[None, ...].astype(np.float32)
+    if array.ndim == 3:
+        return array.astype(np.float32)
+    raise ValueError(f"{key} must have shape [tokens, channels] or [batch, tokens, channels], got {array.shape}")
 
 
 def build_layernorm_witness_report(
@@ -444,6 +538,191 @@ def _round_float32_to_bf16(values: np.ndarray) -> np.ndarray:
     return rounded.view(np.float32)
 
 
+def _noaffine_layernorm_two_pass_bf16(x: np.ndarray, *, eps: float) -> np.ndarray:
+    xf = np.asarray(x, dtype=np.float32)
+    mean = np.mean(xf, axis=-1, keepdims=True, dtype=np.float32)
+    centered = xf - mean
+    var = np.mean(centered * centered, axis=-1, keepdims=True, dtype=np.float32)
+    normed = centered * (np.float32(1.0) / np.sqrt(var + np.float32(eps), dtype=np.float32))
+    return _round_float32_to_bf16(normed)
+
+
+def _boundary_coordinate_summary(
+    reference_norm: np.ndarray,
+    candidate_norm: np.ndarray,
+    layernorm_input: np.ndarray,
+) -> dict[str, Any]:
+    diff = reference_norm.astype(np.float32) - candidate_norm.astype(np.float32)
+    coords = np.argwhere(diff != 0)
+    if coords.size == 0:
+        return {
+            "affected_value_count": 0,
+            "affected_token_count": 0,
+            "affected_channel_count": 0,
+            "unique_signed_diffs": [],
+            "tokens": [],
+        }
+    token_pairs = sorted({(int(batch), int(token)) for batch, token, _ in coords})
+    channels = sorted({int(channel) for _, _, channel in coords})
+    values, counts = np.unique(diff[diff != 0], return_counts=True)
+    means = np.mean(layernorm_input, axis=-1, dtype=np.float32)
+    centered = layernorm_input - means[..., None]
+    variances = np.mean(centered * centered, axis=-1, dtype=np.float32)
+    token_rows = []
+    for batch, token in token_pairs:
+        token_coords = coords[(coords[:, 0] == batch) & (coords[:, 1] == token)]
+        token_diffs = diff[batch, token, token_coords[:, 2]]
+        token_values, token_counts = np.unique(token_diffs, return_counts=True)
+        token_rows.append(
+            {
+                "batch": batch,
+                "token": token,
+                "affected_value_count": int(len(token_coords)),
+                "input_mean": float(means[batch, token]),
+                "input_variance": float(variances[batch, token]),
+                "channels": [int(channel) for channel in token_coords[:, 2]],
+                "unique_signed_diffs": [
+                    {"value": float(value), "count": int(count)}
+                    for value, count in zip(token_values, token_counts)
+                ],
+            }
+        )
+    token_rows.sort(key=lambda item: (-item["affected_value_count"], item["batch"], item["token"]))
+    return {
+        "affected_value_count": int(len(coords)),
+        "affected_token_count": int(len(token_pairs)),
+        "affected_channel_count": int(len(channels)),
+        "affected_channels": channels,
+        "unique_signed_diffs": [
+            {"value": float(value), "count": int(count)}
+            for value, count in zip(values, counts)
+        ],
+        "tokens": token_rows,
+    }
+
+
+def _rowwise_perturbation_probe(
+    *,
+    reference_norm: np.ndarray,
+    candidate_norm: np.ndarray,
+    layernorm_input: np.ndarray,
+    eps: float,
+) -> dict[str, Any]:
+    normalized_float = _noaffine_layernorm_two_pass_float(layernorm_input, eps=eps)
+    affected = np.argwhere(reference_norm != candidate_norm)
+    token_pairs = sorted({(int(batch), int(token)) for batch, token, _ in affected})
+    scale_grid = _perturbation_grid()
+    bias_grid = _perturbation_grid()
+    return {
+        "scale": _score_rowwise_grid(
+            reference_norm=reference_norm,
+            candidate_norm=candidate_norm,
+            normalized_float=normalized_float,
+            token_pairs=token_pairs,
+            grid=scale_grid,
+            mode="scale",
+        ),
+        "bias": _score_rowwise_grid(
+            reference_norm=reference_norm,
+            candidate_norm=candidate_norm,
+            normalized_float=normalized_float,
+            token_pairs=token_pairs,
+            grid=bias_grid,
+            mode="bias",
+        ),
+    }
+
+
+def _noaffine_layernorm_two_pass_float(x: np.ndarray, *, eps: float) -> np.ndarray:
+    xf = np.asarray(x, dtype=np.float32)
+    mean = np.mean(xf, axis=-1, keepdims=True, dtype=np.float32)
+    centered = xf - mean
+    var = np.mean(centered * centered, axis=-1, keepdims=True, dtype=np.float32)
+    return (centered * (np.float32(1.0) / np.sqrt(var + np.float32(eps), dtype=np.float32))).astype(np.float32)
+
+
+def _perturbation_grid() -> list[float]:
+    return sorted(
+        {
+            float(value)
+            for span, count in ((2e-5, 161), (2e-4, 161), (1e-3, 201))
+            for value in np.linspace(-span, span, count)
+        }
+    )
+
+
+def _score_rowwise_grid(
+    *,
+    reference_norm: np.ndarray,
+    candidate_norm: np.ndarray,
+    normalized_float: np.ndarray,
+    token_pairs: list[tuple[int, int]],
+    grid: list[float],
+    mode: str,
+) -> dict[str, Any]:
+    rows = []
+    solved = 0
+    improved = 0
+    for batch, token in token_pairs:
+        target = reference_norm[batch, token]
+        baseline = _row_score(candidate_norm[batch, token], target)
+        best = {"value": 0.0, **baseline}
+        for value in grid:
+            if mode == "scale":
+                candidate = _round_float32_to_bf16(normalized_float[batch, token] * np.float32(1.0 + value))
+            elif mode == "bias":
+                candidate = _round_float32_to_bf16(normalized_float[batch, token] + np.float32(value))
+            else:
+                raise ValueError(f"unknown perturbation mode: {mode}")
+            current = _row_score(candidate, target)
+            if _score_tuple(current) < _score_tuple(best):
+                best = {"value": float(value), **current}
+        is_solved = best["nonzero_count"] == 0
+        is_improved = _score_tuple(best) < _score_tuple(baseline)
+        solved += int(is_solved)
+        improved += int(is_improved)
+        rows.append(
+            {
+                "batch": batch,
+                "token": token,
+                "baseline": baseline,
+                "best": best,
+                "solved": bool(is_solved),
+                "improved": bool(is_improved),
+            }
+        )
+    rows.sort(key=lambda item: (not item["solved"], not item["improved"], item["batch"], item["token"]))
+    return {
+        "mode": mode,
+        "affected_token_count": int(len(token_pairs)),
+        "solved_token_count": int(solved),
+        "improved_token_count": int(improved),
+        "grid": {
+            "min": float(min(grid)) if grid else None,
+            "max": float(max(grid)) if grid else None,
+            "count": int(len(grid)),
+        },
+        "tokens": rows,
+    }
+
+
+def _row_score(candidate: np.ndarray, reference: np.ndarray) -> dict[str, Any]:
+    diff = np.abs(candidate.astype(np.float64) - reference.astype(np.float64))
+    return {
+        "nonzero_count": int(np.count_nonzero(diff)),
+        "mean_abs_diff": float(np.mean(diff)) if diff.size else 0.0,
+        "max_abs_diff": float(np.max(diff)) if diff.size else 0.0,
+    }
+
+
+def _score_tuple(score: dict[str, Any]) -> tuple[int, float, float]:
+    return (
+        int(score["nonzero_count"]),
+        float(score["mean_abs_diff"]),
+        float(score["max_abs_diff"]),
+    )
+
+
 def _write_witness_npz(
     path: Path,
     *,
@@ -584,6 +863,16 @@ def _compact_console_summary(report: dict[str, Any]) -> dict[str, Any]:
             "status": report.get("status"),
             "failure_phase": report.get("failure_phase"),
             "error": report.get("error"),
+        }
+    if report.get("schema") == BOUNDARY_REPORT_SCHEMA:
+        return {
+            "schema": report["schema"],
+            "status": report["status"],
+            "affected_value_count": report["coordinate_summary"]["affected_value_count"],
+            "affected_token_count": report["coordinate_summary"]["affected_token_count"],
+            "affected_channel_count": report["coordinate_summary"]["affected_channel_count"],
+            "scale_solved_token_count": report["rowwise_perturbation_probe"]["scale"]["solved_token_count"],
+            "bias_solved_token_count": report["rowwise_perturbation_probe"]["bias"]["solved_token_count"],
         }
     return {
         "schema": report["schema"],
