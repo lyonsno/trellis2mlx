@@ -157,6 +157,101 @@ def test_cross_attention_witness_arrays_include_cached_kv_and_projection_weights
     assert arrays["route_identity_json"].shape == ()
 
 
+def test_cross_q_witness_arrays_include_norm_q_and_projection_weights():
+    from scripts.source_sparse_block_replay import build_cross_q_witness_arrays
+
+    source = {
+        "after_self": np.ones((2, 12), dtype=np.float32),
+        "norm2": np.ones((2, 12), dtype=np.float32) * 2,
+        "cross_q_pre_norm": np.ones((2, 3, 4), dtype=np.float32) * 3,
+        "cross_q_post_norm": np.ones((2, 3, 4), dtype=np.float32) * 4,
+    }
+    captured = {
+        "after_self": np.ones((2, 12), dtype=np.float32) * 5,
+        "norm2": np.ones((2, 12), dtype=np.float32) * 6,
+        "cross_q_pre_norm": np.ones((2, 3, 4), dtype=np.float32) * 7,
+        "cross_q_post_norm": np.ones((2, 3, 4), dtype=np.float32) * 8,
+    }
+    arrays = build_cross_q_witness_arrays(
+        source=source,
+        captured=captured,
+        norm2_weight=np.arange(12, dtype=np.float32),
+        norm2_bias=np.arange(12, dtype=np.float32) + 1,
+        to_q_weight=np.eye(12, dtype=np.float32),
+        to_q_bias=np.arange(12, dtype=np.float32) + 2,
+        q_rms_norm_gamma=np.ones((3, 4), dtype=np.float32) * 9,
+        route_identity={"effective_route": "official-trellis2-source-cpu-selected-sparse-block"},
+    )
+
+    assert arrays["source_after_self"].shape == (2, 12)
+    assert arrays["captured_norm2"][0, 0] == 6
+    assert arrays["source_cross_q_pre_norm"].shape == (2, 3, 4)
+    assert arrays["captured_cross_q_post_norm"][0, 0, 0] == 8
+    assert arrays["source_norm2_weight"].shape == (12,)
+    assert arrays["source_to_q_weight"].shape == (12, 12)
+    assert arrays["source_q_rms_norm_gamma"].shape == (3, 4)
+    assert arrays["route_identity_json"].shape == ()
+
+
+def test_cuda_sparse_cross_q_metric_reports_exact_and_delta():
+    from scripts.cuda_sparse_cross_q_witness import metric_np
+
+    report = metric_np(
+        np.array([[1.0, 2.0]], dtype=np.float32),
+        np.array([[1.25, 2.0]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["exact"] is False
+    assert report["nonzero"] == 1
+    assert report["mean_abs"] == 0.125
+    assert report["max_abs"] == 0.25
+    assert report["normalized_singleton_batch"] is False
+
+
+def test_cuda_sparse_cross_q_metric_aligns_only_extra_singleton_batch():
+    from scripts.cuda_sparse_cross_q_witness import metric_np
+
+    report = metric_np(
+        np.array([[[1.0, 2.0]]], dtype=np.float32),
+        np.array([[1.0, 2.25]], dtype=np.float32),
+    )
+
+    assert report["shape"] == [1, 2]
+    assert report["normalized_singleton_batch"] is True
+    assert report["nonzero"] == 1
+    assert report["max_abs"] == 0.25
+
+
+def test_cuda_sparse_cross_q_rms_norm_matches_source_formula():
+    from scripts.cuda_sparse_cross_q_witness import _multihead_rms_norm_np
+
+    x = np.array([[[3.0, 4.0], [5.0, 12.0]]], dtype=np.float32)
+    gamma = np.array([[2.0, 0.5], [1.0, 3.0]], dtype=np.float32)
+
+    out = _multihead_rms_norm_np(x, gamma)
+
+    expected = x / np.linalg.norm(x, axis=-1, keepdims=True) * gamma * np.sqrt(2.0)
+    np.testing.assert_allclose(out, expected.astype(np.float32), rtol=1e-6, atol=1e-6)
+
+
+def test_cuda_sparse_cross_q_witness_requires_named_arrays():
+    from scripts.cuda_sparse_cross_q_witness import _require
+
+    with pytest.raises(KeyError, match="captured_after_self"):
+        _require({}, "captured_after_self")
+
+
+def test_cuda_sparse_cross_q_witness_schema_and_failure_phase_are_stable():
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "cuda_sparse_cross_q_witness.py"
+    ).read_text()
+
+    assert 'SCHEMA = "trellis2mlx.cuda_sparse_cross_q.v1"' in source
+    assert '"failure_phase": "cuda_sparse_cross_q"' in source
+    assert "cuda_captured_after_self_vs_captured_cross_q_post_norm" in source
+
+
 def test_cuda_sparse_attention_metric_reports_exact_and_delta():
     from scripts.cuda_sparse_attention_witness import metric_np
 

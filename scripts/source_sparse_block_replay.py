@@ -62,6 +62,12 @@ CROSS_ATTENTION_WITNESS_NAMES = (
     "cross_attention_raw",
     "cross_attn",
 )
+CROSS_Q_WITNESS_NAMES = (
+    "after_self",
+    "norm2",
+    "cross_q_pre_norm",
+    "cross_q_post_norm",
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -284,12 +290,43 @@ def build_cross_attention_witness_arrays(
     return arrays
 
 
+def build_cross_q_witness_arrays(
+    *,
+    source: dict[str, np.ndarray],
+    captured: dict[str, np.ndarray],
+    norm2_weight: np.ndarray,
+    norm2_bias: np.ndarray,
+    to_q_weight: np.ndarray,
+    to_q_bias: np.ndarray,
+    q_rms_norm_gamma: np.ndarray,
+    route_identity: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {
+        "route_identity_json": np.asarray(json.dumps(route_identity, sort_keys=True)),
+        "source_norm2_weight": np.asarray(norm2_weight, dtype=np.float32),
+        "source_norm2_bias": np.asarray(norm2_bias, dtype=np.float32),
+        "source_to_q_weight": np.asarray(to_q_weight, dtype=np.float32),
+        "source_to_q_bias": np.asarray(to_q_bias, dtype=np.float32),
+        "source_q_rms_norm_gamma": np.asarray(q_rms_norm_gamma, dtype=np.float32),
+    }
+    for name in CROSS_Q_WITNESS_NAMES:
+        arrays[f"source_{name}"] = _require_array(source, name, label="source")
+        arrays[f"captured_{name}"] = _require_array(captured, name, label="captured")
+    return arrays
+
+
 def _linear_weight_bias(linear: Any) -> tuple[np.ndarray, np.ndarray | None]:
     weight = linear.weight.detach().float().cpu().numpy()
     bias = None
     if getattr(linear, "bias", None) is not None:
         bias = linear.bias.detach().float().cpu().numpy()
     return weight, bias
+
+
+def _parameter_array(parameter: Any, *, name: str) -> np.ndarray:
+    if parameter is None:
+        raise RuntimeError(f"source sparse block parameter {name} is required")
+    return parameter.detach().float().cpu().numpy()
 
 
 def module_parameter_dtype(module: Any, *, fallback: Any) -> Any:
@@ -592,6 +629,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sha256": _sha256(args.cross_attention_witness_output),
             "arrays": {key: list(value.shape) for key, value in arrays.items()},
         }
+    cross_q_witness_status = None
+    if args.cross_q_witness_output is not None:
+        phase = "write_cross_q_witness"
+        block = model.blocks[args.block_index]
+        to_q_weight, to_q_bias = _linear_weight_bias(block.cross_attn.to_q)
+        if to_q_bias is None:
+            raise RuntimeError("source sparse block cross_attn.to_q bias is required")
+        arrays = build_cross_q_witness_arrays(
+            source=source,
+            captured=payload["captured"],
+            norm2_weight=_parameter_array(block.norm2.weight, name="norm2.weight"),
+            norm2_bias=_parameter_array(block.norm2.bias, name="norm2.bias"),
+            to_q_weight=to_q_weight,
+            to_q_bias=to_q_bias,
+            q_rms_norm_gamma=_parameter_array(
+                block.cross_attn.q_rms_norm.gamma,
+                name="cross_attn.q_rms_norm.gamma",
+            ),
+            route_identity=route_identity,
+        )
+        args.cross_q_witness_output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.cross_q_witness_output, **arrays)
+        cross_q_witness_status = {
+            "path": _jsonable_path(args.cross_q_witness_output),
+            "sha256": _sha256(args.cross_q_witness_output),
+            "arrays": {key: list(value.shape) for key, value in arrays.items()},
+        }
     return {
         "schema": SCHEMA,
         "status": "ok",
@@ -604,6 +668,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "final_metrics": final_metrics,
         "attention_witness": attention_witness_status,
         "cross_attention_witness": cross_attention_witness_status,
+        "cross_q_witness": cross_q_witness_status,
     }
 
 
@@ -615,6 +680,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--attention-witness-output", type=Path)
     parser.add_argument("--cross-attention-witness-output", type=Path)
+    parser.add_argument("--cross-q-witness-output", type=Path)
     parser.add_argument("--branch", choices=("pos", "neg"), required=True)
     parser.add_argument("--block-index", required=True, type=int)
     return parser.parse_args(argv)
