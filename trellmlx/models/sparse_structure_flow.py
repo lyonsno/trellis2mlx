@@ -432,6 +432,8 @@ class ModulatedBlock(nn.Module):
         rope_phases: mx.array = None,
         cross_kv_cache: tuple = None,
         trace_prefix: str = "block0",
+        injection=None,
+        branch: str = "pos",
     ) -> tuple[mx.array, dict[str, mx.array]]:
         mod = (self.modulation + mod).astype(mod.dtype)
 
@@ -452,9 +454,21 @@ class ModulatedBlock(nn.Module):
             f"{trace_prefix}_gate_mlp": gate_mlp,
         }
 
-        h = _layernorm_noaffine(x)
+        if _is_rowwise_layernorm_correction(injection):
+            h = _layernorm_noaffine_rowwise_perturbed(
+                x,
+                injection,
+                branch=branch,
+                eps=1e-6,
+            )
+        else:
+            h = _layernorm_noaffine(x)
+        if injection is not None and injection.stage == "norm1":
+            h = _injected_tensor_like(injection, h, branch=branch)
         trace[f"{trace_prefix}_norm1"] = h
         h = h * (1 + scale_msa) + shift_msa
+        if injection is not None and injection.stage == "modulated_self_input":
+            h = _injected_tensor_like(injection, h, branch=branch)
         trace[f"{trace_prefix}_modulated_self_input"] = h
         h, attn_trace = self.self_attn.trace_self_attention(
             h,
@@ -465,6 +479,8 @@ class ModulatedBlock(nn.Module):
         trace[f"{trace_prefix}_self_attn"] = h
         h = h * gate_msa
         x = x + h
+        if injection is not None and injection.stage == "after_self":
+            x = _injected_tensor_like(injection, x, branch=branch)
         trace[f"{trace_prefix}_after_self"] = x
 
         h = self.norm2(x)
@@ -725,6 +741,8 @@ class SparseStructureFlowModel(nn.Module):
         cond: mx.array,
         block_index: int = 0,
         cross_kv_cache: list = None,
+        sparse_block_injection=None,
+        sparse_block_injection_branch: str | None = None,
     ) -> dict[str, mx.array]:
         if block_index < 0 or block_index >= len(self.blocks):
             raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
@@ -750,6 +768,12 @@ class SparseStructureFlowModel(nn.Module):
         trace: dict[str, mx.array] = {"input_projected": x}
         for i, block in enumerate(self.blocks):
             block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+            block_injection = None
+            if sparse_block_injection is not None:
+                if hasattr(sparse_block_injection, "injection_for_block"):
+                    block_injection = sparse_block_injection.injection_for_block(i)
+                elif i == sparse_block_injection.block_index:
+                    block_injection = sparse_block_injection
             if i == block_index:
                 trace_prefix = f"block{block_index}"
                 trace[f"{trace_prefix}_input"] = x
@@ -760,6 +784,8 @@ class SparseStructureFlowModel(nn.Module):
                     rope_phases=rope_phases,
                     cross_kv_cache=block_kv,
                     trace_prefix=trace_prefix,
+                    injection=block_injection,
+                    branch=sparse_block_injection_branch or "pos",
                 )
                 trace.update(block_trace)
                 if i == len(self.blocks) - 1:
@@ -772,13 +798,24 @@ class SparseStructureFlowModel(nn.Module):
                     trace["final_out_flat"] = x
                     trace["final_output"] = x.reshape(B, R, R, R, self.out_channels).transpose(0, 4, 1, 2, 3)
                 break
-            x = block(
-                x,
-                mod[0],
-                cond,
-                rope_phases=rope_phases,
-                cross_kv_cache=block_kv,
-            )
+            if block_injection is not None:
+                x = block.forward_with_injection(
+                    x,
+                    mod[0],
+                    cond,
+                    injection=block_injection,
+                    branch=sparse_block_injection_branch or "pos",
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
+            else:
+                x = block(
+                    x,
+                    mod[0],
+                    cond,
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
             if (i + 1) % 6 == 0:
                 mx.eval(x)
         mx.eval(*trace.values())
@@ -792,6 +829,8 @@ class SparseStructureFlowModel(nn.Module):
         block_index: int = 0,
         resolution: int | None = None,
         cross_kv_cache: list = None,
+        sparse_block_injection=None,
+        sparse_block_injection_branch: str | None = None,
     ) -> dict[str, mx.array]:
         """Trace one block starting from a saved projected block input.
 
@@ -847,6 +886,12 @@ class SparseStructureFlowModel(nn.Module):
 
         trace_prefix = f"block{block_index}"
         trace: dict[str, mx.array] = {f"{trace_prefix}_input": x}
+        block_injection = None
+        if sparse_block_injection is not None:
+            if hasattr(sparse_block_injection, "injection_for_block"):
+                block_injection = sparse_block_injection.injection_for_block(block_index)
+            elif block_index == sparse_block_injection.block_index:
+                block_injection = sparse_block_injection
         x_after, block_trace = self.blocks[block_index].trace(
             x,
             mod[0],
@@ -854,6 +899,8 @@ class SparseStructureFlowModel(nn.Module):
             rope_phases=rope_phases,
             cross_kv_cache=block_kv,
             trace_prefix=trace_prefix,
+            injection=block_injection,
+            branch=sparse_block_injection_branch or "pos",
         )
         trace.update(block_trace)
         if block_index == len(self.blocks) - 1:

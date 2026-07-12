@@ -779,6 +779,20 @@ def test_generate_sparse_flow_block_trace_can_save_selected_trace_keys():
     assert "sparse_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str)" in source
 
 
+def test_generate_sparse_flow_block_trace_forwards_active_sparse_block_injection():
+    source = GENERATE_SOURCE.read_text()
+    trace_start = source.index('if args.stop_after_stage == "sparse_flow_block_trace":')
+    trace_end = source.index('step_capture = {} if args.stop_after_stage == "sparse_flow_step"', trace_start)
+    trace_source = source[trace_start:trace_end]
+
+    assert "def active_trace_injection(branch):" in trace_source
+    assert "active_for_step_branch" in trace_source
+    assert 'sparse_block_injection=active_trace_injection("pos")' in trace_source
+    assert 'sparse_block_injection_branch="pos"' in trace_source
+    assert 'sparse_block_injection=active_trace_injection("neg")' in trace_source
+    assert 'sparse_block_injection_branch="neg"' in trace_source
+
+
 def test_generate_can_load_conditioning_sample():
     source = GENERATE_SOURCE.read_text()
 

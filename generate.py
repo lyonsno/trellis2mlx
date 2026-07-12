@@ -1173,6 +1173,18 @@ def main():
                     f"one of {candidate_keys}; available keys: {block_input_npz.files}"
                 )
 
+            def active_trace_injection(branch):
+                if sparse_block_injection is None:
+                    return None
+                if hasattr(sparse_block_injection, "active_for_step_branch"):
+                    return sparse_block_injection.active_for_step_branch(
+                        step_index=trace_step_index,
+                        branch=branch,
+                    )
+                if sparse_block_injection.applies(step_index=trace_step_index, branch=branch):
+                    return sparse_block_injection
+                return None
+
             if args.sparse_flow_trace_block_input_sample:
                 if args.sparse_flow_trace_sample:
                     raise ValueError(
@@ -1190,6 +1202,8 @@ def main():
                     pos_cond,
                     block_index=trace_block_index,
                     cross_kv_cache=pos_kv_cache,
+                    sparse_block_injection=active_trace_injection("pos"),
+                    sparse_block_injection_branch="pos",
                 )
                 neg_trace = ss_flow.trace_projected_block_input(
                     neg_block_input,
@@ -1197,6 +1211,8 @@ def main():
                     neg_cond_fp32,
                     block_index=trace_block_index,
                     cross_kv_cache=neg_kv_cache,
+                    sparse_block_injection=active_trace_injection("neg"),
+                    sparse_block_injection_branch="neg",
                 )
                 trace_input_mode = "projected_block_input"
             elif args.sparse_flow_trace_sample:
@@ -1227,6 +1243,8 @@ def main():
                     pos_cond,
                     block_index=trace_block_index,
                     cross_kv_cache=pos_kv_cache,
+                    sparse_block_injection=active_trace_injection("pos"),
+                    sparse_block_injection_branch="pos",
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -1234,6 +1252,8 @@ def main():
                     neg_cond_fp32,
                     block_index=trace_block_index,
                     cross_kv_cache=neg_kv_cache,
+                    sparse_block_injection=active_trace_injection("neg"),
+                    sparse_block_injection_branch="neg",
                 )
             elif trace_step_index == 0:
                 trace_sample = noise
@@ -1245,6 +1265,8 @@ def main():
                     pos_cond,
                     block_index=trace_block_index,
                     cross_kv_cache=pos_kv_cache,
+                    sparse_block_injection=active_trace_injection("pos"),
+                    sparse_block_injection_branch="pos",
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -1252,6 +1274,8 @@ def main():
                     neg_cond_fp32,
                     block_index=trace_block_index,
                     cross_kv_cache=neg_kv_cache,
+                    sparse_block_injection=active_trace_injection("neg"),
+                    sparse_block_injection_branch="neg",
                 )
             else:
                 trace_steps = []
@@ -1278,6 +1302,8 @@ def main():
                     pos_cond,
                     block_index=trace_block_index,
                     cross_kv_cache=pos_kv_cache,
+                    sparse_block_injection=active_trace_injection("pos"),
+                    sparse_block_injection_branch="pos",
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -1285,6 +1311,8 @@ def main():
                     neg_cond_fp32,
                     block_index=trace_block_index,
                     cross_kv_cache=neg_kv_cache,
+                    sparse_block_injection=active_trace_injection("neg"),
+                    sparse_block_injection_branch="neg",
                 )
             def trace_np(value):
                 return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)

@@ -149,6 +149,51 @@ def test_modulated_block_applies_rowwise_layernorm_correction_before_self_attent
     np.testing.assert_array_equal(seen_np[1], expected_row_np)
 
 
+def test_sparse_flow_trace_block_records_effective_sparse_block_injection():
+    import mlx.core as mx
+
+    from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
+    from trellmlx.sparse_block_injection import SparseBlockInjection
+
+    model = SparseStructureFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=4,
+        num_heads=1,
+        num_blocks=1,
+        mlp_hidden=8,
+        context_channels=4,
+    )
+    injected = np.arange(8 * 4, dtype=np.float32).reshape(1, 8, 4) / 10.0
+    injection = SparseBlockInjection(
+        trace_path=None,
+        array_key="pos_block0_modulated_self_input",
+        branch="pos",
+        step_index=2,
+        block_index=0,
+        stage="modulated_self_input",
+        arrays_by_branch={"pos": injected},
+        trace_identity={},
+    )
+
+    trace = model.trace_block(
+        mx.zeros((1, 2, 2, 2, 2), dtype=mx.float32),
+        mx.array([500.0], dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        block_index=0,
+        sparse_block_injection=injection,
+        sparse_block_injection_branch="pos",
+    )
+    mx.eval(trace["block0_modulated_self_input"])
+
+    expected = mx.array(injected.reshape(8, 4), dtype=trace["block0_modulated_self_input"].dtype)
+    mx.eval(expected)
+    np.testing.assert_allclose(
+        np.array(trace["block0_modulated_self_input"].astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+    )
+
+
 def test_flow_euler_sample_dispatches_sparse_block_injection_by_step_and_branch():
     import mlx.core as mx
 
