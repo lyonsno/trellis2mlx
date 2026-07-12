@@ -391,7 +391,15 @@ class ModulatedBlock(nn.Module):
         scale_mlp = mod[4*C:5*C]
         gate_mlp = mod[5*C:6*C]
 
-        h = _layernorm_noaffine(x)
+        if _is_rowwise_layernorm_correction(injection):
+            h = _layernorm_noaffine_rowwise_perturbed(
+                x,
+                injection,
+                branch=branch,
+                eps=1e-6,
+            )
+        else:
+            h = _layernorm_noaffine(x)
         if injection.stage == "norm1":
             h = _injected_tensor_like(injection, h, branch=branch)
         h = h * (1 + scale_msa) + shift_msa
@@ -499,6 +507,81 @@ def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
         var = mx.mean((xf - mean) * (xf - mean), axis=-1, keepdims=True)
         return ((xf - mean) * mx.rsqrt(var + eps)).astype(input_dtype)
     return mx.fast.layer_norm(x, None, None, eps)
+
+
+def _is_rowwise_layernorm_correction(injection) -> bool:
+    return getattr(injection, "stage", None) in {"norm1_rowwise_scale", "norm1_rowwise_bias"}
+
+
+def _layernorm_noaffine_rowwise_perturbed(
+    x: mx.array,
+    correction,
+    *,
+    branch: str,
+    eps: float = 1e-6,
+) -> mx.array:
+    """No-affine LayerNorm with diagnostic row-local perturbations before BF16 cast."""
+    base = _layernorm_noaffine(x, eps=eps)
+    rows = np.asarray(correction.array_for_branch(branch), dtype=np.float32)
+    if rows.size == 0:
+        return base
+    if rows.ndim != 2 or rows.shape[1] != 3:
+        raise ValueError(
+            "rowwise LayerNorm correction rows must have shape [N, 3] "
+            f"for batch/token/value, got {rows.shape}"
+        )
+
+    leading_shape = tuple(int(dim) for dim in x.shape[:-1])
+    if len(leading_shape) == 1:
+        values = np.zeros(leading_shape, dtype=np.float32)
+        active = np.zeros(leading_shape, dtype=np.bool_)
+        for batch_f, token_f, value_f in rows:
+            batch = int(batch_f)
+            token = int(token_f)
+            if batch != 0:
+                raise ValueError(
+                    "rowwise LayerNorm correction for 2D tokens requires batch 0, "
+                    f"got batch {batch}"
+                )
+            if token < 0 or token >= leading_shape[0]:
+                raise ValueError(
+                    f"rowwise LayerNorm correction token {token} outside [0, {leading_shape[0]})"
+                )
+            values[token] = float(value_f)
+            active[token] = True
+    elif len(leading_shape) == 2:
+        values = np.zeros(leading_shape, dtype=np.float32)
+        active = np.zeros(leading_shape, dtype=np.bool_)
+        for batch_f, token_f, value_f in rows:
+            batch = int(batch_f)
+            token = int(token_f)
+            if batch < 0 or batch >= leading_shape[0] or token < 0 or token >= leading_shape[1]:
+                raise ValueError(
+                    "rowwise LayerNorm correction coordinate "
+                    f"({batch}, {token}) outside {leading_shape}"
+                )
+            values[batch, token] = float(value_f)
+            active[batch, token] = True
+    else:
+        raise ValueError(
+            "rowwise LayerNorm correction supports [tokens, channels] or "
+            f"[batch, tokens, channels], got {x.shape}"
+        )
+
+    xf = x.astype(mx.float32)
+    mean = mx.mean(xf, axis=-1, keepdims=True)
+    centered = xf - mean
+    var = mx.mean(centered * centered, axis=-1, keepdims=True)
+    normalized = centered * mx.rsqrt(var + eps)
+    row_values = mx.array(values)[..., None]
+    row_active = mx.array(active)[..., None]
+    if correction.mode == "scale":
+        corrected = normalized * (1.0 + row_values)
+    elif correction.mode == "bias":
+        corrected = normalized + row_values
+    else:
+        raise ValueError(f"unknown rowwise LayerNorm correction mode: {correction.mode!r}")
+    return mx.where(row_active, corrected.astype(base.dtype), base)
 
 
 def _injected_tensor_like(injection, reference: mx.array, *, branch: str) -> mx.array:

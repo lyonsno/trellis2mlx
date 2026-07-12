@@ -646,6 +646,22 @@ def main():
                         help="Diagnostic: block tensor stage to replace.")
     parser.add_argument("--sparse-flow-block-injection-array-key",
                         help="Diagnostic: explicit trace array key for block injection.")
+    parser.add_argument("--sparse-flow-layernorm-correction-report", metavar="JSON",
+                        help="Diagnostic: apply row-wise no-affine LayerNorm correction from a "
+                             "boundary-probe report.")
+    parser.add_argument("--sparse-flow-layernorm-correction-step-index", type=int, default=2,
+                        help="Diagnostic: sampler step index where row-wise LayerNorm correction applies.")
+    parser.add_argument("--sparse-flow-layernorm-correction-block-index", type=int, default=0,
+                        help="Diagnostic: sparse-flow block index where row-wise LayerNorm correction applies.")
+    parser.add_argument("--sparse-flow-layernorm-correction-branch",
+                        choices=["pos", "neg", "both"], default="pos",
+                        help="Diagnostic: CFG branch where row-wise LayerNorm correction applies.")
+    parser.add_argument("--sparse-flow-layernorm-correction-mode",
+                        choices=["scale", "bias"], default="scale",
+                        help="Diagnostic: row-wise LayerNorm perturbation mode from the boundary report.")
+    parser.add_argument("--sparse-flow-layernorm-correction-include",
+                        choices=["improved", "solved", "all"], default="improved",
+                        help="Diagnostic: boundary-report rows to apply (default: improved).")
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow block index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
@@ -700,8 +716,17 @@ def main():
             "--sparse-flow-block-injection-trace and "
             "--sparse-flow-block-injection-manifest are mutually exclusive"
         )
+    if args.sparse_flow_layernorm_correction_report and (
+        args.sparse_flow_block_injection_trace or args.sparse_flow_block_injection_manifest
+    ):
+        parser.error(
+            "--sparse-flow-layernorm-correction-report is mutually exclusive with "
+            "sparse-flow block injection"
+        )
     if (args.sparse_flow_block_injection_trace or args.sparse_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with sparse-flow block injection")
+    if args.sparse_flow_layernorm_correction_report and args.compile:
+        parser.error("--compile is not supported with sparse-flow LayerNorm correction")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1047,6 +1072,7 @@ def main():
     else:
         sparse_block_injection = None
         sparse_block_injection_json = ""
+        sparse_flow_layernorm_correction_json = ""
         if args.sparse_flow_block_injection_trace and args.sparse_flow_block_injection_manifest:
             raise ValueError(
                 "--sparse-flow-block-injection-trace and "
@@ -1059,6 +1085,21 @@ def main():
                 args.sparse_flow_block_injection_manifest,
             )
             sparse_block_injection_json = json.dumps(
+                sparse_block_injection.report_identity(),
+                sort_keys=True,
+            )
+        elif args.sparse_flow_layernorm_correction_report:
+            from trellmlx.sparse_block_injection import load_sparse_layernorm_correction
+
+            sparse_block_injection = load_sparse_layernorm_correction(
+                args.sparse_flow_layernorm_correction_report,
+                branch=args.sparse_flow_layernorm_correction_branch,
+                step_index=args.sparse_flow_layernorm_correction_step_index,
+                block_index=args.sparse_flow_layernorm_correction_block_index,
+                mode=args.sparse_flow_layernorm_correction_mode,
+                include=args.sparse_flow_layernorm_correction_include,
+            )
+            sparse_flow_layernorm_correction_json = json.dumps(
                 sparse_block_injection.report_identity(),
                 sort_keys=True,
             )
@@ -1396,6 +1437,7 @@ def main():
             sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
             sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
+            sparse_flow_layernorm_correction_json=np.array(sparse_flow_layernorm_correction_json),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
         return
@@ -1439,6 +1481,7 @@ def main():
             sparse_flow_start_sample_path=np.array(sparse_flow_start_sample_path),
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
             sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
+            sparse_flow_layernorm_correction_json=np.array(sparse_flow_layernorm_correction_json),
         )
         print("  Stop after stage: sparse_flow_steps", flush=True)
         return

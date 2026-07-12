@@ -98,6 +98,49 @@ class SparseBlockInjectionSet:
         }
 
 
+@dataclass(frozen=True)
+class SparseLayerNormCorrection:
+    report_path: Path | None
+    branch: str
+    step_index: int
+    block_index: int
+    stage: str
+    mode: str
+    arrays_by_branch: dict[str, np.ndarray]
+    source_report_identity: dict[str, Any]
+
+    def applies(self, *, step_index: int, branch: str) -> bool:
+        return int(step_index) == self.step_index and (
+            self.branch == "both" or self.branch == branch
+        )
+
+    def array_for_branch(self, branch: str) -> np.ndarray:
+        if branch in self.arrays_by_branch:
+            return self.arrays_by_branch[branch]
+        if self.branch == "both" and "both" in self.arrays_by_branch:
+            return self.arrays_by_branch["both"]
+        if self.branch != "both" and self.branch in self.arrays_by_branch:
+            return self.arrays_by_branch[self.branch]
+        raise KeyError(f"sparse LayerNorm correction has no rows for branch {branch!r}")
+
+    def report_identity(self) -> dict[str, Any]:
+        return {
+            "report_path": str(self.report_path) if self.report_path is not None else None,
+            "report_sha256": _sha256_file(self.report_path) if self.report_path else None,
+            "branch": self.branch,
+            "step_index": self.step_index,
+            "block_index": self.block_index,
+            "stage": self.stage,
+            "mode": self.mode,
+            "report_identity": self.source_report_identity,
+            "comparison_class": "mlx_sparse_flow_with_rowwise_layernorm_correction",
+            "route_identity_evidence": True,
+            "row_count_by_branch": {
+                key: int(value.shape[0]) for key, value in sorted(self.arrays_by_branch.items())
+            },
+        }
+
+
 def load_sparse_block_injection(
     trace_path: str | Path,
     *,
@@ -156,6 +199,70 @@ def load_sparse_block_injection(
         stage=stage,
         arrays_by_branch=arrays_by_branch,
         trace_identity=trace_identity,
+    )
+
+
+def load_sparse_layernorm_correction(
+    report_path: str | Path,
+    *,
+    branch: str,
+    step_index: int,
+    block_index: int,
+    mode: str,
+    include: str = "improved",
+) -> SparseLayerNormCorrection:
+    if branch not in {"pos", "neg", "both"}:
+        raise ValueError("branch must be one of: pos, neg, both")
+    if mode not in {"scale", "bias"}:
+        raise ValueError("mode must be one of: scale, bias")
+    if include not in {"improved", "solved", "all"}:
+        raise ValueError("include must be one of: improved, solved, all")
+
+    report_path = Path(report_path)
+    report = json.loads(report_path.read_text())
+    probe = report.get("rowwise_perturbation_probe")
+    if not isinstance(probe, dict) or mode not in probe:
+        raise KeyError(f"LayerNorm boundary report missing rowwise mode {mode!r}")
+    mode_payload = probe[mode]
+    tokens = mode_payload.get("tokens") if isinstance(mode_payload, dict) else None
+    if not isinstance(tokens, list):
+        raise ValueError(f"LayerNorm boundary report mode {mode!r} must contain a tokens list")
+
+    rows: list[tuple[int, int, float]] = []
+    for index, token in enumerate(tokens):
+        if not isinstance(token, dict):
+            raise ValueError(f"rowwise token entry {index} must be an object")
+        if include == "improved" and not bool(token.get("improved")):
+            continue
+        if include == "solved" and not bool(token.get("solved")):
+            continue
+        best = token.get("best")
+        if not isinstance(best, dict) or "value" not in best:
+            raise KeyError(f"rowwise token entry {index} missing best.value")
+        rows.append((int(token.get("batch", 0)), int(token["token"]), float(best["value"])))
+
+    row_array = np.asarray(rows, dtype=np.float32).reshape((-1, 3))
+    arrays_by_branch = {"pos": row_array, "neg": row_array} if branch == "both" else {branch: row_array}
+    source_report_identity = {
+        "schema": report.get("schema"),
+        "status": report.get("status"),
+        "requested_route": report.get("requested_route"),
+        "effective_route": report.get("effective_route"),
+        "known_routes": report.get("known_routes"),
+        "artifacts": report.get("artifacts"),
+        "include": include,
+        "source_mode_token_count": int(len(tokens)),
+        "selected_row_count": int(row_array.shape[0]),
+    }
+    return SparseLayerNormCorrection(
+        report_path=report_path,
+        branch=branch,
+        step_index=int(step_index),
+        block_index=int(block_index),
+        stage=f"norm1_rowwise_{mode}",
+        mode=mode,
+        arrays_by_branch=arrays_by_branch,
+        source_report_identity=source_report_identity,
     )
 
 
