@@ -77,6 +77,32 @@ def test_route_identity_records_block_input_replay_scope(tmp_path):
     assert "not a captured-MLX-block-input replay" not in route["forbidden_inferences"]
 
 
+def test_route_identity_records_block_stage_replay_scope(tmp_path):
+    replay = tmp_path / "mlx-block-stages.npz"
+    route = trace.build_route_identity(
+        device_type="cuda",
+        output_npz=tmp_path / "trace.npz",
+        conditioning_path=tmp_path / "conditioning.npz",
+        support_sample_path=tmp_path / "support.npz",
+        noise_sample_path=tmp_path / "noise.npz",
+        block_indices=[1],
+        trace_names=["after_cross", "after_mlp"],
+        steps=8,
+        seed=42,
+        branch="both",
+        block_stage_replay_sample=replay,
+        block_stage_replay_scope=["pos_block1_after_cross", "neg_block1_after_cross"],
+    )
+
+    assert route["effective_route"].endswith("-with-captured-block-stage-replay")
+    assert route["block_stage_replay_sample"] == str(replay)
+    assert route["block_stage_replay_scope"] == [
+        "pos_block1_after_cross",
+        "neg_block1_after_cross",
+    ]
+    assert "not a captured-MLX-block-stage replay" not in route["forbidden_inferences"]
+
+
 def test_load_support_and_noise_rejects_coordinate_mismatch(tmp_path):
     support = tmp_path / "support.npz"
     noise = tmp_path / "noise.npz"
@@ -152,6 +178,54 @@ def test_load_block_input_replay_rejects_wrong_token_count(tmp_path):
             replay,
             branches=["pos"],
             block_indices=[1],
+            token_count=2,
+        )
+
+
+def test_load_block_stage_replay_accepts_requested_stages(tmp_path):
+    replay = tmp_path / "replay.npz"
+    pos = np.arange(12, dtype=np.float32).reshape(1, 2, 6)
+    neg = np.arange(12, 24, dtype=np.float32).reshape(2, 6)
+    np.savez(replay, pos_block1_after_cross=pos, neg_block1_after_cross=neg)
+
+    loaded = trace.load_block_stage_replay(
+        replay,
+        branches=["pos", "neg"],
+        block_indices=[1],
+        stages=["after_cross"],
+        token_count=2,
+    )
+
+    assert set(loaded.arrays) == {("pos", 1, "after_cross"), ("neg", 1, "after_cross")}
+    assert np.array_equal(loaded.arrays[("pos", 1, "after_cross")], pos[0])
+    assert np.array_equal(loaded.arrays[("neg", 1, "after_cross")], neg)
+    assert loaded.scope == ["pos_block1_after_cross", "neg_block1_after_cross"]
+
+
+def test_load_block_stage_replay_rejects_unknown_stage(tmp_path):
+    replay = tmp_path / "replay.npz"
+    np.savez(replay, pos_block1_after_cross=np.zeros((1, 2, 6), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="unsupported block stage replay"):
+        trace.load_block_stage_replay(
+            replay,
+            branches=["pos"],
+            block_indices=[1],
+            stages=["attention_raw"],
+            token_count=2,
+        )
+
+
+def test_load_block_stage_replay_rejects_missing_requested_key(tmp_path):
+    replay = tmp_path / "replay.npz"
+    np.savez(replay, pos_block1_after_cross=np.zeros((1, 2, 6), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="missing neg_block1_after_cross"):
+        trace.load_block_stage_replay(
+            replay,
+            branches=["pos", "neg"],
+            block_indices=[1],
+            stages=["after_cross"],
             token_count=2,
         )
 

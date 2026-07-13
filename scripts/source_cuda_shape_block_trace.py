@@ -64,6 +64,13 @@ TRACE_NAMES = (
     "after_mlp",
 )
 COMPACT_TRACE_NAMES = ("input", "attention_raw", "after_self", "cross_attention_raw", "after_cross", "after_mlp")
+BLOCK_STAGE_REPLAY_NAMES = (
+    "norm1",
+    "modulated_self_input",
+    "after_self",
+    "after_cross",
+    "mlp_input",
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,12 @@ class SupportAndNoise:
 @dataclass(frozen=True)
 class BlockInputReplay:
     arrays: dict[tuple[str, int], np.ndarray]
+    scope: list[str]
+
+
+@dataclass(frozen=True)
+class BlockStageReplay:
+    arrays: dict[tuple[str, int, str], np.ndarray]
     scope: list[str]
 
 
@@ -130,6 +143,24 @@ def parse_block_indices(value: str | Iterable[int]) -> list[int]:
     return indices
 
 
+def parse_block_stage_replay_stages(value: str | Iterable[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        names = [str(part).strip() for part in value if str(part).strip()]
+    unknown = sorted(set(names) - set(BLOCK_STAGE_REPLAY_NAMES))
+    if unknown:
+        raise ValueError(
+            "unsupported block stage replay name(s): "
+            f"{', '.join(unknown)}; supported: {', '.join(BLOCK_STAGE_REPLAY_NAMES)}"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate block stage replay name in {names!r}")
+    return names
+
+
 def build_route_identity(
     *,
     device_type: str,
@@ -147,6 +178,8 @@ def build_route_identity(
     pipeline_config: str | None = None,
     block_input_replay_sample: Path | None = None,
     block_input_replay_scope: Iterable[str] | None = None,
+    block_stage_replay_sample: Path | None = None,
+    block_stage_replay_scope: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     if device_type != "cuda":
         raise RuntimeError(
@@ -154,23 +187,32 @@ def build_route_identity(
             f"refusing effective device {device_type!r}"
         )
     replay_scope = [str(value) for value in (block_input_replay_scope or [])]
-    is_replay = block_input_replay_sample is not None
+    stage_replay_scope = [str(value) for value in (block_stage_replay_scope or [])]
+    replay_modes = []
+    if block_input_replay_sample is not None:
+        replay_modes.append("captured-block-input-replay")
+    if block_stage_replay_sample is not None:
+        replay_modes.append("captured-block-stage-replay")
     forbidden_inferences = [
         "not Trellis-Mac/MPS evidence",
         "not final GLB parity evidence",
         "not texture/finalization evidence unless downstream outputs are listed",
     ]
-    if is_replay:
+    if block_input_replay_sample is not None or block_stage_replay_sample is not None:
         forbidden_inferences.append(
             "not evidence that source-CUDA upstream blocks before the replay point match MLX"
         )
-    else:
+    if block_input_replay_sample is None:
         forbidden_inferences.append("not a captured-MLX-block-input replay")
+    if block_stage_replay_sample is None:
+        forbidden_inferences.append("not a captured-MLX-block-stage replay")
     return {
         "schema": SCHEMA,
         "requested_route": REQUESTED_ROUTE,
         "effective_route": (
-            f"{EFFECTIVE_ROUTE}-with-captured-block-input-replay" if is_replay else EFFECTIVE_ROUTE
+            f"{EFFECTIVE_ROUTE}-with-{'-and-'.join(replay_modes)}"
+            if replay_modes
+            else EFFECTIVE_ROUTE
         ),
         "backend": "source-trellis",
         "device": "cuda",
@@ -191,6 +233,13 @@ def build_route_identity(
             None if block_input_replay_sample is None else _sha256_file(block_input_replay_sample)
         ),
         "block_input_replay_scope": replay_scope,
+        "block_stage_replay_sample": (
+            None if block_stage_replay_sample is None else _jsonable_path(block_stage_replay_sample)
+        ),
+        "block_stage_replay_sample_sha256": (
+            None if block_stage_replay_sample is None else _sha256_file(block_stage_replay_sample)
+        ),
+        "block_stage_replay_scope": stage_replay_scope,
         "model_repo": model_repo,
         "pipeline_config": pipeline_config,
         "shape_flow_trace_block_indices": [int(v) for v in block_indices],
@@ -287,6 +336,46 @@ def load_block_input_replay(
     return BlockInputReplay(arrays=arrays, scope=scope)
 
 
+def load_block_stage_replay(
+    replay_sample_path: Path,
+    *,
+    branches: Iterable[str],
+    block_indices: Iterable[int],
+    stages: Iterable[str],
+    token_count: int,
+) -> BlockStageReplay:
+    stages = parse_block_stage_replay_stages(stages)
+    if not stages:
+        raise ValueError("--block-stage-replay-stages must contain at least one stage")
+    replay_sample_path = Path(replay_sample_path)
+    arrays: dict[tuple[str, int, str], np.ndarray] = {}
+    scope: list[str] = []
+    with np.load(replay_sample_path) as data:
+        available = set(data.files)
+        for branch in branches:
+            for block_index in block_indices:
+                for stage in stages:
+                    key = f"{branch}_block{int(block_index)}_{stage}"
+                    if key not in available:
+                        raise ValueError(
+                            f"block stage replay sample {replay_sample_path} missing {key}"
+                        )
+                    value = np.asarray(data[key], dtype=np.float32)
+                    if value.ndim == 3 and value.shape[0] == 1:
+                        value = value[0]
+                    if value.ndim != 2:
+                        raise ValueError(
+                            f"{key} must have shape [1, N, C] or [N, C], got {value.shape}"
+                        )
+                    if value.shape[0] != token_count:
+                        raise ValueError(
+                            f"{key} token count mismatch: expected {token_count}, got {value.shape[0]}"
+                        )
+                    arrays[(str(branch), int(block_index), str(stage))] = np.ascontiguousarray(value)
+                    scope.append(key)
+    return BlockStageReplay(arrays=arrays, scope=scope)
+
+
 def schedule_pairs(steps: int, rescale_t: float) -> list[tuple[float, float]]:
     if steps <= 0:
         raise ValueError("--steps must be positive")
@@ -366,8 +455,32 @@ def _source_mlp_gelu(torch: Any, mlp: Any) -> Any:
     return torch.nn.GELU(approximate="tanh")
 
 
-def _trace_shape_block(torch: Any, block: Any, x: Any, mod: Any, context: Any) -> tuple[Any, dict[str, np.ndarray]]:
+def _trace_shape_block(
+    torch: Any,
+    block: Any,
+    x: Any,
+    mod: Any,
+    context: Any,
+    *,
+    stage_replay: BlockStageReplay | None = None,
+    branch_name: str = "",
+    block_index: int = 0,
+) -> tuple[Any, dict[str, np.ndarray]]:
     from trellis2.modules.sparse.attention.full_attn import sparse_scaled_dot_product_attention
+
+    def maybe_replay_sparse(stage: str, value: Any) -> Any:
+        if stage_replay is None:
+            return value
+        replay = stage_replay.arrays.get((branch_name, int(block_index), stage))
+        if replay is None:
+            return value
+        replay_feats = torch.from_numpy(replay).to(device=value.feats.device, dtype=value.feats.dtype)
+        if tuple(replay_feats.shape) != tuple(value.feats.shape):
+            raise ValueError(
+                f"{branch_name}_block{block_index}_{stage} replay tensor shape "
+                f"{tuple(replay_feats.shape)} does not match live shape {tuple(value.feats.shape)}"
+            )
+        return value.replace(replay_feats)
 
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = split_block_modulation(block, mod)
     source: dict[str, np.ndarray] = {
@@ -381,8 +494,10 @@ def _trace_shape_block(torch: Any, block: Any, x: Any, mod: Any, context: Any) -
     }
 
     h = x.replace(block.norm1(x.feats))
+    h = maybe_replay_sparse("norm1", h)
     source["norm1"] = _tensor_to_numpy(h, batched_sparse=True)
     h = h * (1 + scale_msa) + shift_msa
+    h = maybe_replay_sparse("modulated_self_input", h)
     source["modulated_self_input"] = _tensor_to_numpy(h, batched_sparse=True)
 
     attn = block.self_attn
@@ -409,6 +524,7 @@ def _trace_shape_block(torch: Any, block: Any, x: Any, mod: Any, context: Any) -
     source["self_attn"] = _tensor_to_numpy(h, batched_sparse=True)
     h = h * gate_msa
     x = x + h
+    x = maybe_replay_sparse("after_self", x)
     source["after_self"] = _tensor_to_numpy(x, batched_sparse=True)
 
     h = x.replace(block.norm2(x.feats))
@@ -433,10 +549,12 @@ def _trace_shape_block(torch: Any, block: Any, x: Any, mod: Any, context: Any) -
     h = attn._linear(attn.to_out, h)
     source["cross_attn"] = _tensor_to_numpy(h, batched_sparse=True)
     x = x + h
+    x = maybe_replay_sparse("after_cross", x)
     source["after_cross"] = _tensor_to_numpy(x, batched_sparse=True)
 
     h = x.replace(block.norm3(x.feats))
     h = h * (1 + scale_mlp) + shift_mlp
+    h = maybe_replay_sparse("mlp_input", h)
     source["mlp_input"] = _tensor_to_numpy(h, batched_sparse=True)
     fc1, fc2 = _source_mlp_linears(block.mlp)
     h_fc1 = fc1(h)
@@ -486,6 +604,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional NPZ with {branch}_block{index}_input arrays. When set, the "
             "source-CUDA trace replaces h at each requested block before tracing it."
+        ),
+    )
+    parser.add_argument(
+        "--block-stage-replay-sample",
+        type=Path,
+        help=(
+            "Optional NPZ with {branch}_block{index}_{stage} arrays for the stages "
+            "named by --block-stage-replay-stages."
+        ),
+    )
+    parser.add_argument(
+        "--block-stage-replay-stages",
+        default="",
+        help=(
+            "Comma-separated sparse stages to replay from --block-stage-replay-sample. "
+            f"Supported: {', '.join(BLOCK_STAGE_REPLAY_NAMES)}."
         ),
     )
     parser.add_argument("--source-tar", default=Path("trellis2_source_tarball.bin"), type=Path)
@@ -563,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.block_input_replay_sample is None
             else _jsonable_path(args.block_input_replay_sample)
         ),
+        "block_stage_replay_sample": (
+            None
+            if args.block_stage_replay_sample is None
+            else _jsonable_path(args.block_stage_replay_sample)
+        ),
         "branch": args.branch,
     }
 
@@ -585,6 +724,11 @@ def main(argv: list[str] | None = None) -> int:
             args.shape_flow_noise_sample,
         )
         branch_names = [branch_name for branch_name, _ in _select_branches(args.branch)]
+        block_stage_replay_stages = parse_block_stage_replay_stages(args.block_stage_replay_stages)
+        if args.block_stage_replay_sample is not None and not block_stage_replay_stages:
+            raise ValueError("--block-stage-replay-sample requires --block-stage-replay-stages")
+        if args.block_stage_replay_sample is None and block_stage_replay_stages:
+            raise ValueError("--block-stage-replay-stages requires --block-stage-replay-sample")
         block_input_replay = (
             load_block_input_replay(
                 args.block_input_replay_sample,
@@ -595,12 +739,24 @@ def main(argv: list[str] | None = None) -> int:
             if args.block_input_replay_sample is not None
             else None
         )
+        block_stage_replay = (
+            load_block_stage_replay(
+                args.block_stage_replay_sample,
+                branches=branch_names,
+                block_indices=block_indices,
+                stages=block_stage_replay_stages,
+                token_count=support_noise.coords.shape[0],
+            )
+            if args.block_stage_replay_sample is not None
+            else None
+        )
         report["input_identity"] = {
             "coords_shape": [int(v) for v in support_noise.coords.shape],
             "coords_3d_shape": [int(v) for v in support_noise.coords_3d.shape],
             "noise_shape": [int(v) for v in support_noise.noise.shape],
             "noise_key": support_noise.noise_key,
             "block_input_replay_scope": [] if block_input_replay is None else block_input_replay.scope,
+            "block_stage_replay_scope": [] if block_stage_replay is None else block_stage_replay.scope,
         }
         report["requested_sparse_backend"] = apply_sparse_backend_env(
             args.sparse_conv_backend,
@@ -685,6 +841,8 @@ def main(argv: list[str] | None = None) -> int:
             pipeline_config=args.pipeline_config,
             block_input_replay_sample=args.block_input_replay_sample,
             block_input_replay_scope=[] if block_input_replay is None else block_input_replay.scope,
+            block_stage_replay_sample=args.block_stage_replay_sample,
+            block_stage_replay_scope=[] if block_stage_replay is None else block_stage_replay.scope,
         )
         report["route_identity"] = route_identity
         report["model"] = {
@@ -741,7 +899,16 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         h = h.replace(replay_feats)
                     if block_index in block_set:
-                        h, block_trace = _trace_shape_block(torch, block, h, t_emb, context)
+                        h, block_trace = _trace_shape_block(
+                            torch,
+                            block,
+                            h,
+                            t_emb,
+                            context,
+                            stage_replay=block_stage_replay,
+                            branch_name=branch_name,
+                            block_index=block_index,
+                        )
                         for name in trace_names:
                             if name in block_trace:
                                 arrays[f"{branch_name}_block{block_index}_{name}"] = block_trace[name]
