@@ -15,15 +15,6 @@ class AtlasContractError(ValueError):
     """Raised when an input cannot support the claimed atlas coordinate."""
 
 
-ALPHA_CAUSAL_METRICS = (
-    "pred_final_source_mean_abs",
-    "move_to_source_norm_ratio",
-    "cosine_to_source_direction",
-    "projection_fraction",
-    "pred_final_changed_values",
-)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the TRELLIS.2 causal basin atlas")
     parser.add_argument("--prefix", required=True, type=Path)
@@ -224,30 +215,40 @@ def _build_alpha_chart(
             if not math.isfinite(alpha):
                 raise AtlasContractError("attention-alpha coordinate must be finite numeric")
             _require_metrics(row, ("pred_final_source_mean_abs", "move_to_source_norm_ratio"))
-            for metric_name in ALPHA_CAUSAL_METRICS[2:]:
-                if metric_name in row and row[metric_name] is not None:
-                    _require_metrics(row, (metric_name,))
-            signature = tuple(row.get(name) for name in ALPHA_CAUSAL_METRICS)
+            metrics = _copy_metrics(row)
+            _require_optional_numeric_metrics(metrics, label=f"attention-alpha {alpha:g}")
             artifact = row.get("artifact") or row.get("path")
-            row_observation = {**observation, "artifact": artifact}
+            row_observation = {
+                **observation,
+                "artifact": artifact,
+                "route_identity": _route_identity(artifact),
+                "metrics": metrics,
+            }
             if alpha in by_alpha:
                 existing = by_alpha[alpha]
-                if existing["signature"] != signature:
+                conflicts = sorted(
+                    name
+                    for name in existing["metrics"].keys() & metrics.keys()
+                    if existing["metrics"][name] != metrics[name]
+                )
+                if conflicts:
                     raise AtlasContractError(
-                        f"attention-alpha {alpha:g} has conflicting observations"
+                        f"attention-alpha {alpha:g} has conflicting observations for: "
+                        + ", ".join(conflicts)
                     )
+                existing["metrics"].update(metrics)
                 existing["observations"].append(row_observation)
             else:
                 by_alpha[alpha] = {
-                    "row": row,
-                    "signature": signature,
+                    "metrics": dict(metrics),
                     "observations": [row_observation],
                 }
 
     nodes = []
     for alpha, entry in sorted(by_alpha.items()):
-        row = entry["row"]
-        artifact = row.get("artifact") or row.get("path")
+        observations = entry["observations"]
+        artifacts = [item["artifact"] for item in observations]
+        artifact = artifacts[0] if len(set(artifacts)) == 1 else None
         nodes.append(
             {
                 "id": f"attention-alpha:{alpha:g}",
@@ -256,15 +257,16 @@ def _build_alpha_chart(
                 "coordinate": {"alpha": alpha},
                 "placement": "on_axis",
                 "artifact": artifact,
-                "route_identity": _route_identity(artifact),
+                "artifact_observations": artifacts,
+                "route_identity": _aggregate_observation_routes(observations),
                 "intervention": {
                     "kind": "block1_source_cuda_attention_delta_scale",
                     "block": 1,
                     "stage": "attention_raw",
                     "scale": alpha,
                 },
-                "metrics": _copy_metrics(row),
-                "source_observations": entry["observations"],
+                "metrics": entry["metrics"],
+                "source_observations": observations,
             }
         )
     if not nodes:
@@ -445,7 +447,15 @@ def _alpha_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for coordinate, point in points.items():
         row = dict(point)
         row.setdefault("alpha", float(coordinate))
-        pred_final = row.get("arrays", {}).get("pred_final", {})
+        arrays = row.get("arrays", {})
+        for array_name, values in arrays.items():
+            if not isinstance(values, dict):
+                continue
+            for metric_name, value in values.items():
+                row.setdefault(f"{array_name}_{metric_name}", value)
+            row.setdefault(f"{array_name}_source_mean_abs", values.get("source_mean_abs_after"))
+            row.setdefault(f"{array_name}_source_max_abs", values.get("source_max_abs_after"))
+        pred_final = arrays.get("pred_final", {})
         aliases = {
             "pred_final_source_mean_abs": "source_mean_abs_after",
             "move_to_source_norm_ratio": "move_norm_over_source_displacement_norm",
@@ -466,6 +476,59 @@ def _copy_metrics(row: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in row.items()
         if key not in excluded and isinstance(value, (int, float, str, bool, type(None)))
+    }
+
+
+def _require_optional_numeric_metrics(metrics: dict[str, Any], *, label: str) -> None:
+    invalid = [
+        name
+        for name, value in metrics.items()
+        if value is not None
+        and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        )
+    ]
+    if invalid:
+        raise AtlasContractError(
+            f"{label} metrics must be finite numeric values or null: {', '.join(sorted(invalid))}"
+        )
+
+
+def _aggregate_observation_routes(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    routes = [item["route_identity"] for item in observations]
+    if len(routes) == 1:
+        return routes[0]
+    statuses = [str(route.get("status", "unverified")) for route in routes]
+    for blocked_status in ("failed", "stale", "partial", "missing", "unverified"):
+        if blocked_status in statuses:
+            return {
+                "status": blocked_status,
+                "authority": "multiple_observation_routes",
+                "observation_count": len(observations),
+                "observation_statuses": statuses,
+                "reason": (
+                    "duplicate coordinate has multiple provenance-only artifact observations; "
+                    f"aggregate authority is limited by {blocked_status}"
+                ),
+            }
+    artifact_hashes = {route.get("artifact_sha256") for route in routes}
+    if len(artifact_hashes) != 1 or None in artifact_hashes:
+        return {
+            "status": "unverified",
+            "authority": "multiple_distinct_artifact_bindings",
+            "observation_count": len(observations),
+            "observation_statuses": statuses,
+            "reason": (
+                "duplicate coordinate has distinct digest-bound artifacts; full observations "
+                "are preserved as provenance but no single artifact owns the coordinate"
+            ),
+        }
+    return {
+        **routes[0],
+        "authority": "repeated_digest_bound_observation",
+        "observation_count": len(observations),
     }
 
 

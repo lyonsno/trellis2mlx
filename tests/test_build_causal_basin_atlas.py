@@ -482,13 +482,15 @@ def test_alpha_duplicates_require_exact_causal_metrics_and_preserve_provenance(t
         "alpha": 0.25,
         "artifact": "/runs/a25/checkpoints/shape_flow_step.npz",
         "pred_final_source_mean_abs": 0.028,
+        "pred_final_source_max_abs": 0.2,
+        "sample_next_source_mean_abs": 0.001,
         "move_to_source_norm_ratio": 0.96,
     }
     first = _alpha_summary(tmp_path, "first.json", [row])
     second_row = dict(
         row,
         artifact="/runs/a25-repeat/checkpoints/shape_flow_step.npz",
-        pred_final_source_max_abs=0.2,
+        source_displacement_norm=18.0,
     )
     second = _alpha_summary(tmp_path, "second.json", [second_row])
     atlas = build_atlas(
@@ -498,11 +500,80 @@ def test_alpha_duplicates_require_exact_causal_metrics_and_preserve_provenance(t
     observations = atlas["charts"]["attention_alpha"]["nodes"][0]["source_observations"]
     assert [Path(item["path"]).name for item in observations] == ["first.json", "second.json"]
     assert [item["artifact"] for item in observations] == [row["artifact"], second_row["artifact"]]
+    assert observations[0]["metrics"]["pred_final_source_max_abs"] == 0.2
+    assert observations[1]["metrics"]["source_displacement_norm"] == 18.0
+    assert all("route_identity" in item for item in observations)
+    node = atlas["charts"]["attention_alpha"]["nodes"][0]
+    assert node["artifact"] is None
+    assert node["route_identity"]["status"] == "missing"
+    assert node["metrics"]["source_displacement_norm"] == 18.0
 
-    conflicting = dict(row, pred_final_source_mean_abs=0.029)
-    with pytest.raises(AtlasContractError, match="conflicting observations"):
-        build_atlas(
-            prefix_path=_prefix_summary(tmp_path),
-            alpha_paths=[first, _alpha_summary(tmp_path, "conflict.json", [conflicting])],
-            composition_path=_composition_summary(tmp_path), operation_path=None,
-        )
+    for metric, value in (
+        ("pred_final_source_mean_abs", 0.029),
+        ("pred_final_source_max_abs", 0.3),
+        ("sample_next_source_mean_abs", 0.002),
+    ):
+        conflicting = dict(row, **{metric: value})
+        with pytest.raises(AtlasContractError, match=f"conflicting.*{metric}"):
+            build_atlas(
+                prefix_path=_prefix_summary(tmp_path),
+                alpha_paths=[first, _alpha_summary(tmp_path, f"conflict-{metric}.json", [conflicting])],
+                composition_path=_composition_summary(tmp_path), operation_path=None,
+            )
+
+
+def test_alpha_duplicate_normalization_preserves_fraction_and_count_metrics_separately(tmp_path: Path) -> None:
+    from scripts.build_causal_basin_atlas import build_atlas
+
+    improved_fraction = 0.5054850915941276
+    worsened_fraction = 0.49451084838248666
+    coarse = _write_json(
+        tmp_path / "coarse-points.json",
+        {
+            "schema": "trellis2mlx.shape_attention_alpha_curve.v1",
+            "points": {
+                "0.25": {
+                    "path": "/runs/coarse.npz",
+                    "arrays": {
+                        "pred_final": {
+                            "source_mean_abs_after": 0.028,
+                            "source_max_abs_after": 0.2,
+                            "move_norm_over_source_displacement_norm": 0.96,
+                            "move_vs_source_displacement_cosine": 0.49,
+                            "projection_fraction_of_source_displacement": 0.47,
+                            "move_nonzero": 246303,
+                            "cells_improved_fraction": improved_fraction,
+                            "cells_worsened_fraction": worsened_fraction,
+                        }
+                    },
+                }
+            },
+        },
+    )
+    fine = _alpha_summary(
+        tmp_path,
+        "fine-rows.json",
+        [{
+            "alpha": 0.25,
+            "artifact": "/runs/fine.npz",
+            "pred_final_source_mean_abs": 0.028,
+            "pred_final_source_max_abs": 0.2,
+            "move_to_source_norm_ratio": 0.96,
+            "cosine_to_source_direction": 0.49,
+            "projection_fraction": 0.47,
+            "pred_final_changed_values": 246303,
+            "pred_final_improved_values": 124503,
+            "pred_final_worsened_values": 121800,
+        }],
+    )
+
+    atlas = build_atlas(
+        prefix_path=_prefix_summary(tmp_path), alpha_paths=[coarse, fine],
+        composition_path=_composition_summary(tmp_path), operation_path=None,
+    )
+
+    metrics = atlas["charts"]["attention_alpha"]["nodes"][0]["metrics"]
+    assert metrics["pred_final_cells_improved_fraction"] == improved_fraction
+    assert metrics["pred_final_cells_worsened_fraction"] == worsened_fraction
+    assert metrics["pred_final_improved_values"] == 124503
+    assert metrics["pred_final_worsened_values"] == 121800
