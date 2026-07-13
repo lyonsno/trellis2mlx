@@ -128,7 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--shape-flow-block-injection-stage",
-        choices=["attention_raw"],
+        choices=[
+            "norm1",
+            "modulated_self_input",
+            "attention_raw",
+            "after_self",
+            "after_cross",
+            "after_mlp",
+        ],
         default="attention_raw",
     )
     parser.add_argument("--shape-flow-block-injection-array-key")

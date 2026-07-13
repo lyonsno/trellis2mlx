@@ -85,6 +85,69 @@ def test_load_shape_attention_raw_injection_rejects_unidentified_or_wrong_site_t
         )
 
 
+def test_load_shape_norm1_injection_preserves_hidden_shape_and_records_stage(tmp_path):
+    from trellmlx.shape_block_injection import load_shape_block_injection
+
+    trace = tmp_path / "source_cuda_block0.npz"
+    pos = np.arange(3 * 4, dtype=np.float32).reshape(1, 3, 4)
+    neg = pos + 100
+    np.savez_compressed(
+        trace,
+        pos_block0_norm1=pos,
+        neg_block0_norm1=neg,
+        route_identity_json=np.asarray(
+            json.dumps(
+                {
+                    "effective_route": "microsoft-trellis2-cuda-t4",
+                    "effective_device_type": "cuda",
+                }
+            )
+        ),
+        trace_block_index=np.asarray([0], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+
+    injection = load_shape_block_injection(
+        trace,
+        branch="both",
+        step_index=0,
+        block_index=0,
+        stage="norm1",
+    )
+
+    np.testing.assert_array_equal(injection.array_for_branch("pos"), pos)
+    np.testing.assert_array_equal(injection.array_for_branch("neg"), neg)
+    identity = injection.report_identity()
+    assert identity["stage"] == "norm1"
+    assert identity["comparison_class"] == "mlx_shape_flow_with_source_cuda_block_stage_injection"
+    assert identity["effective_array_shape_by_branch"] == {
+        "neg": [1, 3, 4],
+        "pos": [1, 3, 4],
+    }
+
+
+def test_stage_capture_accepts_shape_norm1_injection_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"input")
+    trace = tmp_path / "source_cuda_block0.npz"
+    trace.write_bytes(b"trace")
+    args = build_parser().parse_args(
+        [
+            "--image", str(image),
+            "--output-dir", str(tmp_path / "out"),
+            "--stop-after-stage", "shape_flow_step",
+            "--shape-flow-block-injection-trace", str(trace),
+            "--shape-flow-block-injection-block-index", "0",
+            "--shape-flow-block-injection-stage", "norm1",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--shape-flow-block-injection-stage") + 1] == "norm1"
+
 @pytest.mark.parametrize(
     ("source_delta_scale", "expected_raw"),
     [(0.0, 7.0), (0.5, 4.5), (1.0, 2.0)],

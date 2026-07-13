@@ -672,7 +672,7 @@ def main():
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
     parser.add_argument("--shape-flow-block-injection-trace", metavar="NPZ",
-                        help="Diagnostic: inject a named shape-flow attention_raw tensor from an NPZ trace.")
+                        help="Diagnostic: inject a named shape-flow block tensor from an NPZ trace.")
     parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0,
                         help="Diagnostic: shape-flow sampler step where block injection applies.")
     parser.add_argument("--shape-flow-block-injection-block-index", type=int, default=1,
@@ -681,12 +681,14 @@ def main():
                         choices=["pos", "neg", "both"], default="both",
                         help="Diagnostic: shape-flow CFG branch where block injection applies.")
     parser.add_argument("--shape-flow-block-injection-stage",
-                        choices=["attention_raw"], default="attention_raw",
+                        choices=["norm1", "modulated_self_input", "attention_raw",
+                                 "after_self", "after_cross", "after_mlp"],
+                        default="attention_raw",
                         help="Diagnostic: shape-flow block tensor stage to replace.")
     parser.add_argument("--shape-flow-block-injection-array-key",
                         help="Diagnostic: explicit trace array key for single-branch shape injection.")
     parser.add_argument("--shape-flow-block-injection-scale", type=float, default=1.0,
-                        help="Diagnostic: scale source-minus-live attention_raw before injection.")
+                        help="Diagnostic: scale source-minus-live block tensor before injection.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")

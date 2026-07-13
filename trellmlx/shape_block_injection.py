@@ -12,6 +12,16 @@ from typing import Any
 import numpy as np
 
 
+SHAPE_BLOCK_INJECTION_STAGES = {
+    "norm1",
+    "modulated_self_input",
+    "attention_raw",
+    "after_self",
+    "after_cross",
+    "after_mlp",
+}
+
+
 @dataclass(frozen=True)
 class ShapeBlockInjection:
     trace_path: Path | None
@@ -38,6 +48,11 @@ class ShapeBlockInjection:
         raise KeyError(f"shape block injection has no array for branch {branch!r}")
 
     def report_identity(self) -> dict[str, Any]:
+        comparison_class = (
+            "mlx_shape_flow_with_source_cuda_attention_raw_injection"
+            if self.stage == "attention_raw"
+            else "mlx_shape_flow_with_source_cuda_block_stage_injection"
+        )
         return {
             "trace_path": str(self.trace_path) if self.trace_path is not None else None,
             "trace_sha256": _sha256_file(self.trace_path) if self.trace_path else None,
@@ -48,7 +63,7 @@ class ShapeBlockInjection:
             "stage": self.stage,
             "source_delta_scale": self.source_delta_scale,
             "trace_identity": self.trace_identity,
-            "comparison_class": "mlx_shape_flow_with_source_cuda_attention_raw_injection",
+            "comparison_class": comparison_class,
             "route_identity_evidence": True,
             "source_array_shape_by_branch": {
                 name: list(shape) for name, shape in sorted(self.source_shapes_by_branch.items())
@@ -71,10 +86,10 @@ def load_shape_block_injection(
 ) -> ShapeBlockInjection:
     if branch not in {"pos", "neg", "both"}:
         raise ValueError(f"shape block injection branch must be pos, neg, or both; got {branch!r}")
-    if stage != "attention_raw":
+    if stage not in SHAPE_BLOCK_INJECTION_STAGES:
         raise ValueError(
-            "shape block injection currently accepts only attention_raw; "
-            f"got {stage!r}"
+            f"unknown shape block injection stage {stage!r}; "
+            f"expected one of {sorted(SHAPE_BLOCK_INJECTION_STAGES)}"
         )
     if not math.isfinite(source_delta_scale):
         raise ValueError(f"shape block injection source delta scale must be finite, got {source_delta_scale}")
@@ -98,7 +113,11 @@ def load_shape_block_injection(
                 )
             source = np.asarray(trace[key], dtype=np.float32)
             source_shapes_by_branch[active_branch] = source.shape
-            arrays_by_branch[active_branch] = _normalize_attention_raw(source, key=key)
+            arrays_by_branch[active_branch] = _normalize_block_stage(
+                source,
+                key=key,
+                stage=stage,
+            )
             keys.append(key)
         trace_identity = _read_trace_identity(trace)
         effective_route = trace_identity.get("effective_route")
@@ -136,13 +155,14 @@ def load_shape_block_injection(
     )
 
 
-def _normalize_attention_raw(array: np.ndarray, *, key: str) -> np.ndarray:
-    if array.ndim == 4 and array.shape[0] == 1:
+def _normalize_block_stage(array: np.ndarray, *, key: str, stage: str) -> np.ndarray:
+    if stage == "attention_raw" and array.ndim == 4 and array.shape[0] == 1:
         return array.reshape(array.shape[0], array.shape[1], array.shape[2] * array.shape[3])
     if array.ndim == 3 and array.shape[0] == 1:
         return array
     raise ValueError(
-        f"shape attention_raw array {key!r} must have shape [1,N,H,D] or [1,N,C], "
+        f"shape block stage array {key!r} for {stage!r} must have shape "
+        "[1,N,C], or [1,N,H,D] for attention_raw; "
         f"got {array.shape}"
     )
 
