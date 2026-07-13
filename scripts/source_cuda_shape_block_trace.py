@@ -67,6 +67,7 @@ COMPACT_TRACE_NAMES = ("input", "attention_raw", "after_self", "cross_attention_
 BLOCK_STAGE_REPLAY_NAMES = (
     "norm1",
     "modulated_self_input",
+    "attention_raw",
     "after_self",
     "after_cross",
     "mlp_input",
@@ -476,10 +477,13 @@ def _trace_shape_block(
             return value
         replay_feats = torch.from_numpy(replay).to(device=value.feats.device, dtype=value.feats.dtype)
         if tuple(replay_feats.shape) != tuple(value.feats.shape):
-            raise ValueError(
-                f"{branch_name}_block{block_index}_{stage} replay tensor shape "
-                f"{tuple(replay_feats.shape)} does not match live shape {tuple(value.feats.shape)}"
-            )
+            if replay_feats.numel() == value.feats.numel():
+                replay_feats = replay_feats.reshape(value.feats.shape)
+            else:
+                raise ValueError(
+                    f"{branch_name}_block{block_index}_{stage} replay tensor shape "
+                    f"{tuple(replay_feats.shape)} does not match live shape {tuple(value.feats.shape)}"
+                )
         return value.replace(replay_feats)
 
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = split_block_modulation(block, mod)
@@ -518,6 +522,7 @@ def _trace_shape_block(
     source["k_post_rope"] = _tensor_to_numpy(k, batched_sparse=True)
     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
     h = sparse_scaled_dot_product_attention(qkv)
+    h = maybe_replay_sparse("attention_raw", h)
     source["attention_raw"] = _tensor_to_numpy(h, batched_sparse=True)
     h = attn._reshape_chs(h, (-1,))
     h = attn._linear(attn.to_out, h)

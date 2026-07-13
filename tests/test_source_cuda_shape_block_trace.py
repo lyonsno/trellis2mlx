@@ -202,6 +202,23 @@ def test_load_block_stage_replay_accepts_requested_stages(tmp_path):
     assert loaded.scope == ["pos_block1_after_cross", "neg_block1_after_cross"]
 
 
+def test_load_block_stage_replay_accepts_flattened_attention_raw(tmp_path):
+    replay = tmp_path / "replay.npz"
+    raw = np.arange(2 * 12 * 4, dtype=np.float32).reshape(1, 2, 48)
+    np.savez(replay, pos_block1_attention_raw=raw)
+
+    loaded = trace.load_block_stage_replay(
+        replay,
+        branches=["pos"],
+        block_indices=[1],
+        stages=["attention_raw"],
+        token_count=2,
+    )
+
+    assert np.array_equal(loaded.arrays[("pos", 1, "attention_raw")], raw[0])
+    assert loaded.scope == ["pos_block1_attention_raw"]
+
+
 def test_load_block_stage_replay_rejects_unknown_stage(tmp_path):
     replay = tmp_path / "replay.npz"
     np.savez(replay, pos_block1_after_cross=np.zeros((1, 2, 6), dtype=np.float32))
@@ -211,7 +228,7 @@ def test_load_block_stage_replay_rejects_unknown_stage(tmp_path):
             replay,
             branches=["pos"],
             block_indices=[1],
-            stages=["attention_raw"],
+            stages=["q_pre_norm"],
             token_count=2,
         )
 
