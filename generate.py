@@ -673,6 +673,8 @@ def main():
                              "containing coords plus noise or sample_feats.")
     parser.add_argument("--shape-flow-block-injection-trace", metavar="NPZ",
                         help="Diagnostic: inject a named shape-flow block tensor from an NPZ trace.")
+    parser.add_argument("--shape-flow-block-injection-manifest", metavar="JSON",
+                        help="Diagnostic: inject multiple named shape-flow block tensors from a JSON manifest.")
     parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0,
                         help="Diagnostic: shape-flow sampler step where block injection applies.")
     parser.add_argument("--shape-flow-block-injection-block-index", type=int, default=1,
@@ -748,7 +750,12 @@ def main():
         parser.error("--compile is not supported with sparse-flow block injection")
     if args.sparse_flow_layernorm_correction_report and args.compile:
         parser.error("--compile is not supported with sparse-flow LayerNorm correction")
-    if args.shape_flow_block_injection_trace and args.compile:
+    if args.shape_flow_block_injection_trace and args.shape_flow_block_injection_manifest:
+        parser.error(
+            "--shape-flow-block-injection-trace and "
+            "--shape-flow-block-injection-manifest are mutually exclusive"
+        )
+    if (args.shape_flow_block_injection_trace or args.shape_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with shape-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
@@ -1626,7 +1633,17 @@ def main():
 
     shape_block_injection = None
     shape_block_injection_json = ""
-    if args.shape_flow_block_injection_trace:
+    if args.shape_flow_block_injection_manifest:
+        from trellmlx.shape_block_injection import load_shape_block_injection_manifest
+
+        shape_block_injection = load_shape_block_injection_manifest(
+            args.shape_flow_block_injection_manifest,
+        )
+        shape_block_injection_json = json.dumps(
+            shape_block_injection.report_identity(),
+            sort_keys=True,
+        )
+    elif args.shape_flow_block_injection_trace:
         from trellmlx.shape_block_injection import load_shape_block_injection
 
         shape_block_injection = load_shape_block_injection(

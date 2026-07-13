@@ -241,11 +241,17 @@ def _branch_model_kwargs(
         kw["sparse_block_injection_branch"] = branch
         kw["sparse_block_injection"] = active_injection
     if shape_block_injection is not None:
-        active_injection = (
-            shape_block_injection
-            if shape_block_injection.applies(step_index=step_index, branch=branch)
-            else None
-        )
+        if hasattr(shape_block_injection, "active_for_step_branch"):
+            active_injection = shape_block_injection.active_for_step_branch(
+                step_index=step_index,
+                branch=branch,
+            )
+        else:
+            active_injection = (
+                shape_block_injection
+                if shape_block_injection.applies(step_index=step_index, branch=branch)
+                else None
+            )
         kw["shape_block_injection_branch"] = branch
         kw["shape_block_injection"] = active_injection
     return kw

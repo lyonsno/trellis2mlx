@@ -148,6 +148,99 @@ def test_stage_capture_accepts_shape_norm1_injection_route(tmp_path):
 
     assert command[command.index("--shape-flow-block-injection-stage") + 1] == "norm1"
 
+
+def test_load_shape_block_injection_manifest_routes_multiple_source_cuda_sites(tmp_path):
+    from trellmlx.shape_block_injection import load_shape_block_injection_manifest
+
+    route_identity = np.asarray(
+        json.dumps(
+            {
+                "effective_route": "microsoft-trellis2-cuda-t4",
+                "effective_device_type": "cuda",
+            }
+        )
+    )
+    block0 = tmp_path / "block0.npz"
+    np.savez_compressed(
+        block0,
+        pos_block0_norm1=np.ones((1, 3, 4), dtype=np.float32),
+        neg_block0_norm1=np.ones((1, 3, 4), dtype=np.float32) * 2,
+        route_identity_json=route_identity,
+        trace_block_index=np.asarray([0], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+    block1 = tmp_path / "block1.npz"
+    np.savez_compressed(
+        block1,
+        pos_block1_attention_raw=np.ones((1, 3, 1, 4), dtype=np.float32) * 3,
+        neg_block1_attention_raw=np.ones((1, 3, 1, 4), dtype=np.float32) * 4,
+        route_identity_json=route_identity,
+        trace_block_index=np.asarray([1], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "trellis2mlx.shape_block_injection_manifest.v1",
+                "sites": [
+                    {
+                        "trace_path": "block0.npz",
+                        "branch": "both",
+                        "step_index": 0,
+                        "block_index": 0,
+                        "stage": "norm1",
+                    },
+                    {
+                        "trace_path": "block1.npz",
+                        "branch": "both",
+                        "step_index": 0,
+                        "block_index": 1,
+                        "stage": "attention_raw",
+                        "source_delta_scale": 0.25,
+                    },
+                ],
+            }
+        )
+    )
+
+    injection_set = load_shape_block_injection_manifest(manifest)
+    active = injection_set.active_for_step_branch(step_index=0, branch="pos")
+
+    assert active is not None
+    assert active.injection_for_block(0).stage == "norm1"
+    assert active.injection_for_block(1).stage == "attention_raw"
+    assert active.injection_for_block(1).source_delta_scale == 0.25
+    assert injection_set.active_for_step_branch(step_index=1, branch="pos") is None
+    identity = injection_set.report_identity()
+    assert identity["comparison_class"] == "mlx_shape_flow_with_source_cuda_block_stage_injection_set"
+    assert identity["manifest_sha256"]
+    assert len(identity["sites"]) == 2
+
+
+def test_stage_capture_records_and_forwards_shape_injection_manifest(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"input")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"sites": []}')
+    args = build_parser().parse_args(
+        [
+            "--image", str(image),
+            "--output-dir", str(tmp_path / "out"),
+            "--stop-after-stage", "shape_flow_step",
+            "--shape-flow-block-injection-manifest", str(manifest),
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    identity = build_route_identity(args, command)["route"]
+
+    assert command[command.index("--shape-flow-block-injection-manifest") + 1] == str(manifest)
+    assert identity["shape_flow_block_injection_manifest_path"] == str(manifest)
+    assert identity["shape_flow_block_injection_manifest_sha256"]
+
 @pytest.mark.parametrize(
     ("source_delta_scale", "expected_raw"),
     [(0.0, 7.0), (0.5, 4.5), (1.0, 2.0)],

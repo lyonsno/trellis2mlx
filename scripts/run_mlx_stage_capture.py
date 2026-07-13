@@ -119,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-noise-sample")
     parser.add_argument("--shape-flow-block-injection-trace")
+    parser.add_argument("--shape-flow-block-injection-manifest")
     parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-block-injection-block-index", type=int, default=1)
     parser.add_argument(
@@ -253,6 +254,14 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "shape_flow_block_injection_trace_sha256": (
                 _sha256_file(args.shape_flow_block_injection_trace)
                 if args.shape_flow_block_injection_trace else None
+            ),
+            "shape_flow_block_injection_manifest_path": (
+                str(Path(args.shape_flow_block_injection_manifest))
+                if args.shape_flow_block_injection_manifest else None
+            ),
+            "shape_flow_block_injection_manifest_sha256": (
+                _sha256_file(args.shape_flow_block_injection_manifest)
+                if args.shape_flow_block_injection_manifest else None
             ),
             "shape_flow_block_injection_step_index": args.shape_flow_block_injection_step_index,
             "shape_flow_block_injection_block_index": args.shape_flow_block_injection_block_index,
@@ -506,6 +515,11 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
                 "--shape-flow-block-injection-array-key",
                 args.shape_flow_block_injection_array_key,
             ])
+    if args.shape_flow_block_injection_manifest:
+        command.extend([
+            "--shape-flow-block-injection-manifest",
+            str(Path(args.shape_flow_block_injection_manifest)),
+        ])
     return command
 
 
