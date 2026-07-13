@@ -980,3 +980,22 @@ def test_stage_capture_wrapper_forwards_layernorm_correction_route(tmp_path):
     assert route_identity["route"]["sparse_flow_layernorm_correction_branch"] == "pos"
     assert route_identity["route"]["sparse_flow_layernorm_correction_mode"] == "scale"
     assert route_identity["route"]["sparse_flow_layernorm_correction_include"] == "improved"
+
+
+def test_stage_capture_artifact_status_binds_path_size_and_digest(tmp_path):
+    import hashlib
+
+    from scripts.run_mlx_stage_capture import _artifact_status
+
+    checkpoint = tmp_path / "shape_flow_step.npz"
+    checkpoint.write_bytes(b"bound evidence")
+
+    status = _artifact_status(tmp_path, "shape_flow_step")
+
+    assert status == {
+        "shape_flow_step.npz": {
+            "path": str(checkpoint),
+            "size_bytes": len(b"bound evidence"),
+            "sha256": hashlib.sha256(b"bound evidence").hexdigest(),
+        }
+    }

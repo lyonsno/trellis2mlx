@@ -529,12 +529,16 @@ def _resolve_target_faces(args: argparse.Namespace) -> int:
     return STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES[args.smoke_profile]
 
 
-def _artifact_status(checkpoint_dir: Path, stage: str) -> dict[str, str]:
+def _artifact_status(checkpoint_dir: Path, stage: str) -> dict[str, dict[str, Any]]:
     artifacts = {}
     for suffix in (".npz", ".json"):
         path = checkpoint_dir / f"{stage}{suffix}"
         if path.exists():
-            artifacts[f"{stage}{suffix}"] = str(path)
+            artifacts[f"{stage}{suffix}"] = {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
     return artifacts
 
 

@@ -1,4 +1,6 @@
+import hashlib
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -60,6 +62,7 @@ def _composition_summary(tmp_path: Path) -> Path:
     return _write_json(
         tmp_path / "composition.json",
         {
+            "schema": "trellis2mlx.shape_flow.source_island_composition.v1",
             "baseline": "/evidence/baseline.npz",
             "source": "/evidence/source.npz",
             "rows": [
@@ -68,6 +71,7 @@ def _composition_summary(tmp_path: Path) -> Path:
                     "path": "/runs/combo/checkpoints/shape_flow_step.npz",
                     "move_to_source_norm_ratio": 1.01,
                     "cosine_to_source_direction": 0.51,
+                    "projection_fraction": 0.52,
                     "pred_final_source_mean_abs": 0.029,
                     "pred_final_changed_values": 246304,
                 }
@@ -80,7 +84,7 @@ def _operation_summary(tmp_path: Path) -> Path:
     return _write_json(
         tmp_path / "operation.json",
         {
-            "schema": "trellis2mlx.shape_flow.block_operation_chart.v1",
+            "schema": "trellis2mlx.shape_flow.block29_source_prefix28_operation_compare.v1",
             "comparison_class": "exact_source_prefix_then_mlx_block29",
             "rows": [
                 {
@@ -209,6 +213,7 @@ def test_build_atlas_preserves_semantic_coordinates_and_all_nodes(tmp_path: Path
     composition = atlas["charts"]["composition"]
     assert composition["nodes"][0]["placement"] == "off_chart"
     assert composition["nodes"][0]["metrics"]["cosine_to_source_direction"] == 0.51
+    assert composition["x_axis"]["field"] == "projection_fraction"
 
     operation = atlas["charts"]["block_operation"]
     assert [node["coordinate"] for node in operation["nodes"]] == [
@@ -277,6 +282,24 @@ def test_route_identity_reads_effective_nested_mlx_route(tmp_path: Path) -> None
             },
         },
     )
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    route_payload = json.loads((artifact.parent.parent / "route_identity.json").read_text())
+    _write_json(
+        artifact.parent.parent / "run_report.json",
+        {
+            "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+            "status": "done",
+            "primary_output_status": "written",
+            "route_identity": route_payload,
+            "artifacts": {
+                artifact.name: {
+                    "path": str(artifact),
+                    "size_bytes": artifact.stat().st_size,
+                    "sha256": artifact_sha,
+                }
+            },
+        },
+    )
 
     route = _route_identity(str(artifact))
 
@@ -285,6 +308,42 @@ def test_route_identity_reads_effective_nested_mlx_route(tmp_path: Path) -> None
     assert route["effective_device"] == "mlx-metal"
     assert route["effective_attention_backend"] == "fast"
     assert route["intervention_manifest"] == "/evidence/manifest.json"
+    assert route["artifact_sha256"] == artifact_sha
+
+
+def test_route_identity_rejects_stale_artifact_beside_failed_or_unbound_run(tmp_path: Path) -> None:
+    from scripts.build_causal_basin_atlas import _route_identity
+
+    artifact = tmp_path / "run" / "checkpoints" / "shape_flow_step.npz"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"stale artifact")
+    route = {
+        "schema": "trellis2mlx.mlx_stage_capture_route.v1",
+        "requested_stop": "shape_flow_step",
+        "route": {"family": "trellis2mlx/mlx", "backend": "mlx-metal"},
+    }
+    _write_json(artifact.parent.parent / "route_identity.json", route)
+    report_path = artifact.parent.parent / "run_report.json"
+    _write_json(
+        report_path,
+        {
+            "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+            "status": "failed",
+            "primary_output_status": "missing",
+            "failure_phase": "generate_subprocess",
+            "route_identity": route,
+            "artifacts": {},
+        },
+    )
+    assert _route_identity(str(artifact))["status"] == "failed"
+
+    report = json.loads(report_path.read_text())
+    report.update(status="done", primary_output_status="written")
+    report["artifacts"] = {artifact.name: str(artifact)}
+    _write_json(report_path, report)
+    identity = _route_identity(str(artifact))
+    assert identity["status"] == "unverified"
+    assert "digest" in identity["reason"]
 
 
 def test_build_atlas_rejects_missing_or_duplicate_semantic_coordinates(tmp_path: Path) -> None:
@@ -359,3 +418,91 @@ def test_render_html_is_self_contained_and_names_evidence_limits(tmp_path: Path)
     assert 'type="application/json" id="atlas-data"' in html
     assert "https://" not in html
     assert "http://" not in html
+    assert "evidence-legend" in html
+    assert "node-unverified" in html
+    assert "node-missing" in html
+    assert "aria-label" in html
+    assert "log10(source mean absolute delta + 1e-9)" in html
+    assert "branch==='neg'?.08" not in html
+
+
+@pytest.mark.parametrize("bad_value", [None, "N/A", math.nan, math.inf, -math.inf])
+def test_atlas_rejects_malformed_or_nonfinite_plotted_metrics(tmp_path: Path, bad_value: object) -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, build_atlas
+
+    composition = json.loads(_composition_summary(tmp_path).read_text())
+    composition["rows"][0]["pred_final_source_mean_abs"] = bad_value
+    composition_path = _write_json(tmp_path / "bad-composition.json", composition)
+    with pytest.raises(AtlasContractError, match="finite numeric"):
+        build_atlas(
+            prefix_path=_prefix_summary(tmp_path),
+            alpha_paths=[_alpha_summary(tmp_path, "alpha-valid.json", [{
+                "alpha": 0.0,
+                "artifact": "/run.npz",
+                "pred_final_source_mean_abs": 0.03,
+                "move_to_source_norm_ratio": 0.0,
+            }])],
+            composition_path=composition_path,
+            operation_path=None,
+        )
+
+
+def test_atlas_rejects_missing_operation_metric_and_wrong_source_schema(tmp_path: Path) -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, build_atlas
+
+    operation = json.loads(_operation_summary(tmp_path).read_text())
+    del operation["rows"][0]["source_mean_abs"]
+    alpha = _alpha_summary(tmp_path, "alpha-valid.json", [{
+        "alpha": 0.0,
+        "artifact": "/run.npz",
+        "pred_final_source_mean_abs": 0.03,
+        "move_to_source_norm_ratio": 0.0,
+    }])
+    with pytest.raises(AtlasContractError, match="source_mean_abs"):
+        build_atlas(
+            prefix_path=_prefix_summary(tmp_path), alpha_paths=[alpha],
+            composition_path=_composition_summary(tmp_path),
+            operation_path=_write_json(tmp_path / "bad-operation.json", operation),
+        )
+
+    wrong = json.loads(_composition_summary(tmp_path).read_text())
+    wrong["schema"] = "wrong.schema"
+    with pytest.raises(AtlasContractError, match="composition.*schema"):
+        build_atlas(
+            prefix_path=_prefix_summary(tmp_path), alpha_paths=[alpha],
+            composition_path=_write_json(tmp_path / "wrong-schema.json", wrong),
+            operation_path=None,
+        )
+
+
+def test_alpha_duplicates_require_exact_causal_metrics_and_preserve_provenance(tmp_path: Path) -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, build_atlas
+
+    row = {
+        "alpha": 0.25,
+        "artifact": "/runs/a25/checkpoints/shape_flow_step.npz",
+        "pred_final_source_mean_abs": 0.028,
+        "move_to_source_norm_ratio": 0.96,
+    }
+    first = _alpha_summary(tmp_path, "first.json", [row])
+    second_row = dict(
+        row,
+        artifact="/runs/a25-repeat/checkpoints/shape_flow_step.npz",
+        pred_final_source_max_abs=0.2,
+    )
+    second = _alpha_summary(tmp_path, "second.json", [second_row])
+    atlas = build_atlas(
+        prefix_path=_prefix_summary(tmp_path), alpha_paths=[first, second],
+        composition_path=_composition_summary(tmp_path), operation_path=None,
+    )
+    observations = atlas["charts"]["attention_alpha"]["nodes"][0]["source_observations"]
+    assert [Path(item["path"]).name for item in observations] == ["first.json", "second.json"]
+    assert [item["artifact"] for item in observations] == [row["artifact"], second_row["artifact"]]
+
+    conflicting = dict(row, pred_final_source_mean_abs=0.029)
+    with pytest.raises(AtlasContractError, match="conflicting observations"):
+        build_atlas(
+            prefix_path=_prefix_summary(tmp_path),
+            alpha_paths=[first, _alpha_summary(tmp_path, "conflict.json", [conflicting])],
+            composition_path=_composition_summary(tmp_path), operation_path=None,
+        )
