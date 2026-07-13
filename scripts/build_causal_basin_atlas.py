@@ -431,16 +431,51 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
         )
     nodes.sort(key=lambda node: node["coordinate"]["intervention_depth"])
     nodes_by_name = {node["id"].removeprefix("operation-replay:"): node for node in nodes}
+    parents_by_name: dict[str, str] = {}
+    for name, node in nodes_by_name.items():
+        parent_name = node["intervention"]["causal_parent"]
+        if parent_name is None:
+            continue
+        if parent_name == name:
+            raise AtlasContractError(f"operation replay {name} cannot parent itself")
+        if parent_name not in nodes_by_name:
+            raise AtlasContractError(
+                f"operation replay {node['label']} names missing causal parent {parent_name!r}"
+            )
+        parents_by_name[name] = parent_name
+
+    visit_state: dict[str, int] = {}
+
+    def visit_parent(name: str) -> None:
+        state = visit_state.get(name, 0)
+        if state == 1:
+            raise AtlasContractError(f"operation replay causal parent cycle reaches {name!r}")
+        if state == 2:
+            return
+        visit_state[name] = 1
+        parent_name = parents_by_name.get(name)
+        if parent_name is not None:
+            visit_parent(parent_name)
+        visit_state[name] = 2
+
+    for name in nodes_by_name:
+        visit_parent(name)
+
+    for name, parent_name in parents_by_name.items():
+        child_depth = nodes_by_name[name]["coordinate"]["intervention_depth"]
+        parent_depth = nodes_by_name[parent_name]["coordinate"]["intervention_depth"]
+        if parent_depth >= child_depth:
+            raise AtlasContractError(
+                f"operation replay parent {parent_name!r} at depth {parent_depth} "
+                f"must precede child {name!r} at depth {child_depth}"
+            )
+
     edges = []
     for node in nodes:
         parent_name = node["intervention"]["causal_parent"]
         if parent_name is None:
             continue
-        parent = nodes_by_name.get(parent_name)
-        if parent is None:
-            raise AtlasContractError(
-                f"operation replay {node['label']} names missing causal parent {parent_name!r}"
-            )
+        parent = nodes_by_name[parent_name]
         kind = (
             "causal_intervention_branch"
             if node["intervention"]["topology"] == "side_branch"

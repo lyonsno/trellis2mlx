@@ -295,6 +295,48 @@ def test_operation_replay_chart_rejects_orphan_branch_and_duplicate_names() -> N
         _build_operation_replay_chart(payload)
 
 
+@pytest.mark.parametrize(
+    ("rows", "error"),
+    [
+        (
+            [("natural", 0, "natural"), ("source", 1, None)],
+            "cannot parent itself",
+        ),
+        (
+            [("natural", 0, None), ("after_self", 2, "source"), ("source", 6, None)],
+            "must precede child",
+        ),
+        (
+            [("natural", 0, "after_self"), ("after_self", 1, "natural")],
+            "causal parent cycle",
+        ),
+    ],
+    ids=("self-parent", "forward-parent", "cycle"),
+)
+def test_operation_replay_chart_rejects_impossible_parent_graphs(
+    rows: list[tuple[str, int, str | None]], error: str
+) -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, _build_operation_replay_chart
+
+    def row(name: str, depth: int, parent: str | None) -> dict[str, object]:
+        return {
+            "name": name,
+            "artifact": f"/runs/{name}.npz",
+            "intervention_depth": depth,
+            "intervention_topology": "main_chain",
+            "causal_parent": parent,
+            "pred_final_source_mean_abs": 0.001 / (depth + 1),
+        }
+
+    with pytest.raises(AtlasContractError, match=error):
+        _build_operation_replay_chart(
+            {
+                "status": "done",
+                "replay_rows": [row(name, depth, parent) for name, depth, parent in rows],
+            }
+        )
+
+
 def test_atlas_records_input_hashes_and_route_identity_visibility(tmp_path: Path) -> None:
     from scripts.build_causal_basin_atlas import build_atlas
 
