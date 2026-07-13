@@ -14,6 +14,8 @@ import json
 import re
 import shutil
 import subprocess
+import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -285,6 +287,57 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_downloaded_outputs(
+    packet: KaggleCudaWitnessPacket,
+    output_dir: Path,
+) -> dict[str, dict[str, str | int]]:
+    output_dir = Path(output_dir)
+    records: dict[str, dict[str, str | int]] = {}
+    names = tuple(dict.fromkeys((*packet.outputs, "kaggle_cuda_witness_receipt.json")))
+    for name in names:
+        path = output_dir / name
+        if not path.is_file():
+            raise WitnessPacketError(f"missing downloaded output: {path}")
+        size = path.stat().st_size
+        if size == 0:
+            raise WitnessPacketError(f"blank downloaded output: {path}")
+        if path.suffix == ".json":
+            try:
+                json.loads(path.read_text())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise WitnessPacketError(f"invalid JSON downloaded output {path}: {exc}") from exc
+        if path.suffix == ".npz" and not zipfile.is_zipfile(path):
+            raise WitnessPacketError(f"invalid NPZ downloaded output: {path}")
+        records[name] = {
+            "size_bytes": size,
+            "sha256": sha256_file(path),
+        }
+    return records
+
+
+def wait_for_downloaded_outputs(
+    packet: KaggleCudaWitnessPacket,
+    output_dir: Path,
+    *,
+    max_wait_seconds: float = 30.0,
+    poll_seconds: float = 0.25,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, dict[str, str | int]]:
+    deadline = time.monotonic() + max_wait_seconds
+    last_error: WitnessPacketError | None = None
+    while True:
+        try:
+            return validate_downloaded_outputs(packet, output_dir)
+        except WitnessPacketError as exc:
+            last_error = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WitnessPacketError(
+                f"downloaded outputs did not stabilize within {max_wait_seconds}s: {last_error}"
+            ) from last_error
+        sleeper(min(poll_seconds, remaining))
+
+
 def _kaggle_textual_error(output: str) -> bool:
     for line in output.splitlines():
         lower = line.strip().lower()
@@ -375,7 +428,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "kernel-output":
         packet = load_prepared_packet(args.packet_dir)
         output_dir = args.output_dir or packet.output_dir / "outputs"
-        return _run_cli_command(build_kernel_output_command(packet, output_dir), "kernel_output", args)
+        report_dir = args.report_dir or Path(args.packet_dir) / "reports"
+        report_path = report_dir / "kernel_output.json"
+        report = run_command(
+            build_kernel_output_command(packet, output_dir),
+            phase="kernel_output",
+            report_path=report_path,
+        )
+        if report["status"] == "done":
+            try:
+                report["downloaded_outputs"] = wait_for_downloaded_outputs(packet, output_dir)
+            except WitnessPacketError as exc:
+                report.update(
+                    {
+                        "status": "failed",
+                        "failure_phase": "kernel_output_validation",
+                        "validation_error": str(exc),
+                    }
+                )
+        _write_json(report_path, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["status"] == "done" else 1
     raise AssertionError(f"unhandled command {args.command}")
 
 

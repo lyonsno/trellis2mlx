@@ -1,6 +1,7 @@
 import json
 import subprocess
 
+import numpy as np
 import pytest
 
 
@@ -626,3 +627,76 @@ def test_load_prepared_packet_round_trips_drive_commands(tmp_path):
         accelerator=prepared.accelerator,
     )
     assert build_kernel_push_command(loaded, timeout_seconds=30)[-2:] == ["--timeout", "30"]
+
+
+def test_validate_downloaded_outputs_rejects_blank_or_partial_evidence(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        validate_downloaded_outputs,
+    )
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=tmp_path,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/output-validation-inputs",
+        kernel_id="operator/output-validation-cuda",
+        title="Output Validation CUDA",
+        entrypoint="probe.py",
+        inputs=("probe.py",),
+    )
+    (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
+    (output_dir / "kaggle_cuda_witness_receipt.json").write_text('{"status": "done"}\n')
+    (output_dir / "cuda_result.npz").write_bytes(b"")
+
+    with pytest.raises(WitnessPacketError, match="blank downloaded output"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    (output_dir / "cuda_result.npz").write_bytes(b"partial zip")
+    with pytest.raises(WitnessPacketError, match="invalid NPZ"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1], dtype=np.int32))
+    records = validate_downloaded_outputs(packet, output_dir)
+
+    assert records["cuda_result.json"]["size_bytes"] > 0
+    assert records["cuda_result.json"]["sha256"]
+    assert records["cuda_result.npz"]["size_bytes"] > 0
+    assert records["cuda_result.npz"]["sha256"]
+
+
+def test_wait_for_downloaded_outputs_allows_materializing_npz(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, wait_for_downloaded_outputs
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=tmp_path,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/output-stabilization-inputs",
+        kernel_id="operator/output-stabilization-cuda",
+        title="Output Stabilization CUDA",
+        entrypoint="probe.py",
+        inputs=("probe.py",),
+    )
+    (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
+    (output_dir / "kaggle_cuda_witness_receipt.json").write_text('{"status": "done"}\n')
+    (output_dir / "cuda_result.npz").write_bytes(b"")
+    sleeps = []
+
+    def materialize_npz(seconds):
+        sleeps.append(seconds)
+        np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1], dtype=np.int32))
+
+    records = wait_for_downloaded_outputs(
+        packet,
+        output_dir,
+        max_wait_seconds=1.0,
+        poll_seconds=0.01,
+        sleeper=materialize_npz,
+    )
+
+    assert sleeps == [0.01]
+    assert records["cuda_result.npz"]["size_bytes"] > 0
