@@ -219,6 +219,36 @@ def test_load_block_stage_replay_accepts_flattened_attention_raw(tmp_path):
     assert loaded.scope == ["pos_block1_attention_raw"]
 
 
+def test_load_block_stage_replay_accepts_head_dim_qkv(tmp_path):
+    replay = tmp_path / "replay.npz"
+    q = np.arange(2 * 3 * 4, dtype=np.float32).reshape(1, 2, 3, 4)
+    k = np.arange(24, 48, dtype=np.float32).reshape(2, 3, 4)
+    v = np.arange(48, 72, dtype=np.float32).reshape(1, 2, 3, 4)
+    np.savez(
+        replay,
+        pos_block1_q_post_rope=q,
+        pos_block1_k_post_rope=k,
+        pos_block1_v=v,
+    )
+
+    loaded = trace.load_block_stage_replay(
+        replay,
+        branches=["pos"],
+        block_indices=[1],
+        stages=["q_post_rope", "k_post_rope", "v"],
+        token_count=2,
+    )
+
+    assert np.array_equal(loaded.arrays[("pos", 1, "q_post_rope")], q[0])
+    assert np.array_equal(loaded.arrays[("pos", 1, "k_post_rope")], k)
+    assert np.array_equal(loaded.arrays[("pos", 1, "v")], v[0])
+    assert loaded.scope == [
+        "pos_block1_q_post_rope",
+        "pos_block1_k_post_rope",
+        "pos_block1_v",
+    ]
+
+
 def test_load_block_stage_replay_rejects_unknown_stage(tmp_path):
     replay = tmp_path / "replay.npz"
     np.savez(replay, pos_block1_after_cross=np.zeros((1, 2, 6), dtype=np.float32))

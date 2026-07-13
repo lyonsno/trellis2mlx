@@ -67,6 +67,9 @@ COMPACT_TRACE_NAMES = ("input", "attention_raw", "after_self", "cross_attention_
 BLOCK_STAGE_REPLAY_NAMES = (
     "norm1",
     "modulated_self_input",
+    "q_post_rope",
+    "k_post_rope",
+    "v",
     "attention_raw",
     "after_self",
     "after_cross",
@@ -362,11 +365,12 @@ def load_block_stage_replay(
                             f"block stage replay sample {replay_sample_path} missing {key}"
                         )
                     value = np.asarray(data[key], dtype=np.float32)
-                    if value.ndim == 3 and value.shape[0] == 1:
+                    if value.ndim in (3, 4) and value.shape[0] == 1:
                         value = value[0]
-                    if value.ndim != 2:
+                    if value.ndim not in (2, 3):
                         raise ValueError(
-                            f"{key} must have shape [1, N, C] or [N, C], got {value.shape}"
+                            f"{key} must have shape [1, N, C], [N, C], "
+                            f"[1, N, H, D], or [N, H, D], got {value.shape}"
                         )
                     if value.shape[0] != token_count:
                         raise ValueError(
@@ -510,6 +514,7 @@ def _trace_shape_block(
     q, k, v = qkv.unbind(dim=-3)
     source["q_pre_norm"] = _tensor_to_numpy(q, batched_sparse=True)
     source["k_pre_norm"] = _tensor_to_numpy(k, batched_sparse=True)
+    v = maybe_replay_sparse("v", v)
     source["v"] = _tensor_to_numpy(v, batched_sparse=True)
     if getattr(attn, "qk_rms_norm", False):
         q = attn.q_rms_norm(q)
@@ -518,6 +523,8 @@ def _trace_shape_block(
     source["k_post_norm"] = _tensor_to_numpy(k, batched_sparse=True)
     if getattr(attn, "use_rope", False):
         q, k = attn.rope(q, k)
+    q = maybe_replay_sparse("q_post_rope", q)
+    k = maybe_replay_sparse("k_post_rope", k)
     source["q_post_rope"] = _tensor_to_numpy(q, batched_sparse=True)
     source["k_post_rope"] = _tensor_to_numpy(k, batched_sparse=True)
     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
