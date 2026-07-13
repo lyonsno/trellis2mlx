@@ -684,7 +684,7 @@ def main():
                         help="Diagnostic: shape-flow CFG branch where block injection applies.")
     parser.add_argument("--shape-flow-block-injection-stage",
                         choices=["norm1", "modulated_self_input", "attention_raw",
-                                 "after_self", "after_cross", "after_mlp"],
+                                 "after_self", "cross_attention_raw", "after_cross", "after_mlp"],
                         default="attention_raw",
                         help="Diagnostic: shape-flow block tensor stage to replace.")
     parser.add_argument("--shape-flow-block-injection-array-key",

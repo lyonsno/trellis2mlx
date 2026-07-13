@@ -17,6 +17,7 @@ SHAPE_BLOCK_INJECTION_STAGES = {
     "modulated_self_input",
     "attention_raw",
     "after_self",
+    "cross_attention_raw",
     "after_cross",
     "after_mlp",
 }
@@ -48,10 +49,12 @@ class ShapeBlockInjection:
         raise KeyError(f"shape block injection has no array for branch {branch!r}")
 
     def report_identity(self) -> dict[str, Any]:
-        comparison_class = (
-            "mlx_shape_flow_with_source_cuda_attention_raw_injection"
-            if self.stage == "attention_raw"
-            else "mlx_shape_flow_with_source_cuda_block_stage_injection"
+        raw_stage_classes = {
+            "attention_raw": "mlx_shape_flow_with_source_cuda_attention_raw_injection",
+            "cross_attention_raw": "mlx_shape_flow_with_source_cuda_cross_attention_raw_injection",
+        }
+        comparison_class = raw_stage_classes.get(
+            self.stage, "mlx_shape_flow_with_source_cuda_block_stage_injection"
         )
         return {
             "trace_path": str(self.trace_path) if self.trace_path is not None else None,
@@ -247,13 +250,13 @@ def load_shape_block_injection_manifest(
 
 
 def _normalize_block_stage(array: np.ndarray, *, key: str, stage: str) -> np.ndarray:
-    if stage == "attention_raw" and array.ndim == 4 and array.shape[0] == 1:
+    if stage in {"attention_raw", "cross_attention_raw"} and array.ndim == 4 and array.shape[0] == 1:
         return array.reshape(array.shape[0], array.shape[1], array.shape[2] * array.shape[3])
     if array.ndim == 3 and array.shape[0] == 1:
         return array
     raise ValueError(
         f"shape block stage array {key!r} for {stage!r} must have shape "
-        "[1,N,C], or [1,N,H,D] for attention_raw; "
+        "[1,N,C], or [1,N,H,D] for raw attention stages; "
         f"got {array.shape}"
     )
 

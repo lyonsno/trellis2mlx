@@ -53,6 +53,41 @@ def test_load_shape_attention_raw_injection_flattens_cuda_heads_and_records_rout
     assert identity["source_delta_scale"] == 1.0
 
 
+def test_load_shape_cross_attention_raw_injection_flattens_cuda_heads_and_records_route(tmp_path):
+    from trellmlx.shape_block_injection import load_shape_block_injection
+
+    trace = tmp_path / "source_cuda_cross_attention.npz"
+    raw = np.arange(3 * 2 * 4, dtype=np.float32).reshape(1, 3, 2, 4)
+    np.savez_compressed(
+        trace,
+        pos_block29_cross_attention_raw=raw,
+        route_identity_json=np.asarray(
+            json.dumps(
+                {
+                    "effective_route": "official-trellis2-source-cuda-shape-flow-block-trace",
+                    "effective_device_type": "cuda",
+                }
+            )
+        ),
+        trace_block_index=np.asarray([29], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+
+    injection = load_shape_block_injection(
+        trace,
+        branch="pos",
+        step_index=0,
+        block_index=29,
+        stage="cross_attention_raw",
+    )
+
+    np.testing.assert_array_equal(injection.array_for_branch("pos"), raw.reshape(1, 3, 8))
+    identity = injection.report_identity()
+    assert identity["comparison_class"] == "mlx_shape_flow_with_source_cuda_cross_attention_raw_injection"
+    assert identity["source_array_shape_by_branch"] == {"pos": [1, 3, 2, 4]}
+    assert identity["effective_array_shape_by_branch"] == {"pos": [1, 3, 8]}
+
+
 def test_load_shape_attention_raw_injection_rejects_unidentified_or_wrong_site_trace(tmp_path):
     import pytest
 
@@ -306,6 +341,26 @@ def test_stage_capture_records_and_forwards_shape_injection_manifest(tmp_path):
     assert identity["shape_flow_block_injection_manifest_path"] == str(manifest)
     assert identity["shape_flow_block_injection_manifest_sha256"]
 
+
+def test_stage_capture_accepts_and_forwards_cross_attention_raw_injection(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"input")
+    args = build_parser().parse_args(
+        [
+            "--image", str(image),
+            "--output-dir", str(tmp_path / "out"),
+            "--stop-after-stage", "shape_flow_step",
+            "--shape-flow-block-injection-trace", str(tmp_path / "source.npz"),
+            "--shape-flow-block-injection-stage", "cross_attention_raw",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--shape-flow-block-injection-stage") + 1] == "cross_attention_raw"
+
 @pytest.mark.parametrize(
     ("source_delta_scale", "expected_raw"),
     [(0.0, 7.0), (0.5, 4.5), (1.0, 2.0)],
@@ -372,6 +427,102 @@ def test_modulated_block_injects_attention_raw_before_output_projection(
         np.array(recorder.to_out_input), np.full((2, 4), expected_raw)
     )
     np.testing.assert_array_equal(np.array(out), np.full((2, 4), expected_raw * 3))
+
+
+@pytest.mark.parametrize(
+    ("source_delta_scale", "expected_raw"),
+    [(0.0, 7.0), (0.5, 4.5), (1.0, 2.0)],
+)
+def test_modulated_block_injects_cross_attention_raw_before_output_projection(
+    source_delta_scale, expected_raw
+):
+    import mlx.core as mx
+
+    from trellmlx.models.sparse_structure_flow import ModulatedBlock
+    from trellmlx.shape_block_injection import ShapeBlockInjection
+
+    class ZeroSelfAttention:
+        def __call__(self, x, rope_phases=None):
+            return mx.zeros_like(x)
+
+        def trace_self_attention(self, x, rope_phases=None, trace_prefix="block0"):
+            raw = mx.zeros_like(x)
+            return raw, {f"{trace_prefix}_attention_raw": raw}
+
+    class RecordingCrossAttention:
+        def __init__(self):
+            self.to_out_input = None
+
+        def trace_cross_attention(
+            self, x, context=None, cached_kv=None, trace_prefix="block0"
+        ):
+            raw = mx.ones_like(x) * 7
+            return mx.ones_like(x) * 99, {f"{trace_prefix}_cross_attention_raw": raw}
+
+        def to_out(self, x):
+            self.to_out_input = x
+            return x * 3
+
+    class ZeroMLP:
+        def __call__(self, x):
+            return mx.zeros_like(x)
+
+        def mlp_0(self, x):
+            return mx.zeros_like(x)
+
+        def mlp_2(self, x):
+            return mx.zeros_like(x)
+
+    block = ModulatedBlock(channels=4, num_heads=1, context_channels=4, mlp_hidden=4)
+    recorder = RecordingCrossAttention()
+    block.self_attn = ZeroSelfAttention()
+    block.cross_attn = recorder
+    block.mlp = ZeroMLP()
+    injected = np.full((1, 2, 4), 2.0, dtype=np.float32)
+    injection = ShapeBlockInjection(
+        trace_path=None,
+        array_key="pos_block29_cross_attention_raw",
+        branch="pos",
+        step_index=0,
+        block_index=29,
+        stage="cross_attention_raw",
+        arrays_by_branch={"pos": injected},
+        source_shapes_by_branch={"pos": injected.shape},
+        trace_identity={},
+        source_delta_scale=source_delta_scale,
+    )
+    zeros = mx.zeros((2, 4), dtype=mx.float32)
+    context = mx.zeros((1, 1, 4), dtype=mx.float32)
+    mod = mx.zeros((24,), dtype=mx.float32)
+
+    out = block.forward_with_injection(
+        zeros,
+        mod,
+        context,
+        injection=injection,
+        branch="pos",
+    )
+    mx.eval(out, recorder.to_out_input)
+
+    np.testing.assert_array_equal(np.array(recorder.to_out_input), np.full((2, 4), expected_raw))
+    np.testing.assert_array_equal(np.array(out), np.full((2, 4), expected_raw * 3))
+
+    traced_out, trace = block.trace(
+        zeros,
+        mod,
+        context,
+        trace_prefix="block29",
+        injection=injection,
+        branch="pos",
+    )
+    mx.eval(traced_out, trace["block29_cross_attention_raw"], trace["block29_cross_attn"])
+    np.testing.assert_array_equal(
+        np.array(trace["block29_cross_attention_raw"]), np.full((2, 4), expected_raw)
+    )
+    np.testing.assert_array_equal(
+        np.array(trace["block29_cross_attn"]), np.full((2, 4), expected_raw * 3)
+    )
+    np.testing.assert_array_equal(np.array(traced_out), np.full((2, 4), expected_raw * 3))
 
 
 def test_slat_flow_routes_shape_injection_to_named_block():

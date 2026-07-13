@@ -425,7 +425,20 @@ class ModulatedBlock(nn.Module):
             x = _injected_tensor_like(injection, x, branch=branch)
 
         h = self.norm2(x)
-        if cross_kv_cache is not None:
+        if injection.stage == "cross_attention_raw":
+            _, cross_trace = self.cross_attn.trace_cross_attention(
+                h,
+                context,
+                cached_kv=cross_kv_cache,
+                trace_prefix="injected",
+            )
+            h = _injected_tensor_like(
+                injection,
+                cross_trace["injected_cross_attention_raw"],
+                branch=branch,
+            )
+            h = self.cross_attn.to_out(h)
+        elif cross_kv_cache is not None:
             h = self.cross_attn(h, cached_kv=cross_kv_cache)
         else:
             h = self.cross_attn(h, context)
@@ -517,6 +530,14 @@ class ModulatedBlock(nn.Module):
             cached_kv=cross_kv_cache,
             trace_prefix=trace_prefix,
         )
+        if injection is not None and injection.stage == "cross_attention_raw":
+            cross_attention_raw = _injected_tensor_like(
+                injection,
+                cross_trace[f"{trace_prefix}_cross_attention_raw"],
+                branch=branch,
+            )
+            cross_trace[f"{trace_prefix}_cross_attention_raw"] = cross_attention_raw
+            h = self.cross_attn.to_out(cross_attention_raw)
         trace.update(cross_trace)
         trace[f"{trace_prefix}_cross_attn"] = h
         x = x + h

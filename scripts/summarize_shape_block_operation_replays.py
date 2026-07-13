@@ -21,9 +21,10 @@ INTERVENTION_DEPTH = {
     "prefix28": 0,
     "attention_raw": 1,
     "after_self": 2,
-    "after_cross": 3,
-    "after_mlp": 4,
-    "source": 5,
+    "cross_attention_raw": 3,
+    "after_cross": 4,
+    "after_mlp": 5,
+    "source": 6,
 }
 ROUTE_VECTOR_FIELDS = (
     "effective_device_type",
@@ -485,7 +486,13 @@ def _validate_intervention(
             source_route_vector=source_route_vector,
         )
         stage = str(sites[1].get("stage"))
-        if stage not in {"attention_raw", "after_self", "after_cross", "after_mlp"}:
+        if stage not in {
+            "attention_raw",
+            "after_self",
+            "cross_attention_raw",
+            "after_cross",
+            "after_mlp",
+        }:
             raise ReplayContractError(
                 f"{candidate_name} block29 intervention site has unsupported stage {stage!r}"
             )

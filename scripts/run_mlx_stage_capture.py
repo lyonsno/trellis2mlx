@@ -134,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
             "modulated_self_input",
             "attention_raw",
             "after_self",
+            "cross_attention_raw",
             "after_cross",
             "after_mlp",
         ],

@@ -350,16 +350,37 @@ def test_summary_derives_intervention_depth_from_validated_stage_not_argument_or
         block_input=sample, stage="after_self",
         block29_trace_sha256=source_sha,
     )
+    cross_attention_raw = _write_trace(
+        tmp_path / "cross-attention-raw.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        block_input=sample, stage="cross_attention_raw",
+        block29_trace_sha256=source_sha,
+    )
+    after_mlp = _write_trace(
+        tmp_path / "after-mlp.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_mlp",
+        block_input=sample, stage="after_mlp",
+        block29_trace_sha256=source_sha,
+    )
     report = summarize_replays(
         source_trace_path=source,
         source_step_path=step,
         candidates=[
+            CandidateSpec("after_mlp", after_mlp, "exact_source_cuda_prefix28_plus_block29_after_mlp"),
             CandidateSpec("after_cross", after_cross, "exact_source_cuda_prefix28_plus_block29_after_cross"),
+            CandidateSpec(
+                "cross_attention_raw", cross_attention_raw,
+                "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+            ),
             CandidateSpec("after_self", after_self, "exact_source_cuda_prefix28_plus_block29_after_self"),
         ],
     )
     assert [(row["name"], row["intervention_depth"]) for row in report["replay_rows"]] == [
-        ("after_self", 2), ("after_cross", 3), ("source", 5),
+        ("after_self", 2),
+        ("cross_attention_raw", 3),
+        ("after_cross", 4),
+        ("after_mlp", 5),
+        ("source", 6),
     ]
 
 
