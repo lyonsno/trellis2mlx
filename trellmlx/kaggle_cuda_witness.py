@@ -43,6 +43,8 @@ class KaggleCudaWitnessPacket:
     output_ply: str | None = None
     output_mesh_state: str | None = None
     output_shape_slat: str | None = None
+    output_shape_flow_step: str | None = None
+    shape_flow_noise_sample: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -71,6 +73,8 @@ class KaggleCudaWitnessPacket:
             outputs.append(self.output_mesh_state)
         if self.output_shape_slat:
             outputs.append(self.output_shape_slat)
+        if self.output_shape_flow_step:
+            outputs.append(self.output_shape_flow_step)
         return tuple(outputs)
 
 
@@ -101,6 +105,9 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "title": packet.title,
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
+        "input_roles": {
+            "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+        },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "outputs": list(packet.outputs),
@@ -110,6 +117,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
             "ply": packet.output_ply,
             "mesh_state": packet.output_mesh_state,
             "shape_slat": packet.output_shape_slat,
+            "shape_flow_step": packet.output_shape_flow_step,
         },
         "files": file_records,
     }
@@ -139,6 +147,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
     inputs = tuple(path for path in manifest["files"] if path != "witness-manifest.json")
     outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
     output_roles = manifest.get("output_roles") or {}
+    input_roles = manifest.get("input_roles") or {}
     if len(outputs) < 2:
         raise WitnessPacketError(f"expected at least two outputs in manifest, got {outputs}")
     return KaggleCudaWitnessPacket(
@@ -159,6 +168,11 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         output_ply=output_roles.get("ply") or _legacy_output_by_suffix(outputs[2:], ".ply"),
         output_mesh_state=output_roles.get("mesh_state") or _legacy_output_by_suffix(outputs[2:], "_mesh_state.npz"),
         output_shape_slat=output_roles.get("shape_slat") or _legacy_output_by_suffix(outputs[2:], "_shape_slat.npz"),
+        output_shape_flow_step=(
+            output_roles.get("shape_flow_step")
+            or _legacy_output_by_suffix(outputs[2:], "_shape_flow_step.npz")
+        ),
+        shape_flow_noise_sample=input_roles.get("shape_flow_noise_sample"),
     )
 
 
@@ -301,6 +315,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--output-ply")
     prepare.add_argument("--output-mesh-state")
     prepare.add_argument("--output-shape-slat")
+    prepare.add_argument("--output-shape-flow-step")
+    prepare.add_argument("--shape-flow-noise-sample")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
         drive = subparsers.add_parser(name)
@@ -330,6 +346,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_ply=args.output_ply,
                 output_mesh_state=args.output_mesh_state,
                 output_shape_slat=args.output_shape_slat,
+                output_shape_flow_step=args.output_shape_flow_step,
+                shape_flow_noise_sample=args.shape_flow_noise_sample,
             )
         )
         print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
@@ -403,6 +421,8 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         raise WitnessPacketError(f"unsupported accelerator for this witness bridge: {packet.accelerator}")
     if packet.entrypoint not in packet.inputs:
         raise WitnessPacketError("entrypoint must be one of the staged inputs")
+    if packet.shape_flow_noise_sample is not None and packet.shape_flow_noise_sample not in packet.inputs:
+        raise WitnessPacketError("shape_flow_noise_sample must be one of the staged inputs")
 
 
 def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
@@ -476,6 +496,8 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "output_ply": packet.output_ply,
         "output_mesh_state": packet.output_mesh_state,
         "output_shape_slat": packet.output_shape_slat,
+        "output_shape_flow_step": packet.output_shape_flow_step,
+        "shape_flow_noise_sample": packet.shape_flow_noise_sample,
     }
     return f"""#!/usr/bin/env python3
 from __future__ import annotations
@@ -590,6 +612,10 @@ def main() -> int:
         command += ["--output-mesh-state", CONFIG["output_mesh_state"]]
     if CONFIG["output_shape_slat"]:
         command += ["--output-shape-slat", CONFIG["output_shape_slat"]]
+    if CONFIG["output_shape_flow_step"]:
+        command += ["--output-shape-flow-step", CONFIG["output_shape_flow_step"]]
+    if CONFIG["shape_flow_noise_sample"]:
+        command += ["--shape-flow-noise-sample", CONFIG["shape_flow_noise_sample"]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     extra = {{
         "effective_dataset_dir": str(dataset_dir),

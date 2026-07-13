@@ -49,6 +49,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-ply", default=Path("cuda_result_mesh.ply"), type=Path)
     parser.add_argument("--output-mesh-state", type=Path)
     parser.add_argument("--output-shape-slat", type=Path)
+    parser.add_argument("--output-shape-flow-step", type=Path)
+    parser.add_argument(
+        "--shape-flow-noise-sample",
+        type=Path,
+        help=(
+            "Optional NPZ containing shape-flow first-step noise/sample_feats "
+            "and coords. Coords must exactly match the source support so CUDA "
+            "and MLX first-step captures can share the same input tensor."
+        ),
+    )
     parser.add_argument("--conditioning", default="conditioning.npz", type=Path)
     parser.add_argument("--conditioning-1024", type=Path)
     parser.add_argument("--source-tar", default="trellis2_source_tarball.bin", type=Path)
@@ -147,6 +157,16 @@ def main(argv: list[str] | None = None) -> int:
         output_ply = Path(args.output_ply)
         output_mesh_state = Path(args.output_mesh_state) if args.output_mesh_state is not None else None
         output_shape_slat = Path(args.output_shape_slat) if args.output_shape_slat is not None else None
+        output_shape_flow_step = (
+            Path(args.output_shape_flow_step)
+            if args.output_shape_flow_step is not None
+            else None
+        )
+        shape_flow_noise_sample_path = (
+            Path(args.shape_flow_noise_sample)
+            if args.shape_flow_noise_sample is not None
+            else None
+        )
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         output_ply.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             output_mesh_state.parent.mkdir(parents=True, exist_ok=True)
         if output_shape_slat is not None:
             output_shape_slat.parent.mkdir(parents=True, exist_ok=True)
+        if output_shape_flow_step is not None:
+            output_shape_flow_step.parent.mkdir(parents=True, exist_ok=True)
 
         phase = "validate_args"
         if args.steps <= 0:
@@ -275,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
         torch.manual_seed(args.seed)
         report["stage_timings"] = {}
         stage_timings = report["stage_timings"]
+        shape_flow_step_payload = None
+        shape_flow_noise_sample = None
+        shape_flow_noise_key = None
 
         stage_started = time.perf_counter()
         coords = pipeline.sample_sparse_structure(
@@ -288,6 +313,32 @@ def main(argv: list[str] | None = None) -> int:
         report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
 
         if args.pipeline_type == "512":
+            if output_shape_flow_step is not None:
+                stage_started = time.perf_counter()
+                if shape_flow_noise_sample_path is not None:
+                    shape_flow_noise_sample, shape_flow_noise_key = load_shape_flow_noise_sample(
+                        shape_flow_noise_sample_path,
+                        tensor_to_numpy(coords).astype(np.int32, copy=False),
+                    )
+                    report["shape_flow_noise_sample"] = {
+                        "path": str(shape_flow_noise_sample_path),
+                        "sha256": sha256_file(shape_flow_noise_sample_path),
+                        "coords_shape": [int(v) for v in tensor_to_numpy(coords).shape],
+                        "noise_shape": [int(v) for v in shape_flow_noise_sample.shape],
+                        "noise_key": shape_flow_noise_key,
+                    }
+                with torch.random.fork_rng(devices=[device.index or 0]):
+                    shape_flow_step_payload = capture_source_shape_flow_first_step(
+                        pipeline,
+                        cond_512,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        coords,
+                        {"steps": args.steps},
+                        noise_feats=shape_flow_noise_sample,
+                    )
+                sync_cuda(torch)
+                stage_timings["capture_shape_flow_first_step_elapsed_seconds"] = elapsed(stage_started)
+
             stage_started = time.perf_counter()
             shape_slat = pipeline.sample_shape_slat(
                 cond_512,
@@ -381,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 report["output_mesh_state"] = str(output_mesh_state)
         report["mesh_artifacts"] = mesh_artifacts
+        if output_shape_flow_step is not None and shape_flow_step_payload is not None:
+            report["shape_flow_step_artifact"] = write_source_shape_flow_step_npz(
+                output_shape_flow_step,
+                shape_flow_step_payload,
+                normalization=pipeline_args["shape_slat_normalization"],
+            )
         if output_shape_slat is not None:
             report["shape_slat_artifact"] = write_sparse_tensor_npz(
                 output_shape_slat,
@@ -606,6 +663,208 @@ def write_sparse_tensor_npz(
         "format": "sparse_tensor_npz",
         "coords_shape": [int(v) for v in coords.shape],
         "feats_shape": [int(v) for v in feats.shape],
+    }
+
+
+def capture_source_shape_flow_first_step(
+    pipeline: Any,
+    cond: dict[str, Any],
+    flow_model: Any,
+    coords: Any,
+    sampler_params: dict[str, Any],
+    *,
+    noise_feats: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    from trellis2.modules.sparse import SparseTensor
+
+    torch = __import__("torch")
+    params = {**pipeline.shape_slat_sampler_params, **sampler_params}
+    steps = int(params.get("steps", 50))
+    if steps <= 0:
+        raise ValueError("shape flow first-step capture requires positive steps")
+    rescale_t = float(params.get("rescale_t", 1.0))
+    guidance_strength = float(params.get("guidance_strength", 1.0))
+    guidance_rescale = float(params.get("guidance_rescale", 0.0))
+    guidance_interval = tuple(float(v) for v in params.get("guidance_interval", (0.0, 1.0)))
+    if len(guidance_interval) != 2:
+        raise ValueError(f"guidance_interval must have two values, got {guidance_interval!r}")
+
+    if noise_feats is None:
+        feats = torch.randn(coords.shape[0], flow_model.in_channels).to(pipeline.device)
+    else:
+        noise_array = np.asarray(noise_feats, dtype=np.float32)
+        expected_shape = (int(coords.shape[0]), int(flow_model.in_channels))
+        if noise_array.shape != expected_shape:
+            raise ValueError(
+                "shape flow noise tensor shape mismatch: "
+                f"expected {expected_shape}, got {noise_array.shape}"
+            )
+        feats = torch.as_tensor(noise_array, device=pipeline.device, dtype=torch.float32)
+    noise = SparseTensor(feats=feats, coords=coords)
+    if pipeline.low_vram:
+        flow_model.to(pipeline.device)
+    try:
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t = float(t_seq[0])
+        t_prev = float(t_seq[1])
+        t_model = torch.tensor([1000.0 * t] * noise.shape[0], device=noise.device, dtype=torch.float32)
+        pred_pos = flow_model(noise, t_model, cond["cond"])
+        pred_neg = flow_model(noise, t_model, cond["neg_cond"])
+        guidance_active = guidance_interval[0] <= t <= guidance_interval[1]
+        if guidance_active:
+            pred_cfg = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+        else:
+            pred_cfg = pred_pos
+        x0_pos = pipeline.shape_slat_sampler._pred_to_xstart(noise, t, pred_pos)
+        x0_cfg = pipeline.shape_slat_sampler._pred_to_xstart(noise, t, pred_cfg)
+        std_pos = x0_pos.std(dim=list(range(1, x0_pos.ndim)), keepdim=True)
+        std_cfg = x0_cfg.std(dim=list(range(1, x0_cfg.ndim)), keepdim=True)
+        ratio_raw = std_pos / std_cfg
+        x0_rescaled = x0_cfg * ratio_raw
+        if guidance_active and guidance_rescale > 0:
+            x0_after_rescale = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+            pred_final = pipeline.shape_slat_sampler._xstart_to_pred(noise, t, x0_after_rescale)
+            ratio_effective = ratio_raw
+        else:
+            x0_after_rescale = x0_cfg
+            pred_final = pred_cfg
+            ratio_effective = torch.ones_like(ratio_raw)
+        sample_next = noise - (t - t_prev) * pred_final
+    finally:
+        if pipeline.low_vram:
+            flow_model.cpu()
+
+    return {
+        "noise": tensor_to_numpy(noise.feats).astype(np.float32, copy=False),
+        "sample_feats": tensor_to_numpy(noise.feats).astype(np.float32, copy=False),
+        "coords": tensor_to_numpy(noise.coords).astype(np.int32, copy=False),
+        "coords_3d": tensor_to_numpy(noise.coords[:, 1:]).astype(np.int32, copy=False),
+        "pred_pos": tensor_to_numpy(pred_pos.feats).astype(np.float32, copy=False),
+        "pred_neg": tensor_to_numpy(pred_neg.feats).astype(np.float32, copy=False),
+        "pred_cfg": tensor_to_numpy(pred_cfg.feats).astype(np.float32, copy=False),
+        "x0_pos": tensor_to_numpy(x0_pos.feats).astype(np.float32, copy=False),
+        "x0_cfg": tensor_to_numpy(x0_cfg.feats).astype(np.float32, copy=False),
+        "std_pos": tensor_to_numpy(std_pos).astype(np.float32, copy=False).squeeze(),
+        "std_cfg": tensor_to_numpy(std_cfg).astype(np.float32, copy=False).squeeze(),
+        "ratio_raw": tensor_to_numpy(ratio_raw).astype(np.float32, copy=False).squeeze(),
+        "std_ratio": tensor_to_numpy(ratio_raw).astype(np.float32, copy=False).squeeze(),
+        "ratio_effective": tensor_to_numpy(ratio_effective).astype(np.float32, copy=False).squeeze(),
+        "x0_rescaled": tensor_to_numpy(x0_rescaled.feats).astype(np.float32, copy=False),
+        "x0_after_rescale": tensor_to_numpy(x0_after_rescale.feats).astype(np.float32, copy=False),
+        "pred_final": tensor_to_numpy(pred_final.feats).astype(np.float32, copy=False),
+        "pred_v_feats": tensor_to_numpy(pred_final.feats).astype(np.float32, copy=False),
+        "sample_next": tensor_to_numpy(sample_next.feats).astype(np.float32, copy=False),
+        "t": np.asarray(t, dtype=np.float32),
+        "t_prev": np.asarray(t_prev, dtype=np.float32),
+        "steps": np.asarray(steps, dtype=np.int32),
+        "guidance_strength": np.asarray(guidance_strength, dtype=np.float32),
+        "guidance_rescale": np.asarray(guidance_rescale, dtype=np.float32),
+        "guidance_interval": np.asarray(guidance_interval, dtype=np.float32),
+        "rescale_t": np.asarray(rescale_t, dtype=np.float32),
+    }
+
+
+def load_shape_flow_noise_sample(path: Path, expected_coords: np.ndarray) -> tuple[np.ndarray, str]:
+    expected = np.asarray(expected_coords, dtype=np.int32)
+    if expected.ndim != 2:
+        raise ValueError(f"expected coords must have shape [N, D], got {expected.shape}")
+    with np.load(path) as data:
+        if "coords" not in data:
+            raise ValueError(f"shape flow noise sample {path} missing coords")
+        coords = np.asarray(data["coords"], dtype=np.int32)
+        if "noise" in data:
+            key = "noise"
+        elif "sample_feats" in data:
+            key = "sample_feats"
+        else:
+            raise ValueError(f"shape flow noise sample {path} missing noise/sample_feats")
+        noise = np.asarray(data[key], dtype=np.float32)
+
+    if coords.shape != expected.shape or not np.array_equal(coords, expected):
+        raise ValueError(
+            "shape flow noise sample coords do not exactly match source coords: "
+            f"sample {coords.shape}, expected {expected.shape}"
+        )
+    if noise.ndim != 2:
+        raise ValueError(f"shape flow noise must have shape [N, C], got {noise.shape}")
+    if noise.shape[0] != expected.shape[0]:
+        raise ValueError(
+            "shape flow noise row mismatch: "
+            f"{noise.shape[0]} noise rows vs {expected.shape[0]} coords"
+        )
+    return np.ascontiguousarray(noise), key
+
+
+def write_source_shape_flow_step_npz(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    normalization: str,
+) -> dict[str, Any]:
+    required = {
+        "noise",
+        "sample_feats",
+        "coords",
+        "coords_3d",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+        "t",
+        "t_prev",
+        "steps",
+        "guidance_strength",
+        "guidance_rescale",
+        "guidance_interval",
+        "rescale_t",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"shape flow step payload missing keys: {missing}")
+    arrays = {key: np.asarray(payload[key]) for key in sorted(required)}
+    coords = arrays["coords"].astype(np.int32, copy=False)
+    sample_next = arrays["sample_next"].astype(np.float32, copy=False)
+    if coords.ndim != 2:
+        raise ValueError(f"shape flow coords must have shape [N, D], got {coords.shape}")
+    if sample_next.ndim != 2:
+        raise ValueError(f"shape flow sample_next must have shape [N, C], got {sample_next.shape}")
+    if coords.shape[0] != sample_next.shape[0]:
+        raise ValueError(
+            "shape flow coords/sample_next row mismatch: "
+            f"{coords.shape[0]} coords vs {sample_next.shape[0]} sample_next rows"
+        )
+    metadata = {
+        "artifact_scope": "source_cuda_shape_flow_first_step",
+        "normalization": normalization,
+        "stage": "shape_flow_step",
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        **{key: np.ascontiguousarray(value) for key, value in arrays.items()},
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+    return {
+        **metadata,
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "format": "shape_flow_step_npz",
+        "coords_shape": [int(v) for v in coords.shape],
+        "sample_next_shape": [int(v) for v in sample_next.shape],
     }
 
 

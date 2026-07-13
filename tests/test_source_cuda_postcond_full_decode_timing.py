@@ -80,6 +80,8 @@ def test_postcond_decode_runner_defaults_mesh_override_input():
     assert args.mesh_override == Path("o_voxel_override_convert.py")
     assert args.output_mesh_state is None
     assert args.output_shape_slat is None
+    assert args.output_shape_flow_step is None
+    assert args.shape_flow_noise_sample is None
 
 
 def test_install_mesh_override_copies_into_source_stubs(tmp_path):
@@ -213,3 +215,103 @@ def test_write_sparse_tensor_npz_preserves_coords_feats_and_metadata(tmp_path):
         "normalization": "source-config",
         "stage": "shape_slat",
     }
+
+
+def test_write_source_shape_flow_step_npz_preserves_comparable_fields(tmp_path):
+    import json
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_source_shape_flow_step_npz
+
+    payload = {
+        "noise": np.array([[1.0, -1.0], [0.5, 0.25]], dtype=np.float32),
+        "sample_feats": np.array([[1.0, -1.0], [0.5, 0.25]], dtype=np.float32),
+        "coords": np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+        "coords_3d": np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+        "pred_pos": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+        "pred_neg": np.array([[0.0, 0.1], [0.2, 0.3]], dtype=np.float32),
+        "pred_cfg": np.array([[0.7, 0.8], [0.9, 1.0]], dtype=np.float32),
+        "x0_pos": np.array([[1.1, -0.8], [0.2, 0.1]], dtype=np.float32),
+        "x0_cfg": np.array([[0.3, -0.4], [0.5, 0.6]], dtype=np.float32),
+        "std_pos": np.array(0.75, dtype=np.float32),
+        "std_cfg": np.array(1.5, dtype=np.float32),
+        "ratio_raw": np.array(0.5, dtype=np.float32),
+        "std_ratio": np.array(0.5, dtype=np.float32),
+        "ratio_effective": np.array(0.5, dtype=np.float32),
+        "x0_rescaled": np.array([[0.15, -0.2], [0.25, 0.3]], dtype=np.float32),
+        "x0_after_rescale": np.array([[0.2, -0.3], [0.4, 0.45]], dtype=np.float32),
+        "pred_final": np.array([[0.55, 0.65], [0.75, 0.85]], dtype=np.float32),
+        "pred_v_feats": np.array([[0.55, 0.65], [0.75, 0.85]], dtype=np.float32),
+        "sample_next": np.array([[0.97, -1.03], [0.46, 0.21]], dtype=np.float32),
+        "t": np.array(1.0, dtype=np.float32),
+        "t_prev": np.array(0.95, dtype=np.float32),
+        "steps": np.array(8, dtype=np.int32),
+        "guidance_strength": np.array(7.5, dtype=np.float32),
+        "guidance_rescale": np.array(0.5, dtype=np.float32),
+        "guidance_interval": np.array([0.8, 1.0], dtype=np.float32),
+        "rescale_t": np.array(3.0, dtype=np.float32),
+    }
+    output = tmp_path / "shape_flow_step.npz"
+
+    artifact = write_source_shape_flow_step_npz(output, payload, normalization="source-config")
+
+    assert artifact["path"] == str(output)
+    assert artifact["format"] == "shape_flow_step_npz"
+    assert artifact["artifact_scope"] == "source_cuda_shape_flow_first_step"
+    assert artifact["coords_shape"] == [2, 4]
+    assert artifact["sample_next_shape"] == [2, 2]
+    assert artifact["sha256"]
+
+    with np.load(output) as data:
+        for key, value in payload.items():
+            np.testing.assert_array_equal(data[key], value)
+        metadata = json.loads(str(data["metadata_json"]))
+
+    assert metadata == {
+        "artifact_scope": "source_cuda_shape_flow_first_step",
+        "normalization": "source-config",
+        "stage": "shape_flow_step",
+    }
+
+
+def test_load_shape_flow_noise_sample_accepts_exact_coords(tmp_path):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import load_shape_flow_noise_sample
+
+    sample = tmp_path / "mlx_shape_flow_step.npz"
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    noise = np.array([[1.0, -1.0], [0.5, 0.25]], dtype=np.float32)
+    np.savez(sample, coords=coords, noise=noise)
+
+    loaded, key = load_shape_flow_noise_sample(sample, coords)
+
+    np.testing.assert_array_equal(loaded, noise)
+    assert key == "noise"
+
+
+def test_load_shape_flow_noise_sample_rejects_coord_order_mismatch(tmp_path):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import load_shape_flow_noise_sample
+
+    sample = tmp_path / "mlx_shape_flow_step.npz"
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    swapped = coords[::-1]
+    np.savez(sample, coords=swapped, noise=np.zeros((2, 2), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="coords do not exactly match"):
+        load_shape_flow_noise_sample(sample, coords)
+
+
+def test_load_shape_flow_noise_sample_rejects_feature_row_mismatch(tmp_path):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import load_shape_flow_noise_sample
+
+    sample = tmp_path / "mlx_shape_flow_step.npz"
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    np.savez(sample, coords=coords, sample_feats=np.zeros((1, 2), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="noise row mismatch"):
+        load_shape_flow_noise_sample(sample, coords)

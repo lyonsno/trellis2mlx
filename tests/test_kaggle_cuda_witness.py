@@ -255,6 +255,73 @@ def test_prepare_packet_can_declare_shape_slat_output(tmp_path):
     assert 'command += ["--output-shape-slat", CONFIG["output_shape_slat"]]' in runner
 
 
+def test_prepare_packet_can_declare_shape_flow_step_output(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/shape-step-inputs",
+            kernel_id="operator/shape-flow-step-cuda",
+            title="Shape Flow Step CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            output_shape_flow_step="cuda_result_shape_flow_step.npz",
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["outputs"] == [
+        "cuda_result.json",
+        "cuda_result.npz",
+        "cuda_result_shape_flow_step.npz",
+    ]
+    assert manifest["output_roles"]["shape_flow_step"] == "cuda_result_shape_flow_step.npz"
+    assert loaded.output_shape_flow_step == "cuda_result_shape_flow_step.npz"
+    assert '\\"output_shape_flow_step\\": \\"cuda_result_shape_flow_step.npz\\"' in runner
+    assert 'command += ["--output-shape-flow-step", CONFIG["output_shape_flow_step"]]' in runner
+
+
+def test_prepare_packet_can_declare_shape_flow_noise_sample(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    (capsule / "mlx_shape_flow_step.npz").write_bytes(b"npz bytes")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/shape-step-inputs",
+            kernel_id="operator/shape-step-cuda",
+            title="Shape Step CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py", "mlx_shape_flow_step.npz"),
+            shape_flow_noise_sample="mlx_shape_flow_step.npz",
+            output_shape_flow_step="cuda_result_shape_flow_step.npz",
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["input_roles"]["shape_flow_noise_sample"] == "mlx_shape_flow_step.npz"
+    assert loaded.shape_flow_noise_sample == "mlx_shape_flow_step.npz"
+    assert '\\"shape_flow_noise_sample\\": \\"mlx_shape_flow_step.npz\\"' in runner
+    assert 'command += ["--shape-flow-noise-sample", CONFIG["shape_flow_noise_sample"]]' in runner
+
+
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError, prepare_packet
 
