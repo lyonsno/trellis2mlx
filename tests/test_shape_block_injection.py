@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 
 def test_load_shape_attention_raw_injection_flattens_cuda_heads_and_records_route(tmp_path):
@@ -49,6 +50,7 @@ def test_load_shape_attention_raw_injection_flattens_cuda_heads_and_records_rout
         "pos": [1, 3, 8],
     }
     assert identity["trace_identity"]["effective_route"] == "microsoft-trellis2-cuda-t4"
+    assert identity["source_delta_scale"] == 1.0
 
 
 def test_load_shape_attention_raw_injection_rejects_unidentified_or_wrong_site_trace(tmp_path):
@@ -83,7 +85,13 @@ def test_load_shape_attention_raw_injection_rejects_unidentified_or_wrong_site_t
         )
 
 
-def test_modulated_block_injects_attention_raw_before_output_projection():
+@pytest.mark.parametrize(
+    ("source_delta_scale", "expected_raw"),
+    [(0.0, 7.0), (0.5, 4.5), (1.0, 2.0)],
+)
+def test_modulated_block_injects_attention_raw_before_output_projection(
+    source_delta_scale, expected_raw
+):
     import mlx.core as mx
 
     from trellmlx.models.sparse_structure_flow import ModulatedBlock
@@ -125,6 +133,7 @@ def test_modulated_block_injects_attention_raw_before_output_projection():
         arrays_by_branch={"pos": injected},
         source_shapes_by_branch={"pos": injected.shape},
         trace_identity={},
+        source_delta_scale=source_delta_scale,
     )
     mod = np.zeros((24,), dtype=np.float32)
     mod[8:12] = 1.0  # gate_msa
@@ -138,8 +147,10 @@ def test_modulated_block_injects_attention_raw_before_output_projection():
     )
     mx.eval(out, recorder.to_out_input)
 
-    np.testing.assert_array_equal(np.array(recorder.to_out_input), np.full((2, 4), 2.0))
-    np.testing.assert_array_equal(np.array(out), np.full((2, 4), 6.0))
+    np.testing.assert_array_equal(
+        np.array(recorder.to_out_input), np.full((2, 4), expected_raw)
+    )
+    np.testing.assert_array_equal(np.array(out), np.full((2, 4), expected_raw * 3))
 
 
 def test_slat_flow_routes_shape_injection_to_named_block():
@@ -282,6 +293,7 @@ def test_stage_capture_records_and_forwards_shape_injection_route(tmp_path):
             "--shape-flow-block-injection-block-index", "1",
             "--shape-flow-block-injection-branch", "both",
             "--shape-flow-block-injection-stage", "attention_raw",
+            "--shape-flow-block-injection-scale", "0.25",
         ]
     )
     command = _build_generate_command(args, tmp_path / "checkpoints")
@@ -295,3 +307,5 @@ def test_stage_capture_records_and_forwards_shape_injection_route(tmp_path):
     assert route["shape_flow_block_injection_block_index"] == 1
     assert route["shape_flow_block_injection_branch"] == "both"
     assert route["shape_flow_block_injection_stage"] == "attention_raw"
+    assert route["shape_flow_block_injection_scale"] == 0.25
+    assert command[command.index("--shape-flow-block-injection-scale") + 1] == "0.25"

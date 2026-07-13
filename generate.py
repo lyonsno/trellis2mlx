@@ -685,6 +685,8 @@ def main():
                         help="Diagnostic: shape-flow block tensor stage to replace.")
     parser.add_argument("--shape-flow-block-injection-array-key",
                         help="Diagnostic: explicit trace array key for single-branch shape injection.")
+    parser.add_argument("--shape-flow-block-injection-scale", type=float, default=1.0,
+                        help="Diagnostic: scale source-minus-live attention_raw before injection.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -1632,6 +1634,7 @@ def main():
             block_index=args.shape_flow_block_injection_block_index,
             stage=args.shape_flow_block_injection_stage,
             array_key=args.shape_flow_block_injection_array_key,
+            source_delta_scale=args.shape_flow_block_injection_scale,
         )
         shape_block_injection_json = json.dumps(
             shape_block_injection.report_identity(),

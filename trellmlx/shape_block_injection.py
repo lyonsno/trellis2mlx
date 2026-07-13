@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ class ShapeBlockInjection:
     arrays_by_branch: dict[str, np.ndarray]
     source_shapes_by_branch: dict[str, tuple[int, ...]]
     trace_identity: dict[str, Any]
+    source_delta_scale: float = 1.0
 
     def applies(self, *, step_index: int, branch: str) -> bool:
         return int(step_index) == self.step_index and (
@@ -44,6 +46,7 @@ class ShapeBlockInjection:
             "step_index": self.step_index,
             "block_index": self.block_index,
             "stage": self.stage,
+            "source_delta_scale": self.source_delta_scale,
             "trace_identity": self.trace_identity,
             "comparison_class": "mlx_shape_flow_with_source_cuda_attention_raw_injection",
             "route_identity_evidence": True,
@@ -64,6 +67,7 @@ def load_shape_block_injection(
     block_index: int,
     stage: str = "attention_raw",
     array_key: str | None = None,
+    source_delta_scale: float = 1.0,
 ) -> ShapeBlockInjection:
     if branch not in {"pos", "neg", "both"}:
         raise ValueError(f"shape block injection branch must be pos, neg, or both; got {branch!r}")
@@ -72,6 +76,8 @@ def load_shape_block_injection(
             "shape block injection currently accepts only attention_raw; "
             f"got {stage!r}"
         )
+    if not math.isfinite(source_delta_scale):
+        raise ValueError(f"shape block injection source delta scale must be finite, got {source_delta_scale}")
 
     trace_path = Path(trace_path)
     with np.load(trace_path, allow_pickle=False) as trace:
@@ -126,6 +132,7 @@ def load_shape_block_injection(
         arrays_by_branch=arrays_by_branch,
         source_shapes_by_branch=source_shapes_by_branch,
         trace_identity=trace_identity,
+        source_delta_scale=float(source_delta_scale),
     )
 
 

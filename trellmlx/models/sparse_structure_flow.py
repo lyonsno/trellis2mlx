@@ -632,7 +632,7 @@ def _layernorm_noaffine_rowwise_perturbed(
 
 def _injected_tensor_like(injection, reference: mx.array, *, branch: str) -> mx.array:
     array = injection.array_for_branch(branch)
-    injected = mx.array(array).astype(reference.dtype)
+    injected = mx.array(array)
     if injected.ndim == reference.ndim + 1 and injected.shape[0] == 1:
         injected = injected[0]
     if injected.shape != reference.shape:
@@ -640,7 +640,14 @@ def _injected_tensor_like(injection, reference: mx.array, *, branch: str) -> mx.
             "block injection shape mismatch for "
             f"{branch} {injection.stage}: expected {reference.shape}, got {injected.shape}"
         )
-    return injected
+    source_delta_scale = float(getattr(injection, "source_delta_scale", 1.0))
+    if source_delta_scale != 1.0:
+        injected = (
+            reference.astype(mx.float32)
+            + source_delta_scale
+            * (injected.astype(mx.float32) - reference.astype(mx.float32))
+        )
+    return injected.astype(reference.dtype)
 
 
 def _infer_compute_dtype(module: nn.Module) -> mx.Dtype:

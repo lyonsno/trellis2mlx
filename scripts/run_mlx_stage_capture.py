@@ -132,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="attention_raw",
     )
     parser.add_argument("--shape-flow-block-injection-array-key")
+    parser.add_argument("--shape-flow-block-injection-scale", type=float, default=1.0)
     return parser
 
 
@@ -251,6 +252,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "shape_flow_block_injection_branch": args.shape_flow_block_injection_branch,
             "shape_flow_block_injection_stage": args.shape_flow_block_injection_stage,
             "shape_flow_block_injection_array_key": args.shape_flow_block_injection_array_key,
+            "shape_flow_block_injection_scale": args.shape_flow_block_injection_scale,
             "shape_flow_noise_sample_path": (
                 str(Path(args.shape_flow_noise_sample))
                 if args.shape_flow_noise_sample else None
@@ -489,6 +491,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             args.shape_flow_block_injection_branch,
             "--shape-flow-block-injection-stage",
             args.shape_flow_block_injection_stage,
+            "--shape-flow-block-injection-scale",
+            str(args.shape_flow_block_injection_scale),
         ])
         if args.shape_flow_block_injection_array_key:
             command.extend([
