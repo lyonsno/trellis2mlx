@@ -42,6 +42,7 @@ class KaggleCudaWitnessPacket:
     output_npz: str = "cuda_result.npz"
     output_ply: str | None = None
     output_mesh_state: str | None = None
+    output_shape_slat: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -68,6 +69,8 @@ class KaggleCudaWitnessPacket:
             outputs.append(self.output_ply)
         if self.output_mesh_state:
             outputs.append(self.output_mesh_state)
+        if self.output_shape_slat:
+            outputs.append(self.output_shape_slat)
         return tuple(outputs)
 
 
@@ -106,6 +109,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
             "npz": packet.output_npz,
             "ply": packet.output_ply,
             "mesh_state": packet.output_mesh_state,
+            "shape_slat": packet.output_shape_slat,
         },
         "files": file_records,
     }
@@ -154,6 +158,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         output_npz=output_roles.get("npz") or outputs[1],
         output_ply=output_roles.get("ply") or _legacy_output_by_suffix(outputs[2:], ".ply"),
         output_mesh_state=output_roles.get("mesh_state") or _legacy_output_by_suffix(outputs[2:], "_mesh_state.npz"),
+        output_shape_slat=output_roles.get("shape_slat") or _legacy_output_by_suffix(outputs[2:], "_shape_slat.npz"),
     )
 
 
@@ -295,6 +300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--output-npz", default="cuda_result.npz")
     prepare.add_argument("--output-ply")
     prepare.add_argument("--output-mesh-state")
+    prepare.add_argument("--output-shape-slat")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
         drive = subparsers.add_parser(name)
@@ -323,6 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_npz=args.output_npz,
                 output_ply=args.output_ply,
                 output_mesh_state=args.output_mesh_state,
+                output_shape_slat=args.output_shape_slat,
             )
         )
         print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
@@ -468,6 +475,7 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "outputs": list(packet.outputs),
         "output_ply": packet.output_ply,
         "output_mesh_state": packet.output_mesh_state,
+        "output_shape_slat": packet.output_shape_slat,
     }
     return f"""#!/usr/bin/env python3
 from __future__ import annotations
@@ -580,6 +588,8 @@ def main() -> int:
         command += ["--output-ply", CONFIG["output_ply"]]
     if CONFIG["output_mesh_state"]:
         command += ["--output-mesh-state", CONFIG["output_mesh_state"]]
+    if CONFIG["output_shape_slat"]:
+        command += ["--output-shape-slat", CONFIG["output_shape_slat"]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     extra = {{
         "effective_dataset_dir": str(dataset_dir),

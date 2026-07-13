@@ -220,6 +220,41 @@ def test_prepare_packet_can_declare_full_mesh_state_output(tmp_path):
     assert 'command += ["--output-mesh-state", CONFIG["output_mesh_state"]]' in runner
 
 
+def test_prepare_packet_can_declare_shape_slat_output(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/shape-slat-inputs",
+            kernel_id="operator/shape-slat-cuda",
+            title="Shape SLat CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            output_shape_slat="cuda_result_shape_slat.npz",
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["outputs"] == [
+        "cuda_result.json",
+        "cuda_result.npz",
+        "cuda_result_shape_slat.npz",
+    ]
+    assert manifest["output_roles"]["shape_slat"] == "cuda_result_shape_slat.npz"
+    assert loaded.output_shape_slat == "cuda_result_shape_slat.npz"
+    assert '\\"output_shape_slat\\": \\"cuda_result_shape_slat.npz\\"' in runner
+    assert 'command += ["--output-shape-slat", CONFIG["output_shape_slat"]]' in runner
+
+
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError, prepare_packet
 
