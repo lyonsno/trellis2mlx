@@ -152,8 +152,12 @@ def load_sparse_block_injection(
 ) -> SparseBlockInjection:
     if branch not in {"pos", "neg", "both"}:
         raise ValueError("branch must be one of: pos, neg, both")
-    if stage not in {"norm1", "modulated_self_input", "after_self"}:
-        raise ValueError("stage must be one of: norm1, modulated_self_input, after_self")
+    allowed_stages = {"norm1", "modulated_self_input", "after_self", "after_cross", "after_mlp"}
+    if stage not in allowed_stages:
+        raise ValueError(
+            "stage must be one of: norm1, modulated_self_input, after_self, "
+            "after_cross, after_mlp"
+        )
 
     trace_path = Path(trace_path)
     with np.load(trace_path) as trace:

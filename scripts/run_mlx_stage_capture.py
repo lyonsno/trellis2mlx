@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sparse-flow-block-injection-stage",
-        choices=["norm1", "modulated_self_input", "after_self"],
+        choices=["norm1", "modulated_self_input", "after_self", "after_cross", "after_mlp"],
         default="modulated_self_input",
     )
     parser.add_argument("--sparse-flow-block-injection-array-key")

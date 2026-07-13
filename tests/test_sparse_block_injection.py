@@ -194,6 +194,51 @@ def test_sparse_flow_trace_block_records_effective_sparse_block_injection():
     )
 
 
+def test_sparse_flow_trace_block_records_effective_after_mlp_injection():
+    import mlx.core as mx
+
+    from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
+    from trellmlx.sparse_block_injection import SparseBlockInjection
+
+    model = SparseStructureFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=4,
+        num_heads=1,
+        num_blocks=1,
+        mlp_hidden=8,
+        context_channels=4,
+    )
+    injected = np.arange(8 * 4, dtype=np.float32).reshape(1, 8, 4) / 10.0
+    injection = SparseBlockInjection(
+        trace_path=None,
+        array_key="pos_block0_after_mlp",
+        branch="pos",
+        step_index=2,
+        block_index=0,
+        stage="after_mlp",
+        arrays_by_branch={"pos": injected},
+        trace_identity={},
+    )
+
+    trace = model.trace_block(
+        mx.zeros((1, 2, 2, 2, 2), dtype=mx.float32),
+        mx.array([500.0], dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        block_index=0,
+        sparse_block_injection=injection,
+        sparse_block_injection_branch="pos",
+    )
+    mx.eval(trace["block0_after_mlp"])
+
+    expected = mx.array(injected.reshape(8, 4), dtype=trace["block0_after_mlp"].dtype)
+    mx.eval(expected)
+    np.testing.assert_allclose(
+        np.array(trace["block0_after_mlp"].astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+    )
+
+
 def test_flow_euler_sample_dispatches_sparse_block_injection_by_step_and_branch():
     import mlx.core as mx
 
@@ -306,6 +351,43 @@ def test_load_sparse_block_injection_manifest_dispatches_multiple_sites(tmp_path
     assert identity["comparison_class"] == "mlx_sparse_flow_with_named_block_tensor_injection_set"
     assert identity["manifest_path"] == str(manifest)
     assert [site["block_index"] for site in identity["sites"]] == [0, 4]
+
+
+def test_load_sparse_block_injection_manifest_accepts_after_mlp_sites(tmp_path):
+    from trellmlx.sparse_block_injection import load_sparse_block_injection_manifest
+
+    trace = tmp_path / "source_block3.npz"
+    np.savez(
+        trace,
+        pos_block3_after_mlp=np.ones((1, 8, 4), dtype=np.float32) * 3,
+        route_identity_json=np.array('{"effective_route": "source-cuda-block3"}'),
+    )
+    manifest = tmp_path / "after_mlp.json"
+    manifest.write_text(
+        """
+        {
+          "schema": "trellis2mlx.sparse_block_injection_manifest.v1",
+          "sites": [
+            {
+              "trace_path": "source_block3.npz",
+              "branch": "pos",
+              "step_index": 2,
+              "block_index": 3,
+              "stage": "after_mlp"
+            }
+          ]
+        }
+        """
+    )
+
+    injections = load_sparse_block_injection_manifest(manifest)
+
+    active = injections.active_for_step_branch(step_index=2, branch="pos")
+    assert active is not None
+    site = active.injection_for_block(3)
+    assert site.stage == "after_mlp"
+    assert site.array_key == "pos_block3_after_mlp"
+    np.testing.assert_allclose(site.array_for_branch("pos"), 3.0)
 
 
 def test_flow_euler_sample_dispatches_sparse_block_injection_set_by_step_and_branch():

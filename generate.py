@@ -641,7 +641,7 @@ def main():
                         choices=["pos", "neg", "both"], default="both",
                         help="Diagnostic: CFG branch where block injection applies.")
     parser.add_argument("--sparse-flow-block-injection-stage",
-                        choices=["norm1", "modulated_self_input", "after_self"],
+                        choices=["norm1", "modulated_self_input", "after_self", "after_cross", "after_mlp"],
                         default="modulated_self_input",
                         help="Diagnostic: block tensor stage to replace.")
     parser.add_argument("--sparse-flow-block-injection-array-key",

@@ -417,12 +417,17 @@ class ModulatedBlock(nn.Module):
         else:
             h = self.cross_attn(h, context)
         x = x + h
+        if injection.stage == "after_cross":
+            x = _injected_tensor_like(injection, x, branch=branch)
 
         h = _layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
-        return x + h
+        x = x + h
+        if injection.stage == "after_mlp":
+            x = _injected_tensor_like(injection, x, branch=branch)
+        return x
 
     def trace(
         self,
@@ -494,6 +499,8 @@ class ModulatedBlock(nn.Module):
         trace.update(cross_trace)
         trace[f"{trace_prefix}_cross_attn"] = h
         x = x + h
+        if injection is not None and injection.stage == "after_cross":
+            x = _injected_tensor_like(injection, x, branch=branch)
         trace[f"{trace_prefix}_after_cross"] = x
 
         h = _layernorm_noaffine(x)
@@ -509,6 +516,8 @@ class ModulatedBlock(nn.Module):
         h = h * gate_mlp
         trace[f"{trace_prefix}_mlp_gated"] = h
         x = x + h
+        if injection is not None and injection.stage == "after_mlp":
+            x = _injected_tensor_like(injection, x, branch=branch)
         trace[f"{trace_prefix}_after_mlp"] = x
 
         return x, trace
