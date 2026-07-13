@@ -393,6 +393,16 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         _require_metrics(row, ("intervention_depth", "pred_final_source_mean_abs"))
         name = str(row.get("name", "unnamed"))
+        topology = row.get("intervention_topology")
+        if topology not in {"main_chain", "side_branch"}:
+            raise AtlasContractError(
+                f"operation replay {name} has invalid intervention_topology {topology!r}"
+            )
+        causal_parent = row.get("causal_parent")
+        if causal_parent is not None and not isinstance(causal_parent, str):
+            raise AtlasContractError(
+                f"operation replay {name} causal_parent must be a string or null"
+            )
         artifact = row.get("artifact")
         nodes.append(
             {
@@ -400,31 +410,48 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
                 "chart": "operation_replay",
                 "label": name.replace("_", " "),
                 "coordinate": {"intervention_depth": int(row["intervention_depth"])},
-                "placement": "on_axis",
+                "placement": topology,
                 "artifact": artifact,
                 "route_identity": _route_identity(artifact),
                 "intervention": {
                     "kind": "block29_causal_boundary_replay",
+                    "topology": topology,
+                    "causal_parent": causal_parent,
                     "manifest_identity": row.get("manifest_identity"),
                 },
                 "metrics": _copy_metrics(row),
             }
         )
     nodes.sort(key=lambda node: node["coordinate"]["intervention_depth"])
-    edges = [
-        {
-            "id": f"{left['id']}->{right['id']}",
-            "from": left["id"],
-            "to": right["id"],
-            "kind": "causal_boundary_replay",
-            "intervention": {"from": left["label"], "to": right["label"]},
-        }
-        for left, right in zip(nodes, nodes[1:])
-    ]
+    nodes_by_name = {node["id"].removeprefix("operation-replay:"): node for node in nodes}
+    edges = []
+    for node in nodes:
+        parent_name = node["intervention"]["causal_parent"]
+        if parent_name is None:
+            continue
+        parent = nodes_by_name.get(parent_name)
+        if parent is None:
+            raise AtlasContractError(
+                f"operation replay {node['label']} names missing causal parent {parent_name!r}"
+            )
+        kind = (
+            "causal_intervention_branch"
+            if node["intervention"]["topology"] == "side_branch"
+            else "causal_boundary_replay"
+        )
+        edges.append(
+            {
+                "id": f"{parent['id']}->{node['id']}",
+                "from": parent["id"],
+                "to": node["id"],
+                "kind": kind,
+                "intervention": {"from": parent["label"], "to": node["label"]},
+            }
+        )
     return {
         "title": "Block29 causal replay endpoints",
         "x_axis": {
-            "semantic": "deepest exact source operation boundary",
+            "semantic": "causal intervention rank; side branches are non-cumulative",
             "field": "intervention_depth",
         },
         "y_axis": {
@@ -724,7 +751,7 @@ def render_html(atlas: dict[str, Any]) -> str:
 <title>TRELLIS.2 Causal Basin Atlas</title>
 <style>
 :root{color-scheme:dark;--bg:#101214;--panel:#171a1d;--line:#343a40;--text:#f2f3f5;--muted:#aab0b7;--red:#ff5b57;--cyan:#3ddbd9;--yellow:#ffd166;--green:#66d17a;--violet:#b39cff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0}header{padding:20px 24px 16px;border-bottom:1px solid var(--line);display:flex;gap:24px;align-items:end;justify-content:space-between}h1{margin:0;font-size:22px;font-weight:650;letter-spacing:0}header p{margin:0;color:var(--muted);max-width:720px}.header-meta{display:grid;gap:8px;justify-items:end}.evidence-legend{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:11px}.evidence-legend span::before{content:'○';display:inline-block;width:14px;font-weight:700}.evidence-legend .verified::before{content:'●';color:var(--green)}.evidence-legend .unverified::before{color:var(--yellow)}.evidence-legend .missing::before{content:'×';color:#8b949e}.evidence-legend .failed::before{content:'!';color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;min-height:calc(100vh - 86px)}main{min-width:0}.chart-section{padding:18px 24px 22px;border-bottom:1px solid var(--line)}.chart-section h2{font-size:14px;margin:0 0 4px}.axis-note{color:var(--muted);font-size:12px;margin-bottom:10px}.chart{display:block;width:100%;height:260px;background:var(--panel);border:1px solid var(--line)}aside{border-left:1px solid var(--line);padding:18px;min-width:0;background:#131619}aside h2{font-size:14px;margin:0 0 12px}.detail{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);font-size:12px}svg text{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--muted);letter-spacing:0}.axis{stroke:#59616a;stroke-width:1}.edge{stroke:#6c747d;stroke-width:1.5;fill:none}.edge-unverified{stroke-dasharray:5 5;opacity:.55}.node{cursor:pointer;stroke:#101214;stroke-width:2}.node-unverified{fill:var(--panel)!important;stroke:var(--yellow);stroke-dasharray:3 2}.node-missing{fill:var(--panel)!important;stroke:#8b949e;stroke-dasharray:2 3}.node-failed,.node-stale,.node-partial{fill:var(--panel)!important;stroke:var(--red);stroke-width:3}.node:focus{outline:none;stroke:#fff;stroke-width:3}.label{pointer-events:none}.limit{color:var(--yellow)}@media(max-width:860px){header{align-items:start;flex-direction:column}.header-meta{justify-items:start}.workspace{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}.chart-section{padding:16px;overflow-x:auto}.chart{height:240px;min-width:760px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0}header{padding:20px 24px 16px;border-bottom:1px solid var(--line);display:flex;gap:24px;align-items:end;justify-content:space-between}h1{margin:0;font-size:22px;font-weight:650;letter-spacing:0}header p{margin:0;color:var(--muted);max-width:720px}.header-meta{display:grid;gap:8px;justify-items:end}.evidence-legend{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:11px}.evidence-legend span::before{content:'○';display:inline-block;width:14px;font-weight:700}.evidence-legend .verified::before{content:'●';color:var(--green)}.evidence-legend .unverified::before{color:var(--yellow)}.evidence-legend .missing::before{content:'×';color:#8b949e}.evidence-legend .failed::before{content:'!';color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;min-height:calc(100vh - 86px)}main{min-width:0}.chart-section{padding:18px 24px 22px;border-bottom:1px solid var(--line)}.chart-section h2{font-size:14px;margin:0 0 4px}.axis-note{color:var(--muted);font-size:12px;margin-bottom:10px}.chart{display:block;width:100%;height:260px;background:var(--panel);border:1px solid var(--line)}aside{border-left:1px solid var(--line);padding:18px;min-width:0;background:#131619}aside h2{font-size:14px;margin:0 0 12px}.detail{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);font-size:12px}svg text{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--muted);letter-spacing:0}.axis{stroke:#59616a;stroke-width:1}.edge{stroke:#6c747d;stroke-width:1.5;fill:none}.edge-branch{stroke:var(--yellow);stroke-dasharray:3 4;stroke-width:2}.edge-unverified{stroke-dasharray:5 5;opacity:.55}.node{cursor:pointer;stroke:#101214;stroke-width:2}.node-unverified{fill:var(--panel)!important;stroke:var(--yellow);stroke-dasharray:3 2}.node-missing{fill:var(--panel)!important;stroke:#8b949e;stroke-dasharray:2 3}.node-failed,.node-stale,.node-partial{fill:var(--panel)!important;stroke:var(--red);stroke-width:3}.node:focus{outline:none;stroke:#fff;stroke-width:3}.label{pointer-events:none}.limit{color:var(--yellow)}@media(max-width:860px){header{align-items:start;flex-direction:column}.header-meta{justify-items:start}.workspace{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}.chart-section{padding:16px;overflow-x:auto}.chart{height:240px;min-width:760px}}
 </style>
 </head>
 <body>
@@ -749,7 +776,7 @@ else points=chart.nodes.map(n=>({n,x:n.coordinate.stage_index,y:Math.log10(metri
 if(!points.length)return;const [xmin,xmax]=extent(points.map(q=>q.x)),[ymin,ymax]=extent(points.map(q=>q.y));const X=v=>scale(v,xmin,xmax,p.l,W-p.r),Y=v=>scale(v,ymin,ymax,H-p.b,p.t);svg.append(el('line',{x1:p.l,y1:H-p.b,x2:W-p.r,y2:H-p.b,class:'axis'}),el('line',{x1:p.l,y1:p.t,x2:p.l,y2:H-p.b,class:'axis'}));
 for(let i=0;i<=4;i++){const value=ymin+(ymax-ymin)*i/4,y=Y(value);svg.append(el('line',{x1:p.l-4,y1:y,x2:p.l,y2:y,class:'axis'}));const tick=el('text',{x:p.l-8,y:y+4,'text-anchor':'end'});tick.textContent=chartKey==='block_operation'?value.toFixed(1):value.toPrecision(3);svg.append(tick)}
 for(let i=0;i<=4;i++){const value=xmin+(xmax-xmin)*i/4,x=X(value);svg.append(el('line',{x1:x,y1:H-p.b,x2:x,y2:H-p.b+4,class:'axis'}));const tick=el('text',{x,y:H-p.b+16,'text-anchor':'middle'});tick.textContent=chartKey==='source_prefix'?Math.round(value):value.toPrecision(3);svg.append(tick)}
-const blocked=new Set(['missing','failed','stale','partial']);for(const edge of chart.edges){const a=points.find(q=>q.n.id===edge.from),b=points.find(q=>q.n.id===edge.to);if(!a||!b||blocked.has(a.n.route_identity.status)||blocked.has(b.n.route_identity.status))continue;const edgeClass=a.n.route_identity.status==='visible'&&b.n.route_identity.status==='visible'?'edge':'edge edge-unverified';svg.append(el('line',{x1:X(a.x),y1:Y(a.y),x2:X(b.x),y2:Y(b.y),class:edgeClass}))}
+const blocked=new Set(['missing','failed','stale','partial']);for(const edge of chart.edges){const a=points.find(q=>q.n.id===edge.from),b=points.find(q=>q.n.id===edge.to);if(!a||!b||blocked.has(a.n.route_identity.status)||blocked.has(b.n.route_identity.status))continue;let edgeClass=a.n.route_identity.status==='visible'&&b.n.route_identity.status==='visible'?'edge':'edge edge-unverified';if(edge.kind==='causal_intervention_branch')edgeClass+=' edge-branch';svg.append(el('line',{x1:X(a.x),y1:Y(a.y),x2:X(b.x),y2:Y(b.y),class:edgeClass}))}
 const boxes=[];for(const q of points){let fill=colors[chartKey];if(chartKey==='block_operation'&&q.n.coordinate.branch==='neg')fill='#66d17a';const status=q.n.route_identity.status||'unverified';const accessible=`${q.n.label}; evidence ${status}`;const circle=el('circle',{cx:X(q.x),cy:Y(q.y),r:7,fill,class:`node node-${status}`,tabindex:0,'aria-label':accessible});const tip=el('title');tip.textContent=accessible;circle.append(tip);circle.addEventListener('click',()=>show(q.n));circle.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')show(q.n)});svg.append(circle)}for(const q of points)placeLabel(svg,q,X,Y,boxes,W,p);
 const xl=el('text',{x:(p.l+W-p.r)/2,y:H-10,'text-anchor':'middle'});xl.textContent=chart.x_axis.semantic;svg.append(xl)}
 for(const [key,chart] of Object.entries(atlas.charts))draw(key,chart);

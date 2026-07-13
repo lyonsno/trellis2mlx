@@ -246,6 +246,7 @@ def summarize_replays(
             "manifest_identity": {"route_vector": source_route_vector},
             "intervention_stage": "source",
             "intervention_depth": INTERVENTION_DEPTH["source"],
+            "intervention_topology": "main_chain",
             "pos_final_output_source_mean_abs": 0.0,
             "neg_final_output_source_mean_abs": 0.0,
             "pred_final_source_mean_abs": 0.0,
@@ -258,6 +259,17 @@ def summarize_replays(
     depths = [row["intervention_depth"] for row in replay_rows]
     if len(depths) != len(set(depths)):
         raise ReplayContractError(f"replay candidates contain duplicate intervention depths: {depths}")
+    main_chain_parent: str | None = None
+    prefix_parent = next(
+        (row["name"] for row in replay_rows if row["intervention_stage"] == "prefix28"),
+        None,
+    )
+    for row in replay_rows:
+        if row["intervention_topology"] == "main_chain":
+            row["causal_parent"] = main_chain_parent
+            main_chain_parent = row["name"]
+        else:
+            row["causal_parent"] = prefix_parent
 
     return {
         "schema": "trellis2mlx.shape_block_operation_replays.v1",
@@ -385,6 +397,7 @@ def _summarize_candidate(
             "normalized_sampler_t": candidate_t,
             "intervention_stage": intervention["stage"],
             "intervention_depth": intervention["depth"],
+            "intervention_topology": intervention["topology"],
             "pos_final_output_source_mean_abs": pos_delta["mean_abs"],
             "pos_final_output_source_max_abs": pos_delta["max_abs"],
             "neg_final_output_source_mean_abs": neg_delta["mean_abs"],
@@ -521,6 +534,7 @@ def _validate_intervention(
             },
             "stage": stage,
             "depth": INTERVENTION_DEPTH[stage],
+            "topology": "side_branch" if stage == "cross_attention_raw" else "main_chain",
         }
 
     if expected_manifest_class is not None:
@@ -535,6 +549,7 @@ def _validate_intervention(
         "identity": _manifest_identity(trace),
         "stage": "prefix28",
         "depth": INTERVENTION_DEPTH["prefix28"],
+        "topology": "main_chain",
     }
 
 
@@ -559,6 +574,15 @@ def _validate_site(
     if mismatches:
         raise ReplayContractError(
             f"{candidate_name} block{block_index} intervention site mismatch: {mismatches}"
+        )
+    expected_array_key = ",".join(
+        f"{branch}_block{block_index}_{stage}" for branch in ("pos", "neg")
+    )
+    observed_array_key = site.get("array_key")
+    if observed_array_key != expected_array_key:
+        raise ReplayContractError(
+            f"{candidate_name} block{block_index} intervention array key "
+            f"{observed_array_key!r} does not match declared stage {expected_array_key!r}"
         )
     if float(site.get("source_delta_scale", 1.0)) != 1.0:
         raise ReplayContractError(f"{candidate_name} intervention site is not exact scale 1.0")

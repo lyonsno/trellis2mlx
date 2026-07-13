@@ -121,6 +121,8 @@ def _operation_replays_summary(tmp_path: Path) -> Path:
                     "name": "natural",
                     "artifact": "/runs/natural.npz",
                     "intervention_depth": 0,
+                    "intervention_topology": "main_chain",
+                    "causal_parent": None,
                     "pred_final_source_mean_abs": 0.0015,
                     "sample_next_source_mean_abs": 0.00007,
                 },
@@ -128,13 +130,26 @@ def _operation_replays_summary(tmp_path: Path) -> Path:
                     "name": "after_self",
                     "artifact": "/runs/after-self.npz",
                     "intervention_depth": 1,
+                    "intervention_topology": "main_chain",
+                    "causal_parent": "natural",
                     "pred_final_source_mean_abs": 0.00013,
                     "sample_next_source_mean_abs": 0.000006,
                 },
                 {
+                    "name": "cross_attention_raw",
+                    "artifact": "/runs/cross-raw.npz",
+                    "intervention_depth": 2,
+                    "intervention_topology": "side_branch",
+                    "causal_parent": "natural",
+                    "pred_final_source_mean_abs": 0.001,
+                    "sample_next_source_mean_abs": 0.00005,
+                },
+                {
                     "name": "source",
                     "artifact": "/runs/source.npz",
-                    "intervention_depth": 2,
+                    "intervention_depth": 3,
+                    "intervention_topology": "main_chain",
+                    "causal_parent": "after_self",
                     "pred_final_source_mean_abs": 0.0,
                     "sample_next_source_mean_abs": 0.0,
                 },
@@ -222,11 +237,26 @@ def test_build_atlas_preserves_semantic_coordinates_and_all_nodes(tmp_path: Path
         {"branch": "neg", "stage_index": 0, "stage": "input"},
     ]
     replay = atlas["charts"]["operation_replay"]
-    assert [node["coordinate"]["intervention_depth"] for node in replay["nodes"]] == [0, 1, 2]
-    assert [edge["kind"] for edge in replay["edges"]] == [
-        "causal_boundary_replay",
-        "causal_boundary_replay",
+    assert [node["coordinate"]["intervention_depth"] for node in replay["nodes"]] == [0, 1, 2, 3]
+    assert [(edge["from"], edge["to"], edge["kind"]) for edge in replay["edges"]] == [
+        (
+            "operation-replay:natural",
+            "operation-replay:after_self",
+            "causal_boundary_replay",
+        ),
+        (
+            "operation-replay:natural",
+            "operation-replay:cross_attention_raw",
+            "causal_intervention_branch",
+        ),
+        (
+            "operation-replay:after_self",
+            "operation-replay:source",
+            "causal_boundary_replay",
+        ),
     ]
+    assert replay["nodes"][2]["placement"] == "side_branch"
+    assert "side branches" in replay["x_axis"]["semantic"]
 
 
 def test_atlas_records_input_hashes_and_route_identity_visibility(tmp_path: Path) -> None:

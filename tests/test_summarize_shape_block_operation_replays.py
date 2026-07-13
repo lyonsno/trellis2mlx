@@ -50,6 +50,7 @@ def _write_trace(
         "stage": "after_mlp",
         "branch": "both",
         "source_delta_scale": 1.0,
+        "array_key": "pos_block28_after_mlp,neg_block28_after_mlp",
         "trace_sha256": "a" * 64,
         "trace_identity": route_vector,
     }
@@ -71,6 +72,7 @@ def _write_trace(
                     "stage": stage,
                     "branch": "both",
                     "source_delta_scale": 1.0,
+                    "array_key": f"pos_block29_{stage},neg_block29_{stage}",
                     "trace_sha256": block29_trace_sha256,
                     "trace_identity": route_vector,
                 },
@@ -80,6 +82,8 @@ def _write_trace(
         injection = None
     elif injection_mode == "wrong_site" and isinstance(injection, dict):
         injection["sites"][-1].update(block_index=7, step_index=3, stage="after_mlp", branch="neg")
+    elif injection_mode == "wrong_array_key" and isinstance(injection, dict):
+        injection["sites"][-1]["array_key"] = "pos_block29_after_cross,neg_block29_after_cross"
     if block_input is None:
         block_input = np.zeros_like(pos)
     arrays = {
@@ -323,6 +327,21 @@ def test_summary_rejects_missing_or_wrong_intervention_sites_and_common_input(tm
                          manifest_class=None, block_input=sample + 1),
             None,
         ),
+        (
+            "array key",
+            _write_trace(
+                tmp_path / "wrong-array-key.npz",
+                pos=pos,
+                neg=neg,
+                coords=coords,
+                manifest_class="exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+                block_input=sample,
+                stage="cross_attention_raw",
+                injection_mode="wrong_array_key",
+                block29_trace_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            ),
+            "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        ),
     ]
     for expected_error, path, manifest_class in cases:
         with pytest.raises(ReplayContractError, match=expected_error):
@@ -375,12 +394,20 @@ def test_summary_derives_intervention_depth_from_validated_stage_not_argument_or
             CandidateSpec("after_self", after_self, "exact_source_cuda_prefix28_plus_block29_after_self"),
         ],
     )
-    assert [(row["name"], row["intervention_depth"]) for row in report["replay_rows"]] == [
-        ("after_self", 2),
-        ("cross_attention_raw", 3),
-        ("after_cross", 4),
-        ("after_mlp", 5),
-        ("source", 6),
+    assert [
+        (
+            row["name"],
+            row["intervention_depth"],
+            row["intervention_topology"],
+            row["causal_parent"],
+        )
+        for row in report["replay_rows"]
+    ] == [
+        ("after_self", 2, "main_chain", None),
+        ("cross_attention_raw", 3, "side_branch", None),
+        ("after_cross", 4, "main_chain", "after_self"),
+        ("after_mlp", 5, "main_chain", "after_cross"),
+        ("source", 6, "main_chain", "after_mlp"),
     ]
 
 
