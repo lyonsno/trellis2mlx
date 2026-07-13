@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
+    parser.add_argument("--shape-flow-noise-sample")
     return parser
 
 
@@ -223,6 +224,14 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
+            "shape_flow_noise_sample_path": (
+                str(Path(args.shape_flow_noise_sample))
+                if args.shape_flow_noise_sample else None
+            ),
+            "shape_flow_noise_sample_sha256": (
+                _sha256_file(args.shape_flow_noise_sample)
+                if args.shape_flow_noise_sample else None
+            ),
         },
         "source": {
             "image_path": image_path,
@@ -435,6 +444,11 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             str(args.shape_flow_trace_block_index),
             "--shape-flow-trace-step-index",
             str(args.shape_flow_trace_step_index),
+        ])
+    if args.shape_flow_noise_sample:
+        command.extend([
+            "--shape-flow-noise-sample",
+            str(Path(args.shape_flow_noise_sample)),
         ])
     return command
 

@@ -668,6 +668,9 @@ def main():
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow sampler step index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
+    parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
+                        help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
+                             "containing coords plus noise or sample_feats.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -1602,7 +1605,28 @@ def main():
         lr_slat_flow.compile()
 
     N_lr = len(lr_coords)
-    if shared_noise is not None and args.shared_noise_sparse_only:
+    if args.shape_flow_noise_sample:
+        shape_flow_noise_sample_npz = np.load(args.shape_flow_noise_sample)
+        if "coords" not in shape_flow_noise_sample_npz.files:
+            raise ValueError("--shape-flow-noise-sample NPZ must contain coords array")
+        noise_key = "noise" if "noise" in shape_flow_noise_sample_npz.files else "sample_feats"
+        if noise_key not in shape_flow_noise_sample_npz.files:
+            raise ValueError("--shape-flow-noise-sample NPZ must contain noise or sample_feats array")
+        noise_coords = np.asarray(shape_flow_noise_sample_npz["coords"], dtype=np.int32)
+        if noise_coords.shape != lr_coords_4d.shape or not np.array_equal(noise_coords, lr_coords_4d):
+            raise ValueError(
+                "shape flow noise sample coords do not exactly match shape support coords: "
+                f"{noise_coords.shape} vs {lr_coords_4d.shape}"
+            )
+        noise_np = np.asarray(shape_flow_noise_sample_npz[noise_key], dtype=np.float32)
+        if noise_np.ndim != 2 or noise_np.shape[0] != N_lr:
+            raise ValueError(
+                "--shape-flow-noise-sample noise/sample_feats must have shape [N, C], "
+                f"got {noise_np.shape} for N={N_lr}"
+            )
+        lr_noise = mx.array(noise_np).astype(mx.float32)
+        print(f"  Shape flow noise replay: {args.shape_flow_noise_sample} {lr_noise.shape}", flush=True)
+    elif shared_noise is not None and args.shared_noise_sparse_only:
         print("  Ignoring shared slat_noise_pool; using route-local random shape SLat noise", flush=True)
         lr_noise = mx.random.normal((N_lr, 32))
     elif shared_noise is not None and "slat_noise_pool" in shared_noise:

@@ -310,6 +310,8 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
 
     support_path = tmp_path / "reference_shape_slat.npz"
     support_path.write_bytes(b"shape-slat-support")
+    noise_path = tmp_path / "shape_flow_step.npz"
+    noise_path.write_bytes(b"shape-flow-noise")
     args = build_parser().parse_args(
         [
             "--image",
@@ -321,6 +323,8 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
             "--no-cascade",
             "--shape-slat-support-sample",
             str(support_path),
+            "--shape-flow-noise-sample",
+            str(noise_path),
             "--shape-flow-trace-block-index",
             "7",
             "--shape-flow-trace-step-index",
@@ -335,6 +339,8 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     assert command[command.index("--shape-flow-trace-block-index") + 1] == "7"
     assert "--shape-flow-trace-step-index" in command
     assert command[command.index("--shape-flow-trace-step-index") + 1] == "3"
+    assert "--shape-flow-noise-sample" in command
+    assert command[command.index("--shape-flow-noise-sample") + 1] == str(noise_path)
 
 
 def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path):
@@ -342,6 +348,8 @@ def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path)
 
     support_path = tmp_path / "reference_shape_slat.npz"
     support_path.write_bytes(b"shape-slat-support")
+    noise_path = tmp_path / "shape_flow_step.npz"
+    noise_path.write_bytes(b"shape-flow-noise")
     args = build_parser().parse_args(
         [
             "--image",
@@ -353,6 +361,8 @@ def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path)
             "--no-cascade",
             "--shape-slat-support-sample",
             str(support_path),
+            "--shape-flow-noise-sample",
+            str(noise_path),
             "--shape-flow-trace-block-index",
             "11",
             "--shape-flow-trace-step-index",
@@ -365,6 +375,8 @@ def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path)
 
     assert route_identity["route"]["shape_flow_trace_block_index"] == 11
     assert route_identity["route"]["shape_flow_trace_step_index"] == 4
+    assert route_identity["route"]["shape_flow_noise_sample_path"] == str(noise_path)
+    assert route_identity["route"]["shape_flow_noise_sample_sha256"] is not None
 
 
 def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
@@ -740,6 +752,9 @@ def test_generate_exposes_shape_flow_block_trace():
     assert '"shape_flow_block_trace"' in source
     assert "--shape-flow-trace-block-index" in source
     assert "--shape-flow-trace-step-index" in source
+    assert "--shape-flow-noise-sample" in source
+    assert "shape_flow_noise_sample_npz = np.load(args.shape_flow_noise_sample)" in source
+    assert "shape flow noise sample coords do not exactly match" in source
     assert "lr_slat_flow.trace_block" in source
     assert 'save_checkpoint(\n            args.save_checkpoints,\n            "shape_flow_block_trace"' in source
 
