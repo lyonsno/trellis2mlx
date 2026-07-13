@@ -389,6 +389,9 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
     rows = payload.get("replay_rows")
     if not isinstance(rows, list) or len(rows) < 2:
         raise AtlasContractError("operation replay summary needs at least two replay_rows")
+    names = [str(row.get("name", "unnamed")) for row in rows]
+    if len(names) != len(set(names)):
+        raise AtlasContractError(f"duplicate operation replay names: {names}")
     nodes = []
     for row in rows:
         _require_metrics(row, ("intervention_depth", "pred_final_source_mean_abs"))
@@ -402,6 +405,10 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
         if causal_parent is not None and not isinstance(causal_parent, str):
             raise AtlasContractError(
                 f"operation replay {name} causal_parent must be a string or null"
+            )
+        if topology == "side_branch" and causal_parent is None:
+            raise AtlasContractError(
+                f"operation replay side branch {name} requires a causal parent"
             )
         artifact = row.get("artifact")
         nodes.append(

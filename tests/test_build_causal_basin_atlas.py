@@ -259,6 +259,42 @@ def test_build_atlas_preserves_semantic_coordinates_and_all_nodes(tmp_path: Path
     assert "side branches" in replay["x_axis"]["semantic"]
 
 
+def test_operation_replay_chart_rejects_orphan_branch_and_duplicate_names() -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, _build_operation_replay_chart
+
+    natural = {
+        "name": "natural",
+        "artifact": "/runs/natural.npz",
+        "intervention_depth": 0,
+        "intervention_topology": "main_chain",
+        "causal_parent": None,
+        "pred_final_source_mean_abs": 0.0015,
+    }
+    orphan = {
+        "name": "cross_attention_raw",
+        "artifact": "/runs/cross.npz",
+        "intervention_depth": 3,
+        "intervention_topology": "side_branch",
+        "causal_parent": None,
+        "pred_final_source_mean_abs": 0.001,
+    }
+    payload = {
+        "status": "done",
+        "replay_rows": [natural, orphan],
+    }
+    with pytest.raises(AtlasContractError, match="side branch.*causal parent"):
+        _build_operation_replay_chart(payload)
+
+    duplicate = {
+        **natural,
+        "intervention_depth": 2,
+        "pred_final_source_mean_abs": 0.0001,
+    }
+    payload["replay_rows"] = [natural, duplicate]
+    with pytest.raises(AtlasContractError, match="duplicate operation replay names"):
+        _build_operation_replay_chart(payload)
+
+
 def test_atlas_records_input_hashes_and_route_identity_visibility(tmp_path: Path) -> None:
     from scripts.build_causal_basin_atlas import build_atlas
 

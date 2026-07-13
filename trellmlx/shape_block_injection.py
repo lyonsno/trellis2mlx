@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-SHAPE_BLOCK_INJECTION_STAGES = {
+SHAPE_BLOCK_INJECTION_STAGE_ORDER = (
     "norm1",
     "modulated_self_input",
     "attention_raw",
@@ -20,7 +20,8 @@ SHAPE_BLOCK_INJECTION_STAGES = {
     "cross_attention_raw",
     "after_cross",
     "after_mlp",
-}
+)
+SHAPE_BLOCK_INJECTION_STAGES = set(SHAPE_BLOCK_INJECTION_STAGE_ORDER)
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ class ShapeBlockInjectionSet:
         )
 
     def injection_for_block(self, block_index: int) -> ShapeBlockInjection | None:
-        matches = [site for site in self.sites if site.block_index == block_index]
+        matches = self.injections_for_block(block_index)
         if not matches:
             return None
         if len(matches) > 1:
@@ -112,6 +113,17 @@ class ShapeBlockInjectionSet:
                 f"shape block injection manifest has multiple active sites for block {block_index}"
             )
         return matches[0]
+
+    def injections_for_block(self, block_index: int) -> tuple[ShapeBlockInjection, ...]:
+        stage_order = {
+            stage: index for index, stage in enumerate(SHAPE_BLOCK_INJECTION_STAGE_ORDER)
+        }
+        return tuple(
+            sorted(
+                (site for site in self.sites if site.block_index == block_index),
+                key=lambda site: stage_order[site.stage],
+            )
+        )
 
     def report_identity(self) -> dict[str, Any]:
         return {
@@ -230,17 +242,31 @@ def load_shape_block_injection_manifest(
             ) from exc
         if not trace_path.is_absolute():
             trace_path = manifest_path.parent / trace_path
-        sites.append(
-            load_shape_block_injection(
-                trace_path,
-                branch=branch,
-                step_index=step_index,
-                block_index=block_index,
-                stage=stage,
-                array_key=site.get("array_key"),
-                source_delta_scale=float(site.get("source_delta_scale", 1.0)),
-            )
+        loaded = load_shape_block_injection(
+            trace_path,
+            branch=branch,
+            step_index=step_index,
+            block_index=block_index,
+            stage=stage,
+            array_key=site.get("array_key"),
+            source_delta_scale=float(site.get("source_delta_scale", 1.0)),
         )
+        for existing in sites:
+            same_stage = (
+                existing.step_index == loaded.step_index
+                and existing.block_index == loaded.block_index
+                and existing.stage == loaded.stage
+            )
+            existing_branches = (
+                {"pos", "neg"} if existing.branch == "both" else {existing.branch}
+            )
+            loaded_branches = {"pos", "neg"} if loaded.branch == "both" else {loaded.branch}
+            if same_stage and existing_branches & loaded_branches:
+                raise ValueError(
+                    "shape block injection manifest has duplicate active stage for "
+                    f"block {loaded.block_index}: {loaded.stage}"
+                )
+        sites.append(loaded)
 
     return ShapeBlockInjectionSet(
         manifest_path=manifest_path,

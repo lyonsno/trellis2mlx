@@ -318,6 +318,59 @@ def test_load_shape_block_injection_manifest_routes_multiple_source_cuda_sites(t
     assert len(identity["sites"]) == 2
 
 
+def test_shape_block_manifest_routes_ordered_same_block_sites_and_rejects_duplicate_stage(
+    tmp_path,
+):
+    from trellmlx.shape_block_injection import load_shape_block_injection_manifest
+
+    trace = tmp_path / "block29.npz"
+    route_identity = np.asarray(
+        json.dumps(
+            {
+                "effective_route": "official-trellis2-source-cuda-shape-flow-block-trace",
+                "effective_device_type": "cuda",
+            }
+        )
+    )
+    np.savez_compressed(
+        trace,
+        pos_block29_after_self=np.ones((1, 3, 4), dtype=np.float32),
+        pos_block29_cross_attention_raw=np.ones((1, 3, 1, 4), dtype=np.float32),
+        route_identity_json=route_identity,
+        trace_block_index=np.asarray([29], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+    manifest = tmp_path / "join.json"
+    sites = [
+        {
+            "trace_path": str(trace),
+            "branch": "pos",
+            "step_index": 0,
+            "block_index": 29,
+            "stage": "cross_attention_raw",
+        },
+        {
+            "trace_path": str(trace),
+            "branch": "pos",
+            "step_index": 0,
+            "block_index": 29,
+            "stage": "after_self",
+        },
+    ]
+    manifest.write_text(json.dumps({"sites": sites}))
+
+    injection_set = load_shape_block_injection_manifest(manifest)
+
+    assert [
+        injection.stage for injection in injection_set.injections_for_block(29)
+    ] == ["after_self", "cross_attention_raw"]
+
+    sites.append(dict(sites[-1]))
+    manifest.write_text(json.dumps({"sites": sites}))
+    with pytest.raises(ValueError, match="duplicate active stage.*block 29.*after_self"):
+        load_shape_block_injection_manifest(manifest)
+
+
 def test_stage_capture_records_and_forwards_shape_injection_manifest(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
@@ -525,6 +578,92 @@ def test_modulated_block_injects_cross_attention_raw_before_output_projection(
     np.testing.assert_array_equal(np.array(traced_out), np.full((2, 4), expected_raw * 3))
 
 
+def test_modulated_block_joins_after_self_and_cross_attention_raw_injections():
+    import mlx.core as mx
+
+    from trellmlx.models.sparse_structure_flow import ModulatedBlock
+    from trellmlx.shape_block_injection import ShapeBlockInjection
+
+    class ZeroSelfAttention:
+        def __call__(self, x, rope_phases=None):
+            return mx.zeros_like(x)
+
+        def trace_self_attention(self, x, rope_phases=None, trace_prefix="block0"):
+            raw = mx.zeros_like(x)
+            return raw, {f"{trace_prefix}_attention_raw": raw}
+
+    class RecordingCrossAttention:
+        def trace_cross_attention(
+            self, x, context=None, cached_kv=None, trace_prefix="block0"
+        ):
+            raw = mx.ones_like(x) * 7
+            return mx.ones_like(x) * 99, {f"{trace_prefix}_cross_attention_raw": raw}
+
+        def to_out(self, x):
+            return x * 3
+
+    class ZeroMLP:
+        def __call__(self, x):
+            return mx.zeros_like(x)
+
+        def mlp_0(self, x):
+            return mx.zeros_like(x)
+
+        def mlp_2(self, x):
+            return mx.zeros_like(x)
+
+    def injection(stage, value):
+        array = np.full((1, 2, 4), value, dtype=np.float32)
+        return ShapeBlockInjection(
+            trace_path=None,
+            array_key=f"pos_block29_{stage}",
+            branch="pos",
+            step_index=0,
+            block_index=29,
+            stage=stage,
+            arrays_by_branch={"pos": array},
+            source_shapes_by_branch={"pos": array.shape},
+            trace_identity={},
+        )
+
+    block = ModulatedBlock(channels=4, num_heads=1, context_channels=4, mlp_hidden=4)
+    block.self_attn = ZeroSelfAttention()
+    block.cross_attn = RecordingCrossAttention()
+    block.mlp = ZeroMLP()
+    injections = (
+        injection("after_self", 5.0),
+        injection("cross_attention_raw", 2.0),
+    )
+    zeros = mx.zeros((2, 4), dtype=mx.float32)
+    context = mx.zeros((1, 1, 4), dtype=mx.float32)
+    mod = mx.zeros((24,), dtype=mx.float32)
+
+    out = block.forward_with_injection(
+        zeros,
+        mod,
+        context,
+        injection=injections,
+        branch="pos",
+    )
+    traced_out, trace = block.trace(
+        zeros,
+        mod,
+        context,
+        trace_prefix="block29",
+        injection=injections,
+        branch="pos",
+    )
+    mx.eval(out, traced_out, *trace.values())
+
+    np.testing.assert_array_equal(np.array(out), np.full((2, 4), 11.0))
+    np.testing.assert_array_equal(np.array(trace["block29_after_self"]), np.full((2, 4), 5.0))
+    np.testing.assert_array_equal(
+        np.array(trace["block29_cross_attention_raw"]), np.full((2, 4), 2.0)
+    )
+    np.testing.assert_array_equal(np.array(trace["block29_after_cross"]), np.full((2, 4), 11.0))
+    np.testing.assert_array_equal(np.array(traced_out), np.full((2, 4), 11.0))
+
+
 def test_slat_flow_routes_shape_injection_to_named_block():
     import mlx.core as mx
 
@@ -580,6 +719,70 @@ def test_slat_flow_routes_shape_injection_to_named_block():
 
     assert not blocks[0].injected
     assert blocks[1].injected
+
+
+def test_slat_flow_routes_all_ordered_injections_for_one_block():
+    import mlx.core as mx
+
+    from trellmlx.models.slat_flow import SLatFlowModel
+    from trellmlx.shape_block_injection import ShapeBlockInjection, ShapeBlockInjectionSet
+
+    class RecordingBlock:
+        def __init__(self, index):
+            self.index = index
+            self.stages = []
+
+        def __call__(self, x, mod, cond, rope_phases=None, cross_kv_cache=None):
+            return x
+
+        def forward_with_injection(
+            self, x, mod, cond, *, injection, branch, rope_phases=None, cross_kv_cache=None
+        ):
+            self.stages = [site.stage for site in injection]
+            assert branch == "pos"
+            return x
+
+    def injection(stage):
+        array = np.zeros((1, 2, 4), dtype=np.float32)
+        return ShapeBlockInjection(
+            trace_path=None,
+            array_key=f"pos_block1_{stage}",
+            branch="pos",
+            step_index=0,
+            block_index=1,
+            stage=stage,
+            arrays_by_branch={"pos": array},
+            source_shapes_by_branch={"pos": array.shape},
+            trace_identity={},
+        )
+
+    model = SLatFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=4,
+        num_heads=1,
+        num_blocks=2,
+        mlp_hidden=8,
+        context_channels=4,
+    )
+    blocks = [RecordingBlock(0), RecordingBlock(1)]
+    model.blocks = blocks
+    injection_set = ShapeBlockInjectionSet(
+        manifest_path=None,
+        sites=(injection("cross_attention_raw"), injection("after_self")),
+        manifest_identity={},
+    )
+
+    model(
+        mx.zeros((2, 2), dtype=mx.float32),
+        mx.array([1000.0], dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        shape_block_injection=injection_set,
+        shape_block_injection_branch="pos",
+    )
+
+    assert blocks[0].stages == []
+    assert blocks[1].stages == ["after_self", "cross_attention_raw"]
 
 
 def test_flow_sampler_dispatches_shape_injection_only_at_named_step_and_branch():

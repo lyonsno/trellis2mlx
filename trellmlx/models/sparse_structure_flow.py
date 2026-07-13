@@ -400,19 +400,22 @@ class ModulatedBlock(nn.Module):
             )
         else:
             h = _layernorm_noaffine(x)
-        if injection.stage == "norm1":
-            h = _injected_tensor_like(injection, h, branch=branch)
+        norm1_injection = _injection_at_stage(injection, "norm1")
+        if norm1_injection is not None:
+            h = _injected_tensor_like(norm1_injection, h, branch=branch)
         h = h * (1 + scale_msa) + shift_msa
-        if injection.stage == "modulated_self_input":
-            h = _injected_tensor_like(injection, h, branch=branch)
-        if injection.stage == "attention_raw":
+        modulated_injection = _injection_at_stage(injection, "modulated_self_input")
+        if modulated_injection is not None:
+            h = _injected_tensor_like(modulated_injection, h, branch=branch)
+        attention_injection = _injection_at_stage(injection, "attention_raw")
+        if attention_injection is not None:
             _, attn_trace = self.self_attn.trace_self_attention(
                 h,
                 rope_phases=rope_phases,
                 trace_prefix="injected",
             )
             h = _injected_tensor_like(
-                injection,
+                attention_injection,
                 attn_trace["injected_attention_raw"],
                 branch=branch,
             )
@@ -421,11 +424,13 @@ class ModulatedBlock(nn.Module):
             h = self.self_attn(h, rope_phases=rope_phases)
         h = h * gate_msa
         x = x + h
-        if injection.stage == "after_self":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_self_injection = _injection_at_stage(injection, "after_self")
+        if after_self_injection is not None:
+            x = _injected_tensor_like(after_self_injection, x, branch=branch)
 
         h = self.norm2(x)
-        if injection.stage == "cross_attention_raw":
+        cross_attention_injection = _injection_at_stage(injection, "cross_attention_raw")
+        if cross_attention_injection is not None:
             _, cross_trace = self.cross_attn.trace_cross_attention(
                 h,
                 context,
@@ -433,7 +438,7 @@ class ModulatedBlock(nn.Module):
                 trace_prefix="injected",
             )
             h = _injected_tensor_like(
-                injection,
+                cross_attention_injection,
                 cross_trace["injected_cross_attention_raw"],
                 branch=branch,
             )
@@ -443,16 +448,18 @@ class ModulatedBlock(nn.Module):
         else:
             h = self.cross_attn(h, context)
         x = x + h
-        if injection.stage == "after_cross":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_cross_injection = _injection_at_stage(injection, "after_cross")
+        if after_cross_injection is not None:
+            x = _injected_tensor_like(after_cross_injection, x, branch=branch)
 
         h = _layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
         x = x + h
-        if injection.stage == "after_mlp":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_mlp_injection = _injection_at_stage(injection, "after_mlp")
+        if after_mlp_injection is not None:
+            x = _injected_tensor_like(after_mlp_injection, x, branch=branch)
         return x
 
     def trace(
@@ -494,21 +501,24 @@ class ModulatedBlock(nn.Module):
             )
         else:
             h = _layernorm_noaffine(x)
-        if injection is not None and injection.stage == "norm1":
-            h = _injected_tensor_like(injection, h, branch=branch)
+        norm1_injection = _injection_at_stage(injection, "norm1")
+        if norm1_injection is not None:
+            h = _injected_tensor_like(norm1_injection, h, branch=branch)
         trace[f"{trace_prefix}_norm1"] = h
         h = h * (1 + scale_msa) + shift_msa
-        if injection is not None and injection.stage == "modulated_self_input":
-            h = _injected_tensor_like(injection, h, branch=branch)
+        modulated_injection = _injection_at_stage(injection, "modulated_self_input")
+        if modulated_injection is not None:
+            h = _injected_tensor_like(modulated_injection, h, branch=branch)
         trace[f"{trace_prefix}_modulated_self_input"] = h
         h, attn_trace = self.self_attn.trace_self_attention(
             h,
             rope_phases=rope_phases,
             trace_prefix=trace_prefix,
         )
-        if injection is not None and injection.stage == "attention_raw":
+        attention_injection = _injection_at_stage(injection, "attention_raw")
+        if attention_injection is not None:
             attention_raw = _injected_tensor_like(
-                injection,
+                attention_injection,
                 attn_trace[f"{trace_prefix}_attention_raw"],
                 branch=branch,
             )
@@ -518,8 +528,9 @@ class ModulatedBlock(nn.Module):
         trace[f"{trace_prefix}_self_attn"] = h
         h = h * gate_msa
         x = x + h
-        if injection is not None and injection.stage == "after_self":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_self_injection = _injection_at_stage(injection, "after_self")
+        if after_self_injection is not None:
+            x = _injected_tensor_like(after_self_injection, x, branch=branch)
         trace[f"{trace_prefix}_after_self"] = x
 
         h = self.norm2(x)
@@ -530,9 +541,10 @@ class ModulatedBlock(nn.Module):
             cached_kv=cross_kv_cache,
             trace_prefix=trace_prefix,
         )
-        if injection is not None and injection.stage == "cross_attention_raw":
+        cross_attention_injection = _injection_at_stage(injection, "cross_attention_raw")
+        if cross_attention_injection is not None:
             cross_attention_raw = _injected_tensor_like(
-                injection,
+                cross_attention_injection,
                 cross_trace[f"{trace_prefix}_cross_attention_raw"],
                 branch=branch,
             )
@@ -541,8 +553,9 @@ class ModulatedBlock(nn.Module):
         trace.update(cross_trace)
         trace[f"{trace_prefix}_cross_attn"] = h
         x = x + h
-        if injection is not None and injection.stage == "after_cross":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_cross_injection = _injection_at_stage(injection, "after_cross")
+        if after_cross_injection is not None:
+            x = _injected_tensor_like(after_cross_injection, x, branch=branch)
         trace[f"{trace_prefix}_after_cross"] = x
 
         h = _layernorm_noaffine(x)
@@ -558,8 +571,9 @@ class ModulatedBlock(nn.Module):
         h = h * gate_mlp
         trace[f"{trace_prefix}_mlp_gated"] = h
         x = x + h
-        if injection is not None and injection.stage == "after_mlp":
-            x = _injected_tensor_like(injection, x, branch=branch)
+        after_mlp_injection = _injection_at_stage(injection, "after_mlp")
+        if after_mlp_injection is not None:
+            x = _injected_tensor_like(after_mlp_injection, x, branch=branch)
         trace[f"{trace_prefix}_after_mlp"] = x
 
         return x, trace
@@ -578,6 +592,27 @@ def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
 
 def _is_rowwise_layernorm_correction(injection) -> bool:
     return getattr(injection, "stage", None) in {"norm1_rowwise_scale", "norm1_rowwise_bias"}
+
+
+def _injection_at_stage(injection, stage: str):
+    if injection is None:
+        return None
+    candidates = injection if isinstance(injection, (tuple, list)) else (injection,)
+    matches = [candidate for candidate in candidates if getattr(candidate, "stage", None) == stage]
+    if len(matches) > 1:
+        raise ValueError(f"multiple active shape block injections target stage {stage!r}")
+    return matches[0] if matches else None
+
+
+def _injections_for_block(injection, block_index: int):
+    if injection is None:
+        return None
+    if hasattr(injection, "injections_for_block"):
+        matches = injection.injections_for_block(block_index)
+        return matches or None
+    if hasattr(injection, "injection_for_block"):
+        return injection.injection_for_block(block_index)
+    return injection if block_index == injection.block_index else None
 
 
 def _layernorm_noaffine_rowwise_perturbed(
@@ -828,10 +863,7 @@ class SparseStructureFlowModel(nn.Module):
             block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
             block_injection = None
             if sparse_block_injection is not None:
-                if hasattr(sparse_block_injection, "injection_for_block"):
-                    block_injection = sparse_block_injection.injection_for_block(i)
-                elif i == sparse_block_injection.block_index:
-                    block_injection = sparse_block_injection
+                block_injection = _injections_for_block(sparse_block_injection, i)
             if i == block_index:
                 trace_prefix = f"block{block_index}"
                 trace[f"{trace_prefix}_input"] = x
@@ -946,10 +978,7 @@ class SparseStructureFlowModel(nn.Module):
         trace: dict[str, mx.array] = {f"{trace_prefix}_input": x}
         block_injection = None
         if sparse_block_injection is not None:
-            if hasattr(sparse_block_injection, "injection_for_block"):
-                block_injection = sparse_block_injection.injection_for_block(block_index)
-            elif block_index == sparse_block_injection.block_index:
-                block_injection = sparse_block_injection
+            block_injection = _injections_for_block(sparse_block_injection, block_index)
         x_after, block_trace = self.blocks[block_index].trace(
             x,
             mod[0],
@@ -1013,10 +1042,7 @@ class SparseStructureFlowModel(nn.Module):
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
                 block_injection = None
                 if sparse_block_injection is not None:
-                    if hasattr(sparse_block_injection, "injection_for_block"):
-                        block_injection = sparse_block_injection.injection_for_block(i)
-                    elif i == sparse_block_injection.block_index:
-                        block_injection = sparse_block_injection
+                    block_injection = _injections_for_block(sparse_block_injection, i)
                 if block_injection is not None:
                     x = block.forward_with_injection(
                         x,

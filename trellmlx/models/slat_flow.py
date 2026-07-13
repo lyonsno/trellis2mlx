@@ -26,6 +26,7 @@ from .sparse_structure_flow import (
     _infer_compute_dtype,
     _cast_block_linears,
     _source_shared_modulation,
+    _injections_for_block,
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
@@ -151,10 +152,7 @@ class SLatFlowModel(nn.Module):
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
                 block_injection = None
                 if shape_block_injection is not None:
-                    if hasattr(shape_block_injection, "injection_for_block"):
-                        block_injection = shape_block_injection.injection_for_block(i)
-                    elif i == shape_block_injection.block_index:
-                        block_injection = shape_block_injection
+                    block_injection = _injections_for_block(shape_block_injection, i)
                 if block_injection is None:
                     x = block(x, mod[0], cond, rope_phases=rope_phases,
                               cross_kv_cache=block_kv)
@@ -241,10 +239,7 @@ class SLatFlowModel(nn.Module):
                 trace[f"{trace_prefix}_input"] = x
                 block_injection = None
                 if shape_block_injection is not None:
-                    if hasattr(shape_block_injection, "injection_for_block"):
-                        block_injection = shape_block_injection.injection_for_block(i)
-                    elif i == shape_block_injection.block_index:
-                        block_injection = shape_block_injection
+                    block_injection = _injections_for_block(shape_block_injection, i)
                 x_after, block_trace = block.trace(
                     x,
                     mod[0],
@@ -267,10 +262,7 @@ class SLatFlowModel(nn.Module):
                 break
             block_injection = None
             if shape_block_injection is not None:
-                if hasattr(shape_block_injection, "injection_for_block"):
-                    block_injection = shape_block_injection.injection_for_block(i)
-                elif i == shape_block_injection.block_index:
-                    block_injection = shape_block_injection
+                block_injection = _injections_for_block(shape_block_injection, i)
             if block_injection is None:
                 x = block(
                     x,

@@ -112,6 +112,11 @@ def summarize_replays(
 ) -> dict[str, Any]:
     if not candidates:
         raise ReplayContractError("at least one replay candidate is required")
+    candidate_names = [candidate.name for candidate in candidates]
+    if "source" in candidate_names or len(candidate_names) != len(set(candidate_names)):
+        raise ReplayContractError(
+            f"duplicate replay candidate names or reserved source name: {candidate_names}"
+        )
     _require_file(source_trace_path, "source trace")
     _require_file(source_step_path, "source step")
     source_trace_identity = _file_identity(source_trace_path)
@@ -260,10 +265,16 @@ def summarize_replays(
     if len(depths) != len(set(depths)):
         raise ReplayContractError(f"replay candidates contain duplicate intervention depths: {depths}")
     main_chain_parent: str | None = None
-    prefix_parent = next(
-        (row["name"] for row in replay_rows if row["intervention_stage"] == "prefix28"),
-        None,
-    )
+    prefix_parents = [
+        row["name"] for row in replay_rows if row["intervention_stage"] == "prefix28"
+    ]
+    if any(row["intervention_topology"] == "side_branch" for row in replay_rows):
+        if len(prefix_parents) != 1:
+            raise ReplayContractError(
+                "operation replay side branch requires exactly one validated prefix28 parent; "
+                f"found {prefix_parents}"
+            )
+    prefix_parent = prefix_parents[0] if prefix_parents else None
     for row in replay_rows:
         if row["intervention_topology"] == "main_chain":
             row["causal_parent"] = main_chain_parent

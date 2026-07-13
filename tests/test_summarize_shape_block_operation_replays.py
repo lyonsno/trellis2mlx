@@ -381,11 +381,16 @@ def test_summary_derives_intervention_depth_from_validated_stage_not_argument_or
         block_input=sample, stage="after_mlp",
         block29_trace_sha256=source_sha,
     )
+    natural = _write_trace(
+        tmp_path / "natural.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class=None, block_input=sample,
+    )
     report = summarize_replays(
         source_trace_path=source,
         source_step_path=step,
         candidates=[
             CandidateSpec("after_mlp", after_mlp, "exact_source_cuda_prefix28_plus_block29_after_mlp"),
+            CandidateSpec("natural", natural, None),
             CandidateSpec("after_cross", after_cross, "exact_source_cuda_prefix28_plus_block29_after_cross"),
             CandidateSpec(
                 "cross_attention_raw", cross_attention_raw,
@@ -403,12 +408,65 @@ def test_summary_derives_intervention_depth_from_validated_stage_not_argument_or
         )
         for row in report["replay_rows"]
     ] == [
-        ("after_self", 2, "main_chain", None),
-        ("cross_attention_raw", 3, "side_branch", None),
+        ("natural", 0, "main_chain", None),
+        ("after_self", 2, "main_chain", "natural"),
+        ("cross_attention_raw", 3, "side_branch", "natural"),
         ("after_cross", 4, "main_chain", "after_self"),
         ("after_mlp", 5, "main_chain", "after_cross"),
         ("source", 6, "main_chain", "after_mlp"),
     ]
+
+
+def test_summary_rejects_orphan_side_branch_and_duplicate_candidate_names(tmp_path: Path) -> None:
+    from scripts.summarize_shape_block_operation_replays import (
+        CandidateSpec,
+        ReplayContractError,
+        summarize_replays,
+    )
+
+    source, step, coords, sample, pos, neg = _write_source_pair(tmp_path)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    cross_attention_raw = _write_trace(
+        tmp_path / "orphan-cross-raw.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        block_input=sample, stage="cross_attention_raw", block29_trace_sha256=source_sha,
+    )
+    after_self = _write_trace(
+        tmp_path / "duplicate-after-self.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_self",
+        block_input=sample, stage="after_self", block29_trace_sha256=source_sha,
+    )
+
+    with pytest.raises(ReplayContractError, match="side branch.*prefix28 parent"):
+        summarize_replays(
+            source_trace_path=source,
+            source_step_path=step,
+            candidates=[
+                CandidateSpec(
+                    "cross_attention_raw",
+                    cross_attention_raw,
+                    "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+                )
+            ],
+        )
+
+    with pytest.raises(ReplayContractError, match="duplicate replay candidate names"):
+        summarize_replays(
+            source_trace_path=source,
+            source_step_path=step,
+            candidates=[
+                CandidateSpec(
+                    "duplicate",
+                    cross_attention_raw,
+                    "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+                ),
+                CandidateSpec(
+                    "duplicate",
+                    after_self,
+                    "exact_source_cuda_prefix28_plus_block29_after_self",
+                ),
+            ],
+        )
 
 
 def test_summary_rejects_direct_model_time_schedule_mismatch_and_bad_source_euler(tmp_path: Path) -> None:
