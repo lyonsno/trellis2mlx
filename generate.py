@@ -671,6 +671,20 @@ def main():
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
+    parser.add_argument("--shape-flow-block-injection-trace", metavar="NPZ",
+                        help="Diagnostic: inject a named shape-flow attention_raw tensor from an NPZ trace.")
+    parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0,
+                        help="Diagnostic: shape-flow sampler step where block injection applies.")
+    parser.add_argument("--shape-flow-block-injection-block-index", type=int, default=1,
+                        help="Diagnostic: shape-flow block where block injection applies.")
+    parser.add_argument("--shape-flow-block-injection-branch",
+                        choices=["pos", "neg", "both"], default="both",
+                        help="Diagnostic: shape-flow CFG branch where block injection applies.")
+    parser.add_argument("--shape-flow-block-injection-stage",
+                        choices=["attention_raw"], default="attention_raw",
+                        help="Diagnostic: shape-flow block tensor stage to replace.")
+    parser.add_argument("--shape-flow-block-injection-array-key",
+                        help="Diagnostic: explicit trace array key for single-branch shape injection.")
     parser.add_argument("--checkpoint-stop-file", metavar="PATH",
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
@@ -730,6 +744,8 @@ def main():
         parser.error("--compile is not supported with sparse-flow block injection")
     if args.sparse_flow_layernorm_correction_report and args.compile:
         parser.error("--compile is not supported with sparse-flow LayerNorm correction")
+    if args.shape_flow_block_injection_trace and args.compile:
+        parser.error("--compile is not supported with shape-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
@@ -1604,6 +1620,24 @@ def main():
     if args.compile:
         lr_slat_flow.compile()
 
+    shape_block_injection = None
+    shape_block_injection_json = ""
+    if args.shape_flow_block_injection_trace:
+        from trellmlx.shape_block_injection import load_shape_block_injection
+
+        shape_block_injection = load_shape_block_injection(
+            args.shape_flow_block_injection_trace,
+            branch=args.shape_flow_block_injection_branch,
+            step_index=args.shape_flow_block_injection_step_index,
+            block_index=args.shape_flow_block_injection_block_index,
+            stage=args.shape_flow_block_injection_stage,
+            array_key=args.shape_flow_block_injection_array_key,
+        )
+        shape_block_injection_json = json.dumps(
+            shape_block_injection.report_identity(),
+            sort_keys=True,
+        )
+
     N_lr = len(lr_coords)
     if args.shape_flow_noise_sample:
         shape_flow_noise_sample_npz = np.load(args.shape_flow_noise_sample)
@@ -1699,6 +1733,13 @@ def main():
             coords=mx.array(lr_coords),
             block_index=shape_trace_block_index,
             cross_kv_cache=shape_pos_kv_cache,
+            shape_block_injection=(
+                shape_block_injection
+                if shape_block_injection is not None
+                and shape_block_injection.applies(step_index=shape_trace_step_index, branch="pos")
+                else None
+            ),
+            shape_block_injection_branch="pos",
         )
         neg_trace = lr_slat_flow.trace_block(
             shape_trace_sample,
@@ -1707,6 +1748,13 @@ def main():
             coords=mx.array(lr_coords),
             block_index=shape_trace_block_index,
             cross_kv_cache=shape_neg_kv_cache,
+            shape_block_injection=(
+                shape_block_injection
+                if shape_block_injection is not None
+                and shape_block_injection.applies(step_index=shape_trace_step_index, branch="neg")
+                else None
+            ),
+            shape_block_injection_branch="neg",
         )
 
         def trace_np(value):
@@ -1739,6 +1787,7 @@ def main():
             guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+            shape_flow_block_injection_json=np.array(shape_block_injection_json),
         )
         print(
             f"  Stop after stage: shape_flow_block_trace step={shape_trace_step_index} "
@@ -1753,6 +1802,7 @@ def main():
         coords=mx.array(lr_coords),
         capture_first_step=shape_step_capture,
         stop_after_first_step=args.stop_after_stage == "shape_flow_step",
+        shape_block_injection=shape_block_injection,
         **SHAPE_SAMPLER,
     )
     mx.eval(lr_slat)
@@ -1790,6 +1840,7 @@ def main():
             guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+            shape_flow_block_injection_json=np.array(shape_block_injection_json),
         )
         print("  Stop after stage: shape_flow_step", flush=True)
         return

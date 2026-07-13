@@ -28,6 +28,7 @@ def flow_euler_sample(
     stop_after_first_step: bool = False,
     start_step_index: int = 0,
     sparse_block_injection=None,
+    shape_block_injection=None,
     **model_kwargs,
 ):
     """Generate samples using flow-matching Euler sampling with CFG.
@@ -94,6 +95,7 @@ def flow_euler_sample(
             kw = _branch_model_kwargs(
                 model_kwargs,
                 sparse_block_injection=sparse_block_injection,
+                shape_block_injection=shape_block_injection,
                 step_index=step_idx,
                 branch="pos",
             )
@@ -103,6 +105,7 @@ def flow_euler_sample(
             kw_neg = _branch_model_kwargs(
                 model_kwargs,
                 sparse_block_injection=sparse_block_injection,
+                shape_block_injection=shape_block_injection,
                 step_index=step_idx,
                 branch="neg",
             )
@@ -146,6 +149,7 @@ def flow_euler_sample(
             kw = _branch_model_kwargs(
                 model_kwargs,
                 sparse_block_injection=sparse_block_injection,
+                shape_block_injection=shape_block_injection,
                 step_index=step_idx,
                 branch="pos",
             )
@@ -217,6 +221,7 @@ def _branch_model_kwargs(
     model_kwargs: dict,
     *,
     sparse_block_injection,
+    shape_block_injection,
     step_index: int,
     branch: str,
 ) -> dict:
@@ -235,6 +240,14 @@ def _branch_model_kwargs(
             )
         kw["sparse_block_injection_branch"] = branch
         kw["sparse_block_injection"] = active_injection
+    if shape_block_injection is not None:
+        active_injection = (
+            shape_block_injection
+            if shape_block_injection.applies(step_index=step_index, branch=branch)
+            else None
+        )
+        kw["shape_block_injection_branch"] = branch
+        kw["shape_block_injection"] = active_injection
     return kw
 
 

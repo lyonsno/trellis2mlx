@@ -115,6 +115,8 @@ class SLatFlowModel(nn.Module):
         coords: mx.array = None,  # [N, 3] voxel coordinates for RoPE
         concat_cond: mx.array = None,  # [N, C'] features to concatenate with x
         cross_kv_cache: list = None,  # precomputed cross-attention KV per block
+        shape_block_injection=None,
+        shape_block_injection_branch: str | None = None,
     ) -> mx.array:
         input_dtype = x.dtype
         N = x.shape[0]
@@ -142,13 +144,30 @@ class SLatFlowModel(nn.Module):
 
         # Run through blocks (B=1 assumed)
         # KV cache is incompatible with compiled path (fixed function signature)
-        if self._compiled and cross_kv_cache is None:
+        if self._compiled and cross_kv_cache is None and shape_block_injection is None:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
-                x = block(x, mod[0], cond, rope_phases=rope_phases,
-                          cross_kv_cache=block_kv)
+                block_injection = None
+                if shape_block_injection is not None:
+                    if hasattr(shape_block_injection, "injection_for_block"):
+                        block_injection = shape_block_injection.injection_for_block(i)
+                    elif i == shape_block_injection.block_index:
+                        block_injection = shape_block_injection
+                if block_injection is None:
+                    x = block(x, mod[0], cond, rope_phases=rope_phases,
+                              cross_kv_cache=block_kv)
+                else:
+                    x = block.forward_with_injection(
+                        x,
+                        mod[0],
+                        cond,
+                        injection=block_injection,
+                        branch=shape_block_injection_branch or "pos",
+                        rope_phases=rope_phases,
+                        cross_kv_cache=block_kv,
+                    )
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 
@@ -190,6 +209,8 @@ class SLatFlowModel(nn.Module):
         coords: mx.array = None,
         block_index: int = 0,
         cross_kv_cache: list = None,
+        shape_block_injection=None,
+        shape_block_injection_branch: str | None = None,
     ) -> dict[str, mx.array]:
         if block_index < 0 or block_index >= len(self.blocks):
             raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
@@ -218,6 +239,12 @@ class SLatFlowModel(nn.Module):
             if i == block_index:
                 trace_prefix = f"block{block_index}"
                 trace[f"{trace_prefix}_input"] = x
+                block_injection = None
+                if shape_block_injection is not None:
+                    if hasattr(shape_block_injection, "injection_for_block"):
+                        block_injection = shape_block_injection.injection_for_block(i)
+                    elif i == shape_block_injection.block_index:
+                        block_injection = shape_block_injection
                 x_after, block_trace = block.trace(
                     x,
                     mod[0],
@@ -225,6 +252,8 @@ class SLatFlowModel(nn.Module):
                     rope_phases=rope_phases,
                     cross_kv_cache=block_kv,
                     trace_prefix=trace_prefix,
+                    injection=block_injection,
+                    branch=shape_block_injection_branch or "pos",
                 )
                 trace.update(block_trace)
                 if i == len(self.blocks) - 1:
@@ -236,13 +265,30 @@ class SLatFlowModel(nn.Module):
                     trace["final_out_flat"] = x_final
                     trace["final_output"] = x_final
                 break
-            x = block(
-                x,
-                mod[0],
-                cond,
-                rope_phases=rope_phases,
-                cross_kv_cache=block_kv,
-            )
+            block_injection = None
+            if shape_block_injection is not None:
+                if hasattr(shape_block_injection, "injection_for_block"):
+                    block_injection = shape_block_injection.injection_for_block(i)
+                elif i == shape_block_injection.block_index:
+                    block_injection = shape_block_injection
+            if block_injection is None:
+                x = block(
+                    x,
+                    mod[0],
+                    cond,
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
+            else:
+                x = block.forward_with_injection(
+                    x,
+                    mod[0],
+                    cond,
+                    injection=block_injection,
+                    branch=shape_block_injection_branch or "pos",
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
             if (i + 1) % 6 == 0:
                 mx.eval(x)
         mx.eval(*trace.values())

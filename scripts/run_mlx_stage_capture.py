@@ -118,6 +118,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-noise-sample")
+    parser.add_argument("--shape-flow-block-injection-trace")
+    parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0)
+    parser.add_argument("--shape-flow-block-injection-block-index", type=int, default=1)
+    parser.add_argument(
+        "--shape-flow-block-injection-branch",
+        choices=["pos", "neg", "both"],
+        default="both",
+    )
+    parser.add_argument(
+        "--shape-flow-block-injection-stage",
+        choices=["attention_raw"],
+        default="attention_raw",
+    )
+    parser.add_argument("--shape-flow-block-injection-array-key")
     return parser
 
 
@@ -224,6 +238,19 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
+            "shape_flow_block_injection_trace_path": (
+                str(Path(args.shape_flow_block_injection_trace))
+                if args.shape_flow_block_injection_trace else None
+            ),
+            "shape_flow_block_injection_trace_sha256": (
+                _sha256_file(args.shape_flow_block_injection_trace)
+                if args.shape_flow_block_injection_trace else None
+            ),
+            "shape_flow_block_injection_step_index": args.shape_flow_block_injection_step_index,
+            "shape_flow_block_injection_block_index": args.shape_flow_block_injection_block_index,
+            "shape_flow_block_injection_branch": args.shape_flow_block_injection_branch,
+            "shape_flow_block_injection_stage": args.shape_flow_block_injection_stage,
+            "shape_flow_block_injection_array_key": args.shape_flow_block_injection_array_key,
             "shape_flow_noise_sample_path": (
                 str(Path(args.shape_flow_noise_sample))
                 if args.shape_flow_noise_sample else None
@@ -450,6 +477,24 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             "--shape-flow-noise-sample",
             str(Path(args.shape_flow_noise_sample)),
         ])
+    if args.shape_flow_block_injection_trace:
+        command.extend([
+            "--shape-flow-block-injection-trace",
+            str(Path(args.shape_flow_block_injection_trace)),
+            "--shape-flow-block-injection-step-index",
+            str(args.shape_flow_block_injection_step_index),
+            "--shape-flow-block-injection-block-index",
+            str(args.shape_flow_block_injection_block_index),
+            "--shape-flow-block-injection-branch",
+            args.shape_flow_block_injection_branch,
+            "--shape-flow-block-injection-stage",
+            args.shape_flow_block_injection_stage,
+        ])
+        if args.shape_flow_block_injection_array_key:
+            command.extend([
+                "--shape-flow-block-injection-array-key",
+                args.shape_flow_block_injection_array_key,
+            ])
     return command
 
 

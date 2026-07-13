@@ -405,7 +405,20 @@ class ModulatedBlock(nn.Module):
         h = h * (1 + scale_msa) + shift_msa
         if injection.stage == "modulated_self_input":
             h = _injected_tensor_like(injection, h, branch=branch)
-        h = self.self_attn(h, rope_phases=rope_phases)
+        if injection.stage == "attention_raw":
+            _, attn_trace = self.self_attn.trace_self_attention(
+                h,
+                rope_phases=rope_phases,
+                trace_prefix="injected",
+            )
+            h = _injected_tensor_like(
+                injection,
+                attn_trace["injected_attention_raw"],
+                branch=branch,
+            )
+            h = self.self_attn.to_out(h)
+        else:
+            h = self.self_attn(h, rope_phases=rope_phases)
         h = h * gate_msa
         x = x + h
         if injection.stage == "after_self":
@@ -480,6 +493,14 @@ class ModulatedBlock(nn.Module):
             rope_phases=rope_phases,
             trace_prefix=trace_prefix,
         )
+        if injection is not None and injection.stage == "attention_raw":
+            attention_raw = _injected_tensor_like(
+                injection,
+                attn_trace[f"{trace_prefix}_attention_raw"],
+                branch=branch,
+            )
+            attn_trace[f"{trace_prefix}_attention_raw"] = attention_raw
+            h = self.self_attn.to_out(attention_raw)
         trace.update(attn_trace)
         trace[f"{trace_prefix}_self_attn"] = h
         h = h * gate_msa
@@ -616,7 +637,7 @@ def _injected_tensor_like(injection, reference: mx.array, *, branch: str) -> mx.
         injected = injected[0]
     if injected.shape != reference.shape:
         raise ValueError(
-            "sparse block injection shape mismatch for "
+            "block injection shape mismatch for "
             f"{branch} {injection.stage}: expected {reference.shape}, got {injected.shape}"
         )
     return injected
