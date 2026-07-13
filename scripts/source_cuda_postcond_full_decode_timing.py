@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-npz", required=True, type=Path)
     parser.add_argument("--output-ply", default=Path("cuda_result_mesh.ply"), type=Path)
     parser.add_argument("--output-mesh-state", type=Path)
+    parser.add_argument("--output-shape-slat", type=Path)
     parser.add_argument("--conditioning", default="conditioning.npz", type=Path)
     parser.add_argument("--conditioning-1024", type=Path)
     parser.add_argument("--source-tar", default="trellis2_source_tarball.bin", type=Path)
@@ -145,11 +146,14 @@ def main(argv: list[str] | None = None) -> int:
         output_npz = Path(args.output_npz)
         output_ply = Path(args.output_ply)
         output_mesh_state = Path(args.output_mesh_state) if args.output_mesh_state is not None else None
+        output_shape_slat = Path(args.output_shape_slat) if args.output_shape_slat is not None else None
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         output_ply.parent.mkdir(parents=True, exist_ok=True)
         if output_mesh_state is not None:
             output_mesh_state.parent.mkdir(parents=True, exist_ok=True)
+        if output_shape_slat is not None:
+            output_shape_slat.parent.mkdir(parents=True, exist_ok=True)
 
         phase = "validate_args"
         if args.steps <= 0:
@@ -377,6 +381,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 report["output_mesh_state"] = str(output_mesh_state)
         report["mesh_artifacts"] = mesh_artifacts
+        if output_shape_slat is not None:
+            report["shape_slat_artifact"] = write_sparse_tensor_npz(
+                output_shape_slat,
+                shape_slat,
+                stage="shape_slat",
+                normalization=pipeline_args["shape_slat_normalization"],
+            )
 
         np.savez(
             output_npz,
@@ -554,6 +565,48 @@ def write_mesh_state_npz(path: Path, mesh: Any) -> None:
         voxel_shape=voxel_shape,
         layout_json=np.asarray(layout_json),
     )
+
+
+def write_sparse_tensor_npz(
+    path: Path,
+    value: Any,
+    *,
+    stage: str,
+    normalization: str,
+) -> dict[str, Any]:
+    coords = tensor_to_numpy(value.coords).astype(np.int32, copy=False)
+    feats = tensor_to_numpy(value.feats).astype(np.float32, copy=False)
+    if coords.ndim != 2:
+        raise ValueError(f"sparse tensor coords must have shape [N, D], got {coords.shape}")
+    if feats.ndim != 2:
+        raise ValueError(f"sparse tensor feats must have shape [N, C], got {feats.shape}")
+    if coords.shape[0] != feats.shape[0]:
+        raise ValueError(
+            "sparse tensor coords/feats row mismatch: "
+            f"{coords.shape[0]} coords vs {feats.shape[0]} feats"
+        )
+    metadata = {
+        "artifact_scope": "source_cuda_shape_slat",
+        "normalization": normalization,
+        "stage": stage,
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        coords=np.ascontiguousarray(coords),
+        feats=np.ascontiguousarray(feats),
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+    return {
+        **metadata,
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "format": "sparse_tensor_npz",
+        "coords_shape": [int(v) for v in coords.shape],
+        "feats_shape": [int(v) for v in feats.shape],
+    }
 
 
 def serialize_layout(layout: dict[str, Any]) -> dict[str, list[int | None]]:

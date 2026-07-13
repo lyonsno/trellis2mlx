@@ -79,6 +79,7 @@ def test_postcond_decode_runner_defaults_mesh_override_input():
 
     assert args.mesh_override == Path("o_voxel_override_convert.py")
     assert args.output_mesh_state is None
+    assert args.output_shape_slat is None
 
 
 def test_install_mesh_override_copies_into_source_stubs(tmp_path):
@@ -173,4 +174,42 @@ def test_write_mesh_state_npz_preserves_voxel_payload(tmp_path):
         "metallic": [3, 4, None],
         "roughness": [4, 5, None],
         "alpha": [5, 6, None],
+    }
+
+
+def test_write_sparse_tensor_npz_preserves_coords_feats_and_metadata(tmp_path):
+    import json
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_sparse_tensor_npz
+
+    class SparseTensor:
+        coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int64)
+        feats = np.array([[1.5, -2.0], [3.25, 4.5]], dtype=np.float32)
+
+    output = tmp_path / "shape_slat.npz"
+
+    artifact = write_sparse_tensor_npz(
+        output,
+        SparseTensor(),
+        stage="shape_slat",
+        normalization="source-config",
+    )
+
+    assert artifact["path"] == str(output)
+    assert artifact["format"] == "sparse_tensor_npz"
+    assert artifact["artifact_scope"] == "source_cuda_shape_slat"
+    assert artifact["coords_shape"] == [2, 4]
+    assert artifact["feats_shape"] == [2, 2]
+    assert artifact["sha256"]
+
+    with np.load(output) as data:
+        np.testing.assert_array_equal(data["coords"], SparseTensor.coords.astype(np.int32))
+        np.testing.assert_allclose(data["feats"], SparseTensor.feats)
+        metadata = json.loads(str(data["metadata_json"]))
+
+    assert metadata == {
+        "artifact_scope": "source_cuda_shape_slat",
+        "normalization": "source-config",
+        "stage": "shape_slat",
     }
