@@ -50,6 +50,31 @@ def test_route_identity_records_effective_inputs_and_trace_scope(tmp_path):
     assert route["steps"] == 8
     assert route["seed"] == 42
     assert route["branch"] == "both"
+    assert route["block_input_replay_sample"] is None
+    assert route["block_input_replay_scope"] == []
+
+
+def test_route_identity_records_block_input_replay_scope(tmp_path):
+    replay = tmp_path / "mlx-block-inputs.npz"
+    route = trace.build_route_identity(
+        device_type="cuda",
+        output_npz=tmp_path / "trace.npz",
+        conditioning_path=tmp_path / "conditioning.npz",
+        support_sample_path=tmp_path / "support.npz",
+        noise_sample_path=tmp_path / "noise.npz",
+        block_indices=[1],
+        trace_names=["input", "after_mlp"],
+        steps=8,
+        seed=42,
+        branch="both",
+        block_input_replay_sample=replay,
+        block_input_replay_scope=["pos_block1_input", "neg_block1_input"],
+    )
+
+    assert route["effective_route"].endswith("-with-captured-block-input-replay")
+    assert route["block_input_replay_sample"] == str(replay)
+    assert route["block_input_replay_scope"] == ["pos_block1_input", "neg_block1_input"]
+    assert "not a captured-MLX-block-input replay" not in route["forbidden_inferences"]
 
 
 def test_load_support_and_noise_rejects_coordinate_mismatch(tmp_path):
@@ -84,6 +109,51 @@ def test_load_support_and_noise_accepts_legacy_latents_key(tmp_path):
     assert np.array_equal(loaded.coords, coords)
     assert np.array_equal(loaded.coords_3d, coords_3d)
     assert np.array_equal(loaded.noise, latents)
+
+
+def test_load_block_input_replay_accepts_batched_requested_inputs(tmp_path):
+    replay = tmp_path / "replay.npz"
+    pos = np.arange(12, dtype=np.float32).reshape(1, 2, 6)
+    neg = np.arange(12, 24, dtype=np.float32).reshape(2, 6)
+    np.savez(replay, pos_block1_input=pos, neg_block1_input=neg)
+
+    loaded = trace.load_block_input_replay(
+        replay,
+        branches=["pos", "neg"],
+        block_indices=[1],
+        token_count=2,
+    )
+
+    assert set(loaded.arrays) == {("pos", 1), ("neg", 1)}
+    assert np.array_equal(loaded.arrays[("pos", 1)], pos[0])
+    assert np.array_equal(loaded.arrays[("neg", 1)], neg)
+    assert loaded.scope == ["pos_block1_input", "neg_block1_input"]
+
+
+def test_load_block_input_replay_rejects_missing_requested_key(tmp_path):
+    replay = tmp_path / "replay.npz"
+    np.savez(replay, pos_block1_input=np.zeros((1, 2, 6), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="missing neg_block1_input"):
+        trace.load_block_input_replay(
+            replay,
+            branches=["pos", "neg"],
+            block_indices=[1],
+            token_count=2,
+        )
+
+
+def test_load_block_input_replay_rejects_wrong_token_count(tmp_path):
+    replay = tmp_path / "replay.npz"
+    np.savez(replay, pos_block1_input=np.zeros((1, 3, 6), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="token count"):
+        trace.load_block_input_replay(
+            replay,
+            branches=["pos"],
+            block_indices=[1],
+            token_count=2,
+        )
 
 
 def test_trace_names_parser_preserves_order_and_all_expansion():
