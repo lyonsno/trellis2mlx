@@ -85,6 +85,71 @@ def test_load_shape_attention_raw_injection_rejects_unidentified_or_wrong_site_t
         )
 
 
+def test_load_shape_block_injection_selects_member_of_multi_block_cuda_trace(tmp_path):
+    from trellmlx.shape_block_injection import load_shape_block_injection
+
+    trace = tmp_path / "source_cuda_boundaries.npz"
+    block23 = np.arange(3 * 4, dtype=np.float32).reshape(1, 3, 4)
+    np.savez_compressed(
+        trace,
+        pos_block23_after_mlp=block23,
+        route_identity_json=np.asarray(
+            json.dumps(
+                {
+                    "effective_route": "microsoft-trellis2-cuda-t4",
+                    "effective_device_type": "cuda",
+                    "shape_flow_trace_block_indices": [19, 23, 27],
+                }
+            )
+        ),
+        trace_block_indices=np.asarray([19, 23, 27], dtype=np.int32),
+        trace_block_index=np.asarray([19], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+
+    injection = load_shape_block_injection(
+        trace,
+        branch="pos",
+        step_index=0,
+        block_index=23,
+        stage="after_mlp",
+    )
+
+    np.testing.assert_array_equal(injection.array_for_branch("pos"), block23)
+    assert injection.trace_identity["shape_flow_trace_block_indices"] == [19, 23, 27]
+
+
+def test_load_shape_block_injection_rejects_multi_block_route_identity_mismatch(tmp_path):
+    from trellmlx.shape_block_injection import load_shape_block_injection
+
+    trace = tmp_path / "misidentified_boundaries.npz"
+    np.savez_compressed(
+        trace,
+        pos_block19_after_mlp=np.ones((1, 3, 4), dtype=np.float32),
+        route_identity_json=np.asarray(
+            json.dumps(
+                {
+                    "effective_route": "microsoft-trellis2-cuda-t4",
+                    "effective_device_type": "cuda",
+                    "shape_flow_trace_block_indices": [23],
+                }
+            )
+        ),
+        trace_block_indices=np.asarray([19], dtype=np.int32),
+        trace_block_index=np.asarray([19], dtype=np.int32),
+        shape_flow_trace_step_index=np.asarray([0], dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="block indices.*route identity"):
+        load_shape_block_injection(
+            trace,
+            branch="pos",
+            step_index=0,
+            block_index=19,
+            stage="after_mlp",
+        )
+
+
 def test_load_shape_norm1_injection_preserves_hidden_shape_and_records_stage(tmp_path):
     from trellmlx.shape_block_injection import load_shape_block_injection
 

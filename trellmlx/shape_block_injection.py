@@ -175,11 +175,11 @@ def load_shape_block_injection(
                 "shape block injection requires effective_device_type='cuda', got "
                 f"{trace_identity.get('effective_device_type')!r}"
             )
-        source_block_index = _required_scalar(trace, "trace_block_index")
-        if int(source_block_index) != int(block_index):
+        source_block_indices = _trace_block_indices(trace, trace_identity)
+        if int(block_index) not in source_block_indices:
             raise ValueError(
-                f"shape block injection trace block index {int(source_block_index)} "
-                f"does not match requested {int(block_index)}"
+                f"shape block injection trace block indices {source_block_indices} "
+                f"do not contain requested {int(block_index)}"
             )
         source_step_index = _required_scalar(trace, "shape_flow_trace_step_index")
         if int(source_step_index) != int(step_index):
@@ -280,6 +280,36 @@ def _required_scalar(trace: np.lib.npyio.NpzFile, key: str) -> Any:
     if value.size != 1:
         raise ValueError(f"shape block injection trace {key} must contain exactly one value")
     return value.reshape(-1)[0]
+
+
+def _trace_block_indices(
+    trace: np.lib.npyio.NpzFile,
+    trace_identity: dict[str, Any],
+) -> list[int]:
+    if "trace_block_indices" not in trace.files:
+        return [int(_required_scalar(trace, "trace_block_index"))]
+
+    raw = np.asarray(trace["trace_block_indices"])
+    if raw.size == 0 or raw.dtype.kind not in {"i", "u"}:
+        raise ValueError("shape block injection trace_block_indices must contain integers")
+    indices = [int(value) for value in raw.reshape(-1)]
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"shape block injection trace_block_indices contains duplicates: {indices}")
+
+    scalar = int(_required_scalar(trace, "trace_block_index"))
+    if scalar != indices[0]:
+        raise ValueError(
+            f"shape block injection trace block index {scalar} does not match first "
+            f"trace_block_indices value {indices[0]}"
+        )
+
+    identity_indices = trace_identity.get("shape_flow_trace_block_indices")
+    if not isinstance(identity_indices, list) or identity_indices != indices:
+        raise ValueError(
+            f"shape block injection trace block indices {indices} do not match route identity "
+            f"{identity_indices!r}"
+        )
+    return indices
 
 
 def _sha256_file(path: str | Path | None) -> str | None:
