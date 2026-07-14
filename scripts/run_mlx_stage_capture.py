@@ -12,6 +12,8 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
+
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +152,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
     image_path = str(Path(args.image))
     output_dir = str(Path(args.output_dir))
     target_faces = _resolve_target_faces(args)
+    shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
     return {
         "schema": SCHEMA,
         "route": {
@@ -249,7 +252,13 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
-            "shape_flow_trace_keys": _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys),
+            "shape_flow_trace_key_selection": (
+                "explicit" if shape_flow_trace_requested_keys else "full"
+            ),
+            "shape_flow_trace_requested_keys": shape_flow_trace_requested_keys,
+            "shape_flow_trace_keys": (
+                shape_flow_trace_requested_keys if shape_flow_trace_requested_keys else None
+            ),
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -359,10 +368,19 @@ def main(argv: list[str] | None = None) -> int:
     output_written = checkpoint_npz.exists() or checkpoint_json.exists()
     status = "done" if result.returncode == 0 and output_written else "failed"
     failure_phase = None
+    route_binding_error = None
     if result.returncode != 0:
         failure_phase = "generate_subprocess"
     elif not output_written:
         failure_phase = "missing_primary_output"
+    elif args.stop_after_stage == "shape_flow_block_trace":
+        try:
+            _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
+            _write_json(output_dir / "route_identity.json", route_identity)
+        except (OSError, ValueError) as exc:
+            status = "failed"
+            failure_phase = "bind_effective_route_identity"
+            route_binding_error = str(exc)
 
     _write_json(
         output_dir / "run_report.json",
@@ -375,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "primary_output_status": "written" if output_written else "missing",
             "failure_phase": failure_phase,
+            "error": route_binding_error,
             "exit_code": result.returncode,
             "elapsed_seconds": {"generate_subprocess": elapsed},
             "artifacts": _artifact_status(checkpoint_dir, args.stop_after_stage),
@@ -382,7 +401,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     if result.returncode != 0:
         return result.returncode
-    return 0 if output_written else 2
+    return 0 if status == "done" else 2
+
+
+def _bind_effective_shape_flow_trace_keys(
+    route_identity: dict[str, Any], checkpoint_path: Path
+) -> None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "shape_flow_trace_selected_keys" not in checkpoint:
+            raise ValueError("shape-flow trace omits effective selected-key metadata")
+        selected = np.asarray(checkpoint["shape_flow_trace_selected_keys"])
+        if selected.ndim != 1:
+            raise ValueError("shape-flow effective selected keys must be a one-dimensional list")
+        effective_keys = [str(value) for value in selected.tolist()]
+        if not effective_keys or any(not key for key in effective_keys):
+            raise ValueError("shape-flow effective selected keys must be non-empty")
+        if len(set(effective_keys)) != len(effective_keys):
+            raise ValueError("shape-flow effective selected keys contain duplicates")
+        missing = [key for key in effective_keys if key not in checkpoint]
+        if missing:
+            raise ValueError(f"shape-flow trace omits effective selected arrays: {missing}")
+
+    requested = route.get("shape_flow_trace_requested_keys")
+    if not isinstance(requested, list):
+        raise ValueError("route identity omits requested shape-flow trace keys")
+    selection = route.get("shape_flow_trace_key_selection")
+    if selection not in {"explicit", "full"}:
+        raise ValueError(f"unsupported shape-flow trace key selection {selection!r}")
+    if selection == "full" and requested:
+        raise ValueError("full shape-flow trace selection cannot carry requested keys")
+    if selection == "explicit" and not requested:
+        raise ValueError("explicit shape-flow trace selection must carry requested keys")
+    if selection == "explicit" and effective_keys != requested:
+        raise ValueError("shape-flow effective selected keys differ from the explicit request")
+    route["shape_flow_trace_keys"] = effective_keys
 
 
 def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> list[str]:

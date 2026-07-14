@@ -88,6 +88,7 @@ def _write_run_evidence(output_dir: Path, manifest_path: Path, trace_path: Path)
         "shape_flow_block_injection_manifest_sha256": manifest_sha,
         "shape_flow_trace_block_index": 29,
         "shape_flow_trace_step_index": 0,
+        "shape_flow_trace_key_selection": "explicit",
         "shape_flow_trace_keys": [
             "pos_block29_after_self",
             "pos_block29_cross_attention_raw",
@@ -183,6 +184,40 @@ def test_grid_plan_writes_full_cartesian_manifests_and_semantic_corners(tmp_path
         assert manifest["sites"][1]["source_delta_scale"] == point["coordinate"]["alpha"]
         assert manifest["sites"][2]["source_delta_scale"] == point["coordinate"]["beta"]
         assert point["expected_trace_path"].endswith("/checkpoints/shape_flow_block_trace.npz")
+
+
+def test_grid_plan_cli_rejects_duplicate_control_coordinates(tmp_path: Path) -> None:
+    from scripts.build_shape_block_intervention_grid import main
+
+    common = [
+        "--manifest-dir",
+        str(tmp_path / "manifests"),
+        "--run-root",
+        str(tmp_path / "runs"),
+        "--index-json",
+        str(tmp_path / "index.json"),
+        "--prefix-trace",
+        str(tmp_path / "prefix.npz"),
+        "--block29-trace",
+        str(tmp_path / "block29.npz"),
+        "--alphas",
+        "0,1",
+        "--betas",
+        "0,1",
+    ]
+
+    with pytest.raises(ValueError, match="duplicate control coordinate.*1.0.*1.0"):
+        main(
+            common
+            + [
+                "--control",
+                f"1,1={tmp_path / 'join-a.npz'}",
+                "--control",
+                f"1,1={tmp_path / 'join-b.npz'}",
+            ]
+        )
+
+    assert not (tmp_path / "index.json").exists()
 
 
 @pytest.mark.parametrize("axis", [(0.0, 0.0), (0.0, float("nan")), (float("inf"),)])
@@ -363,6 +398,7 @@ def test_grid_summary_route_rejects_incomplete_effective_trace_key_selection() -
         "shape_flow_block_injection_manifest_sha256": "5" * 64,
         "shape_flow_trace_block_index": 29,
         "shape_flow_trace_step_index": 0,
+        "shape_flow_trace_key_selection": "explicit",
         "shape_flow_trace_keys": ["pos_final_output", "neg_final_output"],
         "steps": 8,
     }

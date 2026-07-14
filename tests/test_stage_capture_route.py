@@ -780,6 +780,22 @@ def test_generate_shape_flow_block_trace_filters_selected_payload_keys():
         generate._filter_shape_flow_trace_payload(payload, ["not_present"])
 
 
+def test_generate_shape_flow_full_trace_materializes_effective_key_order():
+    import generate
+    import numpy as np
+
+    payload = {
+        "pos_block29_after_self": np.ones((1, 2, 3), dtype=np.float32),
+        "pos_final_output": np.zeros((1, 2, 3), dtype=np.float32),
+        "neg_final_output": np.full((1, 2, 3), 2, dtype=np.float32),
+    }
+
+    filtered, effective = generate._select_shape_flow_trace_payload(payload, [])
+
+    assert filtered is payload
+    assert effective == list(payload)
+
+
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():
     source = GENERATE_SOURCE.read_text()
 
@@ -949,6 +965,57 @@ def test_stage_capture_wrapper_forwards_shape_flow_trace_keys(tmp_path):
         "pos_final_output",
         "neg_final_output",
     ]
+    assert route_identity["route"]["shape_flow_trace_key_selection"] == "explicit"
+    assert route_identity["route"]["shape_flow_trace_requested_keys"] == route_identity["route"][
+        "shape_flow_trace_keys"
+    ]
+
+
+def test_stage_capture_binds_omitted_full_shape_trace_keys_from_primary_output(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_trace_keys,
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+        ]
+    )
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+    checkpoint = tmp_path / "checkpoints" / "shape_flow_block_trace.npz"
+    checkpoint.parent.mkdir()
+    effective = ["pos_block29_after_self", "pos_final_output", "neg_final_output"]
+    np.savez(
+        checkpoint,
+        shape_flow_trace_selected_keys=np.asarray(effective),
+        pos_block29_after_self=np.zeros((1, 2, 3), dtype=np.float32),
+        pos_final_output=np.zeros((1, 2, 3), dtype=np.float32),
+        neg_final_output=np.zeros((1, 2, 3), dtype=np.float32),
+    )
+
+    assert route_identity["route"]["shape_flow_trace_key_selection"] == "full"
+    assert route_identity["route"]["shape_flow_trace_requested_keys"] == []
+    assert route_identity["route"]["shape_flow_trace_keys"] is None
+
+    _bind_effective_shape_flow_trace_keys(route_identity, checkpoint)
+
+    assert route_identity["route"]["shape_flow_trace_keys"] == effective
+
+    route_identity["route"]["shape_flow_trace_key_selection"] = "stale-default"
+    with pytest.raises(ValueError, match="unsupported shape-flow trace key selection"):
+        _bind_effective_shape_flow_trace_keys(route_identity, checkpoint)
 
 
 def test_stage_capture_wrapper_forwards_sparse_block_injection_route(tmp_path):

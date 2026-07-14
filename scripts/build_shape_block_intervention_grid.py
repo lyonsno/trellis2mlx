@@ -134,7 +134,7 @@ def build_grid_plan(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    controls = dict(_parse_control(value) for value in args.control)
+    controls = _parse_controls(args.control)
     build_grid_plan(
         manifest_dir=args.manifest_dir,
         run_root=args.run_root,
@@ -146,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         control_references=controls,
     )
     return 0
+
+
+def _parse_controls(values: Iterable[str]) -> dict[tuple[float, float], Path]:
+    controls: dict[tuple[float, float], Path] = {}
+    for value in values:
+        coordinate, path = _parse_control(value)
+        if coordinate in controls:
+            raise ValueError(f"duplicate control coordinate {coordinate}")
+        controls[coordinate] = path
+    return controls
 
 
 def _validate_axis(values: Iterable[float], *, name: str) -> tuple[float, ...]:

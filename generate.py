@@ -114,6 +114,13 @@ def _filter_shape_flow_trace_payload(
     return {key: payload[key] for key in selected_keys}
 
 
+def _select_shape_flow_trace_payload(
+    payload: dict[str, np.ndarray], requested_keys: list[str]
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    effective_keys = requested_keys or list(payload)
+    return _filter_shape_flow_trace_payload(payload, requested_keys), effective_keys
+
+
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
@@ -1821,8 +1828,10 @@ def main():
                 for name, value in neg_trace.items()
             }
         )
-        selected_trace_keys = _parse_shape_flow_trace_keys(args.shape_flow_trace_keys)
-        trace_payload = _filter_shape_flow_trace_payload(trace_payload, selected_trace_keys)
+        requested_trace_keys = _parse_shape_flow_trace_keys(args.shape_flow_trace_keys)
+        trace_payload, effective_trace_keys = _select_shape_flow_trace_payload(
+            trace_payload, requested_trace_keys
+        )
         save_checkpoint(
             args.save_checkpoints,
             "shape_flow_block_trace",
@@ -1831,7 +1840,8 @@ def main():
             coords_3d=lr_coords.astype(np.int32, copy=False),
             trace_block_index=np.array(shape_trace_block_index, dtype=np.int32),
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
-            shape_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str),
+            shape_flow_trace_requested_keys=np.array(requested_trace_keys, dtype=str),
+            shape_flow_trace_selected_keys=np.array(effective_trace_keys, dtype=str),
             shape_slat_support_sample_path=np.array(args.shape_slat_support_sample or ""),
             t=np.array(1000.0 * shape_trace_t, dtype=np.float32),
             steps=np.array(n_steps, dtype=np.int32),

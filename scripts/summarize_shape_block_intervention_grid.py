@@ -38,6 +38,7 @@ ROUTE_FIELDS = (
     "shared_noise_sha256",
     "shape_flow_trace_block_index",
     "shape_flow_trace_step_index",
+    "shape_flow_trace_key_selection",
     "shape_flow_trace_keys",
     "steps",
 )
@@ -249,6 +250,8 @@ def _route_vector(route: Any, *, name: str) -> dict:
         vector["shape_flow_trace_step_index"]
     ) != 0:
         raise ValueError(f"{name} route did not capture block29 at step0")
+    if vector["shape_flow_trace_key_selection"] != "explicit":
+        raise ValueError(f"{name} trace key selection was not explicit")
     if vector["shape_flow_trace_keys"] != list(COMPARED_ARRAYS):
         raise ValueError(
             f"{name} effective trace key selection does not match the evidence contract"
