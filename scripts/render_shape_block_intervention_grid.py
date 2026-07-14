@@ -42,7 +42,9 @@ def main(argv: list[str] | None = None) -> int:
             raise GridRenderContractError(f"summary is missing or blank: {args.summary_json}")
         summary = json.loads(args.summary_json.read_text(encoding="utf-8"))
         phase = "validate_summary"
-        validate_summary(summary)
+        effective_route = validate_summary(summary)
+        summary = dict(summary)
+        summary["route_vector"] = effective_route
         phase = "render_html"
         html = render_html(summary, summary_sha256=str(summary_sha))
         args.output_html.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def validate_summary(summary: Any) -> None:
+def validate_summary(summary: Any) -> dict[str, Any]:
     if not isinstance(summary, dict):
         raise GridRenderContractError("summary must be an object")
     if summary.get("schema") != SUMMARY_SCHEMA:
@@ -103,7 +105,7 @@ def validate_summary(summary: Any) -> None:
 
     route = summary.get("route_vector")
     try:
-        _route_vector(route, name="summary")
+        effective_route = _route_vector(route, name="summary")
     except (TypeError, ValueError) as exc:
         raise GridRenderContractError(
             f"summary route is not the complete admitted MLX Metal/fast route: {exc}"
@@ -164,6 +166,7 @@ def validate_summary(summary: Any) -> None:
         raise GridRenderContractError("geometry axes differ from summary axes")
     _validate_quotients(geometry.get("quotient_classes"), expected_coordinates, point_digests)
     _validate_cells(geometry.get("cells"), tuple(sorted(alphas)), tuple(sorted(betas)))
+    return effective_route
 
 
 def _validate_quotients(

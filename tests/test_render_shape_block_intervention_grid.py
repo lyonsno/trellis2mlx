@@ -255,3 +255,42 @@ def test_renderer_cli_writes_route_bound_report_and_failure_before_html(tmp_path
     assert failure["failure_phase"] == "validate_summary"
     assert failure["summary_sha256"] == hashlib.sha256(summary_path.read_bytes()).hexdigest()
     assert not html_path.exists()
+
+
+def test_renderer_cli_reports_and_embeds_only_canonical_effective_route(tmp_path: Path) -> None:
+    from scripts.render_shape_block_intervention_grid import main
+    from scripts.summarize_shape_block_intervention_grid import ROUTE_FIELDS
+
+    summary = _summary()
+    summary["route_vector"].update(
+        {
+            "shape_flow_trace_block_index": "29",
+            "shape_flow_trace_step_index": "0",
+            "steps": "8",
+            "unvalidated_claim": "cuda",
+        }
+    )
+    summary_path = tmp_path / "summary.json"
+    html_path = tmp_path / "grid.html"
+    report_path = tmp_path / "render-report.json"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    assert main(
+        [
+            "--summary-json",
+            str(summary_path),
+            "--output-html",
+            str(html_path),
+            "--output-report",
+            str(report_path),
+        ]
+    ) == 0
+
+    report = json.loads(report_path.read_text())
+    effective_route = report["effective_route"]
+    assert set(effective_route) == set(ROUTE_FIELDS)
+    assert effective_route["shape_flow_trace_block_index"] == 29
+    assert effective_route["shape_flow_trace_step_index"] == 0
+    assert effective_route["steps"] == 8
+    assert "unvalidated_claim" not in effective_route
+    assert "unvalidated_claim" not in html_path.read_text()
