@@ -96,6 +96,16 @@ def _summary() -> dict:
             "family": "trellis2mlx/mlx",
             "backend": "mlx-metal",
             "attention_backend": "fast",
+            "repo_root": "/worktree",
+            "conditioning_sample_sha256": "1" * 64,
+            "shape_flow_noise_sample_sha256": "2" * 64,
+            "shape_slat_support_sample_sha256": "3" * 64,
+            "shared_noise_sha256": "4" * 64,
+            "shape_flow_trace_block_index": 29,
+            "shape_flow_trace_step_index": 0,
+            "shape_flow_trace_key_selection": "explicit",
+            "shape_flow_trace_keys": list(COMPARED_ARRAYS),
+            "steps": 8,
         },
         "source_trace": "/evidence/source.npz",
         "source_trace_sha256": "b" * 64,
@@ -163,6 +173,39 @@ def test_renderer_rejects_untrusted_or_incomplete_summary(fault: str) -> None:
         summary["coordinate_geometry"]["cells"][0]["arrays"][array_name][
             "mixed_second_difference"
         ]["l2_norm"] = math.inf
+
+    with pytest.raises(GridRenderContractError):
+        validate_summary(summary)
+
+
+@pytest.mark.parametrize(
+    ("fault", "value"),
+    [
+        ("partial", None),
+        ("shape_flow_trace_block_index", 28),
+        ("shape_flow_trace_step_index", 1),
+        ("shape_flow_trace_key_selection", "full"),
+        ("shape_flow_trace_keys", None),
+        ("shape_flow_trace_keys", ["pos_final_output"]),
+    ],
+)
+def test_renderer_rejects_partial_or_wrong_effective_route(fault: str, value: object) -> None:
+    from scripts.render_shape_block_intervention_grid import (
+        GridRenderContractError,
+        validate_summary,
+    )
+
+    summary = copy.deepcopy(_summary())
+    if fault == "partial":
+        summary["route_vector"] = {
+            "family": "trellis2mlx/mlx",
+            "backend": "mlx-metal",
+            "attention_backend": "fast",
+        }
+    elif value is None:
+        summary["route_vector"].pop(fault)
+    else:
+        summary["route_vector"][fault] = value
 
     with pytest.raises(GridRenderContractError):
         validate_summary(summary)

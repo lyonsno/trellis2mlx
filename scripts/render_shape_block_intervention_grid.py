@@ -13,6 +13,7 @@ from scripts.summarize_shape_block_intervention_grid import (
     COMPARED_ARRAYS,
     COMPARISON_CLASS,
     SUMMARY_SCHEMA,
+    _route_vector,
 )
 
 
@@ -101,10 +102,12 @@ def validate_summary(summary: Any) -> None:
     _require_sha(summary.get("source_trace_sha256"), "source trace")
 
     route = summary.get("route_vector")
-    if not isinstance(route, dict) or (
-        route.get("family"), route.get("backend"), route.get("attention_backend")
-    ) != ("trellis2mlx/mlx", "mlx-metal", "fast"):
-        raise GridRenderContractError("summary route is not the admitted MLX Metal/fast route")
+    try:
+        _route_vector(route, name="summary")
+    except (TypeError, ValueError) as exc:
+        raise GridRenderContractError(
+            f"summary route is not the complete admitted MLX Metal/fast route: {exc}"
+        ) from exc
 
     axes = summary.get("axes")
     if not isinstance(axes, dict):
