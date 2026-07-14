@@ -88,6 +88,20 @@ def _write_run_evidence(output_dir: Path, manifest_path: Path, trace_path: Path)
         "shape_flow_block_injection_manifest_sha256": manifest_sha,
         "shape_flow_trace_block_index": 29,
         "shape_flow_trace_step_index": 0,
+        "shape_flow_trace_keys": [
+            "pos_block29_after_self",
+            "pos_block29_cross_attention_raw",
+            "pos_block29_cross_attn",
+            "pos_block29_after_cross",
+            "pos_block29_after_mlp",
+            "pos_final_output",
+            "neg_block29_after_self",
+            "neg_block29_cross_attention_raw",
+            "neg_block29_cross_attn",
+            "neg_block29_after_cross",
+            "neg_block29_after_mlp",
+            "neg_final_output",
+        ],
         "steps": 8,
     }
     (output_dir / "route_identity.json").write_text(
@@ -332,3 +346,26 @@ def test_grid_summary_cli_writes_failure_report_before_primary_summary(tmp_path:
     assert report["status"] == "failed"
     assert report["failure_phase"] == "admit_grid_runs"
     assert report["last_trustworthy_evidence"]["grid_index"] == str(index)
+
+
+def test_grid_summary_route_rejects_incomplete_effective_trace_key_selection() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _route_vector
+
+    route = {
+        "family": "trellis2mlx/mlx",
+        "backend": "mlx-metal",
+        "attention_backend": "fast",
+        "repo_root": "/worktree",
+        "conditioning_sample_sha256": "1" * 64,
+        "shape_flow_noise_sample_sha256": "2" * 64,
+        "shape_slat_support_sample_sha256": "3" * 64,
+        "shared_noise_sha256": "4" * 64,
+        "shape_flow_block_injection_manifest_sha256": "5" * 64,
+        "shape_flow_trace_block_index": 29,
+        "shape_flow_trace_step_index": 0,
+        "shape_flow_trace_keys": ["pos_final_output", "neg_final_output"],
+        "steps": 8,
+    }
+
+    with pytest.raises(ValueError, match="trace key selection"):
+        _route_vector(route, name="incomplete")

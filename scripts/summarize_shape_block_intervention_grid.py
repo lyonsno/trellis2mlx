@@ -38,6 +38,7 @@ ROUTE_FIELDS = (
     "shared_noise_sha256",
     "shape_flow_trace_block_index",
     "shape_flow_trace_step_index",
+    "shape_flow_trace_keys",
     "steps",
 )
 SHA_FIELDS = {
@@ -248,6 +249,10 @@ def _route_vector(route: Any, *, name: str) -> dict:
         vector["shape_flow_trace_step_index"]
     ) != 0:
         raise ValueError(f"{name} route did not capture block29 at step0")
+    if vector["shape_flow_trace_keys"] != list(COMPARED_ARRAYS):
+        raise ValueError(
+            f"{name} effective trace key selection does not match the evidence contract"
+        )
     for field in SHA_FIELDS:
         _require_sha256(vector[field], f"{name} {field}")
     vector["shape_flow_trace_block_index"] = int(vector["shape_flow_trace_block_index"])
