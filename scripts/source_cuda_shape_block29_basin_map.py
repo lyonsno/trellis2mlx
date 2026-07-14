@@ -296,6 +296,17 @@ def _schedule_pairs(steps: int, rescale_t: float) -> list[tuple[float, float]]:
     return [(float(t_seq[i]), float(t_seq[i + 1])) for i in range(steps)]
 
 
+def route_values_match(actual: Any, expected: Any) -> bool:
+    try:
+        actual_values = np.asarray(actual, dtype=np.float32)
+        expected_values = np.asarray(expected, dtype=np.float32)
+    except (TypeError, ValueError):
+        return False
+    return actual_values.shape == expected_values.shape and np.array_equal(
+        actual_values, expected_values
+    )
+
+
 def _target_tensors(
     endpoints: dict[str, np.ndarray], *, alpha: float, beta: float, torch: Any, device: Any
 ) -> dict[tuple[str, str], Any]:
@@ -686,11 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             expected = noise_route[key]
             actual = sampler_params[key]
-            if isinstance(expected, list):
-                matches = [float(v) for v in actual] == expected
-            else:
-                matches = float(actual) == float(expected)
-            if not matches:
+            if not route_values_match(actual, expected):
                 raise ValueError(f"pipeline/noise route mismatch for {key}: {actual} != {expected}")
         sampler = getattr(samplers, pipeline_args["shape_slat_sampler"]["name"])(
             **pipeline_args["shape_slat_sampler"]["args"]

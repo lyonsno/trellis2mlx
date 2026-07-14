@@ -152,6 +152,23 @@ def test_execution_order_checks_source_then_current_before_middle_points():
     assert set(ordered) == set(requested)
 
 
+def test_route_values_match_float32_round_trip_but_reject_real_delta():
+    from scripts import source_cuda_shape_block29_basin_map as basin_map
+
+    def pre_fix_match(actual, expected):
+        if isinstance(expected, list):
+            return [float(value) for value in actual] == expected
+        return float(actual) == float(expected)
+
+    matches = getattr(basin_map, "route_values_match", pre_fix_match)
+    float32_interval = [float(np.float32(0.6)), float(np.float32(1.0))]
+
+    assert matches([0.6, 1.0], float32_interval)
+    assert matches(0.5, float(np.float32(0.5)))
+    assert not matches([0.61, 1.0], float32_interval)
+    assert not matches(0.51, float(np.float32(0.5)))
+
+
 def test_validate_result_requires_exact_source_control_and_all_requested_points():
     from scripts.source_cuda_shape_block29_basin_map import validate_result_manifest
 
