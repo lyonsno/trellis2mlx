@@ -215,6 +215,7 @@ def test_cli_rejects_same_shaped_corrupt_endpoint_before_primary_output(tmp_path
     source_tar.write_bytes(b"not blank")
     report = tmp_path / "failure.json"
     output = tmp_path / "result.npz"
+    output.write_bytes(b"stale primary from an earlier run")
 
     status = main(
         [
@@ -255,6 +256,7 @@ def test_cli_malformed_axes_write_request_validation_report(tmp_path, flag, valu
 
     report = tmp_path / f"{flag[2:]}-failure.json"
     output = tmp_path / f"{flag[2:]}-result.npz"
+    output.write_bytes(b"stale primary from an earlier run")
     status = main(
         [
             "--output-json",
@@ -282,3 +284,35 @@ def test_cli_malformed_axes_write_request_validation_report(tmp_path, flag, valu
     assert payload["primary_output_status"] == "missing"
     assert message in payload["error"]
     assert not output.exists()
+
+
+def test_output_invalidation_refuses_to_delete_an_input_collision(tmp_path):
+    from scripts.source_cuda_shape_block29_basin_map import main
+
+    endpoints = tmp_path / "endpoints.npz"
+    _write_endpoint_packet(endpoints)
+    report = tmp_path / "failure.json"
+
+    status = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(endpoints),
+            "--endpoints",
+            str(endpoints),
+            "--conditioning",
+            str(tmp_path / "conditioning.npz"),
+            "--shape-flow-noise-sample",
+            str(tmp_path / "noise.npz"),
+            "--source-tar",
+            str(tmp_path / "source.tar.gz"),
+        ]
+    )
+
+    assert status == 1
+    assert endpoints.exists()
+    payload = json.loads(report.read_text())
+    assert payload["failure_phase"] == "request_validation"
+    assert payload["primary_output_status"] == "not_owned_due_to_path_collision"
+    assert "collides with endpoint packet" in payload["error"]

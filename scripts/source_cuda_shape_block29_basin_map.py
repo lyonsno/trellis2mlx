@@ -235,6 +235,18 @@ def _validate_file(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} is blank: {path}")
 
 
+def _invalidate_primary_output(path: Path, *, protected: dict[str, Path]) -> None:
+    output = path.resolve()
+    for label, candidate in protected.items():
+        if output == candidate.resolve():
+            raise ValueError(f"primary output path collides with {label}: {output}")
+    if not path.exists() and not path.is_symlink():
+        return
+    if not path.is_file() and not path.is_symlink():
+        raise ValueError(f"primary output path is not a file: {path}")
+    path.unlink()
+
+
 def _route_digest(metadata: dict[str, Any], route_name: str, key: str) -> str:
     route = metadata.get(route_name, {})
     value = route.get(key)
@@ -535,9 +547,25 @@ def main(argv: list[str] | None = None) -> int:
         "last_trustworthy_phase": last_trustworthy_phase,
         "phase_timings": {},
     }
+    primary_written_this_run = False
     try:
         phase = "request_validation"
         phase_started = time.perf_counter()
+        try:
+            _invalidate_primary_output(
+                args.output_npz,
+                protected={
+                    "endpoint packet": args.endpoints,
+                    "conditioning": args.conditioning,
+                    "shape-flow noise sample": args.shape_flow_noise_sample,
+                    "source tar": args.source_tar,
+                },
+            )
+        except ValueError as exc:
+            if "collides with" in str(exc) or "not a file" in str(exc):
+                report["primary_output_status"] = "not_owned_due_to_path_collision"
+            raise
+        report["primary_output_status"] = "missing"
         alphas = parse_axis_values(args.alphas, name="alpha")
         betas = parse_axis_values(args.betas, name="beta")
         coordinates = cartesian_coordinates(alphas, betas)
@@ -853,6 +881,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_started = time.perf_counter()
         args.output_npz.parent.mkdir(parents=True, exist_ok=True)
         np.savez(args.output_npz, **arrays)
+        primary_written_this_run = True
         report.update(
             {
                 "primary_output_status": "written",
@@ -871,12 +900,15 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(args.output_json, report)
         return 0
     except Exception as exc:
+        if report.get("primary_output_status") != "not_owned_due_to_path_collision":
+            report["primary_output_status"] = (
+                "written" if primary_written_this_run and args.output_npz.exists() else "missing"
+            )
         report.update(
             {
                 "status": "failed",
                 "failure_phase": phase,
                 "last_trustworthy_phase": last_trustworthy_phase,
-                "primary_output_status": "written" if args.output_npz.exists() else "missing",
                 "elapsed_seconds": time.perf_counter() - started,
                 "error": f"{type(exc).__name__}: {exc}",
             }
