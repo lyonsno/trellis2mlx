@@ -155,6 +155,31 @@ def test_rendered_grid_is_self_contained_and_preserves_causal_coordinates() -> N
     assert all(f'value="{name}"' in html for name in COMPARED_ARRAYS)
 
 
+def test_direct_renderer_embeds_only_the_canonical_effective_route() -> None:
+    from scripts.render_shape_block_intervention_grid import render_html, validate_summary
+
+    summary = _summary()
+    summary["route_vector"].update(
+        {
+            "shape_flow_trace_block_index": "29",
+            "shape_flow_trace_step_index": "0",
+            "steps": "8",
+            "unvalidated_claim": "cuda",
+        }
+    )
+    effective_route = validate_summary(summary)
+    html = render_html(summary, summary_sha256="c" * 64)
+    marker = '<script type="application/json" id="grid-data">'
+    payload_text = html.split(marker, 1)[1].split("</script>", 1)[0]
+    payload = json.loads(payload_text)
+
+    assert payload["summary"]["route_vector"] == effective_route
+    assert payload["summary"]["route_vector"]["shape_flow_trace_block_index"] == 29
+    assert payload["summary"]["route_vector"]["shape_flow_trace_step_index"] == 0
+    assert payload["summary"]["route_vector"]["steps"] == 8
+    assert "unvalidated_claim" not in payload["summary"]["route_vector"]
+
+
 @pytest.mark.parametrize("fault", ["status", "schema", "arrays", "cells", "nonfinite"])
 def test_renderer_rejects_untrusted_or_incomplete_summary(fault: str) -> None:
     from scripts.render_shape_block_intervention_grid import GridRenderContractError, validate_summary

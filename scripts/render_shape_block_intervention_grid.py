@@ -274,6 +274,9 @@ def _require_sha(value: Any, label: str) -> None:
 
 def render_html(summary: dict[str, Any], *, summary_sha256: str) -> str:
     _require_sha(summary_sha256, "summary")
+    effective_route = validate_summary(summary)
+    summary = dict(summary)
+    summary["route_vector"] = effective_route
     options = "".join(
         f'<option value="{name}"{" selected" if name == "pos_final_output" else ""}>{name}</option>'
         for name in COMPARED_ARRAYS
