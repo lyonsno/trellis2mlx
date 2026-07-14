@@ -1,7 +1,52 @@
 import json
+import hashlib
 
 import numpy as np
 import pytest
+
+
+BRANCH_STAGE_KEYS = (
+    "pos_block29_after_self",
+    "pos_block29_cross_attention_raw",
+    "neg_block29_after_self",
+    "neg_block29_cross_attention_raw",
+)
+
+
+def _write_endpoint_packet(path, *, corrupt_key=None):
+    coords = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    arrays = {"coords": coords}
+    endpoint_digests = {}
+    for index, key in enumerate(BRANCH_STAGE_KEYS):
+        endpoint_digests[key] = {}
+        for endpoint_index, endpoint in enumerate(("current", "source")):
+            values = np.full((1, 1, 4), index + endpoint_index + 1, dtype=np.float32)
+            words = (values.view(np.uint32) >> np.uint32(16)).astype(np.uint16)
+            endpoint_digests[key][f"{endpoint}_float32_sha256"] = hashlib.sha256(
+                values.tobytes()
+            ).hexdigest()
+            packed_key = f"{key}_{endpoint}_bf16_words"
+            if packed_key == corrupt_key:
+                words = words.copy()
+                words.reshape(-1)[0] ^= np.uint16(1)
+            arrays[packed_key] = words
+    metadata = {
+        "schema": "trellis2mlx.shape_block29_cuda_basin_endpoints.v1",
+        "status": "done",
+        "comparison_class": "fixed_block29_endpoint_affine_plane",
+        "endpoint_semantics": "current + scale * (source - current)",
+        "steps": 8,
+        "block_index": 29,
+        "step_index": 0,
+        "endpoint_digests": endpoint_digests,
+        "current_route": {
+            "conditioning_sample_sha256": "1" * 64,
+            "shape_flow_noise_sample_sha256": "2" * 64,
+        },
+        "source_route": {"source_tar_sha256": "3" * 64},
+    }
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(path, **arrays)
 
 
 def test_parse_axis_values_and_cartesian_coordinates_are_uncapped_and_ordered():
@@ -149,6 +194,91 @@ def test_cli_no_download_failure_records_route_and_last_trustworthy_phase(tmp_pa
     payload = json.loads(report.read_text())
     assert payload["status"] == "failed"
     assert payload["failure_phase"] == "input_validation"
-    assert payload["last_trustworthy_phase"] == "arguments_parsed"
+    assert payload["last_trustworthy_phase"] == "request_validation"
     assert payload["requested_route"]["alphas"] == [0.0, 0.5, 1.0]
     assert payload["primary_output_status"] == "missing"
+
+
+def test_cli_rejects_same_shaped_corrupt_endpoint_before_primary_output(tmp_path):
+    from scripts.source_cuda_shape_block29_basin_map import main
+
+    endpoints = tmp_path / "corrupt-endpoints.npz"
+    _write_endpoint_packet(
+        endpoints,
+        corrupt_key="pos_block29_after_self_current_bf16_words",
+    )
+    conditioning = tmp_path / "conditioning.npz"
+    noise = tmp_path / "noise.npz"
+    source_tar = tmp_path / "source.tar.gz"
+    np.savez(conditioning, cond=np.zeros((1, 1, 1)), neg_cond=np.zeros((1, 1, 1)))
+    np.savez(noise, noise=np.zeros((1, 1)), coords=np.asarray([[0, 1, 2, 3]]))
+    source_tar.write_bytes(b"not blank")
+    report = tmp_path / "failure.json"
+    output = tmp_path / "result.npz"
+
+    status = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(output),
+            "--endpoints",
+            str(endpoints),
+            "--conditioning",
+            str(conditioning),
+            "--shape-flow-noise-sample",
+            str(noise),
+            "--source-tar",
+            str(source_tar),
+            "--no-download",
+        ]
+    )
+
+    assert status == 1
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["failure_phase"] == "input_validation"
+    assert payload["primary_output_status"] == "missing"
+    assert "endpoint digest mismatch" in payload["error"]
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--alphas", "0,0.5,0.5,1", "duplicate alpha"),
+        ("--betas", "0,nan,1", "finite beta"),
+    ],
+)
+def test_cli_malformed_axes_write_request_validation_report(tmp_path, flag, value, message):
+    from scripts.source_cuda_shape_block29_basin_map import main
+
+    report = tmp_path / f"{flag[2:]}-failure.json"
+    output = tmp_path / f"{flag[2:]}-result.npz"
+    status = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(output),
+            "--endpoints",
+            str(tmp_path / "missing-endpoints.npz"),
+            "--conditioning",
+            str(tmp_path / "missing-conditioning.npz"),
+            "--shape-flow-noise-sample",
+            str(tmp_path / "missing-noise.npz"),
+            "--source-tar",
+            str(tmp_path / "missing-source.tar.gz"),
+            flag,
+            value,
+        ]
+    )
+
+    assert status == 1
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["failure_phase"] == "request_validation"
+    assert payload["last_trustworthy_phase"] == "arguments_parsed"
+    assert payload["primary_output_status"] == "missing"
+    assert message in payload["error"]
+    assert not output.exists()

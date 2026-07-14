@@ -196,7 +196,13 @@ def _load_endpoints(path: Path) -> tuple[dict[str, np.ndarray], np.ndarray, dict
         if coords.ndim != 2 or coords.shape[1] != 4:
             raise ValueError(f"endpoint coords must have shape [N,4], got {coords.shape}")
         endpoints: dict[str, np.ndarray] = {}
+        endpoint_digests = metadata.get("endpoint_digests")
+        if not isinstance(endpoint_digests, dict):
+            raise ValueError("endpoint metadata has no endpoint_digests object")
         for key in BRANCH_STAGE_KEYS:
+            key_digests = endpoint_digests.get(key)
+            if not isinstance(key_digests, dict):
+                raise ValueError(f"endpoint metadata has no digest object for {key}")
             for endpoint in ("current", "source"):
                 packed_key = f"{key}_{endpoint}_bf16_words"
                 if packed_key not in archive.files:
@@ -205,6 +211,18 @@ def _load_endpoints(path: Path) -> tuple[dict[str, np.ndarray], np.ndarray, dict
                 if values.ndim != 3 or values.shape[0] != 1 or values.shape[1] != coords.shape[0]:
                     raise ValueError(
                         f"endpoint {packed_key} must have shape [1,N,C], got {values.shape}"
+                    )
+                digest_key = f"{endpoint}_float32_sha256"
+                expected_digest = key_digests.get(digest_key)
+                if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+                    raise ValueError(
+                        f"endpoint metadata has no valid {key}.{digest_key}"
+                    )
+                actual_digest = hashlib.sha256(values.tobytes()).hexdigest()
+                if actual_digest != expected_digest:
+                    raise ValueError(
+                        f"endpoint digest mismatch for {packed_key}: "
+                        f"{actual_digest} != {expected_digest}"
                     )
                 endpoints[f"{key}_{endpoint}"] = values
     return endpoints, np.ascontiguousarray(coords), metadata
@@ -497,16 +515,10 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     phase = "arguments_parsed"
     last_trustworthy_phase: str | None = phase
-    alphas = parse_axis_values(args.alphas, name="alpha")
-    betas = parse_axis_values(args.betas, name="beta")
-    coordinates = cartesian_coordinates(alphas, betas)
     requested_route = {
         "route": "official-source-cuda-full-eight-step-shape-flow-with-fixed-block29-endpoints",
-        "alphas": alphas,
-        "betas": betas,
-        "coordinates": [
-            {"alpha": alpha, "beta": beta} for alpha, beta in coordinates
-        ],
+        "alphas_requested": args.alphas,
+        "betas_requested": args.betas,
         "steps": 8,
         "block_index": 29,
         "step_index": 0,
@@ -524,6 +536,23 @@ def main(argv: list[str] | None = None) -> int:
         "phase_timings": {},
     }
     try:
+        phase = "request_validation"
+        phase_started = time.perf_counter()
+        alphas = parse_axis_values(args.alphas, name="alpha")
+        betas = parse_axis_values(args.betas, name="beta")
+        coordinates = cartesian_coordinates(alphas, betas)
+        requested_route.update(
+            {
+                "alphas": alphas,
+                "betas": betas,
+                "coordinates": [
+                    {"alpha": alpha, "beta": beta} for alpha, beta in coordinates
+                ],
+            }
+        )
+        report["phase_timings"][phase] = time.perf_counter() - phase_started
+        last_trustworthy_phase = phase
+
         phase = "input_validation"
         phase_started = time.perf_counter()
         for path, label in (
