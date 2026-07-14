@@ -759,6 +759,27 @@ def test_generate_exposes_shape_flow_block_trace():
     assert 'save_checkpoint(\n            args.save_checkpoints,\n            "shape_flow_block_trace"' in source
 
 
+def test_generate_shape_flow_block_trace_filters_selected_payload_keys():
+    import generate
+    import numpy as np
+    import pytest
+
+    payload = {
+        "pos_block29_after_self": np.ones((1, 2, 3), dtype=np.float32),
+        "neg_block29_after_self": np.zeros((1, 2, 3), dtype=np.float32),
+    }
+
+    selected = generate._parse_shape_flow_trace_keys(
+        "pos_block29_after_self,neg_block29_after_self,pos_block29_after_self"
+    )
+    filtered = generate._filter_shape_flow_trace_payload(payload, selected)
+
+    assert selected == ["pos_block29_after_self", "neg_block29_after_self"]
+    assert list(filtered) == selected
+    with pytest.raises(ValueError, match="shape-flow-trace-keys.*missing key.*not_present"):
+        generate._filter_shape_flow_trace_payload(payload, ["not_present"])
+
+
 def test_generate_sparse_flow_block_trace_can_target_sampler_step():
     source = GENERATE_SOURCE.read_text()
 
@@ -890,6 +911,43 @@ def test_stage_capture_wrapper_forwards_sparse_flow_trace_keys(tmp_path):
         "pos_block5_input",
         "pos_block5_after_self",
         "pos_block5_after_mlp",
+    ]
+
+
+def test_stage_capture_wrapper_forwards_shape_flow_trace_keys(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-trace-keys",
+            "pos_block29_after_self,neg_block29_after_self,pos_final_output,neg_final_output",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+            "--no-cascade",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--shape-flow-trace-keys") + 1] == (
+        "pos_block29_after_self,neg_block29_after_self,pos_final_output,neg_final_output"
+    )
+    assert route_identity["route"]["shape_flow_trace_keys"] == [
+        "pos_block29_after_self",
+        "neg_block29_after_self",
+        "pos_final_output",
+        "neg_final_output",
     ]
 
 

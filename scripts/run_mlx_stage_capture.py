@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
+    parser.add_argument("--shape-flow-trace-keys")
     parser.add_argument("--shape-flow-noise-sample")
     parser.add_argument("--shape-flow-block-injection-trace")
     parser.add_argument("--shape-flow-block-injection-manifest")
@@ -248,6 +249,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
             "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
+            "shape_flow_trace_keys": _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys),
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -491,6 +493,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             "--shape-flow-trace-step-index",
             str(args.shape_flow_trace_step_index),
         ])
+        if args.shape_flow_trace_keys:
+            command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
     if args.shape_flow_noise_sample:
         command.extend([
             "--shape-flow-noise-sample",

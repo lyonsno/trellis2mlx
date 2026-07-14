@@ -90,6 +90,30 @@ def _filter_sparse_flow_trace_payload(payload: dict[str, np.ndarray], selected_k
     return {key: payload[key] for key in selected_keys}
 
 
+def _parse_shape_flow_trace_keys(value: str | None) -> list[str]:
+    if not value:
+        return []
+    keys = [key.strip() for key in value.split(",")]
+    if any(not key for key in keys):
+        raise ValueError("--shape-flow-trace-keys must be a comma-separated list of non-empty keys")
+    return list(dict.fromkeys(keys))
+
+
+def _filter_shape_flow_trace_payload(
+    payload: dict[str, np.ndarray], selected_keys: list[str]
+) -> dict[str, np.ndarray]:
+    if not selected_keys:
+        return payload
+    missing = [key for key in selected_keys if key not in payload]
+    if missing:
+        available = ", ".join(sorted(payload))
+        raise ValueError(
+            "--shape-flow-trace-keys selected missing key(s): "
+            f"{missing}; available keys: {available}"
+        )
+    return {key: payload[key] for key in selected_keys}
+
+
 def _requantize_coords(hr_coords_np, lr_resolution, hr_resolution):
     """Requantize decoder output coords to the target resolution.
 
@@ -668,6 +692,9 @@ def main():
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow sampler step index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
+    parser.add_argument("--shape-flow-trace-keys",
+                        help="Diagnostic: comma-separated final shape-flow block-trace payload keys "
+                             "to save. Omit to save the full block trace.")
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
@@ -1794,6 +1821,8 @@ def main():
                 for name, value in neg_trace.items()
             }
         )
+        selected_trace_keys = _parse_shape_flow_trace_keys(args.shape_flow_trace_keys)
+        trace_payload = _filter_shape_flow_trace_payload(trace_payload, selected_trace_keys)
         save_checkpoint(
             args.save_checkpoints,
             "shape_flow_block_trace",
@@ -1802,6 +1831,7 @@ def main():
             coords_3d=lr_coords.astype(np.int32, copy=False),
             trace_block_index=np.array(shape_trace_block_index, dtype=np.int32),
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
+            shape_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str),
             shape_slat_support_sample_path=np.array(args.shape_slat_support_sample or ""),
             t=np.array(1000.0 * shape_trace_t, dtype=np.float32),
             steps=np.array(n_steps, dtype=np.int32),
