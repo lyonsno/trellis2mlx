@@ -23,6 +23,7 @@ INTERVENTION_DEPTH = {
     "after_self": 2,
     "cross_attention_raw": 3,
     "after_cross": 4,
+    "after_cross_join": 4,
     "after_mlp": 5,
     "source": 6,
 }
@@ -42,6 +43,7 @@ class CandidateSpec:
     name: str
     path: Path
     expected_manifest_class: str | None
+    expected_equivalent_to: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-step", required=True, type=Path)
     parser.add_argument("--candidate", required=True, action="append")
     parser.add_argument("--expected-manifest", action="append", default=[])
+    parser.add_argument("--expected-equivalent", action="append", default=[])
     parser.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -57,13 +60,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     expected = dict(_parse_assignment(value, "expected manifest") for value in args.expected_manifest)
+    equivalents = dict(
+        _parse_assignment(value, "expected equivalent") for value in args.expected_equivalent
+    )
     candidates = []
     for value in args.candidate:
         name, path = _parse_assignment(value, "candidate")
-        candidates.append(CandidateSpec(name, Path(path), expected.get(name)))
+        candidates.append(
+            CandidateSpec(name, Path(path), expected.get(name), equivalents.get(name))
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
+        candidate_names = {candidate.name for candidate in candidates}
+        unknown_manifests = sorted(set(expected) - candidate_names)
+        if unknown_manifests:
+            raise ReplayContractError(
+                f"unknown expected-manifest candidate names: {unknown_manifests}"
+            )
+        unknown_equivalents = sorted(set(equivalents) - candidate_names)
+        if unknown_equivalents:
+            raise ReplayContractError(
+                f"unknown expected-equivalent candidate names: {unknown_equivalents}"
+            )
         report = summarize_replays(
             source_trace_path=args.source_trace,
             source_step_path=args.source_step,
@@ -83,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
                     "name": candidate.name,
                     "path": str(candidate.path),
                     "expected_manifest_class": candidate.expected_manifest_class,
+                    "expected_equivalent_to": candidate.expected_equivalent_to,
                 }
                 for candidate in candidates
             ],
@@ -252,6 +272,7 @@ def summarize_replays(
             "intervention_stage": "source",
             "intervention_depth": INTERVENTION_DEPTH["source"],
             "intervention_topology": "main_chain",
+            "state_equivalents": [],
             "pos_final_output_source_mean_abs": 0.0,
             "neg_final_output_source_mean_abs": 0.0,
             "pred_final_source_mean_abs": 0.0,
@@ -260,15 +281,40 @@ def summarize_replays(
             "sample_next_source_max_abs": 0.0,
         }
     )
-    replay_rows.sort(key=lambda row: row["intervention_depth"])
-    depths = [row["intervention_depth"] for row in replay_rows]
-    if len(depths) != len(set(depths)):
-        raise ReplayContractError(f"replay candidates contain duplicate intervention depths: {depths}")
+    replay_rows.sort(
+        key=lambda row: (
+            row["intervention_depth"],
+            {"main_chain": 0, "side_branch": 1, "join": 2}[row["intervention_topology"]],
+            row["name"],
+        )
+    )
+    stages = [row["intervention_stage"] for row in replay_rows]
+    if len(stages) != len(set(stages)):
+        raise ReplayContractError(f"replay candidates contain duplicate intervention stages: {stages}")
+    rows_by_name = {row["name"]: row for row in replay_rows}
+    candidates_by_name = {candidate.name: candidate for candidate in candidates}
+    for candidate in candidates:
+        row = rows_by_name[candidate.name]
+        row["state_equivalents"] = []
+        target_name = candidate.expected_equivalent_to
+        if target_name is None:
+            continue
+        if target_name == candidate.name:
+            raise ReplayContractError(f"{candidate.name} cannot be equivalent to itself")
+        target = candidates_by_name.get(target_name)
+        if target is None:
+            raise ReplayContractError(
+                f"{candidate.name} names missing equivalence target {target_name!r}"
+            )
+        evidence = _validate_continuation_equivalence(candidate, target)
+        row["state_equivalents"] = [target_name]
+        row["equivalence_evidence"] = evidence
+
     main_chain_parent: str | None = None
     prefix_parents = [
         row["name"] for row in replay_rows if row["intervention_stage"] == "prefix28"
     ]
-    if any(row["intervention_topology"] == "side_branch" for row in replay_rows):
+    if any(row["intervention_topology"] in {"side_branch", "join"} for row in replay_rows):
         if len(prefix_parents) != 1:
             raise ReplayContractError(
                 "operation replay side branch requires exactly one validated prefix28 parent; "
@@ -277,13 +323,28 @@ def summarize_replays(
     prefix_parent = prefix_parents[0] if prefix_parents else None
     for row in replay_rows:
         if row["intervention_topology"] == "main_chain":
-            row["causal_parent"] = main_chain_parent
+            row["causal_parents"] = [] if main_chain_parent is None else [main_chain_parent]
             main_chain_parent = row["name"]
+        elif row["intervention_topology"] == "side_branch":
+            row["causal_parents"] = [prefix_parent]
         else:
-            row["causal_parent"] = prefix_parent
+            join_parents = []
+            for stage in ("after_self", "cross_attention_raw"):
+                matches = [
+                    candidate_row["name"]
+                    for candidate_row in replay_rows
+                    if candidate_row["intervention_stage"] == stage
+                ]
+                if len(matches) != 1:
+                    raise ReplayContractError(
+                        f"operation replay join requires exactly one {stage} parent; "
+                        f"found {matches}"
+                    )
+                join_parents.append(matches[0])
+            row["causal_parents"] = join_parents
 
     return {
-        "schema": "trellis2mlx.shape_block_operation_replays.v1",
+        "schema": "trellis2mlx.shape_block_operation_replays.v2",
         "status": "done",
         "comparison_class": "exact_source_prefix28_then_block29_operation_replay",
         "source_trace": source_trace_identity,
@@ -409,6 +470,7 @@ def _summarize_candidate(
             "intervention_stage": intervention["stage"],
             "intervention_depth": intervention["depth"],
             "intervention_topology": intervention["topology"],
+            "state_equivalents": [],
             "pos_final_output_source_mean_abs": pos_delta["mean_abs"],
             "pos_final_output_source_max_abs": pos_delta["max_abs"],
             "neg_final_output_source_mean_abs": neg_delta["mean_abs"],
@@ -499,9 +561,9 @@ def _validate_intervention(
     identity = evidence.get("manifest_identity")
     if isinstance(identity, dict):
         sites = evidence.get("sites")
-        if not isinstance(sites, list) or len(sites) != 2:
+        if not isinstance(sites, list) or len(sites) not in {2, 3}:
             raise ReplayContractError(
-                f"{candidate_name} manifest must contain prefix28 and one block29 intervention site"
+                f"{candidate_name} manifest must contain prefix28 and one or two block29 sites"
             )
         manifest_sha = evidence.get("manifest_sha256")
         _require_sha256(manifest_sha, f"{candidate_name} manifest")
@@ -509,32 +571,45 @@ def _validate_intervention(
             sites[0], candidate_name=candidate_name, block_index=28, stage="after_mlp",
             source_route_vector=source_route_vector,
         )
-        stage = str(sites[1].get("stage"))
-        if stage not in {
+        observed_class = identity.get("comparison_class")
+        if expected_manifest_class is None or observed_class != expected_manifest_class:
+            raise ReplayContractError(
+                f"{candidate_name} manifest class {observed_class!r} does not match "
+                f"required {expected_manifest_class!r}"
+            )
+        block29_stages = [str(site.get("stage")) for site in sites[1:]]
+        if block29_stages == ["after_self", "cross_attention_raw"]:
+            stage = "after_cross_join"
+            topology = "join"
+            expected_from_sites = (
+                "exact_source_cuda_prefix28_plus_block29_after_self_and_cross_attention_raw"
+            )
+        elif len(block29_stages) == 1 and block29_stages[0] in {
             "attention_raw",
             "after_self",
             "cross_attention_raw",
             "after_cross",
             "after_mlp",
         }:
+            stage = block29_stages[0]
+            topology = "side_branch" if stage == "cross_attention_raw" else "main_chain"
+            expected_from_sites = f"exact_source_cuda_prefix28_plus_block29_{stage}"
+        else:
             raise ReplayContractError(
-                f"{candidate_name} block29 intervention site has unsupported stage {stage!r}"
+                f"{candidate_name} has unsupported ordered block29 sites {block29_stages}"
             )
-        _validate_site(
-            sites[1], candidate_name=candidate_name, block_index=29, stage=stage,
-            source_route_vector=source_route_vector,
-            expected_trace_sha256=source_trace_sha256,
-        )
-        observed_class = identity.get("comparison_class")
-        expected_from_site = f"exact_source_cuda_prefix28_plus_block29_{stage}"
-        if expected_manifest_class is None or observed_class != expected_manifest_class:
-            raise ReplayContractError(
-                f"{candidate_name} manifest class {observed_class!r} does not match "
-                f"required {expected_manifest_class!r}"
+        for site, site_stage in zip(sites[1:], block29_stages):
+            _validate_site(
+                site,
+                candidate_name=candidate_name,
+                block_index=29,
+                stage=site_stage,
+                source_route_vector=source_route_vector,
+                expected_trace_sha256=source_trace_sha256,
             )
-        if observed_class != expected_from_site:
+        if observed_class != expected_from_sites:
             raise ReplayContractError(
-                f"{candidate_name} block29 intervention site {stage!r} contradicts "
+                f"{candidate_name} block29 intervention sites {block29_stages!r} contradict "
                 f"manifest class {observed_class!r}"
             )
         return {
@@ -545,7 +620,7 @@ def _validate_intervention(
             },
             "stage": stage,
             "depth": INTERVENTION_DEPTH[stage],
-            "topology": "side_branch" if stage == "cross_attention_raw" else "main_chain",
+            "topology": topology,
         }
 
     if expected_manifest_class is not None:
@@ -561,6 +636,38 @@ def _validate_intervention(
         "stage": "prefix28",
         "depth": INTERVENTION_DEPTH["prefix28"],
         "topology": "main_chain",
+    }
+
+
+def _validate_continuation_equivalence(
+    candidate: CandidateSpec, target: CandidateSpec
+) -> dict[str, Any]:
+    compared_arrays = [
+        f"{branch}_{stage}"
+        for stage in ("block29_after_cross", "block29_after_mlp", "final_output")
+        for branch in ("pos", "neg")
+    ]
+    try:
+        with np.load(candidate.path, allow_pickle=False) as candidate_trace, np.load(
+            target.path, allow_pickle=False
+        ) as target_trace:
+            for array_name in compared_arrays:
+                _require_exact(
+                    _require_array(target_trace, array_name),
+                    _require_array(candidate_trace, array_name),
+                    f"{candidate.name} continuation equivalence to {target.name} at {array_name}",
+                )
+    except ReplayContractError as exc:
+        raise ReplayContractError(
+            f"{candidate.name} continuation equivalence to {target.name} failed: {exc}"
+        ) from exc
+    return {
+        "comparison_class": "exact_block29_after_cross_through_final_output",
+        "target": target.name,
+        "target_artifact": str(target.path),
+        "target_artifact_sha256": _sha256(target.path),
+        "compared_arrays": compared_arrays,
+        "all_exact": True,
     }
 
 

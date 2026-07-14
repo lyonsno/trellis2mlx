@@ -307,11 +307,15 @@ def test_operation_replay_chart_rejects_orphan_branch_and_duplicate_names() -> N
             "must precede child",
         ),
         (
+            [("natural", 0, None), ("branch_a", 2, None), ("branch_b", 2, "branch_a")],
+            "must precede child",
+        ),
+        (
             [("natural", 0, "after_self"), ("after_self", 1, "natural")],
             "causal parent cycle",
         ),
     ],
-    ids=("self-parent", "forward-parent", "cycle"),
+    ids=("self-parent", "forward-parent", "equal-depth-parent", "cycle"),
 )
 def test_operation_replay_chart_rejects_impossible_parent_graphs(
     rows: list[tuple[str, int, str | None]], error: str
@@ -335,6 +339,126 @@ def test_operation_replay_chart_rejects_impossible_parent_graphs(
                 "replay_rows": [row(name, depth, parent) for name, depth, parent in rows],
             }
         )
+
+
+def test_operation_replay_chart_preserves_join_and_state_equivalence() -> None:
+    from scripts.build_causal_basin_atlas import _build_operation_replay_chart
+
+    def row(
+        name: str,
+        depth: int,
+        topology: str,
+        parents: list[str],
+        equivalents: list[str] | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "name": name,
+            "artifact": f"/runs/{name}.npz",
+            "intervention_depth": depth,
+            "intervention_topology": topology,
+            "causal_parents": parents,
+            "state_equivalents": equivalents or [],
+            "pred_final_source_mean_abs": 0.001 / (depth + 1),
+        }
+        if equivalents:
+            result["equivalence_evidence"] = {
+                "comparison_class": "exact_block29_after_cross_through_final_output",
+                "target": equivalents[0],
+                "all_exact": True,
+                "compared_arrays": [
+                    "pos_block29_after_cross",
+                    "neg_block29_after_cross",
+                    "pos_block29_after_mlp",
+                    "neg_block29_after_mlp",
+                    "pos_final_output",
+                    "neg_final_output",
+                ],
+            }
+        return result
+
+    chart = _build_operation_replay_chart(
+        {
+            "schema": "trellis2mlx.shape_block_operation_replays.v2",
+            "status": "done",
+            "replay_rows": [
+                row("natural", 0, "main_chain", []),
+                row("after_self", 2, "main_chain", ["natural"]),
+                row("cross_attention_raw", 3, "side_branch", ["natural"]),
+                row("after_cross", 4, "main_chain", ["after_self"]),
+                row(
+                    "after_self_cross_raw_join",
+                    4,
+                    "join",
+                    ["after_self", "cross_attention_raw"],
+                    ["after_cross"],
+                ),
+            ],
+        }
+    )
+
+    joined = next(node for node in chart["nodes"] if node["label"].endswith("join"))
+    assert joined["placement"] == "join"
+    assert joined["intervention"]["causal_parents"] == [
+        "after_self",
+        "cross_attention_raw",
+    ]
+    assert {(edge["from"], edge["to"], edge["kind"]) for edge in chart["edges"]} >= {
+        (
+            "operation-replay:after_self",
+            "operation-replay:after_self_cross_raw_join",
+            "causal_intervention_join",
+        ),
+        (
+            "operation-replay:cross_attention_raw",
+            "operation-replay:after_self_cross_raw_join",
+            "causal_intervention_join",
+        ),
+        (
+            "operation-replay:after_self_cross_raw_join",
+            "operation-replay:after_cross",
+            "continuation_equivalence",
+        ),
+    }
+
+
+def test_operation_replay_chart_rejects_unproven_state_equivalence() -> None:
+    from scripts.build_causal_basin_atlas import AtlasContractError, _build_operation_replay_chart
+
+    payload = {
+        "schema": "trellis2mlx.shape_block_operation_replays.v2",
+        "status": "done",
+        "replay_rows": [
+            {
+                "name": "after_cross",
+                "artifact": "/runs/after-cross.npz",
+                "intervention_depth": 4,
+                "intervention_topology": "main_chain",
+                "causal_parents": [],
+                "state_equivalents": [],
+                "pred_final_source_mean_abs": 0.00002,
+            },
+            {
+                "name": "claimed_join",
+                "artifact": "/runs/claimed-join.npz",
+                "intervention_depth": 5,
+                "intervention_topology": "join",
+                "causal_parents": ["after_cross", "natural"],
+                "state_equivalents": ["after_cross"],
+                "pred_final_source_mean_abs": 0.00002,
+            },
+            {
+                "name": "natural",
+                "artifact": "/runs/natural.npz",
+                "intervention_depth": 0,
+                "intervention_topology": "main_chain",
+                "causal_parents": [],
+                "state_equivalents": [],
+                "pred_final_source_mean_abs": 0.0015,
+            },
+        ],
+    }
+    with pytest.raises(AtlasContractError, match="equivalence evidence"):
+        _build_operation_replay_chart(payload)
 
 
 def test_atlas_records_input_hashes_and_route_identity_visibility(tmp_path: Path) -> None:
@@ -529,6 +653,9 @@ def test_render_html_is_self_contained_and_names_evidence_limits(tmp_path: Path)
     assert "evidence-legend" in html
     assert "node-unverified" in html
     assert "node-missing" in html
+    assert "edge-join" in html
+    assert "edge-equivalence" in html
+    assert "pointY" in html
     assert "aria-label" in html
     assert "log10(source mean absolute delta + 1e-9)" in html
     assert "branch==='neg'?.08" not in html

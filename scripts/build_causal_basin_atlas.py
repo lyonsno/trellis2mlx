@@ -99,7 +99,10 @@ def build_atlas(
         _require_schema(
             operation_replays,
             "operation-replay",
-            {"trellis2mlx.shape_block_operation_replays.v1"},
+            {
+                "trellis2mlx.shape_block_operation_replays.v1",
+                "trellis2mlx.shape_block_operation_replays.v2",
+            },
         )
 
     sources = [
@@ -392,24 +395,77 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
     names = [str(row.get("name", "unnamed")) for row in rows]
     if len(names) != len(set(names)):
         raise AtlasContractError(f"duplicate operation replay names: {names}")
+    schema = payload.get("schema")
     nodes = []
     for row in rows:
         _require_metrics(row, ("intervention_depth", "pred_final_source_mean_abs"))
         name = str(row.get("name", "unnamed"))
         topology = row.get("intervention_topology")
-        if topology not in {"main_chain", "side_branch"}:
+        if topology not in {"main_chain", "side_branch", "join"}:
             raise AtlasContractError(
                 f"operation replay {name} has invalid intervention_topology {topology!r}"
             )
-        causal_parent = row.get("causal_parent")
-        if causal_parent is not None and not isinstance(causal_parent, str):
+        if schema == "trellis2mlx.shape_block_operation_replays.v2":
+            causal_parents = row.get("causal_parents")
+            if not isinstance(causal_parents, list) or not all(
+                isinstance(parent, str) for parent in causal_parents
+            ):
+                raise AtlasContractError(
+                    f"operation replay {name} causal_parents must be a string array"
+                )
+        else:
+            causal_parent = row.get("causal_parent")
+            if causal_parent is not None and not isinstance(causal_parent, str):
+                raise AtlasContractError(
+                    f"operation replay {name} causal_parent must be a string or null"
+                )
+            causal_parents = [] if causal_parent is None else [causal_parent]
+        if len(causal_parents) != len(set(causal_parents)):
             raise AtlasContractError(
-                f"operation replay {name} causal_parent must be a string or null"
+                f"operation replay {name} has duplicate causal parents {causal_parents}"
             )
-        if topology == "side_branch" and causal_parent is None:
+        if topology == "side_branch" and len(causal_parents) != 1:
             raise AtlasContractError(
-                f"operation replay side branch {name} requires a causal parent"
+                f"operation replay side branch {name} requires exactly one causal parent"
             )
+        if topology == "join" and len(causal_parents) < 2:
+            raise AtlasContractError(
+                f"operation replay join {name} requires at least two causal parents"
+            )
+        if topology == "main_chain" and len(causal_parents) > 1:
+            raise AtlasContractError(
+                f"operation replay main-chain node {name} has multiple causal parents"
+            )
+        state_equivalents = row.get("state_equivalents", [])
+        if not isinstance(state_equivalents, list) or not all(
+            isinstance(target, str) for target in state_equivalents
+        ):
+            raise AtlasContractError(
+                f"operation replay {name} state_equivalents must be a string array"
+            )
+        if len(state_equivalents) != len(set(state_equivalents)):
+            raise AtlasContractError(
+                f"operation replay {name} has duplicate state equivalents {state_equivalents}"
+            )
+        equivalence_evidence = row.get("equivalence_evidence")
+        if state_equivalents:
+            expected_arrays = [
+                f"{branch}_{stage}"
+                for stage in ("block29_after_cross", "block29_after_mlp", "final_output")
+                for branch in ("pos", "neg")
+            ]
+            if (
+                len(state_equivalents) != 1
+                or not isinstance(equivalence_evidence, dict)
+                or equivalence_evidence.get("comparison_class")
+                != "exact_block29_after_cross_through_final_output"
+                or equivalence_evidence.get("target") != state_equivalents[0]
+                or equivalence_evidence.get("all_exact") is not True
+                or equivalence_evidence.get("compared_arrays") != expected_arrays
+            ):
+                raise AtlasContractError(
+                    f"operation replay {name} has incomplete or contradictory equivalence evidence"
+                )
         artifact = row.get("artifact")
         nodes.append(
             {
@@ -423,7 +479,9 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
                 "intervention": {
                     "kind": "block29_causal_boundary_replay",
                     "topology": topology,
-                    "causal_parent": causal_parent,
+                    "causal_parents": causal_parents,
+                    "state_equivalents": state_equivalents,
+                    "equivalence_evidence": equivalence_evidence,
                     "manifest_identity": row.get("manifest_identity"),
                 },
                 "metrics": _copy_metrics(row),
@@ -431,18 +489,17 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
         )
     nodes.sort(key=lambda node: node["coordinate"]["intervention_depth"])
     nodes_by_name = {node["id"].removeprefix("operation-replay:"): node for node in nodes}
-    parents_by_name: dict[str, str] = {}
+    parents_by_name: dict[str, list[str]] = {}
     for name, node in nodes_by_name.items():
-        parent_name = node["intervention"]["causal_parent"]
-        if parent_name is None:
-            continue
-        if parent_name == name:
-            raise AtlasContractError(f"operation replay {name} cannot parent itself")
-        if parent_name not in nodes_by_name:
-            raise AtlasContractError(
-                f"operation replay {node['label']} names missing causal parent {parent_name!r}"
-            )
-        parents_by_name[name] = parent_name
+        parent_names = node["intervention"]["causal_parents"]
+        for parent_name in parent_names:
+            if parent_name == name:
+                raise AtlasContractError(f"operation replay {name} cannot parent itself")
+            if parent_name not in nodes_by_name:
+                raise AtlasContractError(
+                    f"operation replay {node['label']} names missing causal parent {parent_name!r}"
+                )
+        parents_by_name[name] = parent_names
 
     visit_state: dict[str, int] = {}
 
@@ -453,47 +510,75 @@ def _build_operation_replay_chart(payload: dict[str, Any]) -> dict[str, Any]:
         if state == 2:
             return
         visit_state[name] = 1
-        parent_name = parents_by_name.get(name)
-        if parent_name is not None:
+        for parent_name in parents_by_name.get(name, []):
             visit_parent(parent_name)
         visit_state[name] = 2
 
     for name in nodes_by_name:
         visit_parent(name)
 
-    for name, parent_name in parents_by_name.items():
+    for name, parent_names in parents_by_name.items():
         child_depth = nodes_by_name[name]["coordinate"]["intervention_depth"]
-        parent_depth = nodes_by_name[parent_name]["coordinate"]["intervention_depth"]
-        if parent_depth >= child_depth:
-            raise AtlasContractError(
-                f"operation replay parent {parent_name!r} at depth {parent_depth} "
-                f"must precede child {name!r} at depth {child_depth}"
-            )
+        for parent_name in parent_names:
+            parent_depth = nodes_by_name[parent_name]["coordinate"]["intervention_depth"]
+            if parent_depth >= child_depth:
+                raise AtlasContractError(
+                    f"operation replay parent {parent_name!r} at depth {parent_depth} "
+                    f"must precede child {name!r} at depth {child_depth}"
+                )
 
     edges = []
     for node in nodes:
-        parent_name = node["intervention"]["causal_parent"]
-        if parent_name is None:
-            continue
-        parent = nodes_by_name[parent_name]
-        kind = (
-            "causal_intervention_branch"
-            if node["intervention"]["topology"] == "side_branch"
-            else "causal_boundary_replay"
-        )
-        edges.append(
-            {
-                "id": f"{parent['id']}->{node['id']}",
-                "from": parent["id"],
-                "to": node["id"],
-                "kind": kind,
-                "intervention": {"from": parent["label"], "to": node["label"]},
-            }
-        )
+        for parent_name in node["intervention"]["causal_parents"]:
+            parent = nodes_by_name[parent_name]
+            kind = {
+                "side_branch": "causal_intervention_branch",
+                "join": "causal_intervention_join",
+                "main_chain": "causal_boundary_replay",
+            }[node["intervention"]["topology"]]
+            edges.append(
+                {
+                    "id": f"{parent['id']}->{node['id']}",
+                    "from": parent["id"],
+                    "to": node["id"],
+                    "kind": kind,
+                    "intervention": {"from": parent["label"], "to": node["label"]},
+                }
+            )
+    equivalence_pairs: set[frozenset[str]] = set()
+    for name, node in nodes_by_name.items():
+        for target_name in node["intervention"]["state_equivalents"]:
+            if target_name == name:
+                raise AtlasContractError(f"operation replay {name} cannot equal itself")
+            target = nodes_by_name.get(target_name)
+            if target is None:
+                raise AtlasContractError(
+                    f"operation replay {name} names missing state equivalent {target_name!r}"
+                )
+            pair = frozenset((name, target_name))
+            if pair in equivalence_pairs:
+                continue
+            equivalence_pairs.add(pair)
+            edges.append(
+                {
+                    "id": f"{node['id']}<=>{target['id']}",
+                    "from": node["id"],
+                    "to": target["id"],
+                    "kind": "continuation_equivalence",
+                    "intervention": {
+                        "from": node["label"],
+                        "to": target["label"],
+                        "evidence": node["intervention"]["equivalence_evidence"],
+                    },
+                }
+            )
     return {
         "title": "Block29 causal replay endpoints",
         "x_axis": {
-            "semantic": "causal intervention rank; side branches are non-cumulative",
+            "semantic": (
+                "causal intervention rank; side branches are partial, joins are composed, "
+                "equivalent nodes share continuation state"
+            ),
             "field": "intervention_depth",
         },
         "y_axis": {
@@ -793,7 +878,7 @@ def render_html(atlas: dict[str, Any]) -> str:
 <title>TRELLIS.2 Causal Basin Atlas</title>
 <style>
 :root{color-scheme:dark;--bg:#101214;--panel:#171a1d;--line:#343a40;--text:#f2f3f5;--muted:#aab0b7;--red:#ff5b57;--cyan:#3ddbd9;--yellow:#ffd166;--green:#66d17a;--violet:#b39cff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0}header{padding:20px 24px 16px;border-bottom:1px solid var(--line);display:flex;gap:24px;align-items:end;justify-content:space-between}h1{margin:0;font-size:22px;font-weight:650;letter-spacing:0}header p{margin:0;color:var(--muted);max-width:720px}.header-meta{display:grid;gap:8px;justify-items:end}.evidence-legend{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:11px}.evidence-legend span::before{content:'○';display:inline-block;width:14px;font-weight:700}.evidence-legend .verified::before{content:'●';color:var(--green)}.evidence-legend .unverified::before{color:var(--yellow)}.evidence-legend .missing::before{content:'×';color:#8b949e}.evidence-legend .failed::before{content:'!';color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;min-height:calc(100vh - 86px)}main{min-width:0}.chart-section{padding:18px 24px 22px;border-bottom:1px solid var(--line)}.chart-section h2{font-size:14px;margin:0 0 4px}.axis-note{color:var(--muted);font-size:12px;margin-bottom:10px}.chart{display:block;width:100%;height:260px;background:var(--panel);border:1px solid var(--line)}aside{border-left:1px solid var(--line);padding:18px;min-width:0;background:#131619}aside h2{font-size:14px;margin:0 0 12px}.detail{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);font-size:12px}svg text{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--muted);letter-spacing:0}.axis{stroke:#59616a;stroke-width:1}.edge{stroke:#6c747d;stroke-width:1.5;fill:none}.edge-branch{stroke:var(--yellow);stroke-dasharray:3 4;stroke-width:2}.edge-unverified{stroke-dasharray:5 5;opacity:.55}.node{cursor:pointer;stroke:#101214;stroke-width:2}.node-unverified{fill:var(--panel)!important;stroke:var(--yellow);stroke-dasharray:3 2}.node-missing{fill:var(--panel)!important;stroke:#8b949e;stroke-dasharray:2 3}.node-failed,.node-stale,.node-partial{fill:var(--panel)!important;stroke:var(--red);stroke-width:3}.node:focus{outline:none;stroke:#fff;stroke-width:3}.label{pointer-events:none}.limit{color:var(--yellow)}@media(max-width:860px){header{align-items:start;flex-direction:column}.header-meta{justify-items:start}.workspace{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}.chart-section{padding:16px;overflow-x:auto}.chart{height:240px;min-width:760px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0}header{padding:20px 24px 16px;border-bottom:1px solid var(--line);display:flex;gap:24px;align-items:end;justify-content:space-between}h1{margin:0;font-size:22px;font-weight:650;letter-spacing:0}header p{margin:0;color:var(--muted);max-width:720px}.header-meta{display:grid;gap:8px;justify-items:end}.evidence-legend{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:11px}.evidence-legend span::before{content:'○';display:inline-block;width:14px;font-weight:700}.evidence-legend .verified::before{content:'●';color:var(--green)}.evidence-legend .unverified::before{color:var(--yellow)}.evidence-legend .missing::before{content:'×';color:#8b949e}.evidence-legend .failed::before{content:'!';color:var(--red)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;min-height:calc(100vh - 86px)}main{min-width:0}.chart-section{padding:18px 24px 22px;border-bottom:1px solid var(--line)}.chart-section h2{font-size:14px;margin:0 0 4px}.axis-note{color:var(--muted);font-size:12px;margin-bottom:10px}.chart{display:block;width:100%;height:260px;background:var(--panel);border:1px solid var(--line)}aside{border-left:1px solid var(--line);padding:18px;min-width:0;background:#131619}aside h2{font-size:14px;margin:0 0 12px}.detail{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);font-size:12px}svg text{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--muted);letter-spacing:0}.axis{stroke:#59616a;stroke-width:1}.edge{stroke:#6c747d;stroke-width:1.5;fill:none}.edge-branch{stroke:var(--yellow);stroke-dasharray:3 4;stroke-width:2}.edge-join{stroke:var(--violet);stroke-width:2}.edge-equivalence{stroke:var(--cyan);stroke-dasharray:7 3;stroke-width:2.5}.edge-unverified{stroke-dasharray:5 5;opacity:.55}.node{cursor:pointer;stroke:#101214;stroke-width:2}.node-unverified{fill:var(--panel)!important;stroke:var(--yellow);stroke-dasharray:3 2}.node-missing{fill:var(--panel)!important;stroke:#8b949e;stroke-dasharray:2 3}.node-failed,.node-stale,.node-partial{fill:var(--panel)!important;stroke:var(--red);stroke-width:3}.node:focus{outline:none;stroke:#fff;stroke-width:3}.label{pointer-events:none}.limit{color:var(--yellow)}@media(max-width:860px){header{align-items:start;flex-direction:column}.header-meta{justify-items:start}.workspace{grid-template-columns:1fr}aside{border-left:0;border-top:1px solid var(--line)}.chart-section{padding:16px;overflow-x:auto}.chart{height:240px;min-width:760px}}
 </style>
 </head>
 <body>
@@ -808,7 +893,8 @@ const metric=(node,key)=>{const v=node.metrics[key];if(typeof v!=='number'||!Num
 const extent=(values)=>{let lo=Math.min(...values),hi=Math.max(...values);if(lo===hi){lo-=.5;hi+=.5}return[lo,hi]};
 const scale=(v,a,b,c,d)=>c+(v-a)*(d-c)/(b-a);const show=node=>{detail.textContent=JSON.stringify(node,null,2)};
 const overlaps=(a,b)=>!(a.r<b.l||a.l>b.r||a.b<b.t||a.t>b.b);
-function placeLabel(svg,q,X,Y,boxes,W,p){const px=X(q.x),py=Y(q.y),text=q.n.label,width=Math.min(230,text.length*6.8+4);const anchor=px>W-p.r-180?'end':'start';const x=anchor==='end'?px-9:px+9;const offsets=q.n.coordinate.branch==='neg'?[16,30,-10,-24,44]:[-10,-24,16,30,-38,44];for(const dy of offsets){const box={l:anchor==='end'?x-width:x,r:anchor==='end'?x:x+width,t:py+dy-10,b:py+dy+3};if(box.l<p.l||box.r>W-p.r||boxes.some(other=>overlaps(box,other)))continue;const t=el('text',{x,y:py+dy,class:'label','text-anchor':anchor});t.textContent=text;svg.append(t);boxes.push(box);return}}
+const pointY=(q,Y)=>Y(q.y)+(q.n.placement==='join'?-18:0);
+function placeLabel(svg,q,X,Y,boxes,W,p){const px=X(q.x),py=pointY(q,Y),text=q.n.label,width=Math.min(230,text.length*6.8+4);const anchor=px>W-p.r-180?'end':'start';const x=anchor==='end'?px-9:px+9;const offsets=q.n.coordinate.branch==='neg'?[16,30,-10,-24,44]:[-10,-24,16,30,-38,44];for(const dy of offsets){const box={l:anchor==='end'?x-width:x,r:anchor==='end'?x:x+width,t:py+dy-10,b:py+dy+3};if(box.l<p.l||box.r>W-p.r||boxes.some(other=>overlaps(box,other)))continue;const t=el('text',{x,y:py+dy,class:'label','text-anchor':anchor});t.textContent=text;svg.append(t);boxes.push(box);return}}
 function draw(chartKey,chart){const section=document.createElement('section');section.className='chart-section';const title=document.createElement('h2');title.textContent=chart.title;const note=document.createElement('div');note.className='axis-note';note.textContent=chart.x_axis.semantic+' / '+chart.y_axis.semantic;const svg=el('svg',{class:'chart',viewBox:'0 0 1000 260',role:'img','aria-label':chart.title});section.append(title,note,svg);root.append(section);const W=1000,H=260,p={l:78,r:34,t:28,b:46};let points=[];
 if(chartKey==='source_prefix')points=chart.nodes.map(n=>({n,x:n.coordinate.block,y:metric(n,'pred_final_remaining_norm_ratio')}));
 else if(chartKey==='attention_alpha')points=chart.nodes.map(n=>({n,x:n.coordinate.alpha,y:metric(n,'pred_final_source_mean_abs')}));
@@ -818,8 +904,8 @@ else points=chart.nodes.map(n=>({n,x:n.coordinate.stage_index,y:Math.log10(metri
 if(!points.length)return;const [xmin,xmax]=extent(points.map(q=>q.x)),[ymin,ymax]=extent(points.map(q=>q.y));const X=v=>scale(v,xmin,xmax,p.l,W-p.r),Y=v=>scale(v,ymin,ymax,H-p.b,p.t);svg.append(el('line',{x1:p.l,y1:H-p.b,x2:W-p.r,y2:H-p.b,class:'axis'}),el('line',{x1:p.l,y1:p.t,x2:p.l,y2:H-p.b,class:'axis'}));
 for(let i=0;i<=4;i++){const value=ymin+(ymax-ymin)*i/4,y=Y(value);svg.append(el('line',{x1:p.l-4,y1:y,x2:p.l,y2:y,class:'axis'}));const tick=el('text',{x:p.l-8,y:y+4,'text-anchor':'end'});tick.textContent=chartKey==='block_operation'?value.toFixed(1):value.toPrecision(3);svg.append(tick)}
 for(let i=0;i<=4;i++){const value=xmin+(xmax-xmin)*i/4,x=X(value);svg.append(el('line',{x1:x,y1:H-p.b,x2:x,y2:H-p.b+4,class:'axis'}));const tick=el('text',{x,y:H-p.b+16,'text-anchor':'middle'});tick.textContent=chartKey==='source_prefix'?Math.round(value):value.toPrecision(3);svg.append(tick)}
-const blocked=new Set(['missing','failed','stale','partial']);for(const edge of chart.edges){const a=points.find(q=>q.n.id===edge.from),b=points.find(q=>q.n.id===edge.to);if(!a||!b||blocked.has(a.n.route_identity.status)||blocked.has(b.n.route_identity.status))continue;let edgeClass=a.n.route_identity.status==='visible'&&b.n.route_identity.status==='visible'?'edge':'edge edge-unverified';if(edge.kind==='causal_intervention_branch')edgeClass+=' edge-branch';svg.append(el('line',{x1:X(a.x),y1:Y(a.y),x2:X(b.x),y2:Y(b.y),class:edgeClass}))}
-const boxes=[];for(const q of points){let fill=colors[chartKey];if(chartKey==='block_operation'&&q.n.coordinate.branch==='neg')fill='#66d17a';const status=q.n.route_identity.status||'unverified';const accessible=`${q.n.label}; evidence ${status}`;const circle=el('circle',{cx:X(q.x),cy:Y(q.y),r:7,fill,class:`node node-${status}`,tabindex:0,'aria-label':accessible});const tip=el('title');tip.textContent=accessible;circle.append(tip);circle.addEventListener('click',()=>show(q.n));circle.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')show(q.n)});svg.append(circle)}for(const q of points)placeLabel(svg,q,X,Y,boxes,W,p);
+const blocked=new Set(['missing','failed','stale','partial']);for(const edge of chart.edges){const a=points.find(q=>q.n.id===edge.from),b=points.find(q=>q.n.id===edge.to);if(!a||!b||blocked.has(a.n.route_identity.status)||blocked.has(b.n.route_identity.status))continue;let edgeClass=a.n.route_identity.status==='visible'&&b.n.route_identity.status==='visible'?'edge':'edge edge-unverified';if(edge.kind==='causal_intervention_branch')edgeClass+=' edge-branch';if(edge.kind==='causal_intervention_join')edgeClass+=' edge-join';if(edge.kind==='continuation_equivalence')edgeClass+=' edge-equivalence';svg.append(el('line',{x1:X(a.x),y1:pointY(a,Y),x2:X(b.x),y2:pointY(b,Y),class:edgeClass}))}
+const boxes=[];for(const q of points){let fill=colors[chartKey];if(chartKey==='block_operation'&&q.n.coordinate.branch==='neg')fill='#66d17a';if(chartKey==='operation_replay'&&q.n.placement==='join')fill='#b39cff';const status=q.n.route_identity.status||'unverified';const accessible=`${q.n.label}; evidence ${status}`;const circle=el('circle',{cx:X(q.x),cy:pointY(q,Y),r:7,fill,class:`node node-${status}`,tabindex:0,'aria-label':accessible});const tip=el('title');tip.textContent=accessible;circle.append(tip);circle.addEventListener('click',()=>show(q.n));circle.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')show(q.n)});svg.append(circle)}for(const q of points)placeLabel(svg,q,X,Y,boxes,W,p);
 const xl=el('text',{x:(p.l+W-p.r)/2,y:H-10,'text-anchor':'middle'});xl.textContent=chart.x_axis.semantic;svg.append(xl)}
 for(const [key,chart] of Object.entries(atlas.charts))draw(key,chart);
 </script>

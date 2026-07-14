@@ -27,6 +27,8 @@ def _write_trace(
     t: float = 1000.0,
     block_input: np.ndarray | None = None,
     stage: str = "after_self",
+    stages: tuple[str, ...] | None = None,
+    boundary_offset: float = 0.0,
     injection_mode: str = "valid",
     steps: int = 4,
     rescale_t: float = 1.0,
@@ -56,6 +58,7 @@ def _write_trace(
     }
     injection = prefix_site
     if manifest_class is not None:
+        manifest_stages = stages if stages is not None else (stage,)
         injection = {
             "route_identity_evidence": True,
             "manifest_identity": {
@@ -63,19 +66,21 @@ def _write_trace(
                 "comparison_class": manifest_class,
             },
             "manifest_sha256": "b" * 64,
-            "sites": [
-                prefix_site,
+            "sites": [prefix_site] + [
                 {
                     "route_identity_evidence": True,
                     "block_index": 29,
                     "step_index": 0,
-                    "stage": stage,
+                    "stage": manifest_stage,
                     "branch": "both",
                     "source_delta_scale": 1.0,
-                    "array_key": f"pos_block29_{stage},neg_block29_{stage}",
+                    "array_key": (
+                        f"pos_block29_{manifest_stage},neg_block29_{manifest_stage}"
+                    ),
                     "trace_sha256": block29_trace_sha256,
                     "trace_identity": route_vector,
-                },
+                }
+                for manifest_stage in manifest_stages
             ],
         }
     if injection_mode == "none":
@@ -92,6 +97,10 @@ def _write_trace(
         "neg_block29_input": block_input[None],
         "pos_final_output": pos[None],
         "neg_final_output": neg[None],
+        "pos_block29_after_cross": (pos + boundary_offset)[None],
+        "neg_block29_after_cross": (neg + boundary_offset)[None],
+        "pos_block29_after_mlp": pos[None],
+        "neg_block29_after_mlp": neg[None],
         "trace_block_index": np.asarray(29, dtype=np.int32),
         "shape_flow_trace_step_index": np.asarray(0, dtype=np.int32),
         "guidance_strength": np.asarray(7.5, dtype=np.float32),
@@ -166,7 +175,7 @@ def test_summary_reconstructs_guided_endpoint_and_preserves_manifest_identity(tm
         ],
     )
 
-    assert report["schema"] == "trellis2mlx.shape_block_operation_replays.v1"
+    assert report["schema"] == "trellis2mlx.shape_block_operation_replays.v2"
     assert report["source_reconstruction"]["pred_final_max_abs"] < 1e-6
     assert [row["name"] for row in report["replay_rows"]] == ["natural", "after_self", "source"]
     assert report["replay_rows"][1]["manifest_identity"]["comparison_class"] == (
@@ -404,16 +413,16 @@ def test_summary_derives_intervention_depth_from_validated_stage_not_argument_or
             row["name"],
             row["intervention_depth"],
             row["intervention_topology"],
-            row["causal_parent"],
+            row["causal_parents"],
         )
         for row in report["replay_rows"]
     ] == [
-        ("natural", 0, "main_chain", None),
-        ("after_self", 2, "main_chain", "natural"),
-        ("cross_attention_raw", 3, "side_branch", "natural"),
-        ("after_cross", 4, "main_chain", "after_self"),
-        ("after_mlp", 5, "main_chain", "after_cross"),
-        ("source", 6, "main_chain", "after_mlp"),
+        ("natural", 0, "main_chain", []),
+        ("after_self", 2, "main_chain", ["natural"]),
+        ("cross_attention_raw", 3, "side_branch", ["natural"]),
+        ("after_cross", 4, "main_chain", ["after_self"]),
+        ("after_mlp", 5, "main_chain", ["after_cross"]),
+        ("source", 6, "main_chain", ["after_mlp"]),
     ]
 
 
@@ -467,6 +476,178 @@ def test_summary_rejects_orphan_side_branch_and_duplicate_candidate_names(tmp_pa
                 ),
             ],
         )
+
+
+def test_summary_emits_validated_join_and_exact_continuation_equivalence(tmp_path: Path) -> None:
+    from scripts.summarize_shape_block_operation_replays import CandidateSpec, summarize_replays
+
+    source, step, coords, sample, pos, neg = _write_source_pair(tmp_path)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    natural = _write_trace(
+        tmp_path / "natural-join.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class=None, block_input=sample,
+    )
+    after_self = _write_trace(
+        tmp_path / "after-self-join.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_self",
+        block_input=sample, stage="after_self", block29_trace_sha256=source_sha,
+    )
+    cross_raw = _write_trace(
+        tmp_path / "cross-raw-join.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        block_input=sample, stage="cross_attention_raw", block29_trace_sha256=source_sha,
+    )
+    after_cross = _write_trace(
+        tmp_path / "after-cross-join.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_cross",
+        block_input=sample, stage="after_cross", block29_trace_sha256=source_sha,
+    )
+    join = _write_trace(
+        tmp_path / "joined-after-cross.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class=(
+            "exact_source_cuda_prefix28_plus_block29_after_self_and_cross_attention_raw"
+        ),
+        block_input=sample,
+        stages=("after_self", "cross_attention_raw"),
+        block29_trace_sha256=source_sha,
+    )
+    candidates = [
+        CandidateSpec("natural", natural, None),
+        CandidateSpec(
+            "after_self", after_self, "exact_source_cuda_prefix28_plus_block29_after_self"
+        ),
+        CandidateSpec(
+            "cross_attention_raw",
+            cross_raw,
+            "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        ),
+        CandidateSpec(
+            "after_cross", after_cross, "exact_source_cuda_prefix28_plus_block29_after_cross"
+        ),
+        CandidateSpec(
+            "after_self_cross_raw_join",
+            join,
+            "exact_source_cuda_prefix28_plus_block29_after_self_and_cross_attention_raw",
+            expected_equivalent_to="after_cross",
+        ),
+    ]
+
+    report = summarize_replays(
+        source_trace_path=source,
+        source_step_path=step,
+        candidates=candidates,
+    )
+
+    assert report["schema"] == "trellis2mlx.shape_block_operation_replays.v2"
+    joined = next(row for row in report["replay_rows"] if row["name"].endswith("join"))
+    assert joined["intervention_stage"] == "after_cross_join"
+    assert joined["intervention_topology"] == "join"
+    assert joined["causal_parents"] == ["after_self", "cross_attention_raw"]
+    assert joined["state_equivalents"] == ["after_cross"]
+    assert joined["equivalence_evidence"]["compared_arrays"] == [
+        "pos_block29_after_cross",
+        "neg_block29_after_cross",
+        "pos_block29_after_mlp",
+        "neg_block29_after_mlp",
+        "pos_final_output",
+        "neg_final_output",
+    ]
+
+
+def test_summary_rejects_endpoint_only_join_equivalence(tmp_path: Path) -> None:
+    from scripts.summarize_shape_block_operation_replays import (
+        CandidateSpec,
+        ReplayContractError,
+        summarize_replays,
+    )
+
+    source, step, coords, sample, pos, neg = _write_source_pair(tmp_path)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    after_self = _write_trace(
+        tmp_path / "after-self-parent.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_self",
+        block_input=sample, stage="after_self", block29_trace_sha256=source_sha,
+    )
+    cross_raw = _write_trace(
+        tmp_path / "cross-raw-parent.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+        block_input=sample, stage="cross_attention_raw", block29_trace_sha256=source_sha,
+    )
+    after_cross = _write_trace(
+        tmp_path / "after-cross-target.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class="exact_source_cuda_prefix28_plus_block29_after_cross",
+        block_input=sample, stage="after_cross", block29_trace_sha256=source_sha,
+    )
+    lying_join = _write_trace(
+        tmp_path / "lying-join.npz", pos=pos, neg=neg, coords=coords,
+        manifest_class=(
+            "exact_source_cuda_prefix28_plus_block29_after_self_and_cross_attention_raw"
+        ),
+        block_input=sample,
+        stages=("after_self", "cross_attention_raw"),
+        boundary_offset=1.0,
+        block29_trace_sha256=source_sha,
+    )
+    with pytest.raises(ReplayContractError, match="continuation equivalence.*after_cross"):
+        summarize_replays(
+            source_trace_path=source,
+            source_step_path=step,
+            candidates=[
+                CandidateSpec(
+                    "after_self", after_self,
+                    "exact_source_cuda_prefix28_plus_block29_after_self",
+                ),
+                CandidateSpec(
+                    "cross_attention_raw", cross_raw,
+                    "exact_source_cuda_prefix28_plus_block29_cross_attention_raw",
+                ),
+                CandidateSpec(
+                    "after_cross", after_cross,
+                    "exact_source_cuda_prefix28_plus_block29_after_cross",
+                ),
+                CandidateSpec(
+                    "lying_join",
+                    lying_join,
+                    "exact_source_cuda_prefix28_plus_block29_after_self_and_cross_attention_raw",
+                    expected_equivalent_to="after_cross",
+                ),
+            ],
+        )
+
+
+def test_cli_rejects_unknown_equivalence_request_and_writes_failure(tmp_path: Path) -> None:
+    from scripts.summarize_shape_block_operation_replays import ReplayContractError, main
+
+    source, step, coords, sample, pos, neg = _write_source_pair(tmp_path)
+    natural = _write_trace(
+        tmp_path / "natural-cli.npz",
+        pos=pos,
+        neg=neg,
+        coords=coords,
+        manifest_class=None,
+        block_input=sample,
+    )
+    output = tmp_path / "summary.json"
+    with pytest.raises(ReplayContractError, match="unknown expected-equivalent candidate"):
+        main(
+            [
+                "--source-trace",
+                str(source),
+                "--source-step",
+                str(step),
+                "--candidate",
+                f"natural={natural}",
+                "--expected-equivalent",
+                "typo=natural",
+                "--output",
+                str(output),
+            ]
+        )
+
+    failure = json.loads(output.read_text())
+    assert failure["status"] == "failed"
+    assert failure["failure_phase"] == "summarize_replays"
+    assert "typo" in failure["error"]
 
 
 def test_summary_rejects_direct_model_time_schedule_mismatch_and_bad_source_euler(tmp_path: Path) -> None:
