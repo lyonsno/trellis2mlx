@@ -447,6 +447,23 @@ def test_coordinate_metrics_reject_unrepresentable_derived_scalars() -> None:
         _vector_metrics(vector)
 
 
+def test_coordinate_metrics_handle_subnormal_scale_without_runtime_warning() -> None:
+    import warnings
+
+    from scripts.summarize_shape_block_intervention_grid import _vector_metrics
+
+    smallest = np.nextafter(np.float64(0.0), np.float64(1.0))
+    vector = np.asarray([[smallest, smallest]], dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        metrics = _vector_metrics(vector)
+
+    assert metrics["mean_abs"] == smallest
+    assert metrics["max_abs"] == smallest
+    assert metrics["l2_norm"] == smallest
+
+
 def test_grid_summary_json_rejects_nan_and_infinity(tmp_path: Path) -> None:
     from scripts.summarize_shape_block_intervention_grid import _write_json
 

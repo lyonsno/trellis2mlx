@@ -636,7 +636,7 @@ def _scaled_l2_norm(array: np.ndarray) -> float:
         return 0.0
     scaled = absolute / scale
     unit_norm = math.sqrt(float(np.sum(scaled * scaled, dtype=np.float64)))
-    if not math.isfinite(unit_norm) or unit_norm > np.finfo(np.float64).max / scale:
+    if not math.isfinite(unit_norm) or scale > float(np.finfo(np.float64).max) / unit_norm:
         raise ValueError("coordinate geometry derived non-finite l2_norm")
     return scale * unit_norm
 

@@ -88,6 +88,56 @@ def test_stage_capture_wrapper_builds_generate_stop_route(tmp_path):
     assert "--no-rembg" in command
 
 
+def test_stage_capture_rejects_missing_manifest_before_generate_and_reports(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    missing_manifest = tmp_path / "missing-manifest.json"
+    output_dir = tmp_path / "output"
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("generation must not start with a missing manifest")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", unexpected_generate)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-block-injection-manifest",
+            str(missing_manifest),
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_inputs"
+    assert report["primary_output_status"] == "not_started"
+    assert report["last_trustworthy_phase"] == "requested_route_parsed"
+    assert report["requested_inputs"]["shape_flow_block_injection_manifest"] == str(
+        missing_manifest
+    )
+    assert report["invalid_inputs"] == [
+        {
+            "field": "shape_flow_block_injection_manifest",
+            "path": str(missing_manifest),
+            "reason": "missing",
+        }
+    ]
+    assert not (output_dir / "route_identity.json").exists()
+    assert not (output_dir / "stdout.log").exists()
+
+
 def test_stage_capture_wrapper_records_sparse_only_shared_noise(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 

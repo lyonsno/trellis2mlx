@@ -21,6 +21,22 @@ STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
     "standard": 350_000,
     "source-quality": 500_000,
 }
+INPUT_PATH_FIELDS = (
+    "image",
+    "conditioning_sample",
+    "shape_slat_sample",
+    "shape_slat_support_sample",
+    "shared_noise",
+    "sparse_flow_trace_sample",
+    "sparse_flow_start_sample",
+    "sparse_flow_trace_block_input_sample",
+    "sparse_flow_block_injection_trace",
+    "sparse_flow_block_injection_manifest",
+    "sparse_flow_layernorm_correction_report",
+    "shape_flow_noise_sample",
+    "shape_flow_block_injection_trace",
+    "shape_flow_block_injection_manifest",
+)
 
 
 def _parse_sparse_flow_trace_keys(value: str | None) -> list[str]:
@@ -338,6 +354,23 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     command = _build_generate_command(args, checkpoint_dir)
+    requested_inputs, invalid_inputs = _preflight_input_paths(args)
+    if invalid_inputs:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_inputs",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     route_identity = build_route_identity(args, command)
     _write_json(output_dir / "route_identity.json", route_identity)
     _write_json(
@@ -402,6 +435,35 @@ def main(argv: list[str] | None = None) -> int:
     if result.returncode != 0:
         return result.returncode
     return 0 if status == "done" else 2
+
+
+def _preflight_input_paths(args: argparse.Namespace) -> tuple[dict[str, str | None], list[dict[str, str]]]:
+    requested = {}
+    invalid = []
+    for field in INPUT_PATH_FIELDS:
+        raw = getattr(args, field)
+        requested[field] = str(Path(raw)) if raw else None
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.exists():
+            invalid.append({"field": field, "path": str(path), "reason": "missing"})
+            continue
+        if not path.is_file():
+            invalid.append({"field": field, "path": str(path), "reason": "not_file"})
+            continue
+        if path.stat().st_size == 0:
+            invalid.append({"field": field, "path": str(path), "reason": "blank"})
+            continue
+        if field.endswith("_manifest"):
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                invalid.append({"field": field, "path": str(path), "reason": "invalid_json"})
+                continue
+            if not isinstance(manifest, dict):
+                invalid.append({"field": field, "path": str(path), "reason": "invalid_json"})
+    return requested, invalid
 
 
 def _bind_effective_shape_flow_trace_keys(
