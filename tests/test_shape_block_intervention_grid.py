@@ -264,6 +264,22 @@ def test_grid_plan_is_idempotent_and_does_not_remove_unrelated_files(tmp_path: P
     assert unrelated.read_text() == "owned elsewhere"
 
 
+def test_grid_plan_validation_rejects_duplicate_point_names() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _validate_plan
+
+    index = {
+        "schema": "trellis2mlx.shape_block_intervention_grid_plan.v1",
+        "axes": {"alpha": [0.0, 1.0], "beta": [0.0]},
+        "points": [
+            {"name": "same-name", "coordinate": {"alpha": 0.0, "beta": 0.0}},
+            {"name": "same-name", "coordinate": {"alpha": 1.0, "beta": 0.0}},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="duplicate point names"):
+        _validate_plan(index)
+
+
 def test_grid_summary_requires_complete_route_evidence_and_exact_controls(tmp_path: Path) -> None:
     from scripts.build_shape_block_intervention_grid import build_grid_plan
     from scripts.summarize_shape_block_intervention_grid import summarize_grid
@@ -310,18 +326,104 @@ def test_grid_summary_requires_complete_route_evidence_and_exact_controls(tmp_pa
 
     summary = summarize_grid(tmp_path / "index.json")
 
-    assert summary["schema"] == "trellis2mlx.shape_block_intervention_grid_summary.v1"
+    assert summary["schema"] == "trellis2mlx.shape_block_intervention_grid_summary.v2"
     assert summary["status"] == "done"
     assert summary["point_count"] == 4
     assert all(point["control_exact"] for point in summary["points"])
     assert all(point["route"]["backend"] == "mlx-metal" for point in summary["points"])
     assert all(point["route"]["attention_backend"] == "fast" for point in summary["points"])
     assert summary["route_vector"]["conditioning_sample_sha256"] == "1" * 64
+    assert all(set(point["state_digests"]) == set(summary["compared_arrays"]) for point in summary["points"])
+
+    geometry = summary["coordinate_geometry"]
+    assert geometry["coordinate_system"] == {
+        "alpha": "source_delta_scale at block29 after_self",
+        "beta": "source_delta_scale at block29 cross_attention_raw",
+        "projection": "none",
+    }
+    assert len(geometry["cells"]) == 1
+    cell = geometry["cells"][0]
+    witness = cell["arrays"]["pos_block29_after_cross"]
+    assert witness["lower_corner_tangents"]["cosine"] == pytest.approx(1.0)
+    assert witness["opposite_edge_transport"]["alpha"]["difference"]["l2_norm"] == 0.0
+    assert witness["opposite_edge_transport"]["beta"]["difference"]["l2_norm"] == 0.0
+    assert witness["mixed_second_difference"]["l2_norm"] == 0.0
+    collapsed = [
+        group
+        for group in geometry["quotient_classes"]["pos_block29_after_cross"]
+        if group["point_count"] == 2
+    ]
+    assert len(collapsed) == 1
+    assert collapsed[0]["coordinates"] == [
+        {"alpha": 0.0, "beta": 1.0},
+        {"alpha": 1.0, "beta": 0.0},
+    ]
 
     first = index["points"][0]
     (Path(first["output_dir"]) / "run_report.json").unlink()
     with pytest.raises(ValueError, match="run report"):
         summarize_grid(tmp_path / "index.json")
+
+
+def test_coordinate_geometry_exposes_mixed_interaction_without_projection() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _summarize_array_geometry
+
+    states = {
+        (alpha, beta): (
+            f"a{alpha}-b{beta}",
+            np.full((2, 2), alpha * beta, dtype=np.float32),
+        )
+        for alpha in (0.0, 1.0)
+        for beta in (0.0, 1.0)
+    }
+
+    geometry = _summarize_array_geometry(
+        "interaction", alpha_values=(0.0, 1.0), beta_values=(0.0, 1.0), states=states
+    )
+
+    cell = geometry["cells"][0]
+    assert cell["lower_corner_tangents"]["alpha"]["l2_norm"] == 0.0
+    assert cell["lower_corner_tangents"]["beta"]["l2_norm"] == 0.0
+    assert cell["lower_corner_tangents"]["cosine"] is None
+    assert cell["mixed_second_difference"]["mean_abs"] == pytest.approx(1.0)
+    assert cell["mixed_second_difference"]["l2_norm"] == pytest.approx(2.0)
+    assert cell["opposite_edge_transport"]["alpha"]["difference"]["l2_norm"] == pytest.approx(2.0)
+    assert cell["opposite_edge_transport"]["beta"]["difference"]["l2_norm"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("fault", ["missing", "shape", "nonfinite"])
+def test_coordinate_geometry_rejects_incomplete_or_malformed_states(fault: str) -> None:
+    from scripts.summarize_shape_block_intervention_grid import _summarize_array_geometry
+
+    states = {
+        (alpha, beta): (
+            f"a{alpha}-b{beta}",
+            np.full((2, 2), alpha + beta, dtype=np.float32),
+        )
+        for alpha in (0.0, 1.0)
+        for beta in (0.0, 1.0)
+    }
+    if fault == "missing":
+        del states[(1.0, 1.0)]
+    elif fault == "shape":
+        states[(1.0, 1.0)] = ("bad-shape", np.zeros((2, 3), dtype=np.float32))
+    else:
+        states[(1.0, 1.0)][1][0, 0] = np.nan
+
+    with pytest.raises(ValueError, match="Cartesian|shape|non-finite"):
+        _summarize_array_geometry(
+            "malformed", alpha_values=(0.0, 1.0), beta_values=(0.0, 1.0), states=states
+        )
+
+
+def test_state_digest_binds_dtype_shape_and_bytes() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _state_digest
+
+    base = np.asarray([[1, 2]], dtype=np.float32)
+
+    assert _state_digest(base) == _state_digest(base.copy())
+    assert _state_digest(base) != _state_digest(base.astype(np.int32))
+    assert _state_digest(base) != _state_digest(base.reshape(2, 1))
 
 
 def test_grid_summary_rejects_corner_that_only_matches_at_endpoint(tmp_path: Path) -> None:
@@ -381,6 +483,27 @@ def test_grid_summary_cli_writes_failure_report_before_primary_summary(tmp_path:
     assert report["status"] == "failed"
     assert report["failure_phase"] == "admit_grid_runs"
     assert report["last_trustworthy_evidence"]["grid_index"] == str(index)
+
+
+def test_grid_summary_cli_distinguishes_coordinate_geometry_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import scripts.summarize_shape_block_intervention_grid as module
+    from scripts.summarize_shape_block_intervention_grid import CoordinateGeometryError
+
+    index = tmp_path / "index.json"
+    index.write_text("{}", encoding="utf-8")
+    output = tmp_path / "summary.json"
+
+    def fail_geometry(_index_path):
+        raise CoordinateGeometryError("mixed tensor shape")
+
+    monkeypatch.setattr(module, "summarize_grid", fail_geometry)
+
+    assert module.main(["--grid-index", str(index), "--output-json", str(output)]) == 1
+    report = json.loads(output.read_text())
+    assert report["failure_phase"] == "coordinate_geometry"
+    assert report["error_message"] == "mixed tensor shape"
 
 
 def test_grid_summary_route_rejects_incomplete_effective_trace_key_selection() -> None:

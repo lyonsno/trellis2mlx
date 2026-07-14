@@ -13,7 +13,7 @@ import numpy as np
 
 
 PLAN_SCHEMA = "trellis2mlx.shape_block_intervention_grid_plan.v1"
-SUMMARY_SCHEMA = "trellis2mlx.shape_block_intervention_grid_summary.v1"
+SUMMARY_SCHEMA = "trellis2mlx.shape_block_intervention_grid_summary.v2"
 COMPARISON_CLASS = "block29_after_self_cross_attention_raw_delta_grid"
 COMPARED_ARRAYS = tuple(
     f"{branch}_{stage}"
@@ -50,6 +50,10 @@ SHA_FIELDS = {
 }
 
 
+class CoordinateGeometryError(ValueError):
+    pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid-index", required=True, type=Path)
@@ -77,6 +81,13 @@ def summarize_grid(index_path: Path) -> dict:
             )
         admitted_points.append(admitted)
 
+    try:
+        coordinate_geometry = _build_coordinate_geometry(index["axes"], admitted_points)
+    except CoordinateGeometryError:
+        raise
+    except Exception as exc:
+        raise CoordinateGeometryError(str(exc)) from exc
+
     return {
         "schema": SUMMARY_SCHEMA,
         "status": "done",
@@ -90,6 +101,7 @@ def summarize_grid(index_path: Path) -> dict:
         "source_trace_sha256": _sha256(source_trace_path),
         "compared_arrays": list(COMPARED_ARRAYS),
         "points": admitted_points,
+        "coordinate_geometry": coordinate_geometry,
     }
 
 
@@ -102,7 +114,11 @@ def main(argv: list[str] | None = None) -> int:
         failure = {
             "schema": SUMMARY_SCHEMA,
             "status": "failed",
-            "failure_phase": "admit_grid_runs",
+            "failure_phase": (
+                "coordinate_geometry"
+                if isinstance(exc, CoordinateGeometryError)
+                else "admit_grid_runs"
+            ),
             "error_type": type(exc).__name__,
             "error_message": str(exc),
             "last_trustworthy_evidence": {
@@ -131,12 +147,19 @@ def _validate_plan(index: Any) -> None:
         raise ValueError("grid index points must be a list")
     expected = {(alpha, beta) for alpha in alphas for beta in betas}
     observed = []
+    point_names = []
     for point in points:
         if not isinstance(point, dict) or not isinstance(point.get("coordinate"), dict):
             raise ValueError("grid point must carry a coordinate object")
+        point_name = point.get("name")
+        if not isinstance(point_name, str) or not point_name:
+            raise ValueError("grid point must carry a non-empty name")
+        point_names.append(point_name)
         observed.append(
             (float(point["coordinate"]["alpha"]), float(point["coordinate"]["beta"]))
         )
+    if len(point_names) != len(set(point_names)):
+        raise ValueError("grid index contains duplicate point names")
     if len(observed) != len(set(observed)):
         raise ValueError("grid index contains duplicate coordinates")
     missing = sorted(expected - set(observed))
@@ -342,6 +365,243 @@ def _required_array(trace: Any, name: str, label: str) -> np.ndarray:
     if array.ndim != 2:
         raise ValueError(f"{label} {name} does not normalize to [tokens, channels]: {array.shape}")
     return array
+
+
+def _build_coordinate_geometry(axes: dict[str, list[float]], points: list[dict]) -> dict:
+    alpha_values = tuple(sorted(_axis_values(axes.get("alpha"), "alpha")))
+    beta_values = tuple(sorted(_axis_values(axes.get("beta"), "beta")))
+    for point in points:
+        point["state_digests"] = {}
+
+    quotient_classes = {}
+    combined_cells = None
+    for array_name in COMPARED_ARRAYS:
+        states = {}
+        for point in points:
+            coordinate = point["coordinate"]
+            key = (float(coordinate["alpha"]), float(coordinate["beta"]))
+            with np.load(point["artifact"], allow_pickle=False) as trace:
+                array = np.array(
+                    _required_array(trace, array_name, point["name"]),
+                    copy=True,
+                )
+            states[key] = (point["name"], array)
+
+        array_geometry = _summarize_array_geometry(
+            array_name,
+            alpha_values=alpha_values,
+            beta_values=beta_values,
+            states=states,
+        )
+        quotient_classes[array_name] = array_geometry["quotient_classes"]
+        digest_by_coordinate = {
+            (state["coordinate"]["alpha"], state["coordinate"]["beta"]): state[
+                "state_digest"
+            ]
+            for state in array_geometry["states"]
+        }
+        for point in points:
+            coordinate = point["coordinate"]
+            point["state_digests"][array_name] = digest_by_coordinate[
+                (float(coordinate["alpha"]), float(coordinate["beta"]))
+            ]
+
+        if combined_cells is None:
+            combined_cells = [
+                {
+                    "bounds": cell["bounds"],
+                    "delta": cell["delta"],
+                    "arrays": {
+                        array_name: {
+                            key: value
+                            for key, value in cell.items()
+                            if key not in {"bounds", "delta"}
+                        }
+                    },
+                }
+                for cell in array_geometry["cells"]
+            ]
+        else:
+            if len(combined_cells) != len(array_geometry["cells"]):
+                raise ValueError("coordinate geometry produced inconsistent cell counts")
+            for combined, cell in zip(combined_cells, array_geometry["cells"]):
+                if combined["bounds"] != cell["bounds"] or combined["delta"] != cell["delta"]:
+                    raise ValueError("coordinate geometry produced inconsistent cell bounds")
+                combined["arrays"][array_name] = {
+                    key: value for key, value in cell.items() if key not in {"bounds", "delta"}
+                }
+
+    return {
+        "coordinate_system": {
+            "alpha": "source_delta_scale at block29 after_self",
+            "beta": "source_delta_scale at block29 cross_attention_raw",
+            "projection": "none",
+        },
+        "sorted_axes": {"alpha": list(alpha_values), "beta": list(beta_values)},
+        "quotient_classes": quotient_classes,
+        "cells": combined_cells or [],
+    }
+
+
+def _summarize_array_geometry(
+    array_name: str,
+    *,
+    alpha_values: tuple[float, ...],
+    beta_values: tuple[float, ...],
+    states: dict[tuple[float, float], tuple[str, np.ndarray]],
+) -> dict:
+    alphas = tuple(sorted(float(value) for value in alpha_values))
+    betas = tuple(sorted(float(value) for value in beta_values))
+    if not alphas or not betas:
+        raise ValueError(f"{array_name} coordinate geometry axes must be non-empty")
+    if any(not math.isfinite(value) for value in (*alphas, *betas)):
+        raise ValueError(f"{array_name} coordinate geometry axes contain non-finite values")
+    if len(alphas) != len(set(alphas)) or len(betas) != len(set(betas)):
+        raise ValueError(f"{array_name} coordinate geometry axes contain duplicates")
+    expected = {(alpha, beta) for alpha in alphas for beta in betas}
+    observed = {(float(alpha), float(beta)) for alpha, beta in states}
+    if observed != expected:
+        raise ValueError(
+            f"{array_name} coordinate geometry is not the full Cartesian product: "
+            f"missing={sorted(expected - observed)}, extra={sorted(observed - expected)}"
+        )
+
+    normalized = {}
+    expected_shape = None
+    state_rows = []
+    quotient_groups: dict[str, list[dict]] = {}
+    for coordinate in sorted(expected):
+        point_name, raw_array = states[coordinate]
+        array = np.asarray(raw_array)
+        if array.ndim != 2:
+            raise ValueError(
+                f"{array_name} state at {coordinate} does not have normalized 2-D shape: {array.shape}"
+            )
+        if array.size == 0 or not np.all(np.isfinite(array)):
+            raise ValueError(f"{array_name} state at {coordinate} is blank or non-finite")
+        if expected_shape is None:
+            expected_shape = array.shape
+        elif array.shape != expected_shape:
+            raise ValueError(
+                f"{array_name} state shape differs across coordinates: "
+                f"expected {expected_shape}, got {array.shape} at {coordinate}"
+            )
+        array = np.ascontiguousarray(array)
+        normalized[coordinate] = array
+        digest = _state_digest(array)
+        row = {
+            "point_name": str(point_name),
+            "coordinate": {"alpha": coordinate[0], "beta": coordinate[1]},
+            "state_digest": digest,
+        }
+        state_rows.append(row)
+        quotient_groups.setdefault(digest, []).append(row)
+
+    quotient_classes = []
+    for digest, rows in sorted(
+        quotient_groups.items(),
+        key=lambda item: (
+            item[1][0]["coordinate"]["alpha"],
+            item[1][0]["coordinate"]["beta"],
+        ),
+    ):
+        quotient_classes.append(
+            {
+                "state_digest": digest,
+                "point_count": len(rows),
+                "point_names": [row["point_name"] for row in rows],
+                "coordinates": [row["coordinate"] for row in rows],
+            }
+        )
+
+    cells = []
+    for alpha0, alpha1 in zip(alphas, alphas[1:]):
+        delta_alpha = alpha1 - alpha0
+        if delta_alpha <= 0:
+            raise ValueError(f"{array_name} alpha cell width must be positive")
+        for beta0, beta1 in zip(betas, betas[1:]):
+            delta_beta = beta1 - beta0
+            if delta_beta <= 0:
+                raise ValueError(f"{array_name} beta cell width must be positive")
+            y00 = normalized[(alpha0, beta0)].astype(np.float64)
+            y10 = normalized[(alpha1, beta0)].astype(np.float64)
+            y01 = normalized[(alpha0, beta1)].astype(np.float64)
+            y11 = normalized[(alpha1, beta1)].astype(np.float64)
+            alpha_lower = (y10 - y00) / delta_alpha
+            alpha_upper = (y11 - y01) / delta_alpha
+            beta_lower = (y01 - y00) / delta_beta
+            beta_upper = (y11 - y10) / delta_beta
+            mixed = (y11 - y10 - y01 + y00) / (delta_alpha * delta_beta)
+            cells.append(
+                {
+                    "bounds": {
+                        "alpha": [alpha0, alpha1],
+                        "beta": [beta0, beta1],
+                    },
+                    "delta": {"alpha": delta_alpha, "beta": delta_beta},
+                    "lower_corner_tangents": {
+                        "alpha": _vector_metrics(alpha_lower),
+                        "beta": _vector_metrics(beta_lower),
+                        "cosine": _cosine(alpha_lower, beta_lower),
+                    },
+                    "opposite_edge_transport": {
+                        "alpha": {
+                            "difference": _vector_metrics(alpha_upper - alpha_lower),
+                            "cosine": _cosine(alpha_lower, alpha_upper),
+                        },
+                        "beta": {
+                            "difference": _vector_metrics(beta_upper - beta_lower),
+                            "cosine": _cosine(beta_lower, beta_upper),
+                        },
+                    },
+                    "mixed_second_difference": _vector_metrics(mixed),
+                }
+            )
+
+    return {
+        "array_name": array_name,
+        "states": state_rows,
+        "quotient_classes": quotient_classes,
+        "cells": cells,
+    }
+
+
+def _state_digest(array: np.ndarray) -> str:
+    array = np.ascontiguousarray(np.asarray(array))
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("state digest input is blank or non-finite")
+    digest = hashlib.sha256()
+    digest.update(b"trellis2mlx.coordinate-state.v1\0")
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(",".join(str(size) for size in array.shape).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _vector_metrics(array: np.ndarray) -> dict:
+    array = np.asarray(array, dtype=np.float64)
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("coordinate geometry produced a blank or non-finite vector")
+    absolute = np.abs(array)
+    return {
+        "mean_abs": float(np.mean(absolute, dtype=np.float64)),
+        "max_abs": float(np.max(absolute)),
+        "l2_norm": float(np.linalg.norm(array.ravel())),
+        "nonzero": int(np.count_nonzero(array)),
+    }
+
+
+def _cosine(left: np.ndarray, right: np.ndarray) -> float | None:
+    left_flat = np.asarray(left, dtype=np.float64).ravel()
+    right_flat = np.asarray(right, dtype=np.float64).ravel()
+    left_norm = float(np.linalg.norm(left_flat))
+    right_norm = float(np.linalg.norm(right_flat))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return None
+    value = float(np.dot(left_flat, right_flat) / (left_norm * right_norm))
+    return min(1.0, max(-1.0, value))
 
 
 def _require_file(path: Path, label: str) -> None:
