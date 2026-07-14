@@ -555,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
             _invalidate_primary_output(
                 args.output_npz,
                 protected={
+                    "output report": args.output_json,
                     "endpoint packet": args.endpoints,
                     "conditioning": args.conditioning,
                     "shape-flow noise sample": args.shape_flow_noise_sample,

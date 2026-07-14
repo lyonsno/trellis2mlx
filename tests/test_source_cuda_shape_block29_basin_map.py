@@ -13,7 +13,14 @@ BRANCH_STAGE_KEYS = (
 )
 
 
-def _write_endpoint_packet(path, *, corrupt_key=None):
+def _write_endpoint_packet(
+    path,
+    *,
+    corrupt_key=None,
+    conditioning_sha="1" * 64,
+    noise_sha="2" * 64,
+    source_tar_sha="3" * 64,
+):
     coords = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
     arrays = {"coords": coords}
     endpoint_digests = {}
@@ -40,13 +47,43 @@ def _write_endpoint_packet(path, *, corrupt_key=None):
         "step_index": 0,
         "endpoint_digests": endpoint_digests,
         "current_route": {
-            "conditioning_sample_sha256": "1" * 64,
-            "shape_flow_noise_sample_sha256": "2" * 64,
+            "conditioning_sample_sha256": conditioning_sha,
+            "shape_flow_noise_sample_sha256": noise_sha,
         },
-        "source_route": {"source_tar_sha256": "3" * 64},
+        "source_route": {"source_tar_sha256": source_tar_sha},
     }
     arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
     np.savez(path, **arrays)
+
+
+def _sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_valid_local_inputs(tmp_path):
+    conditioning = tmp_path / "conditioning.npz"
+    noise = tmp_path / "noise.npz"
+    source_tar = tmp_path / "source.tar.gz"
+    np.savez(conditioning, cond=np.zeros((1, 1, 1)), neg_cond=np.zeros((1, 1, 1)))
+    np.savez(
+        noise,
+        noise=np.zeros((1, 4), dtype=np.float32),
+        coords=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
+        steps=np.asarray(8),
+        guidance_strength=np.asarray(7.5),
+        guidance_rescale=np.asarray(0.7),
+        guidance_interval=np.asarray([0.0, 1.0]),
+        rescale_t=np.asarray(3.0),
+    )
+    source_tar.write_bytes(b"not blank")
+    endpoints = tmp_path / "endpoints.npz"
+    _write_endpoint_packet(
+        endpoints,
+        conditioning_sha=_sha256(conditioning),
+        noise_sha=_sha256(noise),
+        source_tar_sha=_sha256(source_tar),
+    )
+    return endpoints, conditioning, noise, source_tar
 
 
 def test_parse_axis_values_and_cartesian_coordinates_are_uncapped_and_ordered():
@@ -316,3 +353,70 @@ def test_output_invalidation_refuses_to_delete_an_input_collision(tmp_path):
     assert payload["failure_phase"] == "request_validation"
     assert payload["primary_output_status"] == "not_owned_due_to_path_collision"
     assert "collides with endpoint packet" in payload["error"]
+
+
+def test_output_invalidation_preserves_report_on_early_alias_failure(tmp_path):
+    from scripts.source_cuda_shape_block29_basin_map import main
+
+    report = tmp_path / "result.json"
+    report.write_text('{"status": "stale"}\n')
+
+    status = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(report),
+            "--endpoints",
+            str(tmp_path / "missing-endpoints.npz"),
+            "--conditioning",
+            str(tmp_path / "missing-conditioning.npz"),
+            "--shape-flow-noise-sample",
+            str(tmp_path / "missing-noise.npz"),
+            "--source-tar",
+            str(tmp_path / "missing-source.tar.gz"),
+            "--alphas",
+            "0,0.5,0.5,1",
+        ]
+    )
+
+    assert status == 1
+    payload = json.loads(report.read_text())
+    assert payload["failure_phase"] == "request_validation"
+    assert payload["primary_output_status"] == "not_owned_due_to_path_collision"
+    assert "collides with output report" in payload["error"]
+    assert "primary_output" not in payload
+
+
+def test_output_invalidation_rejects_report_alias_before_valid_input_admission(tmp_path):
+    from scripts.source_cuda_shape_block29_basin_map import main
+
+    endpoints, conditioning, noise, source_tar = _write_valid_local_inputs(tmp_path)
+    report = tmp_path / "result.json"
+
+    status = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(report),
+            "--endpoints",
+            str(endpoints),
+            "--conditioning",
+            str(conditioning),
+            "--shape-flow-noise-sample",
+            str(noise),
+            "--source-tar",
+            str(source_tar),
+            "--no-download",
+        ]
+    )
+
+    assert status == 1
+    payload = json.loads(report.read_text())
+    assert payload["failure_phase"] == "request_validation"
+    assert payload["last_trustworthy_phase"] == "arguments_parsed"
+    assert payload["primary_output_status"] == "not_owned_due_to_path_collision"
+    assert "collides with output report" in payload["error"]
+    assert "inputs" not in payload
+    assert "primary_output" not in payload
