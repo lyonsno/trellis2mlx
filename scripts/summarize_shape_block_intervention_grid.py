@@ -585,23 +585,60 @@ def _vector_metrics(array: np.ndarray) -> dict:
     if array.size == 0 or not np.all(np.isfinite(array)):
         raise ValueError("coordinate geometry produced a blank or non-finite vector")
     absolute = np.abs(array)
-    return {
-        "mean_abs": float(np.mean(absolute, dtype=np.float64)),
-        "max_abs": float(np.max(absolute)),
-        "l2_norm": float(np.linalg.norm(array.ravel())),
+    scale = float(np.max(absolute))
+    if scale == 0.0:
+        mean_abs = 0.0
+    else:
+        mean_abs = scale * float(np.mean(absolute / scale, dtype=np.float64))
+    metrics = {
+        "mean_abs": mean_abs,
+        "max_abs": scale,
+        "l2_norm": _scaled_l2_norm(array),
         "nonzero": int(np.count_nonzero(array)),
     }
+    for name, value in metrics.items():
+        if name != "nonzero" and not math.isfinite(value):
+            raise ValueError(f"coordinate geometry derived non-finite {name}")
+    return metrics
 
 
 def _cosine(left: np.ndarray, right: np.ndarray) -> float | None:
     left_flat = np.asarray(left, dtype=np.float64).ravel()
     right_flat = np.asarray(right, dtype=np.float64).ravel()
-    left_norm = float(np.linalg.norm(left_flat))
-    right_norm = float(np.linalg.norm(right_flat))
-    if left_norm == 0.0 or right_norm == 0.0:
+    if left_flat.shape != right_flat.shape:
+        raise ValueError("coordinate geometry cosine vectors have different shapes")
+    if not np.all(np.isfinite(left_flat)) or not np.all(np.isfinite(right_flat)):
+        raise ValueError("coordinate geometry cosine input is non-finite")
+    left_scale = float(np.max(np.abs(left_flat)))
+    right_scale = float(np.max(np.abs(right_flat)))
+    if left_scale == 0.0 or right_scale == 0.0:
         return None
-    value = float(np.dot(left_flat, right_flat) / (left_norm * right_norm))
+    left_scaled = left_flat / left_scale
+    right_scaled = right_flat / right_scale
+    left_norm = _scaled_l2_norm(left_scaled)
+    right_norm = _scaled_l2_norm(right_scaled)
+    numerator = float(np.dot(left_scaled, right_scaled))
+    denominator = left_norm * right_norm
+    if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator == 0.0:
+        raise ValueError("coordinate geometry derived non-finite cosine components")
+    value = numerator / denominator
+    if not math.isfinite(value):
+        raise ValueError("coordinate geometry derived non-finite cosine")
     return min(1.0, max(-1.0, value))
+
+
+def _scaled_l2_norm(array: np.ndarray) -> float:
+    absolute = np.abs(np.asarray(array, dtype=np.float64).ravel())
+    if absolute.size == 0 or not np.all(np.isfinite(absolute)):
+        raise ValueError("coordinate geometry norm input is blank or non-finite")
+    scale = float(np.max(absolute))
+    if scale == 0.0:
+        return 0.0
+    scaled = absolute / scale
+    unit_norm = math.sqrt(float(np.sum(scaled * scaled, dtype=np.float64)))
+    if not math.isfinite(unit_norm) or unit_norm > np.finfo(np.float64).max / scale:
+        raise ValueError("coordinate geometry derived non-finite l2_norm")
+    return scale * unit_norm
 
 
 def _require_file(path: Path, label: str) -> None:
@@ -619,7 +656,8 @@ def _require_sha256(value: Any, label: str) -> None:
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    path.write_text(serialized, encoding="utf-8")
 
 
 def _sha256(path: Path) -> str:

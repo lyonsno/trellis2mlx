@@ -426,6 +426,38 @@ def test_state_digest_binds_dtype_shape_and_bytes() -> None:
     assert _state_digest(base) != _state_digest(base.reshape(2, 1))
 
 
+def test_coordinate_metrics_are_scale_safe_for_extreme_finite_vectors() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _cosine, _vector_metrics
+
+    single = np.asarray([[1e308]], dtype=np.float64)
+    pair = np.asarray([[1e154, 1e154]], dtype=np.float64)
+
+    assert _vector_metrics(single)["l2_norm"] == pytest.approx(1e308)
+    assert _cosine(single, single) == pytest.approx(1.0)
+    assert _vector_metrics(pair)["l2_norm"] == pytest.approx(np.sqrt(2.0) * 1e154)
+    assert _cosine(pair, pair) == pytest.approx(1.0)
+
+
+def test_coordinate_metrics_reject_unrepresentable_derived_scalars() -> None:
+    from scripts.summarize_shape_block_intervention_grid import _vector_metrics
+
+    vector = np.full((2, 2), np.finfo(np.float64).max, dtype=np.float64)
+
+    with pytest.raises(ValueError, match="derived.*non-finite"):
+        _vector_metrics(vector)
+
+
+def test_grid_summary_json_rejects_nan_and_infinity(tmp_path: Path) -> None:
+    from scripts.summarize_shape_block_intervention_grid import _write_json
+
+    output = tmp_path / "invalid.json"
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _write_json(output, {"invalid": float("inf")})
+
+    assert not output.exists()
+
+
 def test_grid_summary_rejects_corner_that_only_matches_at_endpoint(tmp_path: Path) -> None:
     from scripts.build_shape_block_intervention_grid import build_grid_plan
     from scripts.summarize_shape_block_intervention_grid import summarize_grid
