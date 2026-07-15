@@ -85,6 +85,11 @@ def build_mesh_support_atlas(
     }
     phase = "validate_request"
     try:
+        output_png_is_protected = any(
+            paths_alias(output_png, path) for path in meshes.values()
+        )
+        if not output_png_is_protected:
+            output_png.unlink(missing_ok=True)
         validate_request(
             meshes=meshes,
             grid_sizes=report["grid_sizes"],
@@ -102,6 +107,9 @@ def build_mesh_support_atlas(
             vertices, face_records, layout = map_binary_ply(path)
             if vertices.shape[0] == 0:
                 raise ValueError(f"mesh {name!r} has no vertices")
+            phase = "validate_source_vertices"
+            validate_finite_vertices(vertices, mesh_name=name)
+            phase = "read_source_identity"
             bounds_min, bounds_max = chunked_bounds(vertices)
             source = {
                 "name": name,
@@ -382,6 +390,28 @@ def chunked_bounds(
     return bounds_min, bounds_max
 
 
+def validate_finite_vertices(
+    vertices: np.ndarray,
+    *,
+    mesh_name: str,
+    chunk_size: int = 1_000_000,
+) -> None:
+    for start in range(0, vertices.shape[0], chunk_size):
+        chunk = vertices[start : start + chunk_size]
+        finite = np.isfinite(chunk)
+        if bool(np.all(finite)):
+            continue
+        first = np.argwhere(~finite)[0]
+        vertex_index = start + int(first[0])
+        coordinate_index = int(first[1])
+        chunk_nonfinite_count = int(finite.size - np.count_nonzero(finite))
+        raise ValueError(
+            f"mesh {mesh_name!r} has non-finite vertex coordinates; "
+            f"first_vertex={vertex_index}, coordinate={coordinate_index}, "
+            f"chunk_nonfinite_count={chunk_nonfinite_count}"
+        )
+
+
 def find_named_path_collisions(named_paths: list[tuple[str, Path]]) -> list[str]:
     collisions: list[str] = []
     for index, (left_name, left_path) in enumerate(named_paths):
@@ -405,7 +435,7 @@ def parse_mesh_args(values: list[str]) -> dict[str, Path]:
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
 def elapsed(started: float) -> float:

@@ -85,6 +85,84 @@ def test_mesh_support_atlas_persists_failure_before_visual_output(tmp_path):
     assert not output_png.exists()
 
 
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_mesh_support_atlas_rejects_nonfinite_vertices(tmp_path, bad_value):
+    import scripts.build_mesh_support_atlas as build_mesh_support_atlas
+    from scripts.postprocess_raw_cuda_mesh import write_binary_ply
+
+    mesh_a = tmp_path / "a.ply"
+    mesh_b = tmp_path / "b.ply"
+    output_json = tmp_path / "atlas.json"
+    output_png = tmp_path / "atlas.png"
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    bad_vertices = vertices.copy()
+    bad_vertices[1, 2] = bad_value
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    write_binary_ply(mesh_a, vertices, faces)
+    write_binary_ply(mesh_b, bad_vertices, faces)
+    output_json.write_text('{"status": "done", "stale": true}\n')
+    output_png.write_bytes(b"stale-png")
+
+    with pytest.raises(ValueError, match="mesh 'bad'.*non-finite"):
+        build_mesh_support_atlas.build_mesh_support_atlas(
+            meshes={"good": mesh_a, "bad": mesh_b},
+            grid_sizes=[8],
+            reference="good",
+            output_json=output_json,
+            output_png=output_png,
+        )
+
+    report_text = output_json.read_text()
+    report = json.loads(report_text)
+    assert report["status"] == "failed"
+    assert report["phase"] == "validate_source_vertices"
+    assert report["error_type"] == "ValueError"
+    assert "mesh 'bad'" in report["error"]
+    assert "NaN" not in report_text
+    assert "Infinity" not in report_text
+    assert not output_png.exists()
+
+
+def test_mesh_support_atlas_callable_request_failure_removes_only_unprotected_png(tmp_path):
+    import scripts.build_mesh_support_atlas as build_mesh_support_atlas
+    from scripts.postprocess_raw_cuda_mesh import write_binary_ply
+
+    mesh_a = tmp_path / "a.ply"
+    mesh_b = tmp_path / "b.ply"
+    output_json = tmp_path / "atlas.json"
+    output_png = tmp_path / "atlas.png"
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    write_binary_ply(mesh_a, vertices, faces)
+    write_binary_ply(mesh_b, vertices + 0.1, faces)
+    output_png.write_bytes(b"stale-png")
+
+    with pytest.raises(ValueError, match="grid sizes"):
+        build_mesh_support_atlas.build_mesh_support_atlas(
+            meshes={"a": mesh_a, "b": mesh_b},
+            grid_sizes=[1],
+            reference="a",
+            output_json=output_json,
+            output_png=output_png,
+        )
+
+    assert json.loads(output_json.read_text())["phase"] == "validate_request"
+    assert not output_png.exists()
+
+    protected_bytes = mesh_a.read_bytes()
+    with pytest.raises(ValueError, match="requested paths must be distinct"):
+        build_mesh_support_atlas.build_mesh_support_atlas(
+            meshes={"a": mesh_a, "b": mesh_b},
+            grid_sizes=[8],
+            reference="a",
+            output_json=output_json,
+            output_png=mesh_a,
+        )
+
+    assert mesh_a.read_bytes() == protected_bytes
+    assert json.loads(output_json.read_text())["phase"] == "validate_request"
+
+
 def test_mesh_support_atlas_cli_runs_as_direct_script(tmp_path):
     import scripts.build_mesh_support_atlas as build_mesh_support_atlas
     from scripts.postprocess_raw_cuda_mesh import write_binary_ply
