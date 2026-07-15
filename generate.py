@@ -249,6 +249,28 @@ def _cleanup_and_simplify_mesh(
     return vertices, faces
 
 
+def _shape_sampler_params(
+    *,
+    steps,
+    guidance_strength=7.5,
+    guidance_rescale=0.5,
+    guidance_low=0.6,
+    guidance_high=1.0,
+):
+    if not 0.0 <= guidance_low <= guidance_high <= 1.0:
+        raise ValueError(
+            "shape guidance interval must satisfy "
+            "0.0 <= low <= high <= 1.0"
+        )
+    return {
+        "steps": steps,
+        "guidance_strength": guidance_strength,
+        "guidance_rescale": guidance_rescale,
+        "guidance_interval": (guidance_low, guidance_high),
+        "rescale_t": 3.0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -262,6 +284,14 @@ def main():
                         help="Simplify mesh to this face count (0 to disable, default: 200K)")
     parser.add_argument("--steps", type=int, default=12,
                         help="Number of ODE sampler steps (default: 12, try 6 for 2x speed)")
+    parser.add_argument("--shape-guidance-strength", type=float, default=7.5,
+                        help="Shape SLat image-conditioning guidance strength (default: 7.5)")
+    parser.add_argument("--shape-guidance-rescale", type=float, default=0.5,
+                        help="Shape SLat CFG rescale blend (default: 0.5)")
+    parser.add_argument("--shape-guidance-low", type=float, default=0.6,
+                        help="Shape SLat guidance interval lower bound (default: 0.6)")
+    parser.add_argument("--shape-guidance-high", type=float, default=1.0,
+                        help="Shape SLat guidance interval upper bound (default: 1.0)")
     parser.add_argument("--no-cascade", action="store_true",
                         help="Skip two-pass cascade (LR→upsample→HR). Uses single 512 SLat pass. "
                              "Much faster (~4x) but lower mesh quality and more holes.")
@@ -311,6 +341,17 @@ def main():
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
+
+    try:
+        shape_sampler = _shape_sampler_params(
+            steps=args.steps,
+            guidance_strength=args.shape_guidance_strength,
+            guidance_rescale=args.shape_guidance_rescale,
+            guidance_low=args.shape_guidance_low,
+            guidance_high=args.shape_guidance_high,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
@@ -556,8 +597,7 @@ def main():
     from trellmlx.models.slat_flow import SLatFlowModel
 
     # Sampler params from pipeline.json
-    SHAPE_SAMPLER = dict(steps=n_steps, guidance_strength=7.5, guidance_rescale=0.5,
-                         guidance_interval=(0.6, 1.0), rescale_t=3.0)
+    SHAPE_SAMPLER = shape_sampler
     TEX_SAMPLER = dict(steps=n_steps, guidance_strength=1.0, guidance_rescale=0.0,
                        guidance_interval=(0.6, 0.9), rescale_t=3.0)
 
