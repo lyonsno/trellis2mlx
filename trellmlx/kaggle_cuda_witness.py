@@ -571,6 +571,12 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "output_shape_slat": packet.output_shape_slat,
         "output_shape_flow_step": packet.output_shape_flow_step,
         "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+        "source_identity": {
+            "dataset_sources": [packet.dataset_id],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+        },
     }
     return f"""#!/usr/bin/env python3
 from __future__ import annotations
@@ -616,6 +622,7 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
         "requested_dataset_id": CONFIG["dataset_id"],
         "requested_kernel_id": CONFIG["kernel_id"],
         "requested_accelerator": CONFIG["accelerator"],
+        "source_identity": CONFIG["source_identity"],
         "cuda_available": cuda_available,
         "cuda_device": cuda_device,
         "torch": torch_version,
@@ -632,7 +639,7 @@ def mounted_input_snapshot() -> dict:
         return {{"mounted_input_root_exists": False, "mounted_input_dirs": [], "mounted_input_files": []}}
     dirs = [str(path) for path in sorted(root.rglob("*")) if path.is_dir()]
     files = [str(path) for path in sorted(root.rglob("*")) if path.is_file()]
-    return {{"mounted_input_root_exists": True, "mounted_input_dirs": dirs, "mounted_input_files": files[:200]}}
+    return {{"mounted_input_root_exists": True, "mounted_input_dirs": dirs, "mounted_input_files": files}}
 
 
 def find_manifest() -> Path | None:
@@ -643,6 +650,21 @@ def find_manifest() -> Path | None:
     if candidates:
         return candidates[0]
     return None
+
+
+def output_snapshot() -> dict:
+    records = {{}}
+    for name in CONFIG["outputs"]:
+        path = Path(name)
+        if not path.is_file():
+            records[name] = {{"exists": False, "sha256": None, "size_bytes": None}}
+            continue
+        records[name] = {{
+            "exists": True,
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+        }}
+    return records
 
 
 def main() -> int:
@@ -693,16 +715,21 @@ def main() -> int:
     extra = {{
         "effective_dataset_dir": str(dataset_dir),
         "effective_command": command,
+        "input_manifest": {{
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        }},
         "inputs": copied,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "exit_code": completed.returncode,
-        "outputs": {{name: Path(name).exists() for name in CONFIG["outputs"]}},
+        "outputs": output_snapshot(),
+        "mounted_input_snapshot": mounted_input_snapshot(),
     }}
     if completed.returncode != 0:
         write_receipt("failed", phase="execution", message="probe exited non-zero", extra=extra)
         return completed.returncode
-    missing = [name for name in CONFIG["outputs"] if not Path(name).exists()]
+    missing = [name for name, record in extra["outputs"].items() if not record["exists"]]
     if missing:
         write_receipt("failed", phase="output", message=f"missing outputs: {{missing}}", extra=extra)
         return 5

@@ -379,6 +379,11 @@ def validate_result_manifest(payload: dict[str, Any]) -> None:
         raise ValueError(f"result switch points differ: {observed}")
     for point in points:
         switch_step = point["switch_step"]
+        canonical_key = f"switch_{switch_step}_shape_slat"
+        if point.get("output_key") != canonical_key:
+            raise ValueError(
+                f"switch {switch_step} canonical output key must be {canonical_key!r}"
+            )
         expected_indices = suffix_step_indices(switch_step)
         if point.get("source_step_indices") != expected_indices:
             raise ValueError(f"switch {switch_step} source step indices are inconsistent")

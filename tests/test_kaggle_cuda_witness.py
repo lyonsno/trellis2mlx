@@ -124,6 +124,67 @@ def test_prepare_packet_runner_config_compiles_with_default_optional_outputs(tmp
     assert not config_line.startswith("CONFIG = {")
 
 
+def test_prepared_runner_hashes_every_output_into_its_receipt(tmp_path, monkeypatch):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/output-hash-inputs",
+            kernel_id="operator/output-hash-cuda",
+            title="Output Hash CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    namespace = {"__name__": "runner_test"}
+    exec((packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text(), namespace)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "cuda_result.json").write_text('{"status":"done"}\n')
+    (tmp_path / "cuda_result.npz").write_bytes(b"npz result")
+
+    snapshot = namespace["output_snapshot"]()
+
+    assert snapshot["cuda_result.json"] == {
+        "exists": True,
+        "sha256": namespace["sha256_file"](tmp_path / "cuda_result.json"),
+        "size_bytes": (tmp_path / "cuda_result.json").stat().st_size,
+    }
+    assert snapshot["cuda_result.npz"] == {
+        "exists": True,
+        "sha256": namespace["sha256_file"](tmp_path / "cuda_result.npz"),
+        "size_bytes": (tmp_path / "cuda_result.npz").stat().st_size,
+    }
+
+
+def test_prepared_runner_records_uncapped_mount_and_exact_source_identity(tmp_path):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/exact-mount-inputs",
+            kernel_id="operator/exact-mount-cuda",
+            title="Exact Mount CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+
+    assert "files[:200]" not in runner
+    assert '"source_identity"' in runner
+    assert '"mounted_input_snapshot": mounted_input_snapshot()' in runner
+
+
 def test_prepare_packet_preserves_entrypoint_args_in_runner(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
 

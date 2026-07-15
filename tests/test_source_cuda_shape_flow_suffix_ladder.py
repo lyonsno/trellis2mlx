@@ -174,6 +174,53 @@ def test_validate_result_requires_all_switches_and_exact_boundaries():
         validate_result_manifest(payload)
 
 
+def test_validate_result_requires_canonical_distinct_switch_output_keys():
+    from scripts.source_cuda_shape_flow_suffix_ladder import validate_result_manifest
+
+    points = [
+        {
+            "switch_step": step,
+            "source_step_indices": list(range(step, 8)),
+            "source_step_count": 8 - step,
+            "step_elapsed_seconds": [1.0] * (8 - step),
+            "output_key": f"switch_{step}_shape_slat",
+            "vs_source_anchor": {
+                "exact": step == 0,
+                "max_abs": 0.0 if step == 0 else 1.0,
+                "nonzero": 0 if step == 0 else 1,
+            },
+            "vs_mlx_anchor": {
+                "exact": step == 8,
+                "max_abs": 0.0 if step == 8 else 1.0,
+                "nonzero": 0 if step == 8 else 1,
+            },
+        }
+        for step in range(9)
+    ]
+    payload = {
+        "status": "done",
+        "effective_route": {
+            "device_type": "cuda",
+            "attention_backend": "sdpa",
+            "conv_backend": "none",
+            "steps": 8,
+            "one_model_load": True,
+            "switch_steps": list(range(9)),
+        },
+        "points": points,
+        "timing": {
+            "source_steps_completed": 36,
+            "source_steps_requested": 36,
+            "switch_points_completed": 9,
+            "switch_points_requested": 9,
+        },
+    }
+    points[4]["output_key"] = points[5]["output_key"]
+
+    with pytest.raises(ValueError, match="canonical output key"):
+        validate_result_manifest(payload)
+
+
 def test_cli_missing_inputs_remove_stale_primary_and_write_durable_report(tmp_path):
     from scripts.source_cuda_shape_flow_suffix_ladder import main
 
