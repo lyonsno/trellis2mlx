@@ -271,6 +271,28 @@ def _shape_sampler_params(
     }
 
 
+def _sparse_structure_sampler_params(
+    *,
+    steps,
+    guidance_strength=7.5,
+    guidance_rescale=0.7,
+    guidance_low=0.6,
+    guidance_high=1.0,
+):
+    if not 0.0 <= guidance_low <= guidance_high <= 1.0:
+        raise ValueError(
+            "sparse structure guidance interval must satisfy "
+            "0.0 <= low <= high <= 1.0"
+        )
+    return {
+        "steps": steps,
+        "guidance_strength": guidance_strength,
+        "guidance_rescale": guidance_rescale,
+        "guidance_interval": (guidance_low, guidance_high),
+        "rescale_t": 5.0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -284,6 +306,14 @@ def main():
                         help="Simplify mesh to this face count (0 to disable, default: 200K)")
     parser.add_argument("--steps", type=int, default=12,
                         help="Number of ODE sampler steps (default: 12, try 6 for 2x speed)")
+    parser.add_argument("--sparse-guidance-strength", type=float, default=7.5,
+                        help="Sparse-structure image-conditioning guidance strength (default: 7.5)")
+    parser.add_argument("--sparse-guidance-rescale", type=float, default=0.7,
+                        help="Sparse-structure CFG rescale blend (default: 0.7)")
+    parser.add_argument("--sparse-guidance-low", type=float, default=0.6,
+                        help="Sparse-structure guidance interval lower bound (default: 0.6)")
+    parser.add_argument("--sparse-guidance-high", type=float, default=1.0,
+                        help="Sparse-structure guidance interval upper bound (default: 1.0)")
     parser.add_argument("--shape-guidance-strength", type=float, default=7.5,
                         help="Shape SLat image-conditioning guidance strength (default: 7.5)")
     parser.add_argument("--shape-guidance-rescale", type=float, default=0.5,
@@ -343,6 +373,13 @@ def main():
     args = parser.parse_args()
 
     try:
+        sparse_structure_sampler = _sparse_structure_sampler_params(
+            steps=args.steps,
+            guidance_strength=args.sparse_guidance_strength,
+            guidance_rescale=args.sparse_guidance_rescale,
+            guidance_low=args.sparse_guidance_low,
+            guidance_high=args.sparse_guidance_high,
+        )
         shape_sampler = _shape_sampler_params(
             steps=args.steps,
             guidance_strength=args.shape_guidance_strength,
@@ -573,7 +610,7 @@ def main():
         # Cast conditioning to fp32 to match the fp32 sparse structure model
         z_s = flow_euler_sample(ss_flow, noise,
                                 cond.astype(mx.float32), neg_cond.astype(mx.float32),
-                                steps=n_steps, verbose=False)
+                                verbose=False, **sparse_structure_sampler)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)

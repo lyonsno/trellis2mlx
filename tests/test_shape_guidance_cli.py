@@ -4,7 +4,48 @@ from pathlib import Path
 
 import pytest
 
-from generate import _shape_sampler_params
+from generate import _shape_sampler_params, _sparse_structure_sampler_params
+
+
+def test_sparse_structure_sampler_defaults_match_reference_pipeline():
+    assert _sparse_structure_sampler_params(steps=12) == {
+        "steps": 12,
+        "guidance_strength": 7.5,
+        "guidance_rescale": 0.7,
+        "guidance_interval": (0.6, 1.0),
+        "rescale_t": 5.0,
+    }
+
+
+def test_sparse_structure_sampler_accepts_explicit_pressure_controls():
+    assert _sparse_structure_sampler_params(
+        steps=6,
+        guidance_strength=3.0,
+        guidance_rescale=0.25,
+        guidance_low=0.4,
+        guidance_high=0.85,
+    ) == {
+        "steps": 6,
+        "guidance_strength": 3.0,
+        "guidance_rescale": 0.25,
+        "guidance_interval": (0.4, 0.85),
+        "rescale_t": 5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("guidance_low", "guidance_high"),
+    [(-0.1, 0.9), (0.8, 0.7), (0.2, 1.1)],
+)
+def test_sparse_structure_sampler_rejects_invalid_guidance_interval(
+    guidance_low, guidance_high
+):
+    with pytest.raises(ValueError, match="sparse structure guidance interval"):
+        _sparse_structure_sampler_params(
+            steps=6,
+            guidance_low=guidance_low,
+            guidance_high=guidance_high,
+        )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
