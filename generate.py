@@ -613,6 +613,7 @@ def main():
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_steps",
             "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
@@ -1735,6 +1736,7 @@ def main():
 
     t0 = time.perf_counter()
     shape_step_capture = {} if args.stop_after_stage == "shape_flow_step" else None
+    shape_step_captures = [] if args.stop_after_stage == "shape_flow_steps" else None
     if args.stop_after_stage == "shape_flow_block_trace":
         shape_trace_step_index = args.shape_flow_trace_step_index
         if shape_trace_step_index < 0 or shape_trace_step_index >= n_steps:
@@ -1863,6 +1865,7 @@ def main():
         verbose=False,
         coords=mx.array(lr_coords),
         capture_first_step=shape_step_capture,
+        capture_steps=shape_step_captures,
         stop_after_first_step=args.stop_after_stage == "shape_flow_step",
         shape_block_injection=shape_block_injection,
         **SHAPE_SAMPLER,
@@ -1905,6 +1908,57 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
         )
         print("  Stop after stage: shape_flow_step", flush=True)
+        return
+
+    if args.save_checkpoints and args.stop_after_stage == "shape_flow_steps":
+        from trellmlx.checkpoint import save_checkpoint
+
+        def shape_stack_step(name: str) -> np.ndarray:
+            return np.stack(
+                [np.array(step[name]).astype(np.float32, copy=False) for step in shape_step_captures],
+                axis=0,
+            )
+
+        save_checkpoint(
+            args.save_checkpoints,
+            "shape_flow_steps",
+            noise=np.array(lr_noise).astype(np.float32, copy=False),
+            sample_feats=np.array(lr_noise).astype(np.float32, copy=False),
+            coords=lr_coords_4d.astype(np.int32, copy=False),
+            coords_3d=lr_coords.astype(np.int32, copy=False),
+            sample_in=shape_stack_step("sample_in"),
+            pred_pos=shape_stack_step("pred_pos"),
+            pred_neg=shape_stack_step("pred_neg"),
+            pred_cfg=shape_stack_step("pred_cfg"),
+            x0_pos=shape_stack_step("x0_pos"),
+            x0_cfg=shape_stack_step("x0_cfg"),
+            std_pos=shape_stack_step("std_pos"),
+            std_cfg=shape_stack_step("std_cfg"),
+            ratio_raw=shape_stack_step("ratio_raw"),
+            std_ratio=shape_stack_step("std_ratio"),
+            ratio_effective=shape_stack_step("ratio_effective"),
+            x0_rescaled=shape_stack_step("x0_rescaled"),
+            x0_after_rescale=shape_stack_step("x0_after_rescale"),
+            pred_final=shape_stack_step("pred_final"),
+            pred_v_feats=shape_stack_step("pred_final"),
+            sample_next=shape_stack_step("sample_next"),
+            t=np.array(
+                [np.array(step["t"]).item() for step in shape_step_captures],
+                dtype=np.float32,
+            ),
+            t_prev=np.array(
+                [np.array(step["t_prev"]).item() for step in shape_step_captures],
+                dtype=np.float32,
+            ),
+            steps=np.array(n_steps, dtype=np.int32),
+            guidance_strength=np.array(SHAPE_SAMPLER["guidance_strength"], dtype=np.float32),
+            guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
+            guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
+            rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
+            shape_flow_block_injection_json=np.array(shape_block_injection_json),
+        )
+        print("  Stop after stage: shape_flow_steps", flush=True)
         return
 
     lr_slat = _denormalize_slat(lr_slat)

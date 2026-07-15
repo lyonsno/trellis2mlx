@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_steps",
             "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
@@ -321,6 +322,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
                 "sparse_flow_block_trace",
                 "sparse_internals",
                 "shape_flow_step",
+                "shape_flow_steps",
                 "shape_flow_block_trace",
                 "shape_slat",
                 "decoder_output",
@@ -371,6 +373,30 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         return 2
+    checkpoint_npz = checkpoint_dir / f"{args.stop_after_stage}.npz"
+    checkpoint_json = checkpoint_dir / f"{args.stop_after_stage}.json"
+    primary_paths = {checkpoint_npz.resolve(), checkpoint_json.resolve()}
+    collisions = [
+        {"field": field, "path": path}
+        for field, path in requested_inputs.items()
+        if path and Path(path).resolve() in primary_paths
+    ]
+    if collisions:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_output_collision",
+                "last_trustworthy_phase": "requested_inputs_validated",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "collisions": collisions,
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     route_identity = build_route_identity(args, command)
     _write_json(output_dir / "route_identity.json", route_identity)
     _write_json(
@@ -384,6 +410,9 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
 
+    for primary_path in (checkpoint_npz, checkpoint_json):
+        primary_path.unlink(missing_ok=True)
+
     started = time.perf_counter()
     result = subprocess.run(
         command,
@@ -396,12 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     (output_dir / "stdout.log").write_text(result.stdout)
     (output_dir / "stderr.log").write_text(result.stderr)
 
-    checkpoint_npz = checkpoint_dir / f"{args.stop_after_stage}.npz"
-    checkpoint_json = checkpoint_dir / f"{args.stop_after_stage}.json"
     output_written = checkpoint_npz.exists() or checkpoint_json.exists()
     status = "done" if result.returncode == 0 and output_written else "failed"
     failure_phase = None
     route_binding_error = None
+    primary_output_validation = None
     if result.returncode != 0:
         failure_phase = "generate_subprocess"
     elif not output_written:
@@ -414,6 +442,18 @@ def main(argv: list[str] | None = None) -> int:
             status = "failed"
             failure_phase = "bind_effective_route_identity"
             route_binding_error = str(exc)
+    elif args.stop_after_stage == "shape_flow_steps":
+        try:
+            primary_output_validation = _validate_shape_flow_steps_checkpoint(
+                checkpoint_npz,
+                expected_steps=args.steps,
+            )
+            route_identity["route"]["shape_flow_steps_output"] = primary_output_validation
+            _write_json(output_dir / "route_identity.json", route_identity)
+        except (OSError, ValueError) as exc:
+            status = "failed"
+            failure_phase = "validate_primary_output"
+            route_binding_error = str(exc)
 
     _write_json(
         output_dir / "run_report.json",
@@ -422,9 +462,20 @@ def main(argv: list[str] | None = None) -> int:
             "status": status,
             "route_identity": route_identity,
             "last_trustworthy_phase": (
-                f"{args.stop_after_stage}_saved" if output_written else "route_identity_written"
+                f"{args.stop_after_stage}_validated"
+                if status == "done" and args.stop_after_stage == "shape_flow_steps"
+                else f"{args.stop_after_stage}_saved"
+                if status == "done" and output_written
+                else "route_identity_written"
             ),
-            "primary_output_status": "written" if output_written else "missing",
+            "primary_output_status": (
+                "invalid"
+                if failure_phase == "validate_primary_output"
+                else "written"
+                if output_written
+                else "missing"
+            ),
+            "primary_output_validation": primary_output_validation,
             "failure_phase": failure_phase,
             "error": route_binding_error,
             "exit_code": result.returncode,
@@ -500,6 +551,149 @@ def _bind_effective_shape_flow_trace_keys(
     if selection == "explicit" and effective_keys != requested:
         raise ValueError("shape-flow effective selected keys differ from the explicit request")
     route["shape_flow_trace_keys"] = effective_keys
+
+
+def _validate_shape_flow_steps_checkpoint(
+    checkpoint_path: Path,
+    *,
+    expected_steps: int,
+) -> dict[str, Any]:
+    required = {
+        "noise",
+        "sample_feats",
+        "coords",
+        "coords_3d",
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+        "t",
+        "t_prev",
+        "steps",
+        "guidance_strength",
+        "guidance_rescale",
+        "guidance_interval",
+        "rescale_t",
+        "sigma_min",
+        "shape_flow_block_injection_json",
+    }
+    stepped_tensor_names = (
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+    )
+    stepped_scalar_names = (
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+    )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        missing = sorted(required.difference(checkpoint.files))
+        if missing:
+            raise ValueError(f"shape_flow_steps missing required arrays: {missing}")
+
+        steps = int(np.asarray(checkpoint["steps"]).item())
+        if steps != expected_steps:
+            raise ValueError(
+                f"shape_flow_steps records {steps} steps, expected {expected_steps}"
+            )
+        sample_in = np.asarray(checkpoint["sample_in"])
+        if sample_in.ndim != 3 or sample_in.shape[0] != expected_steps:
+            raise ValueError(
+                "shape_flow_steps sample_in must have shape [steps,N,C], "
+                f"got {sample_in.shape}"
+            )
+        step_shape = sample_in.shape
+        for name in stepped_tensor_names:
+            array = np.asarray(checkpoint[name])
+            if array.shape != step_shape:
+                raise ValueError(
+                    f"shape_flow_steps {name} shape {array.shape} does not match {step_shape}"
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(f"shape_flow_steps {name} contains non-finite values")
+        for name in stepped_scalar_names:
+            array = np.asarray(checkpoint[name])
+            if array.shape[0:1] != (expected_steps,):
+                raise ValueError(
+                    f"shape_flow_steps {name} must have leading step axis {expected_steps}, "
+                    f"got {array.shape}"
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(f"shape_flow_steps {name} contains non-finite values")
+
+        noise = np.asarray(checkpoint["noise"])
+        sample_feats = np.asarray(checkpoint["sample_feats"])
+        expected_sample_shape = step_shape[1:]
+        if noise.shape != expected_sample_shape or sample_feats.shape != expected_sample_shape:
+            raise ValueError(
+                "shape_flow_steps noise/sample_feats must match [N,C] sample shape "
+                f"{expected_sample_shape}, got {noise.shape} and {sample_feats.shape}"
+            )
+        if not np.array_equal(noise, sample_feats) or not np.array_equal(noise, sample_in[0]):
+            raise ValueError("shape_flow_steps initial noise identity is inconsistent")
+        if not np.array_equal(sample_in[1:], np.asarray(checkpoint["sample_next"][:-1])):
+            raise ValueError("shape_flow_steps recurrence sample_in[s+1] != sample_next[s]")
+        if not np.array_equal(
+            np.asarray(checkpoint["pred_final"]),
+            np.asarray(checkpoint["pred_v_feats"]),
+        ):
+            raise ValueError("shape_flow_steps pred_v_feats does not match pred_final")
+
+        coords = np.asarray(checkpoint["coords"])
+        coords_3d = np.asarray(checkpoint["coords_3d"])
+        if coords.shape != (step_shape[1], 4) or coords_3d.shape != (step_shape[1], 3):
+            raise ValueError(
+                "shape_flow_steps coordinates do not match token count: "
+                f"coords={coords.shape}, coords_3d={coords_3d.shape}, N={step_shape[1]}"
+            )
+        if not np.array_equal(coords[:, 1:], coords_3d):
+            raise ValueError("shape_flow_steps coords and coords_3d disagree")
+
+        t = np.asarray(checkpoint["t"], dtype=np.float64)
+        t_prev = np.asarray(checkpoint["t_prev"], dtype=np.float64)
+        if t.shape != (expected_steps,) or t_prev.shape != (expected_steps,):
+            raise ValueError(
+                f"shape_flow_steps t/t_prev must have shape ({expected_steps},)"
+            )
+        if not np.isfinite(t).all() or not np.isfinite(t_prev).all() or not np.all(t > t_prev):
+            raise ValueError("shape_flow_steps timestep schedule is non-finite or non-descending")
+        if not np.array_equal(t[1:].astype(np.float32), t_prev[:-1].astype(np.float32)):
+            raise ValueError("shape_flow_steps timestep pairs are not contiguous")
+
+    return {
+        "schema": "trellis2mlx.shape_flow_steps_output.v1",
+        "path": str(checkpoint_path),
+        "sha256": _sha256_file(checkpoint_path),
+        "size_bytes": checkpoint_path.stat().st_size,
+        "step_count": expected_steps,
+        "token_count": int(step_shape[1]),
+        "channel_count": int(step_shape[2]),
+        "recurrence_exact": True,
+        "finite": True,
+    }
 
 
 def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> list[str]:

@@ -18,6 +18,7 @@ def test_generate_exposes_stage_capture_cli_contracts():
         "sparse_flow_block_trace",
         "sparse_internals",
         "shape_flow_step",
+        "shape_flow_steps",
         "shape_flow_block_trace",
         "shape_slat",
         "decoder_output",
@@ -353,6 +354,266 @@ def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
     command = _build_generate_command(args, tmp_path / "checkpoints")
 
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_step"
+
+
+def test_generate_exposes_shape_flow_steps_capture():
+    source = GENERATE_SOURCE.read_text()
+
+    assert '"shape_flow_steps"' in source
+    assert "capture_steps=shape_step_captures" in source
+    assert 'save_checkpoint(\n            args.save_checkpoints,\n            "shape_flow_steps"' in source
+    for field in (
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "sample_next",
+    ):
+        assert f'shape_stack_step("{field}")' in source
+
+
+def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--seed",
+            "42",
+            "--steps",
+            "8",
+            "--resolution",
+            "512",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "shape_flow_steps"
+
+
+def test_shape_flow_steps_partial_checkpoint_fails_loud(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_partial(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_steps.npz"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(checkpoint, sample_in=np.zeros((8, 2, 32), dtype=np.float32))
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", write_partial)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--steps",
+            "8",
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "validate_primary_output"
+    assert report["primary_output_status"] == "invalid"
+    assert "missing required arrays" in report["error"]
+
+
+def test_shape_flow_steps_stale_checkpoint_cannot_impersonate_current_run(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    stale = output_dir / "checkpoints" / "shape_flow_steps.npz"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(stale, sample_in=np.zeros((8, 2, 32), dtype=np.float32))
+
+    def write_nothing(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", write_nothing)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--steps",
+            "8",
+        ]
+    )
+
+    assert result == 2
+    assert not stale.exists()
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "missing_primary_output"
+    assert report["primary_output_status"] == "missing"
+
+
+def test_shape_flow_steps_primary_cannot_alias_requested_input(tmp_path, monkeypatch):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    protected = output_dir / "checkpoints" / "shape_flow_steps.npz"
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    protected.write_bytes(b"protected shape flow input")
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("generation must not start with a primary/input collision")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", unexpected_generate)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--steps",
+            "8",
+            "--shape-flow-noise-sample",
+            str(protected),
+        ]
+    )
+
+    assert result == 2
+    assert protected.read_bytes() == b"protected shape flow input"
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_output_collision"
+    assert report["primary_output_status"] == "not_started"
+    assert report["collisions"] == [
+        {"field": "shape_flow_noise_sample", "path": str(protected)}
+    ]
+
+
+def test_shape_flow_steps_complete_checkpoint_is_route_bound(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_complete(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_steps.npz"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        steps, tokens, channels = 3, 2, 4
+        sample_in = np.stack(
+            [np.full((tokens, channels), index, dtype=np.float32) for index in range(steps)]
+        )
+        sample_next = sample_in + np.float32(1.0)
+        stepped = np.zeros_like(sample_in)
+        scalar_steps = np.ones((steps,), dtype=np.float32)
+        coords_3d = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
+        coords = np.column_stack([np.zeros(tokens, dtype=np.int32), coords_3d])
+        np.savez(
+            checkpoint,
+            noise=sample_in[0],
+            sample_feats=sample_in[0],
+            coords=coords,
+            coords_3d=coords_3d,
+            sample_in=sample_in,
+            pred_pos=stepped,
+            pred_neg=stepped,
+            pred_cfg=stepped,
+            x0_pos=stepped,
+            x0_cfg=stepped,
+            std_pos=scalar_steps,
+            std_cfg=scalar_steps,
+            ratio_raw=scalar_steps,
+            std_ratio=scalar_steps,
+            ratio_effective=scalar_steps,
+            x0_rescaled=stepped,
+            x0_after_rescale=stepped,
+            pred_final=stepped,
+            pred_v_feats=stepped,
+            sample_next=sample_next,
+            t=np.array([1.0, 0.6, 0.2], dtype=np.float32),
+            t_prev=np.array([0.6, 0.2, 0.0], dtype=np.float32),
+            steps=np.array(steps, dtype=np.int32),
+            guidance_strength=np.array(7.5, dtype=np.float32),
+            guidance_rescale=np.array(0.5, dtype=np.float32),
+            guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
+            rescale_t=np.array(3.0, dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
+            shape_flow_block_injection_json=np.array(""),
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", write_complete)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--steps",
+            "3",
+        ]
+    )
+
+    assert result == 0
+    report = json.loads((output_dir / "run_report.json").read_text())
+    route = json.loads((output_dir / "route_identity.json").read_text())
+    assert report["status"] == "done"
+    assert report["last_trustworthy_phase"] == "shape_flow_steps_validated"
+    assert report["primary_output_status"] == "written"
+    assert report["primary_output_validation"]["step_count"] == 3
+    assert report["primary_output_validation"]["token_count"] == 2
+    assert route["route"]["shape_flow_steps_output"] == report["primary_output_validation"]
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
