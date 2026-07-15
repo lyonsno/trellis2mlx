@@ -113,6 +113,11 @@ def _fixture() -> tuple[dict, dict, list[dict]]:
                         "variant": variant,
                         "status": "written",
                         "sha256": source_hashes[name],
+                        **(
+                            {"fill_holes_effective_change": False}
+                            if variant == "filled"
+                            else {}
+                        ),
                     }
                 )
         reports.append(
@@ -147,12 +152,23 @@ def _fixture() -> tuple[dict, dict, list[dict]]:
                     "one_model_load": True,
                     "sparse_attention_backend": "sdpa",
                     "sparse_conv_backend": "none",
+                    "resolution": 512,
+                    "raw_meshes": True,
+                    "post_fill_holes_snapshots": True,
+                    "fill_holes_effective_change_count": 0,
                 },
                 "model_load": {
                     "model_ref": "microsoft/TRELLIS.2-4B/ckpts/shape_dec_next_dc_f16c32_fp16",
                     "training_before_eval": True,
                     "training": False,
                 },
+                "point_results": [
+                    {
+                        "coordinate_key": name,
+                        "fill_holes_effective_change": False,
+                    }
+                    for name in chunk
+                ],
             }
         )
     return latent, atlas, reports
@@ -180,8 +196,72 @@ def test_direct_plane_preserves_coordinates_and_binds_both_routes() -> None:
     assert payload["axes"] == {"alpha": [0.0, 1.0], "beta": [0.0, 1.0]}
     assert payload["source_shape_route"]["block_index"] == 29
     assert payload["geometry_decode_route"]["model_training"] is False
+    assert payload["geometry_decode_route"]["resolution"] == 512
+    assert payload["geometry_decode_route"]["raw_meshes"] is True
+    assert payload["geometry_decode_route"]["post_fill_holes_snapshots"] is True
+    assert payload["geometry_decode_route"]["fill_holes_effective_change_count"] == 0
     assert payload["scales"] == [32, 64]
     assert len(payload["pairs"]) == 6
+
+
+def test_direct_plane_precomputes_every_asymmetric_nearest_relation() -> None:
+    from scripts.render_decoded_basin_plane import build_payload
+
+    latent, atlas, reports = _fixture()
+    payload = build_payload(
+        latent=latent,
+        atlas=atlas,
+        decode_reports=reports,
+        input_sha256={"latent": _sha("latent-file"), "atlas": _sha("atlas-file")},
+        decode_report_sha256=[_sha("decode-a"), _sha("decode-b")],
+    )
+
+    expected = set()
+    for point in payload["points"]:
+        options = [
+            pair
+            for pair in payload["pairs"]
+            if point["name"] in (pair["a_name"], pair["b_name"])
+        ]
+        best = min(options, key=lambda pair: pair["support_jaccard_distance"]["64"])
+        expected.add(tuple(sorted((best["a_name"], best["b_name"]))))
+
+    actual = {
+        tuple((chord["a_name"], chord["b_name"]))
+        for chord in payload["nearest_chords"]["support"]["64"]
+    }
+    assert actual == expected
+
+
+def test_direct_plane_normalizes_legacy_paired_mesh_route_from_artifacts() -> None:
+    from scripts.render_decoded_basin_plane import build_payload
+
+    latent, atlas, reports = copy.deepcopy(_fixture())
+    route = reports[0]["effective_route"]
+    route.pop("raw_meshes")
+    route.pop("post_fill_holes_snapshots")
+    route.pop("fill_holes_effective_change_count")
+    route["raw_and_filled_meshes"] = True
+    for result in reports[0]["point_results"]:
+        result.pop("fill_holes_effective_change")
+    for artifact in reports[0]["mesh_artifacts"]:
+        artifact.pop("fill_holes_effective_change", None)
+
+    payload = build_payload(
+        latent=latent,
+        atlas=atlas,
+        decode_reports=reports,
+        input_sha256={"latent": _sha("latent-file"), "atlas": _sha("atlas-file")},
+        decode_report_sha256=[_sha("decode-a"), _sha("decode-b")],
+    )
+
+    assert payload["geometry_decode_route"]["raw_meshes"] is True
+    assert payload["geometry_decode_route"]["post_fill_holes_snapshots"] is True
+    assert payload["geometry_decode_route"]["fill_holes_effective_change_count"] == 0
+    assert payload["geometry_decode_route"]["identity_sources"] == [
+        "current-explicit",
+        "legacy-derived-from-written-pairs",
+    ]
 
 
 def test_direct_plane_first_render_contains_static_evidence() -> None:
@@ -217,6 +297,8 @@ def test_direct_plane_first_render_contains_static_evidence() -> None:
         "decode_training",
         "missing_decode_point",
         "nonfinite",
+        "decode_resolution",
+        "decode_fill_count",
     ],
 )
 def test_direct_plane_rejects_false_closure_inputs(fault: str) -> None:
@@ -237,8 +319,39 @@ def test_direct_plane_rejects_false_closure_inputs(fault: str) -> None:
         reports[0]["model_load"]["training"] = True
     elif fault == "missing_decode_point":
         reports[1]["mesh_artifacts"] = reports[1]["mesh_artifacts"][2:]
-    else:
+    elif fault == "nonfinite":
         latent["pairwise"][0]["metrics"]["mean_abs"] = math.inf
+    elif fault == "decode_resolution":
+        reports[0]["effective_route"]["resolution"] = 256
+    else:
+        reports[0]["effective_route"]["fill_holes_effective_change_count"] = 1
+
+    with pytest.raises(BasinPlaneContractError):
+        build_payload(
+            latent=latent,
+            atlas=atlas,
+            decode_reports=reports,
+            input_sha256={"latent": _sha("latent-file"), "atlas": _sha("atlas-file")},
+            decode_report_sha256=[_sha("decode-a"), _sha("decode-b")],
+        )
+
+
+@pytest.mark.parametrize("fault", ["counter", "missing_filled"])
+def test_direct_plane_rejects_incomplete_decode_accounting(fault: str) -> None:
+    from scripts.render_decoded_basin_plane import BasinPlaneContractError, build_payload
+
+    latent, atlas, reports = copy.deepcopy(_fixture())
+    if fault == "counter":
+        reports[0]["written_artifact_count"] -= 1
+    else:
+        reports[0]["mesh_artifacts"] = [
+            artifact
+            for artifact in reports[0]["mesh_artifacts"]
+            if not (
+                artifact["coordinate_key"] == reports[0]["selected_point_names"][0]
+                and artifact["variant"] == "filled"
+            )
+        ]
 
     with pytest.raises(BasinPlaneContractError):
         build_payload(

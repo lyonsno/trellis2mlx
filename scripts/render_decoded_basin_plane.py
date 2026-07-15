@@ -205,6 +205,21 @@ def build_payload(
     occupied = {
         str(scale): atlas["scales"][str(scale)]["occupied_cells"] for scale in atlas_scales
     }
+    nearest_chords = {
+        "latent": _nearest_chords(
+            points,
+            pairs,
+            lambda pair: pair["latent_mean_abs"],
+        ),
+        "support": {
+            str(scale): _nearest_chords(
+                points,
+                pairs,
+                lambda pair, scale=scale: pair["support_jaccard_distance"][str(scale)],
+            )
+            for scale in atlas_scales
+        },
+    }
     return {
         "schema": REPORT_SCHEMA,
         "input_sha256": input_sha256,
@@ -221,6 +236,7 @@ def build_payload(
             for point in points
         ],
         "pairs": pairs,
+        "nearest_chords": nearest_chords,
         "scales": atlas_scales,
         "occupied_cells": occupied,
         "comparison": comparison,
@@ -356,6 +372,8 @@ def _validate_decode_reports(
         raise BasinPlaneContractError("at least one decode report is required")
     raw_hashes: dict[str, str] = {}
     effective_route: dict[str, Any] | None = None
+    fill_holes_effective_change_count = 0
+    identity_sources: set[str] = set()
     for report in reports:
         if not isinstance(report, dict) or report.get("schema") != DECODE_SCHEMA:
             raise BasinPlaneContractError(f"decode report must use schema {DECODE_SCHEMA}")
@@ -370,6 +388,9 @@ def _validate_decode_reports(
             or model.get("training") is not False
         ):
             raise BasinPlaneContractError("decode model mode identity is not admitted")
+        route_change_count = route.pop("fill_holes_effective_change_count")
+        route_identity_source = route.pop("identity_source")
+        identity_sources.add(route_identity_source)
         if effective_route is None:
             effective_route = route
         elif route != effective_route:
@@ -386,21 +407,72 @@ def _validate_decode_reports(
         artifacts = report.get("mesh_artifacts")
         if not isinstance(selected, list) or not isinstance(artifacts, list):
             raise BasinPlaneContractError("decode report artifacts are missing")
+        if (
+            len(selected) != len(set(selected))
+            or any(name not in names for name in selected)
+            or report.get("expected_artifact_count") != 2 * len(selected)
+            or report.get("written_artifact_count") != 2 * len(selected)
+            or len(artifacts) != 2 * len(selected)
+        ):
+            raise BasinPlaneContractError("decode report completion accounting is inconsistent")
         report_raw: dict[str, str] = {}
+        report_filled: dict[str, tuple[str, bool | None]] = {}
         for artifact in artifacts:
-            if (
-                not isinstance(artifact, dict)
-                or artifact.get("variant") != "raw"
-                or artifact.get("status") != "written"
-            ):
-                continue
+            if not isinstance(artifact, dict) or artifact.get("status") != "written":
+                raise BasinPlaneContractError("decode report contains an unwritten artifact")
             name = artifact.get("coordinate_key")
-            if name not in selected or name in report_raw:
-                raise BasinPlaneContractError("decode raw artifacts contradict selected points")
-            _require_sha(artifact.get("sha256"), f"decode raw mesh {name}")
-            report_raw[name] = artifact["sha256"]
-        if set(report_raw) != set(selected):
-            raise BasinPlaneContractError("decode report is missing a selected raw mesh")
+            variant = artifact.get("variant")
+            if name not in selected or variant not in {"raw", "filled"}:
+                raise BasinPlaneContractError("decode artifacts contradict selected points")
+            _require_sha(artifact.get("sha256"), f"decode {variant} mesh {name}")
+            if variant == "raw":
+                if name in report_raw:
+                    raise BasinPlaneContractError("decode report duplicates a selected raw mesh")
+                report_raw[name] = artifact["sha256"]
+            else:
+                changed = artifact.get("fill_holes_effective_change")
+                if name in report_filled or (
+                    changed is not None and not isinstance(changed, bool)
+                ):
+                    raise BasinPlaneContractError("decode filled artifacts are incomplete")
+                report_filled[name] = (artifact["sha256"], changed)
+        if set(report_raw) != set(selected) or set(report_filled) != set(selected):
+            raise BasinPlaneContractError("decode report is missing a selected raw/filled mesh pair")
+        point_results = report.get("point_results")
+        if not isinstance(point_results, list) or len(point_results) != len(selected):
+            raise BasinPlaneContractError("decode point result accounting is incomplete")
+        result_changes: dict[str, bool | None] = {}
+        for result in point_results:
+            if not isinstance(result, dict):
+                raise BasinPlaneContractError("decode point result is malformed")
+            name = result.get("coordinate_key")
+            changed = result.get("fill_holes_effective_change")
+            if (
+                name not in selected
+                or name in result_changes
+                or (changed is not None and not isinstance(changed, bool))
+            ):
+                raise BasinPlaneContractError("decode point results contradict selected points")
+            result_changes[name] = changed
+        artifact_changes = {name: changed for name, (_, changed) in report_filled.items()}
+        hash_changes = {
+            name: report_filled[name][0] != report_raw[name]
+            for name in selected
+        }
+        explicit_changes = [*result_changes.values(), *artifact_changes.values()]
+        if any(changed is not None for changed in explicit_changes):
+            if (
+                any(changed is None for changed in explicit_changes)
+                or result_changes != artifact_changes
+                or result_changes != hash_changes
+            ):
+                raise BasinPlaneContractError("decode fill-hole evidence is self-contradictory")
+        elif route_identity_source != "legacy-derived-from-written-pairs":
+            raise BasinPlaneContractError("decode fill-hole evidence is missing")
+        actual_change_count = sum(hash_changes.values())
+        if route_change_count is not None and route_change_count != actual_change_count:
+            raise BasinPlaneContractError("decode route fill-hole count contradicts point results")
+        fill_holes_effective_change_count += actual_change_count
         for name, digest in report_raw.items():
             if name in raw_hashes:
                 raise BasinPlaneContractError("decode reports duplicate a coordinate")
@@ -410,6 +482,8 @@ def _validate_decode_reports(
     if raw_hashes != source_hashes:
         raise BasinPlaneContractError("atlas source hashes do not match decoded raw meshes")
     assert effective_route is not None
+    effective_route["fill_holes_effective_change_count"] = fill_holes_effective_change_count
+    effective_route["identity_sources"] = sorted(identity_sources)
     return effective_route
 
 
@@ -443,10 +517,33 @@ def _validate_decode_route(route: Any) -> dict[str, Any]:
         "one_model_load": True,
         "sparse_attention_backend": "sdpa",
         "sparse_conv_backend": "none",
+        "resolution": 512,
     }
     if not isinstance(route, dict) or any(route.get(key) != value for key, value in expected.items()):
         raise BasinPlaneContractError("geometry decode route identity is wrong or incomplete")
-    return expected
+    modern_fields = {
+        "raw_meshes": True,
+        "post_fill_holes_snapshots": True,
+    }
+    if all(route.get(key) == value for key, value in modern_fields.items()):
+        change_count = route.get("fill_holes_effective_change_count")
+        if isinstance(change_count, bool) or not isinstance(change_count, int) or change_count < 0:
+            raise BasinPlaneContractError("geometry decode fill-hole count is invalid")
+        identity_source = "current-explicit"
+    elif (
+        route.get("raw_and_filled_meshes") is True
+        and all(key not in route for key in (*modern_fields, "fill_holes_effective_change_count"))
+    ):
+        change_count = None
+        identity_source = "legacy-derived-from-written-pairs"
+    else:
+        raise BasinPlaneContractError("geometry decode raw/fill route identity is wrong or incomplete")
+    return {
+        **expected,
+        **modern_fields,
+        "fill_holes_effective_change_count": change_count,
+        "identity_source": identity_source,
+    }
 
 
 def _validate_distance_matrix(matrix: Any, names: list[str], scale: int) -> None:
@@ -465,6 +562,28 @@ def _validate_distance_matrix(matrix: Any, names: list[str], scale: int) -> None
                 raise BasinPlaneContractError(f"grid {scale} distance diagonal is nonzero")
             if not math.isclose(value, float(matrix[right][left]), rel_tol=0, abs_tol=1e-12):
                 raise BasinPlaneContractError(f"grid {scale} distance matrix is asymmetric")
+
+
+def _nearest_chords(
+    points: list[dict[str, float]],
+    pairs: list[dict[str, Any]],
+    value: Any,
+) -> list[dict[str, str]]:
+    chords: set[tuple[str, str]] = set()
+    for point in points:
+        name = _coordinate_name(point["alpha"], point["beta"])
+        options = [pair for pair in pairs if name in (pair["a_name"], pair["b_name"])]
+        if not options:
+            raise BasinPlaneContractError(f"point {name} has no pairwise distances")
+        best = min(
+            options,
+            key=lambda pair: (value(pair), pair["a_name"], pair["b_name"]),
+        )
+        chords.add(tuple(sorted((best["a_name"], best["b_name"]))))
+    return [
+        {"a_name": left, "b_name": right}
+        for left, right in sorted(chords)
+    ]
 
 
 def render_html(payload: dict[str, Any]) -> str:
@@ -497,7 +616,7 @@ const value=p=>measure.value==='latent'?p.latent_mean_abs:p.support_jaccard_dist
 function draw(){{svg.querySelectorAll(':scope > :not(title):not(desc)').forEach(n=>n.remove());for(const a of A){{svg.append(el('line',{{x1:X(a),y1:P.t,x2:X(a),y2:H-P.b,class:'grid'}}));const t=el('text',{{x:X(a),y:H-P.b+28,'text-anchor':'middle',class:'label'}});t.textContent=a;svg.append(t)}}for(const b of B){{svg.append(el('line',{{x1:P.l,y1:Y(b),x2:W-P.r,y2:Y(b),class:'grid'}}));const t=el('text',{{x:P.l-15,y:Y(b)+4,'text-anchor':'end',class:'label'}});t.textContent=b;svg.append(t)}}
 const adjacent=D.pairs.filter(p=>{{const da=Math.abs(p.a.alpha-p.b.alpha),db=Math.abs(p.a.beta-p.b.beta);return (da===0&&db>0&&!B.some(x=>x>Math.min(p.a.beta,p.b.beta)&&x<Math.max(p.a.beta,p.b.beta)))||(db===0&&da>0&&!A.some(x=>x>Math.min(p.a.alpha,p.b.alpha)&&x<Math.max(p.a.alpha,p.b.alpha)))}}),vals=adjacent.map(value),lo=Math.min(...vals),hi=Math.max(...vals),width=v=>2+8*(hi===lo?.5:(v-lo)/(hi-lo));
 for(const p of adjacent){{const v=value(p),line=el('line',{{x1:X(p.a.alpha),y1:Y(p.a.beta),x2:X(p.b.alpha),y2:Y(p.b.beta),class:'edge','stroke-width':width(v)}});line.addEventListener('click',()=>show({{measure:measure.value,scale:Number(scale.value),pair:p}}));svg.append(line);const t=el('text',{{x:(X(p.a.alpha)+X(p.b.alpha))/2,y:(Y(p.a.beta)+Y(p.b.beta))/2-8,'text-anchor':'middle',class:'edge-label'}});t.textContent=fmt(v);svg.append(t)}}
-if(nearest.checked){{for(const point of D.points){{const options=D.pairs.filter(p=>p.a_name===point.name||p.b_name===point.name),best=options.reduce((a,b)=>value(a)<=value(b)?a:b),other=best.a_name===point.name?best.b_name:best.a_name;if(point.name<other){{const q=pointMap.get(other);svg.append(el('path',{{d:`M${{X(point.coordinate.alpha)}},${{Y(point.coordinate.beta)}} L${{X(q.coordinate.alpha)}},${{Y(q.coordinate.beta)}}`,class:'nearest'}}))}}}}}}
+if(nearest.checked){{const chords=measure.value==='latent'?D.nearest_chords.latent:D.nearest_chords.support[scale.value];for(const chord of chords){{const p=pointMap.get(chord.a_name),q=pointMap.get(chord.b_name);svg.append(el('path',{{d:`M${{X(p.coordinate.alpha)}},${{Y(p.coordinate.beta)}} L${{X(q.coordinate.alpha)}},${{Y(q.coordinate.beta)}}`,class:'nearest'}}))}}}}
 for(const point of D.points){{const c=el('circle',{{cx:X(point.coordinate.alpha),cy:Y(point.coordinate.beta),r:10,class:'node'}});c.addEventListener('click',()=>show({{point,occupied_cells:D.occupied_cells[scale.value][point.name],raw_mesh_sha256:point.raw_mesh_sha256}}));svg.append(c)}}svg.append(el('line',{{x1:P.l,y1:H-P.b,x2:W-P.r,y2:H-P.b,class:'axis'}}),el('line',{{x1:P.l,y1:P.t,x2:P.l,y2:H-P.b,class:'axis'}}));const xl=el('text',{{x:(P.l+W-P.r)/2,y:H-28,'text-anchor':'middle',class:'label'}});xl.textContent='alpha: after_self source-delta scale';svg.append(xl);const yl=el('text',{{x:25,y:(P.t+H-P.b)/2,transform:`rotate(-90 25 ${{(P.t+H-P.b)/2}})`,'text-anchor':'middle',class:'label'}});yl.textContent='beta: cross-attention-raw source-delta scale';svg.append(yl);show({{measure:measure.value,scale:Number(scale.value),comparison:D.comparison[scale.value],forbidden_inferences:D.forbidden_inferences}})}}
 for(const control of[measure,scale,nearest])control.addEventListener('change',draw);draw();
 </script>
@@ -563,20 +682,9 @@ def _render_static_chart(payload: dict[str, Any], scale: int) -> str:
             f'text-anchor="middle" class="edge-label static">{value:.3e}</text>'
         )
     point_map = {point["name"]: point for point in payload["points"]}
-    drawn_chords: set[tuple[str, str]] = set()
-    for point in payload["points"]:
-        options = [
-            pair
-            for pair in payload["pairs"]
-            if point["name"] in (pair["a_name"], pair["b_name"])
-        ]
-        best = min(options, key=lambda pair: pair["support_jaccard_distance"][str(scale)])
-        other_name = best["b_name"] if best["a_name"] == point["name"] else best["a_name"]
-        chord = tuple(sorted((point["name"], other_name)))
-        if chord in drawn_chords:
-            continue
-        drawn_chords.add(chord)
-        other = point_map[other_name]
+    for chord in payload["nearest_chords"]["support"][str(scale)]:
+        point = point_map[chord["a_name"]]
+        other = point_map[chord["b_name"]]
         parts.append(
             f'<path d="M{x(point["coordinate"]["alpha"]):.3f},{y(point["coordinate"]["beta"]):.3f} '
             f'L{x(other["coordinate"]["alpha"]):.3f},{y(other["coordinate"]["beta"]):.3f}" '
