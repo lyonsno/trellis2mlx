@@ -163,6 +163,40 @@ def test_mesh_support_atlas_callable_request_failure_removes_only_unprotected_pn
     assert json.loads(output_json.read_text())["phase"] == "validate_request"
 
 
+def test_mesh_support_atlas_callable_noncoercible_grid_writes_failure_and_removes_stale_png(
+    tmp_path,
+):
+    import scripts.build_mesh_support_atlas as build_mesh_support_atlas
+    from scripts.postprocess_raw_cuda_mesh import write_binary_ply
+
+    mesh_a = tmp_path / "a.ply"
+    mesh_b = tmp_path / "b.ply"
+    output_json = tmp_path / "atlas.json"
+    output_png = tmp_path / "atlas.png"
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    write_binary_ply(mesh_a, vertices, faces)
+    write_binary_ply(mesh_b, vertices + 0.1, faces)
+    output_json.write_text('{"status": "done", "stale": true}\n')
+    output_png.write_bytes(b"stale-png")
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        build_mesh_support_atlas.build_mesh_support_atlas(
+            meshes={"a": mesh_a, "b": mesh_b},
+            grid_sizes=["bad"],
+            reference="a",
+            output_json=output_json,
+            output_png=output_png,
+        )
+
+    report = json.loads(output_json.read_text())
+    assert report["status"] == "failed"
+    assert report["phase"] == "validate_request"
+    assert report["error_type"] == "ValueError"
+    assert report["grid_sizes"] == []
+    assert not output_png.exists()
+
+
 def test_mesh_support_atlas_cli_runs_as_direct_script(tmp_path):
     import scripts.build_mesh_support_atlas as build_mesh_support_atlas
     from scripts.postprocess_raw_cuda_mesh import write_binary_ply

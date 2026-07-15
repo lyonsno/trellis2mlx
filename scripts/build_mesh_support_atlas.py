@@ -78,7 +78,7 @@ def build_mesh_support_atlas(
         "effective_output_json": str(effective_output_json),
         "output_png": str(output_png),
         "reference": reference,
-        "grid_sizes": sorted(set(int(size) for size in grid_sizes)),
+        "grid_sizes": [],
         "path_collisions": path_collisions,
         "forbidden_inferences": FORBIDDEN_INFERENCES,
         "last_trustworthy_evidence": {},
@@ -90,6 +90,7 @@ def build_mesh_support_atlas(
         )
         if not output_png_is_protected:
             output_png.unlink(missing_ok=True)
+        report["grid_sizes"] = sorted(set(int(size) for size in grid_sizes))
         validate_request(
             meshes=meshes,
             grid_sizes=report["grid_sizes"],
