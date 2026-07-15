@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tarfile
@@ -45,7 +46,7 @@ MODEL_NAMES_BY_PIPELINE_TYPE = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", required=True, type=Path)
-    parser.add_argument("--output-npz", required=True, type=Path)
+    parser.add_argument("--output-npz", type=Path)
     parser.add_argument("--output-ply", default=Path("cuda_result_mesh.ply"), type=Path)
     parser.add_argument("--output-mesh-state", type=Path)
     parser.add_argument("--output-shape-slat", type=Path)
@@ -66,6 +67,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-repo", default="microsoft/TRELLIS.2-4B")
     parser.add_argument("--pipeline-config", default="pipeline.json")
     parser.add_argument("--pipeline-type", default="512")
+    parser.add_argument(
+        "--shape-slat-grid",
+        type=Path,
+        help="Admitted block29 basin NPZ to decode directly with the official shape decoder.",
+    )
+    parser.add_argument(
+        "--shape-slat-grid-report",
+        type=Path,
+        help="Authoritative source-CUDA basin report bound to --shape-slat-grid.",
+    )
+    parser.add_argument(
+        "--shape-slat-point",
+        action="append",
+        default=[],
+        help="Coordinate key to decode, such as alpha-1_beta-1. Repeat for every point.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Output directory for selective raw and hole-filled PLY artifacts.",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Validate selective-decode inputs and stale-output handling, then stop before model download.",
+    )
     parser.add_argument("--steps", default=8, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--max-num-tokens", default=49152, type=int)
@@ -130,6 +157,16 @@ def install_mesh_override(source_root: Path, override_path: Path) -> dict[str, A
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if any(
+        (
+            args.shape_slat_grid is not None,
+            args.shape_slat_grid_report is not None,
+            bool(args.shape_slat_point),
+            args.output_dir is not None,
+            args.no_download,
+        )
+    ):
+        return run_shape_slat_grid_decode(args)
     started = time.perf_counter()
     decode_started: float | None = None
     report: dict[str, Any] = {
@@ -153,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         output_json = Path(args.output_json)
+        if args.output_npz is None:
+            raise ValueError("--output-npz is required for full post-conditioning decode")
         output_npz = Path(args.output_npz)
         output_ply = Path(args.output_ply)
         output_mesh_state = Path(args.output_mesh_state) if args.output_mesh_state is not None else None
@@ -487,6 +526,450 @@ def main(argv: list[str] | None = None) -> int:
             report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        return 1
+
+
+SHAPE_SLAT_POINT_RE = re.compile(r"^alpha-(?:0|0p5|1)_beta-(?:0|0p5|1)$")
+SHAPE_SLAT_BASIN_ROUTE = {
+    "route": "official-source-cuda-full-eight-step-shape-flow-with-fixed-block29-endpoints",
+    "device_type": "cuda",
+    "attention_backend": "sdpa",
+    "conv_backend": "none",
+    "block_index": 29,
+    "step_index": 0,
+    "steps": 8,
+    "one_model_load": True,
+    "endpoint_semantics": "current + scale * (source - current)",
+}
+
+
+def _resolved_path(path: Path) -> Path:
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def _selective_failure_report_path(requested: Path, protected: set[Path]) -> Path:
+    candidate = requested.with_name(f"{requested.name}.selective-decode-failure.json")
+    index = 2
+    while _resolved_path(candidate) in protected:
+        candidate = requested.with_name(
+            f"{requested.name}.selective-decode-failure-{index}.json"
+        )
+        index += 1
+    return candidate
+
+
+def _write_selective_decode_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+
+
+def _validate_source_basin_route(source_report: dict[str, Any]) -> dict[str, Any]:
+    if source_report.get("schema") != "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+        raise ValueError("unsupported source basin report schema")
+    if source_report.get("status") != "done":
+        raise ValueError("source basin report is not done")
+    route = source_report.get("effective_route")
+    if not isinstance(route, dict):
+        raise ValueError("source basin report is missing effective_route")
+    for key, expected in SHAPE_SLAT_BASIN_ROUTE.items():
+        if route.get(key) != expected:
+            raise ValueError(
+                f"source basin route mismatch for {key}: expected {expected!r}, got {route.get(key)!r}"
+            )
+    if not isinstance(route.get("cuda_device"), str) or not route["cuda_device"].strip():
+        raise ValueError("source basin route is missing cuda_device")
+    source_control = source_report.get("source_control")
+    if not isinstance(source_control, dict):
+        raise ValueError("source basin report is missing source_control")
+    if source_control.get("exact") is not True:
+        raise ValueError("source basin report did not prove an exact source control")
+    if source_control.get("coordinate") != {"alpha": 1.0, "beta": 1.0}:
+        raise ValueError("source control coordinate mismatch")
+    return {key: route[key] for key in (*SHAPE_SLAT_BASIN_ROUTE, "cuda_device") if key in route}
+
+
+def _coordinate_from_point_name(point_name: str) -> dict[str, float]:
+    alpha_token, beta_token = point_name.removeprefix("alpha-").split("_beta-", 1)
+    values = {"0": 0.0, "0p5": 0.5, "1": 1.0}
+    return {"alpha": values[alpha_token], "beta": values[beta_token]}
+
+
+def _load_selected_shape_slat_inputs(
+    grid_path: Path,
+    source_report: dict[str, Any],
+    point_names: list[str],
+) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict[str, Any]]]:
+    primary = source_report.get("primary_output")
+    if not isinstance(primary, dict):
+        raise ValueError("source basin report is missing primary_output")
+    actual_primary_sha = sha256_file(grid_path)
+    if primary.get("sha256") != actual_primary_sha:
+        raise ValueError(
+            "primary output digest mismatch: "
+            f"report={primary.get('sha256')!r}, actual={actual_primary_sha!r}"
+        )
+    if primary.get("size_bytes") != grid_path.stat().st_size:
+        raise ValueError("primary output size mismatch")
+    primary_keys = primary.get("keys")
+    if not isinstance(primary_keys, list) or not all(isinstance(key, str) for key in primary_keys):
+        raise ValueError("primary output keys must be a string list")
+    if "coords" not in primary_keys:
+        raise ValueError("primary output key list omits coords")
+
+    point_rows = source_report.get("points")
+    if not isinstance(point_rows, list):
+        raise ValueError("source basin report points must be a list")
+    by_name: dict[str, dict[str, Any]] = {}
+    for row in point_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("coordinate_key"), str):
+            raise ValueError("source basin report contains an invalid point row")
+        name = row["coordinate_key"]
+        if name in by_name:
+            raise ValueError(f"source basin report contains duplicate point {name!r}")
+        by_name[name] = row
+
+    selected_arrays: dict[str, np.ndarray] = {}
+    selected_rows: list[dict[str, Any]] = []
+    with np.load(grid_path, allow_pickle=False) as data:
+        if "coords" not in data.files:
+            raise ValueError("shape-SLat grid is missing coords")
+        coords = np.asarray(data["coords"])
+        if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+            raise ValueError(f"coords must be int32 [N, 4], got {coords.dtype} {coords.shape}")
+        coords = np.ascontiguousarray(coords)
+        for point_name in point_names:
+            row = by_name.get(point_name)
+            if row is None:
+                raise ValueError(f"selected point {point_name!r} is absent from source basin report")
+            output_key = row.get("output_key")
+            if not isinstance(output_key, str) or output_key not in data.files:
+                raise ValueError(f"selected point {point_name!r} is missing output array {output_key!r}")
+            if output_key not in primary_keys:
+                raise ValueError(
+                    f"primary output key list omits selected array {output_key!r}"
+                )
+            expected_coordinate = _coordinate_from_point_name(point_name)
+            if row.get("coordinate") != expected_coordinate:
+                raise ValueError(
+                    f"coordinate mismatch for {point_name!r}: "
+                    f"expected {expected_coordinate!r}, got {row.get('coordinate')!r}"
+                )
+            values = np.asarray(data[output_key])
+            if values.dtype != np.float32 or values.ndim != 2 or values.shape != (coords.shape[0], 32):
+                raise ValueError(
+                    f"selected array {output_key!r} must be float32 [N, 32], got {values.dtype} {values.shape}"
+                )
+            if not np.isfinite(values).all():
+                raise ValueError(f"selected array {output_key!r} contains non-finite values")
+            actual_digest = hashlib.sha256(values.tobytes()).hexdigest()
+            if row.get("sha256") != actual_digest:
+                raise ValueError(
+                    f"selected array digest mismatch for {point_name!r}: "
+                    f"report={row.get('sha256')!r}, actual={actual_digest!r}"
+                )
+            if row.get("shape") != [int(v) for v in values.shape]:
+                raise ValueError(f"selected array shape report mismatch for {point_name!r}")
+            selected_arrays[point_name] = np.ascontiguousarray(values)
+            selected_rows.append(
+                {
+                    "coordinate": row.get("coordinate"),
+                    "coordinate_key": point_name,
+                    "output_key": output_key,
+                    "sha256": actual_digest,
+                    "shape": [int(v) for v in values.shape],
+                }
+            )
+    return coords, selected_arrays, selected_rows
+
+
+def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
+    started = time.perf_counter()
+    requested_output_json = Path(args.output_json)
+    grid_path = Path(args.shape_slat_grid) if args.shape_slat_grid is not None else None
+    source_report_path = (
+        Path(args.shape_slat_grid_report)
+        if args.shape_slat_grid_report is not None
+        else None
+    )
+    protected = {
+        _resolved_path(path)
+        for path in (grid_path, source_report_path, Path(args.source_tar), Path(args.mesh_override))
+        if path is not None
+    }
+    output_json = requested_output_json
+    collision = _resolved_path(requested_output_json) in protected
+    if collision:
+        output_json = _selective_failure_report_path(requested_output_json, protected)
+
+    report: dict[str, Any] = {
+        "schema": "trellis2mlx.source_cuda_shape_slat_grid_decode.v1",
+        "status": "failed",
+        "failure_phase": None,
+        "last_trustworthy_phase": "request_received",
+        "requested_output_json": str(requested_output_json),
+        "effective_output_json": str(output_json),
+        "requested_route": {
+            "route": "official-source-cuda-shape-slat-decoder",
+            "resolution": 512,
+            "raw_and_filled_meshes": True,
+            "one_model_load": True,
+            "no_download": bool(args.no_download),
+        },
+        "mesh_artifacts": [],
+        "written_artifact_count": 0,
+        "forbidden_inferences": [
+            "not a textured mesh or GLB",
+            "not a winding-correctness claim",
+            "not evidence that every exact tensor quotient is a distinct visual basin",
+            "not a full MLX continuation",
+        ],
+    }
+    phase = "request_validation"
+
+    try:
+        if collision:
+            raise ValueError("--output-json collides with protected input")
+        if grid_path is None:
+            raise ValueError("--shape-slat-grid is required for selective decode")
+        if source_report_path is None:
+            raise ValueError("--shape-slat-grid-report is required for selective decode")
+        if args.output_dir is None:
+            raise ValueError("--output-dir is required for selective decode")
+        point_names = list(args.shape_slat_point)
+        if not point_names:
+            raise ValueError("at least one --shape-slat-point is required")
+        invalid_names = [name for name in point_names if not SHAPE_SLAT_POINT_RE.fullmatch(name)]
+        if invalid_names:
+            raise ValueError(f"invalid --shape-slat-point values: {invalid_names!r}")
+        if len(set(point_names)) != len(point_names):
+            raise ValueError("duplicate --shape-slat-point values are not allowed")
+
+        output_dir = Path(args.output_dir)
+        expected_paths = [
+            output_dir / f"{point_name}.{variant}.ply"
+            for point_name in point_names
+            for variant in ("raw", "filled")
+        ]
+        if _resolved_path(requested_output_json) in {_resolved_path(path) for path in expected_paths}:
+            raise ValueError("--output-json collides with an expected mesh output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for path in expected_paths:
+            path.unlink(missing_ok=True)
+        report["selected_point_names"] = point_names
+        report["expected_artifact_count"] = len(expected_paths)
+        report["mesh_artifacts"] = [
+            {
+                "coordinate_key": point_name,
+                "variant": variant,
+                "path": str(output_dir / f"{point_name}.{variant}.ply"),
+                "status": "not_written",
+            }
+            for point_name in point_names
+            for variant in ("raw", "filled")
+        ]
+
+        phase = "input_validation"
+        source_report = json.loads(source_report_path.read_text())
+        source_basin_route = _validate_source_basin_route(source_report)
+        coords, selected_arrays, selected_rows = _load_selected_shape_slat_inputs(
+            grid_path,
+            source_report,
+            point_names,
+        )
+        report.update(
+            {
+                "source_basin_report": {
+                    "path": str(source_report_path),
+                    "sha256": sha256_file(source_report_path),
+                },
+                "source_basin_primary": {
+                    "path": str(grid_path),
+                    "sha256": sha256_file(grid_path),
+                    "size_bytes": grid_path.stat().st_size,
+                },
+                "source_basin_route": source_basin_route,
+                "selected_points": selected_rows,
+                "coords_shape": [int(v) for v in coords.shape],
+                "last_trustworthy_phase": phase,
+            }
+        )
+
+        if args.no_download:
+            for artifact in report["mesh_artifacts"]:
+                artifact["status"] = "not_written_no_download"
+            report.update(
+                {
+                    "status": "preflight_stopped",
+                    "failure_phase": None,
+                    "effective_route": {
+                        "route": "official-source-cuda-shape-slat-decoder",
+                        "device_type": "not_loaded_no_download",
+                        "resolution": 512,
+                        "raw_and_filled_meshes": True,
+                        "one_model_load": True,
+                    },
+                    "elapsed_seconds": elapsed(started),
+                }
+            )
+            _write_selective_decode_report(output_json, report)
+            return 0
+
+        phase = "extract_source"
+        phase_started = time.perf_counter()
+        source_root = extract_source(Path(args.source_tar), Path.cwd())
+        sys.path.insert(0, str(source_root))
+        report["mesh_override"] = install_mesh_override(source_root, Path(args.mesh_override))
+        report["source_root"] = str(source_root)
+        report.setdefault("phase_timings", {})[phase] = elapsed(phase_started)
+
+        phase = "import_runtime"
+        phase_started = time.perf_counter()
+        report["requested_sparse_backend"] = apply_sparse_backend_env(
+            args.sparse_conv_backend,
+            args.sparse_attn_backend,
+        )
+        import torch
+        from huggingface_hub import hf_hub_download
+
+        from trellis2 import models as source_models
+        from trellis2.modules.sparse import SparseTensor
+        from trellis2.modules.sparse import config as sparse_config
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+        device = torch.device("cuda")
+        torch.set_grad_enabled(False)
+        report.update(
+            {
+                "torch": torch.__version__,
+                "cuda_device": torch.cuda.get_device_name(0),
+                "sparse_attention_backend": getattr(sparse_config, "ATTN", None),
+                "sparse_conv_backend": getattr(sparse_config, "CONV", None),
+            }
+        )
+        report["phase_timings"][phase] = elapsed(phase_started)
+
+        phase = "load_pipeline_config"
+        phase_started = time.perf_counter()
+        pipeline_config_path = Path(hf_hub_download(args.model_repo, args.pipeline_config))
+        pipeline_args = json.loads(pipeline_config_path.read_text())["args"]
+        model_ref = resolve_model_ref(
+            args.model_repo,
+            pipeline_args["models"]["shape_slat_decoder"],
+        )
+        report["phase_timings"][phase] = elapsed(phase_started)
+
+        phase = "load_shape_decoder"
+        phase_started = time.perf_counter()
+        decoder = source_models.from_pretrained(model_ref)
+        decoder.set_resolution(512)
+        decoder.to(device)
+        decoder.low_vram = True
+        report["model_load"] = {
+            "name": "shape_slat_decoder",
+            "model_ref": model_ref,
+            "parameter_count": parameter_count(decoder),
+            "elapsed_seconds": elapsed(phase_started),
+        }
+        report["phase_timings"][phase] = report["model_load"]["elapsed_seconds"]
+
+        phase = "decode_selected_points"
+        decode_started = time.perf_counter()
+        written_artifacts: list[dict[str, Any]] = []
+        point_results: list[dict[str, Any]] = []
+        coords_tensor = torch.from_numpy(coords.copy()).to(device=device)
+        artifact_by_key = {
+            (row["coordinate_key"], row["variant"]): row
+            for row in report["mesh_artifacts"]
+        }
+        for point_name in point_names:
+            point_started = time.perf_counter()
+            feats_tensor = torch.from_numpy(selected_arrays[point_name].copy()).to(device=device)
+            shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
+            with torch.no_grad():
+                meshes, _subs = decoder(shape_slat, return_subs=True)
+            sync_cuda(torch)
+            if len(meshes) != 1:
+                raise ValueError(f"expected one decoded mesh for {point_name!r}, got {len(meshes)}")
+            mesh = meshes[0]
+            raw_path = output_dir / f"{point_name}.raw.ply"
+            write_binary_mesh_ply(raw_path, mesh)
+            raw_artifact = artifact_by_key[(point_name, "raw")]
+            raw_artifact.update(
+                {
+                    "status": "written",
+                    "sha256": sha256_file(raw_path),
+                    "size_bytes": raw_path.stat().st_size,
+                    "mesh_summary": mesh_summary(mesh),
+                }
+            )
+            written_artifacts.append(raw_artifact)
+            report["written_artifact_count"] = len(written_artifacts)
+
+            fill_started = time.perf_counter()
+            mesh.fill_holes()
+            sync_cuda(torch)
+            filled_path = output_dir / f"{point_name}.filled.ply"
+            write_binary_mesh_ply(filled_path, mesh)
+            filled_artifact = artifact_by_key[(point_name, "filled")]
+            filled_artifact.update(
+                {
+                    "status": "written",
+                    "sha256": sha256_file(filled_path),
+                    "size_bytes": filled_path.stat().st_size,
+                    "mesh_summary": mesh_summary(mesh),
+                }
+            )
+            written_artifacts.append(filled_artifact)
+            report["written_artifact_count"] = len(written_artifacts)
+            point_results.append(
+                {
+                    "coordinate_key": point_name,
+                    "elapsed_seconds": elapsed(point_started),
+                    "fill_holes_elapsed_seconds": elapsed(fill_started),
+                }
+            )
+        report["decode_selected_points_elapsed_seconds"] = elapsed(decode_started)
+        report["point_results"] = point_results
+        if len(written_artifacts) != len(expected_paths):
+            raise RuntimeError(
+                f"partial output: wrote {len(written_artifacts)} of {len(expected_paths)} expected artifacts"
+            )
+
+        report.update(
+            {
+                "status": "done",
+                "failure_phase": None,
+                "last_trustworthy_phase": "all_selected_meshes_written",
+                "effective_route": {
+                    "route": "official-source-cuda-shape-slat-decoder",
+                    "device_type": "cuda",
+                    "cuda_device": report["cuda_device"],
+                    "sparse_attention_backend": report["sparse_attention_backend"],
+                    "sparse_conv_backend": report["sparse_conv_backend"],
+                    "model_ref": model_ref,
+                    "resolution": 512,
+                    "raw_and_filled_meshes": True,
+                    "one_model_load": True,
+                },
+                "elapsed_seconds": elapsed(started),
+            }
+        )
+        _write_selective_decode_report(output_json, report)
+        return 0
+    except Exception as exc:
+        report.update(
+            {
+                "status": "failed",
+                "failure_phase": phase,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "elapsed_seconds": elapsed(started),
+            }
+        )
+        _write_selective_decode_report(output_json, report)
         return 1
 
 
