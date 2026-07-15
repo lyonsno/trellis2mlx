@@ -898,13 +898,18 @@ def _validate_shape_flow_injection_identity(
             f"shape_flow_steps injection manifest_sha256 {identity.get('manifest_sha256')!r} "
             f"does not match requested {expected_manifest_sha!r}"
         )
-    sites = identity.get("sites")
-    if not isinstance(sites, list) or not sites:
-        raise ValueError("shape_flow_steps injection manifest identity has no effective sites")
-    if any(not isinstance(site, dict) or site.get("route_identity_evidence") is not True for site in sites):
+    if _sha256_file(manifest_path) != expected_manifest_sha:
         raise ValueError(
-            "shape_flow_steps injection manifest sites omit route_identity_evidence=true"
+            "shape_flow_steps requested injection manifest changed after route identity was recorded"
         )
+    from trellmlx.shape_block_injection import load_shape_block_injection_manifest
+
+    expected_identity = load_shape_block_injection_manifest(manifest_path).report_identity()
+    if identity != expected_identity:
+        raise ValueError(
+            "shape_flow_steps effective identity does not match requested manifest"
+        )
+    sites = expected_identity["sites"]
     return {
         "mode": "manifest",
         "route_identity_match": True,

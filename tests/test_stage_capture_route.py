@@ -914,17 +914,44 @@ def test_shape_flow_steps_binds_matching_manifest_injection_identity(tmp_path):
 
     from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
 
+    from trellmlx.shape_block_injection import load_shape_block_injection_manifest
+
+    trace = tmp_path / "trace.npz"
+    np.savez(
+        trace,
+        pos_block7_after_self=np.zeros((1, 2, 4), dtype=np.float32),
+        trace_block_index=np.array(7, dtype=np.int32),
+        shape_flow_trace_step_index=np.array(1, dtype=np.int32),
+        route_identity_json=np.array(
+            json.dumps(
+                {
+                    "effective_route": "official-source-cuda",
+                    "effective_device_type": "cuda",
+                }
+            )
+        ),
+    )
     manifest = tmp_path / "injection-manifest.json"
-    manifest.write_bytes(b'{"sites": [{"trace_path": "trace.npz"}]}')
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "test-manifest",
+                "sites": [
+                    {
+                        "trace_path": trace.name,
+                        "branch": "pos",
+                        "step_index": 1,
+                        "block_index": 7,
+                        "stage": "after_self",
+                    }
+                ],
+            }
+        )
+    )
     manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     checkpoint = tmp_path / "shape_flow_steps.npz"
     _write_valid_shape_flow_steps_checkpoint(checkpoint)
-    identity = {
-        "manifest_path": str(manifest),
-        "manifest_sha256": manifest_sha,
-        "route_identity_evidence": True,
-        "sites": [{"route_identity_evidence": True}],
-    }
+    identity = load_shape_block_injection_manifest(manifest).report_identity()
     _rewrite_npz_array(
         checkpoint,
         "shape_flow_block_injection_json",
@@ -950,6 +977,74 @@ def test_shape_flow_steps_binds_matching_manifest_injection_identity(tmp_path):
         "manifest_sha256": manifest_sha,
         "site_count": 1,
     }
+
+
+def test_shape_flow_steps_rejects_truncated_manifest_site_identity(tmp_path):
+    import hashlib
+    import json
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    trace = tmp_path / "trace.npz"
+    np.savez(
+        trace,
+        pos_block7_after_self=np.zeros((1, 2, 4), dtype=np.float32),
+        trace_block_index=np.array(7, dtype=np.int32),
+        shape_flow_trace_step_index=np.array(1, dtype=np.int32),
+        route_identity_json=np.array(
+            json.dumps(
+                {
+                    "effective_route": "official-source-cuda",
+                    "effective_device_type": "cuda",
+                }
+            )
+        ),
+    )
+    manifest = tmp_path / "injection-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "sites": [
+                    {
+                        "trace_path": trace.name,
+                        "branch": "pos",
+                        "step_index": 1,
+                        "block_index": 7,
+                        "stage": "after_self",
+                    }
+                ]
+            }
+        )
+    )
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    truncated_identity = {
+        "manifest_path": str(manifest),
+        "manifest_sha256": manifest_sha,
+        "route_identity_evidence": True,
+        "sites": [{"route_identity_evidence": True}],
+    }
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_block_injection_json",
+        np.array(json.dumps(truncated_identity, sort_keys=True)),
+    )
+    expected_route = {
+        "shape_flow_block_injection_trace_path": None,
+        "shape_flow_block_injection_trace_sha256": None,
+        "shape_flow_block_injection_manifest_path": str(manifest),
+        "shape_flow_block_injection_manifest_sha256": manifest_sha,
+    }
+
+    with pytest.raises(ValueError, match="effective identity does not match requested manifest"):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route=expected_route,
+        )
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
