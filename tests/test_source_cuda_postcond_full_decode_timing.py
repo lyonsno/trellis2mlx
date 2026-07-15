@@ -155,6 +155,8 @@ def test_shape_slat_grid_decode_rejects_primary_digest_mismatch(tmp_path):
     assert rc == 1
     assert report["failure_phase"] == "input_validation"
     assert "primary output digest mismatch" in report["error"]
+    assert "primary output digest mismatch" in report["traceback"]
+    assert "_load_selected_shape_slat_inputs" in report["traceback"]
 
 
 def test_shape_slat_grid_decode_rejects_selected_array_digest_mismatch_and_stale_output(tmp_path):
@@ -178,6 +180,133 @@ def test_shape_slat_grid_decode_rejects_selected_array_digest_mismatch_and_stale
     assert report["failure_phase"] == "input_validation"
     assert "selected array digest mismatch" in report["error"]
     assert not stale.exists()
+
+
+def test_shape_slat_grid_decode_puts_directly_loaded_decoder_in_eval_mode(
+    tmp_path,
+    monkeypatch,
+):
+    import contextlib
+    import json
+    import sys
+    import types
+
+    import numpy as np
+
+    import scripts.source_cuda_postcond_full_decode_timing as runner
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    config_path = tmp_path / "pipeline.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "args": {
+                    "models": {
+                        "shape_slat_decoder": "ckpts/shape-decoder",
+                    }
+                }
+            }
+        )
+        + "\n"
+    )
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = values
+
+        def to(self, **_kwargs):
+            return self
+
+    class FakeParameter:
+        def numel(self):
+            return 7
+
+    class FakeMesh:
+        vertices = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 1, 2]], dtype=np.int32)
+
+        def fill_holes(self):
+            return None
+
+    class FakeDecoder:
+        def __init__(self):
+            self.training = True
+            self.low_vram = False
+
+        def set_resolution(self, resolution):
+            self.resolution = resolution
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def to(self, _device):
+            return self
+
+        def parameters(self):
+            return [FakeParameter()]
+
+        def __call__(self, _shape_slat, *, return_subs):
+            assert return_subs is True
+            if self.training:
+                raise TypeError("'NoneType' object is not iterable")
+            return [FakeMesh()], []
+
+    decoder = FakeDecoder()
+    source_models = types.ModuleType("trellis2.models")
+    source_models.from_pretrained = lambda _model_ref: decoder
+    sparse_module = types.ModuleType("trellis2.modules.sparse")
+    sparse_module.SparseTensor = lambda **kwargs: kwargs
+    sparse_module.config = types.SimpleNamespace(ATTN="sdpa", CONV="none")
+    modules_package = types.ModuleType("trellis2.modules")
+    modules_package.sparse = sparse_module
+    trellis2_package = types.ModuleType("trellis2")
+    trellis2_package.models = source_models
+    trellis2_package.modules = modules_package
+
+    torch_module = types.ModuleType("torch")
+    torch_module.__version__ = "test-cuda"
+    torch_module.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_name=lambda _index: "Tesla T4",
+        synchronize=lambda: None,
+    )
+    torch_module.device = lambda value: value
+    torch_module.set_grad_enabled = lambda _enabled: None
+    torch_module.from_numpy = FakeTensor
+    torch_module.no_grad = contextlib.nullcontext
+    hub_module = types.ModuleType("huggingface_hub")
+    hub_module.hf_hub_download = lambda _repo, _path: str(config_path)
+
+    for name, module in {
+        "torch": torch_module,
+        "huggingface_hub": hub_module,
+        "trellis2": trellis2_package,
+        "trellis2.models": source_models,
+        "trellis2.modules": modules_package,
+        "trellis2.modules.sparse": sparse_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(runner, "extract_source", lambda *_args: tmp_path)
+    monkeypatch.setattr(runner, "install_mesh_override", lambda *_args: {"status": "installed"})
+
+    args = _shape_slat_decode_args(tmp_path, grid, source_report, point_names)
+    args.remove("--no-download")
+    rc = runner.main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 0
+    assert decoder.training is False
+    assert report["model_load"]["training"] is False
+    assert report["effective_route"]["model_training"] is False
+    assert report["status"] == "done"
+    assert report["written_artifact_count"] == 2
 
 
 def test_shape_slat_grid_decode_report_collision_uses_durable_fallback(tmp_path):

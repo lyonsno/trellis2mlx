@@ -17,6 +17,7 @@ import shutil
 import sys
 import tarfile
 import time
+import traceback
 from typing import Any
 
 import numpy as np
@@ -519,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
                 "failure_phase": phase,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
                 "elapsed_seconds": elapsed(started),
             }
         )
@@ -872,16 +874,23 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         phase = "load_shape_decoder"
         phase_started = time.perf_counter()
         decoder = source_models.from_pretrained(model_ref)
+        training_before_eval = bool(decoder.training)
+        decoder.eval()
         decoder.set_resolution(512)
         decoder.to(device)
         decoder.low_vram = True
+        if decoder.training:
+            raise RuntimeError("shape-SLat decoder remained in training mode after eval()")
         report["model_load"] = {
             "name": "shape_slat_decoder",
             "model_ref": model_ref,
             "parameter_count": parameter_count(decoder),
             "elapsed_seconds": elapsed(phase_started),
+            "training_before_eval": training_before_eval,
+            "training": bool(decoder.training),
         }
         report["phase_timings"][phase] = report["model_load"]["elapsed_seconds"]
+        report["last_trustworthy_phase"] = phase
 
         phase = "decode_selected_points"
         decode_started = time.perf_counter()
@@ -958,6 +967,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     "sparse_attention_backend": report["sparse_attention_backend"],
                     "sparse_conv_backend": report["sparse_conv_backend"],
                     "model_ref": model_ref,
+                    "model_training": bool(decoder.training),
                     "resolution": 512,
                     "raw_and_filled_meshes": True,
                     "one_model_load": True,
@@ -974,6 +984,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 "failure_phase": phase,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
                 "elapsed_seconds": elapsed(started),
             }
         )
