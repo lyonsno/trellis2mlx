@@ -746,6 +746,212 @@ def test_shape_flow_steps_rejects_wrong_step_count_dtype(tmp_path):
         _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
 
 
+def test_shape_flow_steps_rejects_empty_identity_when_injection_requested(
+    tmp_path, monkeypatch
+):
+    import json
+    import subprocess
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    trace = tmp_path / "injection-trace.npz"
+    trace.write_bytes(b"trace")
+    output_dir = tmp_path / "output"
+
+    def write_complete(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_steps.npz"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        _write_valid_shape_flow_steps_checkpoint(checkpoint)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", write_complete)
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--steps",
+            "3",
+            "--shape-flow-block-injection-trace",
+            str(trace),
+            "--shape-flow-block-injection-step-index",
+            "1",
+            "--shape-flow-block-injection-block-index",
+            "7",
+            "--shape-flow-block-injection-branch",
+            "pos",
+            "--shape-flow-block-injection-stage",
+            "after_self",
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["failure_phase"] == "validate_primary_output"
+    assert "requested injection but checkpoint identity is empty" in report["error"]
+
+
+def test_shape_flow_steps_rejects_mismatched_injection_identity(tmp_path):
+    import hashlib
+    import json
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    trace = tmp_path / "injection-trace.npz"
+    trace.write_bytes(b"trace")
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    identity = {
+        "trace_path": str(trace),
+        "trace_sha256": "wrong",
+        "array_key": "pos_block7_after_self",
+        "branch": "pos",
+        "step_index": 1,
+        "block_index": 7,
+        "stage": "after_self",
+        "source_delta_scale": 1.0,
+        "route_identity_evidence": True,
+    }
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_block_injection_json",
+        np.array(json.dumps(identity, sort_keys=True)),
+    )
+    expected_route = {
+        "shape_flow_block_injection_trace_path": str(trace),
+        "shape_flow_block_injection_trace_sha256": hashlib.sha256(b"trace").hexdigest(),
+        "shape_flow_block_injection_manifest_path": None,
+        "shape_flow_block_injection_manifest_sha256": None,
+        "shape_flow_block_injection_step_index": 1,
+        "shape_flow_block_injection_block_index": 7,
+        "shape_flow_block_injection_branch": "pos",
+        "shape_flow_block_injection_stage": "after_self",
+        "shape_flow_block_injection_array_key": None,
+        "shape_flow_block_injection_scale": 1.0,
+    }
+
+    with pytest.raises(ValueError, match="trace_sha256"):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route=expected_route,
+        )
+
+
+def test_shape_flow_steps_binds_matching_trace_injection_identity(tmp_path):
+    import hashlib
+    import json
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    trace = tmp_path / "injection-trace.npz"
+    trace.write_bytes(b"trace")
+    trace_sha = hashlib.sha256(b"trace").hexdigest()
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    identity = {
+        "trace_path": str(trace),
+        "trace_sha256": trace_sha,
+        "array_key": "pos_block7_after_self",
+        "branch": "pos",
+        "step_index": 1,
+        "block_index": 7,
+        "stage": "after_self",
+        "source_delta_scale": 1.0,
+        "route_identity_evidence": True,
+    }
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_block_injection_json",
+        np.array(json.dumps(identity, sort_keys=True)),
+    )
+    expected_route = {
+        "shape_flow_block_injection_trace_path": str(trace),
+        "shape_flow_block_injection_trace_sha256": trace_sha,
+        "shape_flow_block_injection_manifest_path": None,
+        "shape_flow_block_injection_manifest_sha256": None,
+        "shape_flow_block_injection_step_index": 1,
+        "shape_flow_block_injection_block_index": 7,
+        "shape_flow_block_injection_branch": "pos",
+        "shape_flow_block_injection_stage": "after_self",
+        "shape_flow_block_injection_array_key": None,
+        "shape_flow_block_injection_scale": 1.0,
+    }
+
+    validation = _validate_shape_flow_steps_checkpoint(
+        checkpoint,
+        expected_steps=3,
+        expected_route=expected_route,
+    )
+
+    assert validation["sampler"]["shape_flow_block_injection_route"] == {
+        "mode": "trace",
+        "route_identity_match": True,
+        "trace_path": str(trace),
+        "trace_sha256": trace_sha,
+        "array_key": "pos_block7_after_self",
+        "branch": "pos",
+        "step_index": 1,
+        "block_index": 7,
+        "stage": "after_self",
+        "source_delta_scale": 1.0,
+    }
+
+
+def test_shape_flow_steps_binds_matching_manifest_injection_identity(tmp_path):
+    import hashlib
+    import json
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    manifest = tmp_path / "injection-manifest.json"
+    manifest.write_bytes(b'{"sites": [{"trace_path": "trace.npz"}]}')
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    identity = {
+        "manifest_path": str(manifest),
+        "manifest_sha256": manifest_sha,
+        "route_identity_evidence": True,
+        "sites": [{"route_identity_evidence": True}],
+    }
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_block_injection_json",
+        np.array(json.dumps(identity, sort_keys=True)),
+    )
+    expected_route = {
+        "shape_flow_block_injection_trace_path": None,
+        "shape_flow_block_injection_trace_sha256": None,
+        "shape_flow_block_injection_manifest_path": str(manifest),
+        "shape_flow_block_injection_manifest_sha256": manifest_sha,
+    }
+
+    validation = _validate_shape_flow_steps_checkpoint(
+        checkpoint,
+        expected_steps=3,
+        expected_route=expected_route,
+    )
+
+    assert validation["sampler"]["shape_flow_block_injection_route"] == {
+        "mode": "manifest",
+        "route_identity_match": True,
+        "manifest_path": str(manifest),
+        "manifest_sha256": manifest_sha,
+        "site_count": 1,
+    }
+
+
 def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 

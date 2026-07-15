@@ -447,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             primary_output_validation = _validate_shape_flow_steps_checkpoint(
                 checkpoint_npz,
                 expected_steps=args.steps,
+                expected_route=route_identity["route"],
             )
             route_identity["route"]["shape_flow_steps_output"] = primary_output_validation
             _write_json(output_dir / "route_identity.json", route_identity)
@@ -557,6 +558,7 @@ def _validate_shape_flow_steps_checkpoint(
     checkpoint_path: Path,
     *,
     expected_steps: int,
+    expected_route: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     required = {
         "noise",
@@ -751,6 +753,7 @@ def _validate_shape_flow_steps_checkpoint(
                 "shape_flow_steps shape_flow_block_injection_json must be a string scalar"
             )
         injection_json = str(injection_array.item())
+        injection_identity = None
         if injection_json:
             try:
                 injection_identity = json.loads(injection_json)
@@ -762,6 +765,10 @@ def _validate_shape_flow_steps_checkpoint(
                 raise ValueError(
                     "shape_flow_steps shape_flow_block_injection_json must decode to an object"
                 )
+        injection_route = _validate_shape_flow_injection_identity(
+            injection_identity,
+            expected_route=expected_route or {},
+        )
 
         schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
         rescale_t = sampler_scalars["rescale_t"]
@@ -799,8 +806,111 @@ def _validate_shape_flow_steps_checkpoint(
             **sampler_scalars,
             "guidance_interval": [float(value) for value in guidance_interval],
             "shape_flow_block_injection_json": injection_json,
+            "shape_flow_block_injection_route": injection_route,
         },
         "finite": True,
+    }
+
+
+def _validate_shape_flow_injection_identity(
+    identity: dict[str, Any] | None,
+    *,
+    expected_route: dict[str, Any],
+) -> dict[str, Any]:
+    trace_path = expected_route.get("shape_flow_block_injection_trace_path")
+    manifest_path = expected_route.get("shape_flow_block_injection_manifest_path")
+    if trace_path and manifest_path:
+        raise ValueError("shape_flow_steps route requests both trace and manifest injection")
+    if not trace_path and not manifest_path:
+        if identity is not None:
+            raise ValueError(
+                "shape_flow_steps checkpoint carries injection identity but route requested none"
+            )
+        return {"mode": "none", "route_identity_match": True}
+    if identity is None:
+        raise ValueError(
+            "shape_flow_steps route requested injection but checkpoint identity is empty"
+        )
+    if identity.get("route_identity_evidence") is not True:
+        raise ValueError(
+            "shape_flow_steps injection identity omits route_identity_evidence=true"
+        )
+
+    if trace_path:
+        expected = {
+            "trace_sha256": expected_route.get("shape_flow_block_injection_trace_sha256"),
+            "branch": expected_route.get("shape_flow_block_injection_branch"),
+            "step_index": expected_route.get("shape_flow_block_injection_step_index"),
+            "block_index": expected_route.get("shape_flow_block_injection_block_index"),
+            "stage": expected_route.get("shape_flow_block_injection_stage"),
+        }
+        for name, value in expected.items():
+            if identity.get(name) != value:
+                raise ValueError(
+                    f"shape_flow_steps injection {name} {identity.get(name)!r} "
+                    f"does not match requested {value!r}"
+                )
+        if Path(str(identity.get("trace_path"))).resolve() != Path(trace_path).resolve():
+            raise ValueError("shape_flow_steps injection trace_path does not match requested path")
+        branch = str(expected["branch"])
+        block_index = int(expected["block_index"])
+        stage = str(expected["stage"])
+        requested_array_key = expected_route.get("shape_flow_block_injection_array_key")
+        branches = ("pos", "neg") if branch == "both" else (branch,)
+        expected_array_key = requested_array_key or ",".join(
+            f"{active_branch}_block{block_index}_{stage}" for active_branch in branches
+        )
+        if identity.get("array_key") != expected_array_key:
+            raise ValueError(
+                f"shape_flow_steps injection array_key {identity.get('array_key')!r} "
+                f"does not match requested/effective {expected_array_key!r}"
+            )
+        expected_scale = float(expected_route.get("shape_flow_block_injection_scale"))
+        try:
+            identity_scale = float(identity.get("source_delta_scale"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "shape_flow_steps injection source_delta_scale is not numeric"
+            ) from exc
+        if not np.isfinite(identity_scale) or identity_scale != expected_scale:
+            raise ValueError(
+                f"shape_flow_steps injection source_delta_scale {identity_scale!r} "
+                f"does not match requested {expected_scale!r}"
+            )
+        return {
+            "mode": "trace",
+            "route_identity_match": True,
+            "trace_path": str(trace_path),
+            "trace_sha256": expected["trace_sha256"],
+            "array_key": expected_array_key,
+            "branch": branch,
+            "step_index": int(expected["step_index"]),
+            "block_index": block_index,
+            "stage": stage,
+            "source_delta_scale": expected_scale,
+        }
+
+    if Path(str(identity.get("manifest_path"))).resolve() != Path(manifest_path).resolve():
+        raise ValueError("shape_flow_steps injection manifest_path does not match requested path")
+    expected_manifest_sha = expected_route.get("shape_flow_block_injection_manifest_sha256")
+    if identity.get("manifest_sha256") != expected_manifest_sha:
+        raise ValueError(
+            f"shape_flow_steps injection manifest_sha256 {identity.get('manifest_sha256')!r} "
+            f"does not match requested {expected_manifest_sha!r}"
+        )
+    sites = identity.get("sites")
+    if not isinstance(sites, list) or not sites:
+        raise ValueError("shape_flow_steps injection manifest identity has no effective sites")
+    if any(not isinstance(site, dict) or site.get("route_identity_evidence") is not True for site in sites):
+        raise ValueError(
+            "shape_flow_steps injection manifest sites omit route_identity_evidence=true"
+        )
+    return {
+        "mode": "manifest",
+        "route_identity_match": True,
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": expected_manifest_sha,
+        "site_count": len(sites),
     }
 
 
