@@ -614,7 +614,10 @@ def _validate_shape_flow_steps_checkpoint(
         if missing:
             raise ValueError(f"shape_flow_steps missing required arrays: {missing}")
 
-        steps = int(np.asarray(checkpoint["steps"]).item())
+        steps_array = np.asarray(checkpoint["steps"])
+        if steps_array.shape != () or steps_array.dtype != np.dtype(np.int32):
+            raise ValueError("shape_flow_steps steps must be an int32 scalar")
+        steps = int(steps_array.item())
         if steps != expected_steps:
             raise ValueError(
                 f"shape_flow_steps records {steps} steps, expected {expected_steps}"
@@ -628,6 +631,10 @@ def _validate_shape_flow_steps_checkpoint(
         step_shape = sample_in.shape
         for name in stepped_tensor_names:
             array = np.asarray(checkpoint[name])
+            if array.dtype != np.dtype(np.float32):
+                raise ValueError(
+                    f"shape_flow_steps {name} dtype must be float32, got {array.dtype}"
+                )
             if array.shape != step_shape:
                 raise ValueError(
                     f"shape_flow_steps {name} shape {array.shape} does not match {step_shape}"
@@ -636,6 +643,10 @@ def _validate_shape_flow_steps_checkpoint(
                 raise ValueError(f"shape_flow_steps {name} contains non-finite values")
         for name in stepped_scalar_names:
             array = np.asarray(checkpoint[name])
+            if array.dtype != np.dtype(np.float32):
+                raise ValueError(
+                    f"shape_flow_steps {name} dtype must be float32, got {array.dtype}"
+                )
             if array.shape[0:1] != (expected_steps,):
                 raise ValueError(
                     f"shape_flow_steps {name} must have leading step axis {expected_steps}, "
@@ -646,6 +657,11 @@ def _validate_shape_flow_steps_checkpoint(
 
         noise = np.asarray(checkpoint["noise"])
         sample_feats = np.asarray(checkpoint["sample_feats"])
+        if noise.dtype != np.dtype(np.float32) or sample_feats.dtype != np.dtype(np.float32):
+            raise ValueError(
+                "shape_flow_steps noise/sample_feats dtype must both be float32, "
+                f"got {noise.dtype} and {sample_feats.dtype}"
+            )
         expected_sample_shape = step_shape[1:]
         if noise.shape != expected_sample_shape or sample_feats.shape != expected_sample_shape:
             raise ValueError(
@@ -664,6 +680,11 @@ def _validate_shape_flow_steps_checkpoint(
 
         coords = np.asarray(checkpoint["coords"])
         coords_3d = np.asarray(checkpoint["coords_3d"])
+        if coords.dtype != np.dtype(np.int32) or coords_3d.dtype != np.dtype(np.int32):
+            raise ValueError(
+                "shape_flow_steps coords/coords_3d dtype must both be int32, "
+                f"got {coords.dtype} and {coords_3d.dtype}"
+            )
         if coords.shape != (step_shape[1], 4) or coords_3d.shape != (step_shape[1], 3):
             raise ValueError(
                 "shape_flow_steps coordinates do not match token count: "
@@ -674,6 +695,11 @@ def _validate_shape_flow_steps_checkpoint(
 
         t = np.asarray(checkpoint["t"], dtype=np.float64)
         t_prev = np.asarray(checkpoint["t_prev"], dtype=np.float64)
+        if (
+            np.asarray(checkpoint["t"]).dtype != np.dtype(np.float32)
+            or np.asarray(checkpoint["t_prev"]).dtype != np.dtype(np.float32)
+        ):
+            raise ValueError("shape_flow_steps t/t_prev dtype must both be float32")
         if t.shape != (expected_steps,) or t_prev.shape != (expected_steps,):
             raise ValueError(
                 f"shape_flow_steps t/t_prev must have shape ({expected_steps},)"
@@ -682,6 +708,82 @@ def _validate_shape_flow_steps_checkpoint(
             raise ValueError("shape_flow_steps timestep schedule is non-finite or non-descending")
         if not np.array_equal(t[1:].astype(np.float32), t_prev[:-1].astype(np.float32)):
             raise ValueError("shape_flow_steps timestep pairs are not contiguous")
+
+        expected_sampler_scalars = {
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.5,
+            "rescale_t": 3.0,
+            "sigma_min": 1e-5,
+        }
+        sampler_scalars = {}
+        for name, expected in expected_sampler_scalars.items():
+            array = np.asarray(checkpoint[name])
+            if array.shape != () or array.dtype != np.dtype(np.float32):
+                raise ValueError(f"shape_flow_steps {name} must be a float32 scalar")
+            value = float(array.item())
+            if not np.isfinite(value):
+                raise ValueError(f"shape_flow_steps {name} must be finite")
+            if not np.isclose(value, expected, rtol=0.0, atol=1e-7):
+                raise ValueError(
+                    f"shape_flow_steps {name}={value} does not match route value {expected}"
+                )
+            sampler_scalars[name] = value
+
+        guidance_interval = np.asarray(checkpoint["guidance_interval"])
+        if (
+            guidance_interval.shape != (2,)
+            or guidance_interval.dtype != np.dtype(np.float32)
+            or not np.isfinite(guidance_interval).all()
+            or not np.allclose(
+                guidance_interval,
+                np.array([0.6, 1.0], dtype=np.float32),
+                rtol=0.0,
+                atol=1e-7,
+            )
+        ):
+            raise ValueError(
+                "shape_flow_steps guidance_interval must be finite route value [0.6, 1.0]"
+            )
+
+        injection_array = np.asarray(checkpoint["shape_flow_block_injection_json"])
+        if injection_array.shape != () or injection_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape_flow_steps shape_flow_block_injection_json must be a string scalar"
+            )
+        injection_json = str(injection_array.item())
+        if injection_json:
+            try:
+                injection_identity = json.loads(injection_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "shape_flow_steps shape_flow_block_injection_json is invalid JSON"
+                ) from exc
+            if not isinstance(injection_identity, dict):
+                raise ValueError(
+                    "shape_flow_steps shape_flow_block_injection_json must decode to an object"
+                )
+
+        schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
+        rescale_t = sampler_scalars["rescale_t"]
+        schedule = rescale_t * schedule / (1 + (rescale_t - 1) * schedule)
+        expected_t = schedule[:-1].astype(np.float32)
+        expected_t_prev = schedule[1:].astype(np.float32)
+        if not np.array_equal(t.astype(np.float32), expected_t) or not np.array_equal(
+            t_prev.astype(np.float32), expected_t_prev
+        ):
+            raise ValueError("shape_flow_steps t/t_prev do not match the rescaled route schedule")
+
+        pred_final = np.asarray(checkpoint["pred_final"], dtype=np.float32)
+        expected_next = sample_in.astype(np.float32) - (
+            (expected_t - expected_t_prev)[:, None, None] * pred_final
+        )
+        sample_next = np.asarray(checkpoint["sample_next"], dtype=np.float32)
+        euler_residual = np.abs(sample_next.astype(np.float64) - expected_next.astype(np.float64))
+        if not np.allclose(sample_next, expected_next, rtol=2e-5, atol=2e-5):
+            raise ValueError(
+                "shape_flow_steps Euler transition is inconsistent; "
+                f"max_abs_residual={float(np.max(euler_residual))}"
+            )
 
     return {
         "schema": "trellis2mlx.shape_flow_steps_output.v1",
@@ -692,6 +794,12 @@ def _validate_shape_flow_steps_checkpoint(
         "token_count": int(step_shape[1]),
         "channel_count": int(step_shape[2]),
         "recurrence_exact": True,
+        "euler_transition_max_abs_residual": float(np.max(euler_residual)),
+        "sampler": {
+            **sampler_scalars,
+            "guidance_interval": [float(value) for value in guidance_interval],
+            "shape_flow_block_injection_json": injection_json,
+        },
         "finite": True,
     }
 

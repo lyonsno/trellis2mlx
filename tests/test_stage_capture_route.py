@@ -407,6 +407,72 @@ def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_steps"
 
 
+def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channels=4):
+    import numpy as np
+
+    rescale_t = np.float32(3.0)
+    schedule = np.linspace(1, 0, steps + 1, dtype=np.float64)
+    schedule = rescale_t * schedule / (1 + (rescale_t - 1) * schedule)
+    t = schedule[:-1].astype(np.float32)
+    t_prev = schedule[1:].astype(np.float32)
+    pred_final = np.ones((steps, tokens, channels), dtype=np.float32)
+    sample_in = np.empty_like(pred_final)
+    sample_next = np.empty_like(pred_final)
+    sample_in[0] = 0.0
+    for index in range(steps):
+        sample_next[index] = (
+            sample_in[index]
+            - np.float32(t[index] - t_prev[index]) * pred_final[index]
+        )
+        if index + 1 < steps:
+            sample_in[index + 1] = sample_next[index]
+    stepped = np.zeros_like(sample_in)
+    scalar_steps = np.ones((steps,), dtype=np.float32)
+    coords_3d = np.arange(tokens * 3, dtype=np.int32).reshape(tokens, 3)
+    coords = np.column_stack([np.zeros(tokens, dtype=np.int32), coords_3d])
+    np.savez(
+        path,
+        noise=sample_in[0],
+        sample_feats=sample_in[0],
+        coords=coords,
+        coords_3d=coords_3d,
+        sample_in=sample_in,
+        pred_pos=stepped,
+        pred_neg=stepped,
+        pred_cfg=stepped,
+        x0_pos=stepped,
+        x0_cfg=stepped,
+        std_pos=scalar_steps,
+        std_cfg=scalar_steps,
+        ratio_raw=scalar_steps,
+        std_ratio=scalar_steps,
+        ratio_effective=scalar_steps,
+        x0_rescaled=stepped,
+        x0_after_rescale=stepped,
+        pred_final=pred_final,
+        pred_v_feats=pred_final,
+        sample_next=sample_next,
+        t=t,
+        t_prev=t_prev,
+        steps=np.array(steps, dtype=np.int32),
+        guidance_strength=np.array(7.5, dtype=np.float32),
+        guidance_rescale=np.array(0.5, dtype=np.float32),
+        guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
+        rescale_t=rescale_t,
+        sigma_min=np.array(1e-5, dtype=np.float32),
+        shape_flow_block_injection_json=np.array(""),
+    )
+
+
+def _rewrite_npz_array(path, name, value):
+    import numpy as np
+
+    with np.load(path, allow_pickle=False) as checkpoint:
+        payload = {key: np.asarray(checkpoint[key]) for key in checkpoint.files}
+    payload[name] = value
+    np.savez(path, **payload)
+
+
 def test_shape_flow_steps_partial_checkpoint_fails_loud(tmp_path, monkeypatch):
     import json
     import subprocess
@@ -536,8 +602,6 @@ def test_shape_flow_steps_complete_checkpoint_is_route_bound(tmp_path, monkeypat
     import json
     import subprocess
 
-    import numpy as np
-
     from scripts.run_mlx_stage_capture import main
 
     image = tmp_path / "input.png"
@@ -547,47 +611,7 @@ def test_shape_flow_steps_complete_checkpoint_is_route_bound(tmp_path, monkeypat
     def write_complete(command, **kwargs):
         checkpoint = output_dir / "checkpoints" / "shape_flow_steps.npz"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        steps, tokens, channels = 3, 2, 4
-        sample_in = np.stack(
-            [np.full((tokens, channels), index, dtype=np.float32) for index in range(steps)]
-        )
-        sample_next = sample_in + np.float32(1.0)
-        stepped = np.zeros_like(sample_in)
-        scalar_steps = np.ones((steps,), dtype=np.float32)
-        coords_3d = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
-        coords = np.column_stack([np.zeros(tokens, dtype=np.int32), coords_3d])
-        np.savez(
-            checkpoint,
-            noise=sample_in[0],
-            sample_feats=sample_in[0],
-            coords=coords,
-            coords_3d=coords_3d,
-            sample_in=sample_in,
-            pred_pos=stepped,
-            pred_neg=stepped,
-            pred_cfg=stepped,
-            x0_pos=stepped,
-            x0_cfg=stepped,
-            std_pos=scalar_steps,
-            std_cfg=scalar_steps,
-            ratio_raw=scalar_steps,
-            std_ratio=scalar_steps,
-            ratio_effective=scalar_steps,
-            x0_rescaled=stepped,
-            x0_after_rescale=stepped,
-            pred_final=stepped,
-            pred_v_feats=stepped,
-            sample_next=sample_next,
-            t=np.array([1.0, 0.6, 0.2], dtype=np.float32),
-            t_prev=np.array([0.6, 0.2, 0.0], dtype=np.float32),
-            steps=np.array(steps, dtype=np.int32),
-            guidance_strength=np.array(7.5, dtype=np.float32),
-            guidance_rescale=np.array(0.5, dtype=np.float32),
-            guidance_interval=np.array([0.6, 1.0], dtype=np.float32),
-            rescale_t=np.array(3.0, dtype=np.float32),
-            sigma_min=np.array(1e-5, dtype=np.float32),
-            shape_flow_block_injection_json=np.array(""),
-        )
+        _write_valid_shape_flow_steps_checkpoint(checkpoint)
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
     monkeypatch.setattr("scripts.run_mlx_stage_capture.subprocess.run", write_complete)
@@ -614,6 +638,112 @@ def test_shape_flow_steps_complete_checkpoint_is_route_bound(tmp_path, monkeypat
     assert report["primary_output_validation"]["step_count"] == 3
     assert report["primary_output_validation"]["token_count"] == 2
     assert route["route"]["shape_flow_steps_output"] == report["primary_output_validation"]
+
+
+def test_shape_flow_steps_rejects_sampler_inconsistent_final_transition(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as artifact:
+        sample_next = np.asarray(artifact["sample_next"]).copy()
+    sample_next[-1] += np.float32(0.25)
+    _rewrite_npz_array(checkpoint, "sample_next", sample_next)
+
+    with pytest.raises(ValueError, match="Euler transition"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
+
+
+def test_shape_flow_steps_rejects_wrong_contiguous_schedule(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "t",
+        np.array([1.0, 0.75, 0.25], dtype=np.float32),
+    )
+    _rewrite_npz_array(
+        checkpoint,
+        "t_prev",
+        np.array([0.75, 0.25, 0.0], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="rescaled route schedule"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
+
+
+def test_shape_flow_steps_rejects_nonfinite_sampler_metadata(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "guidance_strength",
+        np.array(np.nan, dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="guidance_strength"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
+
+
+def test_shape_flow_steps_rejects_wrong_tensor_dtype(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as artifact:
+        sample_in = np.asarray(artifact["sample_in"], dtype=np.float64)
+    _rewrite_npz_array(checkpoint, "sample_in", sample_in)
+
+    with pytest.raises(ValueError, match="sample_in dtype"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
+
+
+def test_shape_flow_steps_rejects_invalid_injection_identity(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_block_injection_json",
+        np.array("not-json"),
+    )
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
+
+
+def test_shape_flow_steps_rejects_wrong_step_count_dtype(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(checkpoint, "steps", np.array(3.0, dtype=np.float32))
+
+    with pytest.raises(ValueError, match="steps must be an int32 scalar"):
+        _validate_shape_flow_steps_checkpoint(checkpoint, expected_steps=3)
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):

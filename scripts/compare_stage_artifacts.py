@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sparse_flow_block_trace",
             "sparse_internals",
             "shape_flow_step",
+            "shape_flow_steps",
             "shape_flow_block_trace",
             "shape_slat",
             "decoder_output",
@@ -100,6 +101,9 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
                 name: _array_delta(ref[name], cand[name])
                 for name in sorted(set(ref.files) & set(cand.files) - {"coords", "coords_3d"})
             }
+            return report
+        if stage == "shape_flow_steps":
+            report.update(_shape_flow_steps_delta(ref, cand))
             return report
         if stage == "sparse_internals":
             report["arrays"] = {
@@ -183,6 +187,95 @@ def _feature_delta(
     return {
         "common_shape": list(ref_common.shape),
         **_diff_summary(diff),
+    }
+
+
+def _shape_flow_steps_delta(reference: Any, candidate: Any) -> dict[str, Any]:
+    token_arrays = ("noise", "sample_feats", "coords_3d")
+    stepped_token_arrays = (
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+    )
+    direct_arrays = (
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "t",
+        "t_prev",
+        "steps",
+        "guidance_strength",
+        "guidance_rescale",
+        "guidance_interval",
+        "rescale_t",
+        "sigma_min",
+    )
+    required = (
+        "coords",
+        *token_arrays,
+        *stepped_token_arrays,
+        *direct_arrays,
+        "shape_flow_block_injection_json",
+    )
+    _require_keys(reference, required, "reference")
+    _require_keys(candidate, required, "candidate")
+    ref_coords = np.asarray(reference["coords"])
+    cand_coords = np.asarray(candidate["coords"])
+    if len(_coord_index(ref_coords)) != len(ref_coords):
+        raise ValueError("reference shape_flow_steps coordinates contain duplicates")
+    if len(_coord_index(cand_coords)) != len(cand_coords):
+        raise ValueError("candidate shape_flow_steps coordinates contain duplicates")
+    coords_report, ref_order, cand_order = _coord_overlap(ref_coords, cand_coords)
+    coords_report["exact_order_match"] = bool(np.array_equal(ref_coords, cand_coords))
+
+    arrays = {}
+    ref_index = np.asarray(ref_order, dtype=np.int64)
+    cand_index = np.asarray(cand_order, dtype=np.int64)
+    for name in token_arrays:
+        arrays[name] = _array_delta(
+            np.asarray(reference[name])[ref_index],
+            np.asarray(candidate[name])[cand_index],
+        )
+    for name in stepped_token_arrays:
+        ref_array = np.asarray(reference[name])
+        cand_array = np.asarray(candidate[name])
+        if ref_array.ndim < 2 or cand_array.ndim < 2:
+            arrays[name] = _array_delta(ref_array, cand_array)
+        else:
+            arrays[name] = _array_delta(
+                ref_array[:, ref_index, ...],
+                cand_array[:, cand_index, ...],
+            )
+    for name in direct_arrays:
+        arrays[name] = _array_delta(reference[name], candidate[name])
+
+    ref_injection = np.asarray(reference["shape_flow_block_injection_json"])
+    cand_injection = np.asarray(candidate["shape_flow_block_injection_json"])
+    if ref_injection.shape != () or cand_injection.shape != ():
+        raise ValueError("shape_flow_block_injection_json must be scalar in both artifacts")
+    ref_injection_value = str(ref_injection.item())
+    cand_injection_value = str(cand_injection.item())
+    return {
+        "coords": coords_report,
+        "token_alignment": "common-coordinate-order",
+        "arrays": arrays,
+        "metadata": {
+            "shape_flow_block_injection_json": {
+                "reference": ref_injection_value,
+                "candidate": cand_injection_value,
+                "exact_match": ref_injection_value == cand_injection_value,
+            }
+        },
     }
 
 
