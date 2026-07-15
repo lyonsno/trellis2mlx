@@ -879,8 +879,6 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         decoder.set_resolution(512)
         decoder.to(device)
         decoder.low_vram = True
-        if decoder.training:
-            raise RuntimeError("shape-SLat decoder remained in training mode after eval()")
         report["model_load"] = {
             "name": "shape_slat_decoder",
             "model_ref": model_ref,
@@ -891,6 +889,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         }
         report["phase_timings"][phase] = report["model_load"]["elapsed_seconds"]
         report["last_trustworthy_phase"] = phase
+        if decoder.training:
+            raise RuntimeError("shape-SLat decoder remained in training mode after eval()")
 
         phase = "decode_selected_points"
         decode_started = time.perf_counter()

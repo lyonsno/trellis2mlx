@@ -182,9 +182,11 @@ def test_shape_slat_grid_decode_rejects_selected_array_digest_mismatch_and_stale
     assert not stale.exists()
 
 
-def test_shape_slat_grid_decode_puts_directly_loaded_decoder_in_eval_mode(
+@pytest.mark.parametrize("eval_clears_training", [True, False])
+def test_shape_slat_grid_decode_records_direct_decoder_eval_mode(
     tmp_path,
     monkeypatch,
+    eval_clears_training,
 ):
     import contextlib
     import json
@@ -243,7 +245,8 @@ def test_shape_slat_grid_decode_puts_directly_loaded_decoder_in_eval_mode(
             self.resolution = resolution
 
         def eval(self):
-            self.training = False
+            if eval_clears_training:
+                self.training = False
             return self
 
         def to(self, _device):
@@ -253,6 +256,7 @@ def test_shape_slat_grid_decode_puts_directly_loaded_decoder_in_eval_mode(
             return [FakeParameter()]
 
         def __call__(self, _shape_slat, *, return_subs):
+            self.called = True
             assert return_subs is True
             if self.training:
                 raise TypeError("'NoneType' object is not iterable")
@@ -301,12 +305,25 @@ def test_shape_slat_grid_decode_puts_directly_loaded_decoder_in_eval_mode(
     rc = runner.main(args)
 
     report = json.loads((tmp_path / "decode-report.json").read_text())
-    assert rc == 0
-    assert decoder.training is False
-    assert report["model_load"]["training"] is False
-    assert report["effective_route"]["model_training"] is False
-    assert report["status"] == "done"
-    assert report["written_artifact_count"] == 2
+    if eval_clears_training:
+        assert rc == 0
+        assert decoder.training is False
+        assert decoder.called is True
+        assert report["model_load"]["training_before_eval"] is True
+        assert report["model_load"]["training"] is False
+        assert report["effective_route"]["model_training"] is False
+        assert report["status"] == "done"
+        assert report["written_artifact_count"] == 2
+    else:
+        assert rc == 1
+        assert decoder.training is True
+        assert not hasattr(decoder, "called")
+        assert report["failure_phase"] == "load_shape_decoder"
+        assert report["model_load"]["training_before_eval"] is True
+        assert report["model_load"]["training"] is True
+        assert "remained in training mode" in report["error"]
+        assert "remained in training mode" in report["traceback"]
+        assert report["written_artifact_count"] == 0
 
 
 def test_shape_slat_grid_decode_report_collision_uses_durable_fallback(tmp_path):
