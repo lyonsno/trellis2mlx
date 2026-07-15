@@ -182,11 +182,15 @@ def test_shape_slat_grid_decode_rejects_selected_array_digest_mismatch_and_stale
     assert not stale.exists()
 
 
-@pytest.mark.parametrize("eval_clears_training", [True, False])
+@pytest.mark.parametrize(
+    ("eval_clears_training", "fill_holes_changes_geometry"),
+    [(True, False), (True, True), (False, False)],
+)
 def test_shape_slat_grid_decode_records_direct_decoder_eval_mode(
     tmp_path,
     monkeypatch,
     eval_clears_training,
+    fill_holes_changes_geometry,
 ):
     import contextlib
     import json
@@ -234,7 +238,9 @@ def test_shape_slat_grid_decode_records_direct_decoder_eval_mode(
         faces = np.array([[0, 1, 2]], dtype=np.int32)
 
         def fill_holes(self):
-            return None
+            if fill_holes_changes_geometry:
+                self.vertices = self.vertices.copy()
+                self.vertices[0, 0] = 0.125
 
     class FakeDecoder:
         def __init__(self):
@@ -312,8 +318,14 @@ def test_shape_slat_grid_decode_records_direct_decoder_eval_mode(
         assert report["model_load"]["training_before_eval"] is True
         assert report["model_load"]["training"] is False
         assert report["effective_route"]["model_training"] is False
+        assert "raw_and_filled_meshes" not in report["effective_route"]
+        assert report["effective_route"]["post_fill_holes_snapshots"] is True
         assert report["status"] == "done"
         assert report["written_artifact_count"] == 2
+        assert report["point_results"][0]["fill_holes_effective_change"] is fill_holes_changes_geometry
+        artifacts = {row["variant"]: row for row in report["mesh_artifacts"]}
+        assert artifacts["filled"]["fill_holes_effective_change"] is fill_holes_changes_geometry
+        assert (artifacts["filled"]["sha256"] != artifacts["raw"]["sha256"]) is fill_holes_changes_geometry
     else:
         assert rc == 1
         assert decoder.training is True

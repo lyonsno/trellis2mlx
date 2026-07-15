@@ -715,7 +715,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         "requested_route": {
             "route": "official-source-cuda-shape-slat-decoder",
             "resolution": 512,
-            "raw_and_filled_meshes": True,
+            "raw_meshes": True,
+            "post_fill_holes_snapshots": True,
             "one_model_load": True,
             "no_download": bool(args.no_download),
         },
@@ -724,6 +725,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         "forbidden_inferences": [
             "not a textured mesh or GLB",
             "not a winding-correctness claim",
+            "a post-fill_holes snapshot is not proof that geometry changed",
             "not evidence that every exact tensor quotient is a distinct visual basin",
             "not a full MLX continuation",
         ],
@@ -817,7 +819,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "route": "official-source-cuda-shape-slat-decoder",
                         "device_type": "not_loaded_no_download",
                         "resolution": 512,
-                        "raw_and_filled_meshes": True,
+                        "raw_meshes": True,
+                        "post_fill_holes_snapshots": True,
                         "one_model_load": True,
                     },
                     "elapsed_seconds": elapsed(started),
@@ -924,19 +927,23 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             )
             written_artifacts.append(raw_artifact)
             report["written_artifact_count"] = len(written_artifacts)
+            raw_sha256 = raw_artifact["sha256"]
 
             fill_started = time.perf_counter()
             mesh.fill_holes()
             sync_cuda(torch)
             filled_path = output_dir / f"{point_name}.filled.ply"
             write_binary_mesh_ply(filled_path, mesh)
+            filled_sha256 = sha256_file(filled_path)
+            fill_holes_effective_change = filled_sha256 != raw_sha256
             filled_artifact = artifact_by_key[(point_name, "filled")]
             filled_artifact.update(
                 {
                     "status": "written",
-                    "sha256": sha256_file(filled_path),
+                    "sha256": filled_sha256,
                     "size_bytes": filled_path.stat().st_size,
                     "mesh_summary": mesh_summary(mesh),
+                    "fill_holes_effective_change": fill_holes_effective_change,
                 }
             )
             written_artifacts.append(filled_artifact)
@@ -946,6 +953,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     "coordinate_key": point_name,
                     "elapsed_seconds": elapsed(point_started),
                     "fill_holes_elapsed_seconds": elapsed(fill_started),
+                    "fill_holes_effective_change": fill_holes_effective_change,
                 }
             )
         report["decode_selected_points_elapsed_seconds"] = elapsed(decode_started)
@@ -969,7 +977,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     "model_ref": model_ref,
                     "model_training": bool(decoder.training),
                     "resolution": 512,
-                    "raw_and_filled_meshes": True,
+                    "raw_meshes": True,
+                    "post_fill_holes_snapshots": True,
+                    "fill_holes_effective_change_count": sum(
+                        bool(point["fill_holes_effective_change"])
+                        for point in point_results
+                    ),
                     "one_model_load": True,
                 },
                 "elapsed_seconds": elapsed(started),
