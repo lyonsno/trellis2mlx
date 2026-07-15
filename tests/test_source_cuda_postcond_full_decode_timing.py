@@ -202,6 +202,34 @@ def test_shape_slat_grid_decode_report_collision_uses_durable_fallback(tmp_path)
     assert "collides with protected input" in report["error"]
 
 
+def test_shape_slat_grid_decode_expected_mesh_report_collision_uses_fallback(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(tmp_path)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    colliding_mesh = output_dir / f"{point_names[0]}.raw.ply"
+    colliding_mesh.write_bytes(b"stale mesh")
+    args = _shape_slat_decode_args(tmp_path, grid, source_report, point_names)
+    args[1] = str(colliding_mesh)
+
+    rc = main(args)
+
+    fallback = colliding_mesh.with_name(
+        f"{colliding_mesh.name}.selective-decode-failure.json"
+    )
+    report = json.loads(fallback.read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert report["requested_output_json"] == str(colliding_mesh)
+    assert report["effective_output_json"] == str(fallback)
+    assert "collides with an expected mesh output" in report["error"]
+    assert not colliding_mesh.exists()
+    assert not list(output_dir.glob("*.ply"))
+
+
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [

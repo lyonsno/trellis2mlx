@@ -752,8 +752,14 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             for point_name in point_names
             for variant in ("raw", "filled")
         ]
-        if _resolved_path(requested_output_json) in {_resolved_path(path) for path in expected_paths}:
-            raise ValueError("--output-json collides with an expected mesh output")
+        resolved_expected_paths = {_resolved_path(path) for path in expected_paths}
+        expected_output_collision = _resolved_path(requested_output_json) in resolved_expected_paths
+        if expected_output_collision:
+            output_json = _selective_failure_report_path(
+                requested_output_json,
+                protected | resolved_expected_paths,
+            )
+            report["effective_output_json"] = str(output_json)
         output_dir.mkdir(parents=True, exist_ok=True)
         for path in expected_paths:
             path.unlink(missing_ok=True)
@@ -769,6 +775,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             for point_name in point_names
             for variant in ("raw", "filled")
         ]
+        if expected_output_collision:
+            raise ValueError("--output-json collides with an expected mesh output")
 
         phase = "input_validation"
         source_report = json.loads(source_report_path.read_text())
