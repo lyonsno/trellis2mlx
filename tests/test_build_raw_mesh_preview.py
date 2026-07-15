@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -149,3 +152,68 @@ def test_build_preview_removes_invalid_post_write_output(monkeypatch, tmp_path):
     assert report["invalid_output_observed"]["sha256"]
     assert report["invalid_output_removed"] is True
     assert not output_glb.exists()
+
+
+def test_build_preview_failure_sidecar_cannot_alias_input(tmp_path):
+    import scripts.build_raw_mesh_preview as build_raw_mesh_preview
+
+    output_glb = tmp_path / "preview.glb"
+    report_json = output_glb
+    input_ply = tmp_path / "preview.glb.failure.json"
+    expected_failure_report = tmp_path / "preview.glb.failure.1.json"
+    build_raw_mesh_preview.write_binary_ply(
+        input_ply,
+        np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        np.array([[0, 1, 2]], dtype=np.int32),
+    )
+    input_sha256 = build_raw_mesh_preview.sha256_file(input_ply)
+
+    with pytest.raises(ValueError, match="requested paths must be distinct"):
+        build_raw_mesh_preview.build_raw_mesh_preview(
+            input_ply=input_ply,
+            output_glb=output_glb,
+            report_json=report_json,
+            face_stride=1,
+        )
+
+    assert build_raw_mesh_preview.sha256_file(input_ply) == input_sha256
+    assert not output_glb.exists()
+    report = json.loads(expected_failure_report.read_text())
+    assert report["effective_report_json"] == str(expected_failure_report)
+
+
+def test_build_preview_cli_runs_as_a_direct_script(tmp_path):
+    import scripts.build_raw_mesh_preview as build_raw_mesh_preview
+
+    input_ply = tmp_path / "raw.ply"
+    output_glb = tmp_path / "preview.glb"
+    report_json = tmp_path / "preview.json"
+    build_raw_mesh_preview.write_binary_ply(
+        input_ply,
+        np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        np.array([[0, 1, 2]], dtype=np.int32),
+    )
+    script = Path(build_raw_mesh_preview.__file__)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--input-ply",
+            str(input_ply),
+            "--output-glb",
+            str(output_glb),
+            "--report-json",
+            str(report_json),
+            "--face-stride",
+            "1",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report_json.read_text())["status"] == "done"
+    assert output_glb.exists()

@@ -10,17 +10,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 import numpy as np
 import trimesh
 
-from scripts.postprocess_raw_cuda_mesh import (
-    export_glb,
-    sha256_file,
-    write_binary_ply,
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.postprocess_raw_cuda_mesh import export_glb, sha256_file, write_binary_ply
 
 
 ROUTE = "deterministic_face_stride_preview"
@@ -55,7 +56,10 @@ def build_raw_mesh_preview(
     path_collisions = find_path_collisions(input_ply, output_glb, report_json)
     effective_report_json = report_json
     if any("report_json" in collision for collision in path_collisions):
-        effective_report_json = report_json.with_name(report_json.name + ".failure.json")
+        effective_report_json = choose_failure_report_path(
+            report_json,
+            protected_paths=[input_ply, output_glb, report_json],
+        )
     report: dict[str, Any] = {
         "schema": "trellis2mlx.raw_mesh_face_stride_preview.v1",
         "status": "failed",
@@ -302,6 +306,15 @@ def paths_alias(left: Path, right: Path) -> bool:
         return left.samefile(right)
     except (FileNotFoundError, OSError):
         return False
+
+
+def choose_failure_report_path(requested: Path, *, protected_paths: list[Path]) -> Path:
+    candidate = requested.with_name(requested.name + ".failure.json")
+    suffix = 1
+    while any(paths_alias(candidate, protected) for protected in protected_paths):
+        candidate = requested.with_name(requested.name + f".failure.{suffix}.json")
+        suffix += 1
+    return candidate
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
