@@ -372,6 +372,31 @@ def test_analyzer_rejects_stale_npz_and_reported_pairwise_lies(tmp_path):
         analyze_suffix_ladder(result_json, result_npz, receipt, download_report, manifest)
 
 
+def test_metric_validation_accepts_four_float32_ulps_but_rejects_five():
+    from scripts.analyze_shape_flow_suffix_ladder import _validate_metrics
+
+    actual_mean = np.float32(0.1637459546327591)
+    reported_mean = actual_mean
+    for _ in range(4):
+        reported_mean = np.nextafter(reported_mean, np.float32(np.inf), dtype=np.float32)
+    actual = {
+        "shape_match": True,
+        "mean_abs": float(actual_mean),
+        "max_abs": 1.0,
+        "nonzero": 42,
+        "exact": False,
+    }
+    reported = {**actual, "mean_abs": float(reported_mean)}
+
+    _validate_metrics(reported, actual, label="float32 reduction")
+
+    reported["mean_abs"] = float(
+        np.nextafter(reported_mean, np.float32(np.inf), dtype=np.float32)
+    )
+    with pytest.raises(ValueError, match="mean_abs differs"):
+        _validate_metrics(reported, actual, label="fabricated reduction")
+
+
 def test_analyzer_rejects_nonfinite_endpoint_even_with_rehashed_lie(tmp_path):
     from scripts.analyze_shape_flow_suffix_ladder import analyze_suffix_ladder
 

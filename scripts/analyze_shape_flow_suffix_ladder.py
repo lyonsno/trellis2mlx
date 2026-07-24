@@ -32,6 +32,7 @@ except ModuleNotFoundError as exc:
 
 
 SCHEMA = "trellis2mlx.shape_flow_suffix_ladder_analysis.v1"
+FLOAT32_REDUCTION_ULPS = 4
 
 
 def _sha256(path: Path) -> str:
@@ -314,6 +315,20 @@ def _metrics(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _float32_metrics_close(left: float, right: float) -> bool:
+    left32 = np.float32(left)
+    right32 = np.float32(right)
+    if not np.isfinite(left32) or not np.isfinite(right32):
+        return False
+    if left32 == right32:
+        return True
+    if left32 < 0 or right32 < 0:
+        return False
+    left_bits = int(left32.view(np.uint32))
+    right_bits = int(right32.view(np.uint32))
+    return abs(left_bits - right_bits) <= FLOAT32_REDUCTION_ULPS
+
+
 def _validate_metrics(reported: dict[str, Any], actual: dict[str, Any], *, label: str) -> None:
     for key in ("shape_match", "nonzero", "exact"):
         _require_equal(reported.get(key), actual[key], label=f"{label} {key}")
@@ -321,7 +336,7 @@ def _validate_metrics(reported: dict[str, Any], actual: dict[str, Any], *, label
         value = reported.get(key)
         if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise ValueError(f"{label} {key} is not finite")
-        if not math.isclose(float(value), actual[key], rel_tol=1e-12, abs_tol=1e-12):
+        if not _float32_metrics_close(float(value), actual[key]):
             raise ValueError(f"{label} {key} differs: {value!r} versus {actual[key]!r}")
 
 
