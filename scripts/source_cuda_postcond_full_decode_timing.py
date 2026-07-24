@@ -79,6 +79,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Authoritative source-CUDA basin report bound to --shape-slat-grid.",
     )
     parser.add_argument(
+        "--shape-slat-grid-sha256",
+        help=(
+            "Expected SHA256 of --shape-slat-grid. Required for suffix-ladder "
+            "selective decode so the caller binds the accepted NPZ before cleanup."
+        ),
+    )
+    parser.add_argument(
+        "--shape-slat-grid-report-sha256",
+        help=(
+            "Expected SHA256 of --shape-slat-grid-report. Required for "
+            "suffix-ladder selective decode."
+        ),
+    )
+    parser.add_argument(
         "--shape-slat-point",
         action="append",
         default=[],
@@ -531,7 +545,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-SHAPE_SLAT_POINT_RE = re.compile(r"^alpha-(?:0|0p5|1)_beta-(?:0|0p5|1)$")
+SHAPE_SLAT_POINT_RE = re.compile(
+    r"^(?:alpha-(?:0|0p5|1)_beta-(?:0|0p5|1)|switch-[0-8])$"
+)
 SHAPE_SLAT_BASIN_ROUTE = {
     "route": "official-source-cuda-full-eight-step-shape-flow-with-fixed-block29-endpoints",
     "device_type": "cuda",
@@ -542,6 +558,16 @@ SHAPE_SLAT_BASIN_ROUTE = {
     "steps": 8,
     "one_model_load": True,
     "endpoint_semantics": "current + scale * (source - current)",
+}
+SHAPE_SLAT_SUFFIX_ROUTE = {
+    "route": "official-source-cuda-shape-flow-suffix-ladder-from-exact-mlx-prefixes",
+    "device_type": "cuda",
+    "attention_backend": "sdpa",
+    "conv_backend": "none",
+    "steps": 8,
+    "switch_steps": list(range(9)),
+    "one_model_load": True,
+    "comparison_class": "exact-mlx-prefix-plus-source-cuda-suffix",
 }
 
 
@@ -567,29 +593,70 @@ def _write_selective_decode_report(path: Path, report: dict[str, Any]) -> None:
     )
 
 
-def _validate_source_basin_route(source_report: dict[str, Any]) -> dict[str, Any]:
-    if source_report.get("schema") != "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
-        raise ValueError("unsupported source basin report schema")
+def _validate_source_shape_slat_route(source_report: dict[str, Any]) -> dict[str, Any]:
+    schema = source_report.get("schema")
+    supported_schemas = {
+        "trellis2mlx.source_cuda_shape_block29_basin_map.v1",
+        "trellis2mlx.source_cuda_shape_flow_suffix_ladder.v1",
+    }
+    if schema not in supported_schemas:
+        raise ValueError("unsupported source shape-SLat report schema")
     if source_report.get("status") != "done":
-        raise ValueError("source basin report is not done")
+        raise ValueError("source shape-SLat report is not done")
     route = source_report.get("effective_route")
     if not isinstance(route, dict):
-        raise ValueError("source basin report is missing effective_route")
-    for key, expected in SHAPE_SLAT_BASIN_ROUTE.items():
+        raise ValueError("source shape-SLat report is missing effective_route")
+    expected_route = (
+        SHAPE_SLAT_BASIN_ROUTE
+        if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1"
+        else SHAPE_SLAT_SUFFIX_ROUTE
+    )
+    route_label = (
+        "source basin"
+        if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1"
+        else "source suffix"
+    )
+    for key, expected in expected_route.items():
         if route.get(key) != expected:
             raise ValueError(
-                f"source basin route mismatch for {key}: expected {expected!r}, got {route.get(key)!r}"
+                f"source shape-SLat route mismatch for {key}: "
+                f"expected {expected!r}, got {route.get(key)!r}"
             )
     if not isinstance(route.get("cuda_device"), str) or not route["cuda_device"].strip():
-        raise ValueError("source basin route is missing cuda_device")
-    source_control = source_report.get("source_control")
-    if not isinstance(source_control, dict):
-        raise ValueError("source basin report is missing source_control")
-    if source_control.get("exact") is not True:
-        raise ValueError("source basin report did not prove an exact source control")
-    if source_control.get("coordinate") != {"alpha": 1.0, "beta": 1.0}:
-        raise ValueError("source control coordinate mismatch")
-    return {key: route[key] for key in (*SHAPE_SLAT_BASIN_ROUTE, "cuda_device") if key in route}
+        raise ValueError(f"{route_label} route is missing cuda_device")
+    if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+        source_control = source_report.get("source_control")
+        if not isinstance(source_control, dict):
+            raise ValueError("source basin report is missing source_control")
+        if source_control.get("exact") is not True:
+            raise ValueError("source basin report did not prove an exact source control")
+        if source_control.get("coordinate") != {"alpha": 1.0, "beta": 1.0}:
+            raise ValueError("source control coordinate mismatch")
+    else:
+        timing = source_report.get("timing")
+        if not isinstance(timing, dict):
+            raise ValueError("source suffix report is missing timing")
+        expected_timing = {
+            "source_steps_completed": 36,
+            "source_steps_requested": 36,
+            "switch_points_completed": 9,
+            "switch_points_requested": 9,
+        }
+        for key, expected in expected_timing.items():
+            if timing.get(key) != expected:
+                raise ValueError(
+                    f"source suffix {key} must be {expected}, got {timing.get(key)!r}"
+                )
+        primary = source_report.get("primary_output", {})
+        validation = primary.get("validation", {}) if isinstance(primary, dict) else {}
+        if validation.get("point_arrays_bound") is not True:
+            raise ValueError("source suffix primary output does not bind point arrays")
+        if validation.get("switch_count") != 9:
+            raise ValueError("source suffix primary output does not bind all nine switches")
+    return {
+        "source_schema": schema,
+        **{key: route[key] for key in (*expected_route, "cuda_device") if key in route},
+    }
 
 
 def _coordinate_from_point_name(point_name: str) -> dict[str, float]:
@@ -605,7 +672,7 @@ def _load_selected_shape_slat_inputs(
 ) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict[str, Any]]]:
     primary = source_report.get("primary_output")
     if not isinstance(primary, dict):
-        raise ValueError("source basin report is missing primary_output")
+        raise ValueError("source shape-SLat report is missing primary_output")
     actual_primary_sha = sha256_file(grid_path)
     if primary.get("sha256") != actual_primary_sha:
         raise ValueError(
@@ -622,15 +689,37 @@ def _load_selected_shape_slat_inputs(
 
     point_rows = source_report.get("points")
     if not isinstance(point_rows, list):
-        raise ValueError("source basin report points must be a list")
+        raise ValueError("source shape-SLat report points must be a list")
+    schema = source_report.get("schema")
     by_name: dict[str, dict[str, Any]] = {}
     for row in point_rows:
-        if not isinstance(row, dict) or not isinstance(row.get("coordinate_key"), str):
-            raise ValueError("source basin report contains an invalid point row")
-        name = row["coordinate_key"]
+        if not isinstance(row, dict):
+            raise ValueError("source shape-SLat report contains an invalid point row")
+        if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+            name = row.get("coordinate_key")
+            if not isinstance(name, str):
+                raise ValueError("source basin report contains an invalid point row")
+        else:
+            step = row.get("switch_step")
+            if not isinstance(step, int) or step not in range(9):
+                raise ValueError("source suffix report contains an invalid switch row")
+            name = f"switch-{step}"
+            if row.get("source_step_indices") != list(range(step, 8)):
+                raise ValueError(f"source suffix switch {step} has invalid source step indices")
+            if row.get("source_step_count") != 8 - step:
+                raise ValueError(f"source suffix switch {step} has invalid source step count")
+            if row.get("output_key") != f"switch_{step}_shape_slat":
+                raise ValueError(f"source suffix switch {step} has noncanonical output key")
         if name in by_name:
-            raise ValueError(f"source basin report contains duplicate point {name!r}")
+            raise ValueError(f"source shape-SLat report contains duplicate point {name!r}")
         by_name[name] = row
+    expected_names = (
+        {f"switch-{step}" for step in range(9)}
+        if schema == "trellis2mlx.source_cuda_shape_flow_suffix_ladder.v1"
+        else None
+    )
+    if expected_names is not None and set(by_name) != expected_names:
+        raise ValueError("source suffix report does not contain exactly all nine switches")
 
     selected_arrays: dict[str, np.ndarray] = {}
     selected_rows: list[dict[str, Any]] = []
@@ -641,10 +730,78 @@ def _load_selected_shape_slat_inputs(
         if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
             raise ValueError(f"coords must be int32 [N, 4], got {coords.dtype} {coords.shape}")
         coords = np.ascontiguousarray(coords)
-        for point_name in point_names:
+        point_names_to_validate = point_names
+        if schema == "trellis2mlx.source_cuda_shape_flow_suffix_ladder.v1":
+            if set(primary_keys) != set(data.files):
+                missing = sorted(set(primary_keys) - set(data.files))
+                unreported = sorted(set(data.files) - set(primary_keys))
+                raise ValueError(
+                    "primary output key manifest differs from archive: "
+                    f"missing={missing}, unreported={unreported}"
+                )
+            canonical_output_keys = {
+                f"switch_{step}_shape_slat" for step in range(9)
+            }
+            for output_key in sorted(canonical_output_keys):
+                if output_key not in data.files:
+                    raise ValueError(
+                        f"source suffix is missing canonical suffix array {output_key!r}"
+                    )
+            if "switch_steps" not in data.files:
+                raise ValueError("source suffix is missing switch_steps")
+            switch_steps = np.asarray(data["switch_steps"])
+            if (
+                switch_steps.dtype != np.int32
+                or switch_steps.shape != (9,)
+                or not np.array_equal(switch_steps, np.arange(9, dtype=np.int32))
+            ):
+                raise ValueError("source suffix switch_steps must be int32 [0..8]")
+            if "metadata_json" not in data.files:
+                raise ValueError("source suffix is missing metadata_json")
+            raw_metadata = np.asarray(data["metadata_json"])
+            if raw_metadata.shape != () or raw_metadata.dtype.kind not in {"U", "S"}:
+                raise ValueError("source suffix metadata_json must be a string scalar")
+            try:
+                metadata = json.loads(str(raw_metadata.item()))
+            except json.JSONDecodeError as exc:
+                raise ValueError("source suffix metadata_json is invalid JSON") from exc
+            if (
+                metadata.get("schema")
+                != "trellis2mlx.source_cuda_shape_flow_suffix_ladder.artifact.v1"
+            ):
+                raise ValueError("source suffix artifact metadata schema is invalid")
+            if metadata.get("artifact_status") != "computed_pending_serialization":
+                raise ValueError("source suffix artifact metadata status is invalid")
+            if metadata.get("external_report_required") is not True:
+                raise ValueError(
+                    "source suffix artifact metadata must require the external report"
+                )
+            metadata_fields = (
+                "effective_route",
+                "inputs",
+                "points",
+                "pairwise",
+                "timing",
+                "forbidden_inferences",
+            )
+            for field in metadata_fields:
+                if metadata.get(field) != source_report.get(field):
+                    label = "point manifest" if field == "points" else field
+                    raise ValueError(
+                        f"source suffix artifact {label} differs from external report"
+                    )
+            point_names_to_validate = [
+                f"switch-{step}" for step in range(9)
+            ]
+
+        validated_arrays: dict[str, np.ndarray] = {}
+        validated_rows: dict[str, dict[str, Any]] = {}
+        for point_name in point_names_to_validate:
             row = by_name.get(point_name)
             if row is None:
-                raise ValueError(f"selected point {point_name!r} is absent from source basin report")
+                raise ValueError(
+                    f"selected point {point_name!r} is absent from source shape-SLat report"
+                )
             output_key = row.get("output_key")
             if not isinstance(output_key, str) or output_key not in data.files:
                 raise ValueError(f"selected point {point_name!r} is missing output array {output_key!r}")
@@ -652,12 +809,13 @@ def _load_selected_shape_slat_inputs(
                 raise ValueError(
                     f"primary output key list omits selected array {output_key!r}"
                 )
-            expected_coordinate = _coordinate_from_point_name(point_name)
-            if row.get("coordinate") != expected_coordinate:
-                raise ValueError(
-                    f"coordinate mismatch for {point_name!r}: "
-                    f"expected {expected_coordinate!r}, got {row.get('coordinate')!r}"
-                )
+            if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+                expected_coordinate = _coordinate_from_point_name(point_name)
+                if row.get("coordinate") != expected_coordinate:
+                    raise ValueError(
+                        f"coordinate mismatch for {point_name!r}: "
+                        f"expected {expected_coordinate!r}, got {row.get('coordinate')!r}"
+                    )
             values = np.asarray(data[output_key])
             if values.dtype != np.float32 or values.ndim != 2 or values.shape != (coords.shape[0], 32):
                 raise ValueError(
@@ -673,16 +831,21 @@ def _load_selected_shape_slat_inputs(
                 )
             if row.get("shape") != [int(v) for v in values.shape]:
                 raise ValueError(f"selected array shape report mismatch for {point_name!r}")
-            selected_arrays[point_name] = np.ascontiguousarray(values)
-            selected_rows.append(
-                {
-                    "coordinate": row.get("coordinate"),
-                    "coordinate_key": point_name,
-                    "output_key": output_key,
-                    "sha256": actual_digest,
-                    "shape": [int(v) for v in values.shape],
-                }
-            )
+            validated_arrays[point_name] = np.ascontiguousarray(values)
+            validated_row = {
+                "coordinate_key": point_name,
+                "output_key": output_key,
+                "sha256": actual_digest,
+                "shape": [int(v) for v in values.shape],
+            }
+            if schema == "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+                validated_row["coordinate"] = row.get("coordinate")
+            else:
+                validated_row["switch_step"] = row.get("switch_step")
+            validated_rows[point_name] = validated_row
+        for point_name in point_names:
+            selected_arrays[point_name] = validated_arrays[point_name]
+            selected_rows.append(validated_rows[point_name])
     return coords, selected_arrays, selected_rows
 
 
@@ -719,6 +882,10 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "post_fill_holes_snapshots": True,
             "one_model_load": True,
             "no_download": bool(args.no_download),
+        },
+        "requested_source_shape_slat_identity": {
+            "report_sha256": args.shape_slat_grid_report_sha256,
+            "primary_sha256": args.shape_slat_grid_sha256,
         },
         "mesh_artifacts": [],
         "written_artifact_count": 0,
@@ -757,6 +924,14 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             for variant in ("raw", "filled")
         ]
         resolved_expected_paths = {_resolved_path(path) for path in expected_paths}
+        protected_output_collisions = sorted(
+            str(path) for path in resolved_expected_paths & protected
+        )
+        if protected_output_collisions:
+            raise ValueError(
+                "expected mesh output collides with protected input: "
+                f"{protected_output_collisions}"
+            )
         expected_output_collision = _resolved_path(requested_output_json) in resolved_expected_paths
         if expected_output_collision:
             output_json = _selective_failure_report_path(
@@ -764,6 +939,46 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 protected | resolved_expected_paths,
             )
             report["effective_output_json"] = str(output_json)
+
+        expected_grid_sha256 = args.shape_slat_grid_sha256
+        expected_report_sha256 = args.shape_slat_grid_report_sha256
+        suffix_selection = any(name.startswith("switch-") for name in point_names)
+        if suffix_selection and not (
+            expected_grid_sha256 and expected_report_sha256
+        ):
+            raise ValueError(
+                "expected report and NPZ SHA256 values are required for "
+                "suffix selective decode"
+            )
+        if bool(expected_grid_sha256) != bool(expected_report_sha256):
+            raise ValueError(
+                "--shape-slat-grid-sha256 and "
+                "--shape-slat-grid-report-sha256 must be provided together"
+            )
+        if expected_grid_sha256 and expected_report_sha256:
+            for label, expected in (
+                ("primary", expected_grid_sha256),
+                ("report", expected_report_sha256),
+            ):
+                if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+                    raise ValueError(
+                        f"expected source shape-SLat {label} SHA256 is not "
+                        "canonical lowercase hex"
+                    )
+            actual_report_sha256 = sha256_file(source_report_path)
+            if actual_report_sha256 != expected_report_sha256:
+                raise ValueError(
+                    "expected source shape-SLat report digest mismatch: "
+                    f"expected={expected_report_sha256}, "
+                    f"actual={actual_report_sha256}"
+                )
+            actual_grid_sha256 = sha256_file(grid_path)
+            if actual_grid_sha256 != expected_grid_sha256:
+                raise ValueError(
+                    "expected source shape-SLat primary digest mismatch: "
+                    f"expected={expected_grid_sha256}, actual={actual_grid_sha256}"
+                )
+
         output_dir.mkdir(parents=True, exist_ok=True)
         for path in expected_paths:
             path.unlink(missing_ok=True)
@@ -784,29 +999,39 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
 
         phase = "input_validation"
         source_report = json.loads(source_report_path.read_text())
-        source_basin_route = _validate_source_basin_route(source_report)
+        source_shape_slat_route = _validate_source_shape_slat_route(source_report)
         coords, selected_arrays, selected_rows = _load_selected_shape_slat_inputs(
             grid_path,
             source_report,
             point_names,
         )
+        source_shape_slat_report = {
+            "path": str(source_report_path),
+            "sha256": sha256_file(source_report_path),
+        }
+        source_shape_slat_primary = {
+            "path": str(grid_path),
+            "sha256": sha256_file(grid_path),
+            "size_bytes": grid_path.stat().st_size,
+        }
         report.update(
             {
-                "source_basin_report": {
-                    "path": str(source_report_path),
-                    "sha256": sha256_file(source_report_path),
-                },
-                "source_basin_primary": {
-                    "path": str(grid_path),
-                    "sha256": sha256_file(grid_path),
-                    "size_bytes": grid_path.stat().st_size,
-                },
-                "source_basin_route": source_basin_route,
+                "source_shape_slat_report": source_shape_slat_report,
+                "source_shape_slat_primary": source_shape_slat_primary,
+                "source_shape_slat_route": source_shape_slat_route,
                 "selected_points": selected_rows,
                 "coords_shape": [int(v) for v in coords.shape],
                 "last_trustworthy_phase": phase,
             }
         )
+        if source_report.get("schema") == "trellis2mlx.source_cuda_shape_block29_basin_map.v1":
+            report.update(
+                {
+                    "source_basin_report": source_shape_slat_report,
+                    "source_basin_primary": source_shape_slat_primary,
+                    "source_basin_route": source_shape_slat_route,
+                }
+            )
 
         if args.no_download:
             for artifact in report["mesh_artifacts"]:

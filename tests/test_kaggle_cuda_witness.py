@@ -1,8 +1,90 @@
 import json
+import re
 import subprocess
+import sys
+import types
+import zipfile
 
 import numpy as np
 import pytest
+
+
+def _write_valid_ply(path):
+    path.write_bytes(
+        b"ply\n"
+        b"format ascii 1.0\n"
+        b"element vertex 3\n"
+        b"property float x\n"
+        b"property float y\n"
+        b"property float z\n"
+        b"element face 1\n"
+        b"property list uchar int vertex_indices\n"
+        b"end_header\n"
+        b"0 0 0\n"
+        b"1 0 0\n"
+        b"0 1 0\n"
+        b"3 0 1 2\n"
+    )
+
+
+def _write_success_receipt(
+    packet,
+    output_dir,
+    *,
+    status="done",
+    failure_phase=None,
+    cuda_available=True,
+    cuda_device="Tesla T4",
+):
+    from trellmlx.kaggle_cuda_witness import sha256_file
+
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    if not manifest_path.is_file():
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "trellis2mlx.kaggle_cuda_witness.inputs.v1",
+                    "dataset_id": packet.dataset_id,
+                    "kernel_id": packet.kernel_id,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    outputs = {}
+    for name in packet.outputs:
+        path = output_dir / name
+        outputs[name] = {
+            "exists": path.is_file(),
+            "sha256": sha256_file(path) if path.is_file() else None,
+            "size_bytes": path.stat().st_size if path.is_file() else None,
+        }
+    receipt = {
+        "schema": "trellis2mlx.kaggle_cuda_witness.receipt.v1",
+        "status": status,
+        "failure_phase": failure_phase,
+        "requested_dataset_id": packet.dataset_id,
+        "requested_kernel_id": packet.kernel_id,
+        "requested_accelerator": packet.accelerator,
+        "cuda_available": cuda_available,
+        "cuda_device": cuda_device,
+        "input_manifest": {
+            "sha256": sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        },
+        "source_identity": {
+            "dataset_sources": [packet.dataset_id],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+        },
+        "outputs": outputs,
+    }
+    (output_dir / "kaggle_cuda_witness_receipt.json").write_text(
+        json.dumps(receipt) + "\n"
+    )
+    return receipt
 
 
 def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
@@ -61,6 +143,8 @@ def test_prepare_packet_writes_private_dataset_kernel_and_manifest(tmp_path):
     assert manifest["files"]["witness.npz"]["size_bytes"] == len(b"npz bytes")
     assert "kaggle_cuda_witness_receipt.json" in runner
     assert "torch.cuda.is_available()" in runner
+    assert 'phase="cuda_route"' in runner
+    assert "CUDA route is unavailable" in runner
     assert "find_manifest()" in runner
     assert "rglob(\"witness-manifest.json\")" in runner
     assert "mounted_input_files" in runner
@@ -185,6 +269,116 @@ def test_prepared_runner_records_uncapped_mount_and_exact_source_identity(tmp_pa
     assert '"mounted_input_snapshot": mounted_input_snapshot()' in runner
 
 
+def test_prepared_runner_rejects_substituted_mounted_manifest_identity(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-npz', required=True)\n"
+        "a=p.parse_args()\n"
+        "Path(a.output_json).write_text('{\"status\":\"done\"}\\n')\n"
+        "Path(a.output_npz).write_bytes(b'npz')\n"
+    )
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/requested-inputs",
+            kernel_id="operator/requested-cuda",
+            title="Requested CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["dataset_id"] = "attacker/substituted-inputs"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    runner = runner.replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    rc = namespace["main"]()
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc != 0
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] in {
+        "input_manifest_digest",
+        "input_manifest_identity",
+    }
+    assert not (work / "cuda_result.json").exists()
+
+
+def test_prepared_runner_rejects_missing_effective_cuda_before_probe(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text(
+        "from pathlib import Path\n"
+        "Path('probe-executed').write_text('yes')\n"
+    )
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/no-cuda-inputs",
+            kernel_id="operator/no-cuda-witness",
+            title="No CUDA Witness",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    fake_torch = types.SimpleNamespace(
+        __version__="test",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: False,
+            get_device_name=lambda _index: "",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    runner = runner.replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    rc = namespace["main"]()
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc != 0
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "cuda_route"
+    assert receipt["cuda_available"] is False
+    assert receipt["cuda_device"] is None
+    assert receipt["input_manifest"]["sha256"]
+    assert not (work / "probe-executed").exists()
+
+
 def test_prepare_packet_preserves_entrypoint_args_in_runner(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, load_prepared_packet, prepare_packet
 
@@ -243,6 +437,131 @@ def test_prepare_packet_can_declare_mesh_ply_output(tmp_path):
     assert loaded.output_ply == "cuda_result_mesh.ply"
     assert '\\"output_ply\\": \\"cuda_result_mesh.ply\\"' in runner
     assert 'command += ["--output-ply", CONFIG["output_ply"]]' in runner
+
+
+def test_prepare_packet_can_declare_json_and_nested_expected_outputs_without_npz(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        build_kernel_output_command,
+        load_prepared_packet,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "decode.py").write_text("print('decode')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/selective-decode-inputs",
+            kernel_id="operator/selective-decode-cuda",
+            title="Selective Decode CUDA",
+            entrypoint="decode.py",
+            inputs=("decode.py",),
+            output_json="selective_decode_report.json",
+            output_npz=None,
+            expected_outputs=(
+                "meshes/switch-1.raw.ply",
+                "meshes/switch-1.filled.ply",
+            ),
+            entrypoint_args=(
+                "--shape-slat-grid",
+                "cuda_result.npz",
+                "--shape-slat-grid-sha256",
+                "3" * 64,
+                "--shape-slat-grid-report",
+                "cuda_result.json",
+                "--shape-slat-grid-report-sha256",
+                "4" * 64,
+            ),
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+    output_command = build_kernel_output_command(packet, tmp_path / "downloaded")
+
+    assert manifest["outputs"] == [
+        "selective_decode_report.json",
+        "meshes/switch-1.raw.ply",
+        "meshes/switch-1.filled.ply",
+    ]
+    assert manifest["output_roles"]["npz"] is None
+    assert manifest["output_roles"]["expected"] == [
+        "meshes/switch-1.raw.ply",
+        "meshes/switch-1.filled.ply",
+    ]
+    assert loaded.output_npz is None
+    assert loaded.expected_outputs == (
+        "meshes/switch-1.raw.ply",
+        "meshes/switch-1.filled.ply",
+    )
+    assert loaded.entrypoint_args == tuple(manifest["entrypoint_args"])
+    assert manifest["entrypoint_args"][-3:] == [
+        "cuda_result.json",
+        "--shape-slat-grid-report-sha256",
+        "4" * 64,
+    ]
+    assert '\\"output_json\\": \\"selective_decode_report.json\\"' in runner
+    assert '\\"output_npz\\": null' in runner
+    assert '\\"--shape-slat-grid-sha256\\"' in runner
+    assert f'\\\"{"3" * 64}\\\"' in runner
+    assert '\\"--shape-slat-grid-report-sha256\\"' in runner
+    assert f'\\\"{"4" * 64}\\\"' in runner
+    assert 'if CONFIG["output_npz"]:' in runner
+    assert '"--output-npz", CONFIG["output_npz"]' in runner
+    assert "selective_decode_report\\.json" in output_command[-1]
+    assert "meshes/switch\\-1\\.raw\\.ply" in output_command[-1]
+    assert "meshes/switch\\-1\\.filled\\.ply" in output_command[-1]
+    output_pattern = re.compile(output_command[-1])
+    expected_names = (*packet.outputs, "kaggle_cuda_witness_receipt.json")
+    for name in expected_names:
+        assert output_pattern.search(name)
+        assert not output_pattern.search(f"../../{name}")
+        assert not output_pattern.search(f"prefix-{name}")
+        assert not output_pattern.search(f"{name}.stale")
+        assert not output_pattern.search(f"./{name}")
+
+
+def test_validate_downloaded_outputs_rejects_missing_declared_nested_mesh(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        validate_downloaded_outputs,
+    )
+
+    output_dir = tmp_path / "outputs"
+    (output_dir / "meshes").mkdir(parents=True)
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=tmp_path,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/selective-output-inputs",
+        kernel_id="operator/selective-output-cuda",
+        title="Selective Output CUDA",
+        entrypoint="decode.py",
+        inputs=("decode.py",),
+        output_json="selective_decode_report.json",
+        output_npz=None,
+        expected_outputs=(
+            "meshes/switch-1.raw.ply",
+            "meshes/switch-1.filled.ply",
+        ),
+    )
+    (output_dir / "selective_decode_report.json").write_text('{"status": "done"}\n')
+    _write_valid_ply(output_dir / "meshes" / "switch-1.raw.ply")
+    _write_success_receipt(packet, output_dir)
+
+    with pytest.raises(WitnessPacketError, match="switch-1.filled.ply"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    (output_dir / "meshes" / "switch-1.filled.ply").write_bytes(b"not a ply")
+    _write_success_receipt(packet, output_dir)
+    with pytest.raises(WitnessPacketError, match="invalid PLY"):
+        validate_downloaded_outputs(packet, output_dir)
 
 
 def test_prepare_packet_can_declare_full_mesh_state_output(tmp_path):
@@ -406,6 +725,78 @@ def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
     assert not (tmp_path / "packet").exists()
 
 
+def test_prepare_packet_rejects_normalized_output_aliases(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    with pytest.raises(WitnessPacketError, match="canonical|unique"):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/alias-inputs",
+                kernel_id="operator/alias-cuda",
+                title="Alias CUDA",
+                entrypoint="cuda_probe.py",
+                inputs=("cuda_probe.py",),
+                output_json="result.json",
+                output_npz=None,
+                expected_outputs=("./result.json",),
+            )
+        )
+
+
+@pytest.mark.parametrize("unsafe_output", ("../outside.json", "/tmp/outside.json"))
+def test_load_prepared_packet_rejects_unsafe_manifest_output(
+    tmp_path,
+    unsafe_output,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        load_prepared_packet,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/unsafe-load-inputs",
+            kernel_id="operator/unsafe-load-cuda",
+            title="Unsafe Load CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["outputs"] = [unsafe_output]
+    manifest["output_roles"] = {
+        "json": unsafe_output,
+        "npz": None,
+        "ply": None,
+        "mesh_state": None,
+        "shape_slat": None,
+        "shape_flow_step": None,
+        "expected": [],
+    }
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+
+    with pytest.raises(WitnessPacketError, match="relative|canonical"):
+        load_prepared_packet(packet.output_dir)
+
+
 def test_prepare_packet_expands_directory_inputs(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
 
@@ -538,7 +929,10 @@ def test_build_commands_preserve_dataset_kernel_and_accelerator(tmp_path):
         str(tmp_path / "outputs"),
         "-o",
         "--file-pattern",
-        ".*(cuda_result|kaggle_cuda_witness_receipt).*",
+        (
+            "\\A(?:cuda_result\\.json|cuda_result\\.npz|"
+            "kaggle_cuda_witness_receipt\\.json)\\Z"
+        ),
     ]
 
 
@@ -709,23 +1103,117 @@ def test_validate_downloaded_outputs_rejects_blank_or_partial_evidence(tmp_path)
         inputs=("probe.py",),
     )
     (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
-    (output_dir / "kaggle_cuda_witness_receipt.json").write_text('{"status": "done"}\n')
     (output_dir / "cuda_result.npz").write_bytes(b"")
+    _write_success_receipt(packet, output_dir)
 
     with pytest.raises(WitnessPacketError, match="blank downloaded output"):
         validate_downloaded_outputs(packet, output_dir)
 
     (output_dir / "cuda_result.npz").write_bytes(b"partial zip")
+    _write_success_receipt(packet, output_dir)
+    with pytest.raises(WitnessPacketError, match="invalid NPZ"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    with zipfile.ZipFile(output_dir / "cuda_result.npz", "w") as archive:
+        archive.writestr("not-an-array.txt", "this is not an npz")
+    _write_success_receipt(packet, output_dir)
     with pytest.raises(WitnessPacketError, match="invalid NPZ"):
         validate_downloaded_outputs(packet, output_dir)
 
     np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1], dtype=np.int32))
+    _write_success_receipt(packet, output_dir)
     records = validate_downloaded_outputs(packet, output_dir)
 
     assert records["cuda_result.json"]["size_bytes"] > 0
     assert records["cuda_result.json"]["sha256"]
     assert records["cuda_result.npz"]["size_bytes"] > 0
     assert records["cuda_result.npz"]["sha256"]
+
+
+def test_validate_downloaded_outputs_rejects_failed_or_mismatched_receipt(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        validate_downloaded_outputs,
+    )
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=tmp_path,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/receipt-inputs",
+        kernel_id="operator/receipt-cuda",
+        title="Receipt CUDA",
+        entrypoint="probe.py",
+        inputs=("probe.py",),
+    )
+    (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
+    np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1]))
+    _write_success_receipt(
+        packet,
+        output_dir,
+        status="failed",
+        failure_phase="execution",
+    )
+
+    with pytest.raises(WitnessPacketError, match="receipt status"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    receipt = _write_success_receipt(packet, output_dir)
+    receipt["outputs"]["cuda_result.npz"]["sha256"] = "0" * 64
+    (output_dir / "kaggle_cuda_witness_receipt.json").write_text(
+        json.dumps(receipt) + "\n"
+    )
+    with pytest.raises(WitnessPacketError, match="receipt.*digest|digest.*receipt"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    receipt = _write_success_receipt(packet, output_dir)
+    receipt["input_manifest"]["sha256"] = "0" * 64
+    (output_dir / "kaggle_cuda_witness_receipt.json").write_text(
+        json.dumps(receipt) + "\n"
+    )
+    with pytest.raises(WitnessPacketError, match="manifest.*digest|digest.*manifest"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    _write_success_receipt(
+        packet,
+        output_dir,
+        cuda_available=False,
+        cuda_device=None,
+    )
+    with pytest.raises(WitnessPacketError, match="CUDA"):
+        validate_downloaded_outputs(packet, output_dir)
+
+
+def test_validate_downloaded_outputs_rejects_header_only_ply(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        validate_downloaded_outputs,
+    )
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=tmp_path,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/ply-validation-inputs",
+        kernel_id="operator/ply-validation-cuda",
+        title="PLY Validation CUDA",
+        entrypoint="probe.py",
+        inputs=("probe.py",),
+        output_npz=None,
+        expected_outputs=("mesh.ply",),
+    )
+    (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
+    (output_dir / "mesh.ply").write_bytes(b"ply\nend_header\n")
+    _write_success_receipt(packet, output_dir)
+
+    with pytest.raises(WitnessPacketError, match="invalid PLY"):
+        validate_downloaded_outputs(packet, output_dir)
 
 
 def test_wait_for_downloaded_outputs_allows_materializing_npz(tmp_path):
@@ -743,13 +1231,14 @@ def test_wait_for_downloaded_outputs_allows_materializing_npz(tmp_path):
         inputs=("probe.py",),
     )
     (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
-    (output_dir / "kaggle_cuda_witness_receipt.json").write_text('{"status": "done"}\n')
     (output_dir / "cuda_result.npz").write_bytes(b"")
+    _write_success_receipt(packet, output_dir)
     sleeps = []
 
     def materialize_npz(seconds):
         sleeps.append(seconds)
         np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1], dtype=np.int32))
+        _write_success_receipt(packet, output_dir)
 
     records = wait_for_downloaded_outputs(
         packet,

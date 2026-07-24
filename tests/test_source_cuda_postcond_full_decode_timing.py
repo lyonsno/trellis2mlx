@@ -73,8 +73,17 @@ def _write_shape_slat_grid_fixture(tmp_path, *, points=None):
     return grid, source_report, [row[0] for row in points]
 
 
-def _shape_slat_decode_args(tmp_path, grid, source_report, point_names):
-    return [
+def _shape_slat_decode_args(
+    tmp_path,
+    grid,
+    source_report,
+    point_names,
+    *,
+    bind_expected_suffix_digests=True,
+):
+    import hashlib
+
+    args = [
         "--output-json",
         str(tmp_path / "decode-report.json"),
         "--shape-slat-grid",
@@ -90,6 +99,148 @@ def _shape_slat_decode_args(tmp_path, grid, source_report, point_names):
             for item in ("--shape-slat-point", point_name)
         ],
     ]
+    if bind_expected_suffix_digests and any(
+        point_name.startswith("switch-") for point_name in point_names
+    ):
+        args.extend(
+            [
+                "--shape-slat-grid-sha256",
+                hashlib.sha256(grid.read_bytes()).hexdigest(),
+                "--shape-slat-grid-report-sha256",
+                hashlib.sha256(source_report.read_bytes()).hexdigest(),
+            ]
+        )
+    return args
+
+
+def _write_shape_slat_suffix_fixture(tmp_path):
+    import hashlib
+    import json
+    from pathlib import Path
+
+    import numpy as np
+
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    arrays = {"coords": coords, "switch_steps": np.arange(9, dtype=np.int32)}
+    points = []
+    for step in range(9):
+        output_key = f"switch_{step}_shape_slat"
+        values = np.full((2, 32), step + 0.25, dtype=np.float32)
+        arrays[output_key] = values
+        points.append(
+            {
+                "switch_step": step,
+                "source_step_indices": list(range(step, 8)),
+                "source_step_count": 8 - step,
+                "output_key": output_key,
+                "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+                "shape": [2, 32],
+            }
+        )
+
+    effective_route = {
+        "route": (
+            "official-source-cuda-shape-flow-suffix-ladder-"
+            "from-exact-mlx-prefixes"
+        ),
+        "device_type": "cuda",
+        "cuda_device": "Tesla T4",
+        "attention_backend": "sdpa",
+        "conv_backend": "none",
+        "steps": 8,
+        "switch_steps": list(range(9)),
+        "one_model_load": True,
+        "comparison_class": "exact-mlx-prefix-plus-source-cuda-suffix",
+    }
+    timing = {
+        "source_steps_completed": 36,
+        "source_steps_requested": 36,
+        "switch_points_completed": 9,
+        "switch_points_requested": 9,
+    }
+    inputs = {
+        "conditioning_sha256": "conditioning-sha256",
+        "accepted_source_baseline_sha256": "source-baseline-sha256",
+    }
+    pairwise = {
+        f"{left}:{right}": {
+            "mean_abs": float(abs(left - right)),
+            "max_abs": float(abs(left - right)),
+            "nonzero": 0 if left == right else 64,
+        }
+        for left in range(9)
+        for right in range(9)
+    }
+    forbidden_inferences = [
+        "not final mesh, texture, winding, or GLB evidence",
+        "not proof of a visual basin until quotient-distinct endpoints are decoded",
+    ]
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(
+            {
+                "schema": (
+                    "trellis2mlx.source_cuda_shape_flow_suffix_ladder.artifact.v1"
+                ),
+                "artifact_status": "computed_pending_serialization",
+                "external_report_required": True,
+                "effective_route": effective_route,
+                "inputs": inputs,
+                "points": points,
+                "pairwise": pairwise,
+                "timing": timing,
+                "forbidden_inferences": forbidden_inferences,
+            },
+            sort_keys=True,
+        )
+    )
+    grid = Path(tmp_path) / "suffix-result.npz"
+    np.savez(grid, **arrays)
+    report = Path(tmp_path) / "suffix-result.json"
+    report.write_text(
+        json.dumps(
+            {
+                "schema": "trellis2mlx.source_cuda_shape_flow_suffix_ladder.v1",
+                "status": "done",
+                "effective_route": effective_route,
+                "inputs": inputs,
+                "primary_output": {
+                    "path": grid.name,
+                    "sha256": hashlib.sha256(grid.read_bytes()).hexdigest(),
+                    "size_bytes": grid.stat().st_size,
+                    "keys": sorted(arrays),
+                    "validation": {"point_arrays_bound": True, "switch_count": 9},
+                },
+                "points": points,
+                "pairwise": pairwise,
+                "timing": timing,
+                "forbidden_inferences": forbidden_inferences,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return grid, report
+
+
+def _rewrite_shape_slat_suffix_fixture_self_consistently(grid, report):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    payload = json.loads(report.read_text())
+    with np.load(grid, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    metadata = json.loads(str(arrays["metadata_json"].item()))
+    substituted_inputs = dict(payload["inputs"])
+    substituted_inputs["substitution_marker"] = "fabricated-but-self-consistent"
+    payload["inputs"] = substituted_inputs
+    metadata["inputs"] = substituted_inputs
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(grid, **arrays)
+    payload["primary_output"]["sha256"] = hashlib.sha256(grid.read_bytes()).hexdigest()
+    payload["primary_output"]["size_bytes"] = grid.stat().st_size
+    report.write_text(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def test_shape_slat_grid_decode_preflight_invalidates_stale_outputs(tmp_path):
@@ -120,6 +271,203 @@ def test_shape_slat_grid_decode_preflight_invalidates_stale_outputs(tmp_path):
     assert {row["status"] for row in report["mesh_artifacts"]} == {"not_written_no_download"}
     assert not stale_raw.exists()
     assert not stale_filled.exists()
+
+
+def test_shape_slat_suffix_decode_preflight_admits_exact_switch_identity(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    rc = main(_shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"]))
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["selected_point_names"] == ["switch-1"]
+    assert report["source_shape_slat_route"]["route"].startswith(
+        "official-source-cuda-shape-flow-suffix-ladder"
+    )
+    assert report["selected_points"] == [
+        {
+            "switch_step": 1,
+            "coordinate_key": "switch-1",
+            "output_key": "switch_1_shape_slat",
+            "sha256": report["selected_points"][0]["sha256"],
+            "shape": [2, 32],
+        }
+    ]
+
+
+def test_shape_slat_suffix_decode_requires_expected_digests_before_stale_cleanup(
+    tmp_path,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "switch-1.raw.ply"
+    stale.write_bytes(b"stale")
+
+    rc = main(
+        _shape_slat_decode_args(
+            tmp_path,
+            grid,
+            source_report,
+            ["switch-1"],
+            bind_expected_suffix_digests=False,
+        )
+    )
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "expected report and NPZ SHA256 values are required" in report["error"]
+    assert stale.read_bytes() == b"stale"
+
+
+def test_shape_slat_suffix_decode_rejects_self_consistent_substitute_before_cleanup(
+    tmp_path,
+):
+    import hashlib
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        build_parser,
+        run_shape_slat_grid_decode,
+    )
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    args = build_parser().parse_args(
+        _shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"])
+    )
+    args.shape_slat_grid_sha256 = hashlib.sha256(grid.read_bytes()).hexdigest()
+    args.shape_slat_grid_report_sha256 = hashlib.sha256(
+        source_report.read_bytes()
+    ).hexdigest()
+    _rewrite_shape_slat_suffix_fixture_self_consistently(grid, source_report)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "switch-1.raw.ply"
+    stale.write_bytes(b"stale")
+
+    rc = run_shape_slat_grid_decode(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "expected source shape-SLat" in report["error"]
+    assert stale.read_bytes() == b"stale"
+
+
+def test_shape_slat_suffix_decode_rejects_partial_ladder(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    payload = json.loads(source_report.read_text())
+    payload["timing"]["source_steps_completed"] = 35
+    source_report.write_text(json.dumps(payload) + "\n")
+
+    rc = main(_shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"]))
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "input_validation"
+    assert "source_steps_completed" in report["error"]
+
+
+def test_shape_slat_suffix_decode_rejects_substituted_artifact_route(tmp_path):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    with np.load(grid, allow_pickle=False) as archive:
+        arrays = {key: np.asarray(archive[key]) for key in archive.files}
+    metadata = json.loads(str(arrays["metadata_json"].item()))
+    metadata["effective_route"]["device_type"] = "cpu"
+    metadata["effective_route"]["route"] = "substituted-non-cuda-route"
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(grid, **arrays)
+    payload = json.loads(source_report.read_text())
+    payload["primary_output"]["sha256"] = hashlib.sha256(grid.read_bytes()).hexdigest()
+    payload["primary_output"]["size_bytes"] = grid.stat().st_size
+    source_report.write_text(json.dumps(payload) + "\n")
+
+    rc = main(_shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"]))
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "input_validation"
+    assert "artifact effective_route differs from external report" in report["error"]
+
+
+def test_shape_slat_suffix_decode_rejects_substituted_artifact_provenance(
+    tmp_path,
+):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    with np.load(grid, allow_pickle=False) as archive:
+        arrays = {key: np.asarray(archive[key]) for key in archive.files}
+    metadata = json.loads(str(arrays["metadata_json"].item()))
+    metadata["inputs"]["conditioning_sha256"] = "fabricated"
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(grid, **arrays)
+    payload = json.loads(source_report.read_text())
+    payload["primary_output"]["sha256"] = hashlib.sha256(grid.read_bytes()).hexdigest()
+    payload["primary_output"]["size_bytes"] = grid.stat().st_size
+    source_report.write_text(json.dumps(payload) + "\n")
+
+    rc = main(_shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"]))
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "input_validation"
+    assert "artifact inputs differs from external report" in report["error"]
+
+
+def test_shape_slat_suffix_decode_rejects_missing_unselected_switch_array(tmp_path):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report = _write_shape_slat_suffix_fixture(tmp_path)
+    with np.load(grid, allow_pickle=False) as archive:
+        arrays = {
+            key: np.asarray(archive[key])
+            for key in archive.files
+            if key != "switch_8_shape_slat"
+        }
+    np.savez(grid, **arrays)
+    payload = json.loads(source_report.read_text())
+    payload["primary_output"]["sha256"] = hashlib.sha256(grid.read_bytes()).hexdigest()
+    payload["primary_output"]["size_bytes"] = grid.stat().st_size
+    payload["primary_output"]["keys"] = sorted(arrays)
+    source_report.write_text(json.dumps(payload) + "\n")
+
+    rc = main(_shape_slat_decode_args(tmp_path, grid, source_report, ["switch-1"]))
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "input_validation"
+    assert "missing canonical suffix array 'switch_8_shape_slat'" in report["error"]
 
 
 def test_shape_slat_grid_decode_rejects_duplicate_selection_with_report(tmp_path):
@@ -386,6 +734,35 @@ def test_shape_slat_grid_decode_expected_mesh_report_collision_uses_fallback(tmp
     assert "collides with an expected mesh output" in report["error"]
     assert not colliding_mesh.exists()
     assert not list(output_dir.glob("*.ply"))
+
+
+def test_shape_slat_grid_decode_rejects_expected_mesh_collision_with_protected_input(
+    tmp_path,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(tmp_path)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    colliding_grid = output_dir / f"{point_names[0]}.raw.ply"
+    grid.replace(colliding_grid)
+    original = colliding_grid.read_bytes()
+    args = _shape_slat_decode_args(
+        tmp_path,
+        colliding_grid,
+        source_report,
+        point_names,
+    )
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "expected mesh output collides with protected input" in report["error"]
+    assert colliding_grid.read_bytes() == original
 
 
 @pytest.mark.parametrize(

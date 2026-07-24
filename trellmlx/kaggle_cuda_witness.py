@@ -15,10 +15,11 @@ import re
 import shutil
 import subprocess
 import time
-import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence
+
+import numpy as np
 
 
 class WitnessPacketError(ValueError):
@@ -41,11 +42,12 @@ class KaggleCudaWitnessPacket:
     accelerator: str = "NvidiaTeslaT4"
     enable_internet: bool = False
     output_json: str = "cuda_result.json"
-    output_npz: str = "cuda_result.npz"
+    output_npz: str | None = "cuda_result.npz"
     output_ply: str | None = None
     output_mesh_state: str | None = None
     output_shape_slat: str | None = None
     output_shape_flow_step: str | None = None
+    expected_outputs: tuple[str, ...] = ()
     shape_flow_noise_sample: str | None = None
 
     def __post_init__(self) -> None:
@@ -53,6 +55,7 @@ class KaggleCudaWitnessPacket:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         object.__setattr__(self, "inputs", tuple(self.inputs))
         object.__setattr__(self, "entrypoint_args", tuple(self.entrypoint_args))
+        object.__setattr__(self, "expected_outputs", tuple(self.expected_outputs))
 
     @property
     def dataset_dir(self) -> Path:
@@ -68,7 +71,9 @@ class KaggleCudaWitnessPacket:
 
     @property
     def outputs(self) -> tuple[str, ...]:
-        outputs = [self.output_json, self.output_npz]
+        outputs = [self.output_json]
+        if self.output_npz:
+            outputs.append(self.output_npz)
         if self.output_ply:
             outputs.append(self.output_ply)
         if self.output_mesh_state:
@@ -77,6 +82,7 @@ class KaggleCudaWitnessPacket:
             outputs.append(self.output_shape_slat)
         if self.output_shape_flow_step:
             outputs.append(self.output_shape_flow_step)
+        outputs.extend(self.expected_outputs)
         return tuple(outputs)
 
 
@@ -120,6 +126,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
             "mesh_state": packet.output_mesh_state,
             "shape_slat": packet.output_shape_slat,
             "shape_flow_step": packet.output_shape_flow_step,
+            "expected": list(packet.expected_outputs),
         },
         "files": file_records,
     }
@@ -150,9 +157,51 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
     outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
     output_roles = manifest.get("output_roles") or {}
     input_roles = manifest.get("input_roles") or {}
-    if len(outputs) < 2:
-        raise WitnessPacketError(f"expected at least two outputs in manifest, got {outputs}")
-    return KaggleCudaWitnessPacket(
+    if not outputs:
+        raise WitnessPacketError("expected at least one output in manifest")
+    output_json = output_roles.get("json") or outputs[0]
+    output_npz = (
+        output_roles["npz"]
+        if "npz" in output_roles
+        else _legacy_output_by_suffix(outputs[1:], ".npz")
+    )
+    output_ply = (
+        output_roles["ply"]
+        if "ply" in output_roles
+        else _legacy_output_by_suffix(outputs[1:], ".ply")
+    )
+    output_mesh_state = (
+        output_roles["mesh_state"]
+        if "mesh_state" in output_roles
+        else _legacy_output_by_suffix(outputs[1:], "_mesh_state.npz")
+    )
+    output_shape_slat = (
+        output_roles["shape_slat"]
+        if "shape_slat" in output_roles
+        else _legacy_output_by_suffix(outputs[1:], "_shape_slat.npz")
+    )
+    output_shape_flow_step = (
+        output_roles["shape_flow_step"]
+        if "shape_flow_step" in output_roles
+        else _legacy_output_by_suffix(outputs[1:], "_shape_flow_step.npz")
+    )
+    claimed_outputs = {
+        output
+        for output in (
+            output_json,
+            output_npz,
+            output_ply,
+            output_mesh_state,
+            output_shape_slat,
+            output_shape_flow_step,
+        )
+        if output is not None
+    }
+    expected_outputs = tuple(
+        output_roles.get("expected")
+        or (output for output in outputs if output not in claimed_outputs)
+    )
+    packet = KaggleCudaWitnessPacket(
         capsule_dir=output_dir / "dataset",
         output_dir=output_dir,
         dataset_id=manifest["dataset_id"],
@@ -165,17 +214,17 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         enable_internet=_bool_metadata(
             kernel_metadata.get("enable_internet", manifest.get("enable_internet", False))
         ),
-        output_json=output_roles.get("json") or outputs[0],
-        output_npz=output_roles.get("npz") or outputs[1],
-        output_ply=output_roles.get("ply") or _legacy_output_by_suffix(outputs[2:], ".ply"),
-        output_mesh_state=output_roles.get("mesh_state") or _legacy_output_by_suffix(outputs[2:], "_mesh_state.npz"),
-        output_shape_slat=output_roles.get("shape_slat") or _legacy_output_by_suffix(outputs[2:], "_shape_slat.npz"),
-        output_shape_flow_step=(
-            output_roles.get("shape_flow_step")
-            or _legacy_output_by_suffix(outputs[2:], "_shape_flow_step.npz")
-        ),
+        output_json=output_json,
+        output_npz=output_npz,
+        output_ply=output_ply,
+        output_mesh_state=output_mesh_state,
+        output_shape_slat=output_shape_slat,
+        output_shape_flow_step=output_shape_flow_step,
+        expected_outputs=expected_outputs,
         shape_flow_noise_sample=input_roles.get("shape_flow_noise_sample"),
     )
+    _validate_refs(packet)
+    return packet
 
 
 def build_dataset_command(packet: KaggleCudaWitnessPacket, *, version: bool = False) -> list[str]:
@@ -226,6 +275,8 @@ def build_kernel_status_command(packet: KaggleCudaWitnessPacket) -> list[str]:
 
 
 def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Path) -> list[str]:
+    output_names = (*packet.outputs, "kaggle_cuda_witness_receipt.json")
+    file_pattern = r"\A(?:" + "|".join(re.escape(name) for name in output_names) + r")\Z"
     return [
         "kaggle",
         "kernels",
@@ -235,7 +286,7 @@ def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Pat
         str(output_dir),
         "-o",
         "--file-pattern",
-        ".*(cuda_result|kaggle_cuda_witness_receipt).*",
+        file_pattern,
     ]
 
 
@@ -292,10 +343,84 @@ def validate_downloaded_outputs(
     output_dir: Path,
 ) -> dict[str, dict[str, str | int]]:
     output_dir = Path(output_dir)
+    resolved_output_dir = output_dir.resolve()
     records: dict[str, dict[str, str | int]] = {}
-    names = tuple(dict.fromkeys((*packet.outputs, "kaggle_cuda_witness_receipt.json")))
-    for name in names:
-        path = output_dir / name
+    receipt_name = "kaggle_cuda_witness_receipt.json"
+    receipt_path = output_dir / receipt_name
+    if not receipt_path.is_file():
+        raise WitnessPacketError(f"missing downloaded output: {receipt_path}")
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WitnessPacketError(
+            f"invalid JSON downloaded output {receipt_path}: {exc}"
+        ) from exc
+    if receipt.get("schema") != "trellis2mlx.kaggle_cuda_witness.receipt.v1":
+        raise WitnessPacketError("downloaded receipt schema is invalid")
+    if receipt.get("status") != "done":
+        raise WitnessPacketError(
+            f"downloaded receipt status is not done: {receipt.get('status')!r}"
+        )
+    if receipt.get("failure_phase") is not None:
+        raise WitnessPacketError("downloaded done receipt has a failure phase")
+    expected_source_identity = {
+        "dataset_sources": [packet.dataset_id],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+    }
+    expected_receipt_identity = {
+        "requested_dataset_id": packet.dataset_id,
+        "requested_kernel_id": packet.kernel_id,
+        "requested_accelerator": packet.accelerator,
+        "source_identity": expected_source_identity,
+    }
+    for field, expected in expected_receipt_identity.items():
+        if receipt.get(field) != expected:
+            raise WitnessPacketError(
+                f"downloaded receipt {field} mismatch: "
+                f"expected {expected!r}, got {receipt.get(field)!r}"
+            )
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    if not manifest_path.is_file():
+        raise WitnessPacketError(
+            f"prepared packet manifest is missing: {manifest_path}"
+        )
+    expected_manifest_record = {
+        "sha256": sha256_file(manifest_path),
+        "size_bytes": manifest_path.stat().st_size,
+    }
+    if receipt.get("input_manifest") != expected_manifest_record:
+        raise WitnessPacketError(
+            "downloaded receipt manifest digest or size mismatch: "
+            f"expected {expected_manifest_record!r}, "
+            f"got {receipt.get('input_manifest')!r}"
+        )
+    if receipt.get("cuda_available") is not True:
+        raise WitnessPacketError(
+            "downloaded receipt does not prove an effective CUDA route"
+        )
+    cuda_device = receipt.get("cuda_device")
+    if not isinstance(cuda_device, str) or not cuda_device.strip():
+        raise WitnessPacketError(
+            "downloaded receipt CUDA device is missing or blank"
+        )
+    receipt_outputs = receipt.get("outputs")
+    if not isinstance(receipt_outputs, dict):
+        raise WitnessPacketError("downloaded receipt is missing its output snapshot")
+    if set(receipt_outputs) != set(packet.outputs):
+        raise WitnessPacketError(
+            "downloaded receipt output set mismatch: "
+            f"expected {sorted(packet.outputs)}, got {sorted(receipt_outputs)}"
+        )
+
+    for name in packet.outputs:
+        canonical_name = _canonical_output_name(name)
+        path = output_dir / canonical_name
+        if not path.resolve().is_relative_to(resolved_output_dir):
+            raise WitnessPacketError(
+                f"downloaded output escapes output directory: {path}"
+            )
         if not path.is_file():
             raise WitnessPacketError(f"missing downloaded output: {path}")
         size = path.stat().st_size
@@ -306,13 +431,90 @@ def validate_downloaded_outputs(
                 json.loads(path.read_text())
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise WitnessPacketError(f"invalid JSON downloaded output {path}: {exc}") from exc
-        if path.suffix == ".npz" and not zipfile.is_zipfile(path):
-            raise WitnessPacketError(f"invalid NPZ downloaded output: {path}")
-        records[name] = {
+        if path.suffix == ".npz":
+            try:
+                with np.load(path, allow_pickle=False) as archive:
+                    if not archive.files:
+                        raise ValueError("archive contains no arrays")
+                    members = archive.zip.namelist()
+                    if (
+                        len(members) != len(archive.files)
+                        or any(
+                            member != f"{array_name}.npy"
+                            for member, array_name in zip(
+                                members, archive.files, strict=True
+                            )
+                        )
+                    ):
+                        raise ValueError(
+                            "archive contains members that are not canonical NPY arrays"
+                        )
+                    for array_name in archive.files:
+                        array = archive[array_name]
+                        if not isinstance(array, np.ndarray):
+                            raise ValueError(
+                                f"member {array_name!r} is not an ndarray"
+                            )
+                        np.asarray(array)
+            except (OSError, ValueError, EOFError) as exc:
+                raise WitnessPacketError(
+                    f"invalid NPZ downloaded output {path}: {exc}"
+                ) from exc
+        if path.suffix == ".ply":
+            _validate_ply_output(path)
+        record = {
             "size_bytes": size,
             "sha256": sha256_file(path),
         }
+        receipt_record = receipt_outputs.get(name)
+        if not isinstance(receipt_record, dict) or receipt_record.get("exists") is not True:
+            raise WitnessPacketError(
+                f"downloaded receipt does not prove output existence: {name}"
+            )
+        if receipt_record.get("size_bytes") != record["size_bytes"]:
+            raise WitnessPacketError(
+                f"downloaded output size differs from receipt for {name}"
+            )
+        if receipt_record.get("sha256") != record["sha256"]:
+            raise WitnessPacketError(
+                f"downloaded output digest differs from receipt for {name}"
+            )
+        records[name] = record
+    receipt_size = receipt_path.stat().st_size
+    if receipt_size == 0:
+        raise WitnessPacketError(f"blank downloaded output: {receipt_path}")
+    records[receipt_name] = {
+        "size_bytes": receipt_size,
+        "sha256": sha256_file(receipt_path),
+    }
     return records
+
+
+def _validate_ply_output(path: Path) -> None:
+    try:
+        import trimesh
+
+        mesh = trimesh.load(path, file_type="ply", process=False)
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError(
+                f"expected one triangular mesh, got {type(mesh).__name__}"
+            )
+        vertices = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.faces)
+        if vertices.ndim != 2 or vertices.shape[0] == 0 or vertices.shape[1] != 3:
+            raise ValueError(f"invalid vertex array shape {vertices.shape}")
+        if faces.ndim != 2 or faces.shape[0] == 0 or faces.shape[1] != 3:
+            raise ValueError(f"invalid face array shape {faces.shape}")
+        if not np.isfinite(vertices).all():
+            raise ValueError("vertices contain non-finite values")
+        if faces.min() < 0 or faces.max() >= vertices.shape[0]:
+            raise ValueError("face indices escape the vertex array")
+    except Exception as exc:
+        if isinstance(exc, WitnessPacketError):
+            raise
+        raise WitnessPacketError(
+            f"invalid PLY downloaded output {path}: {exc}"
+        ) from exc
 
 
 def wait_for_downloaded_outputs(
@@ -365,10 +567,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--enable-internet", action="store_true")
     prepare.add_argument("--output-json", default="cuda_result.json")
     prepare.add_argument("--output-npz", default="cuda_result.npz")
+    prepare.add_argument("--no-output-npz", action="store_true")
     prepare.add_argument("--output-ply")
     prepare.add_argument("--output-mesh-state")
     prepare.add_argument("--output-shape-slat")
     prepare.add_argument("--output-shape-flow-step")
+    prepare.add_argument(
+        "--expected-output",
+        action="append",
+        dest="expected_outputs",
+        default=[],
+    )
     prepare.add_argument("--shape-flow-noise-sample")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
@@ -395,11 +604,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 accelerator=args.accelerator,
                 enable_internet=args.enable_internet,
                 output_json=args.output_json,
-                output_npz=args.output_npz,
+                output_npz=None if args.no_output_npz else args.output_npz,
                 output_ply=args.output_ply,
                 output_mesh_state=args.output_mesh_state,
                 output_shape_slat=args.output_shape_slat,
                 output_shape_flow_step=args.output_shape_flow_step,
+                expected_outputs=tuple(args.expected_outputs),
                 shape_flow_noise_sample=args.shape_flow_noise_sample,
             )
         )
@@ -428,6 +638,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "kernel-output":
         packet = load_prepared_packet(args.packet_dir)
         output_dir = args.output_dir or packet.output_dir / "outputs"
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True)
         report_dir = args.report_dir or Path(args.packet_dir) / "reports"
         report_path = report_dir / "kernel_output.json"
         report = run_command(
@@ -467,6 +680,7 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "entrypoint_args": list(packet.entrypoint_args),
+        "outputs": list(packet.outputs),
         "dataset_dir": str(packet.dataset_dir),
         "kernel_dir": str(packet.kernel_dir),
         "commands": {
@@ -496,6 +710,11 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         raise WitnessPacketError("entrypoint must be one of the staged inputs")
     if packet.shape_flow_noise_sample is not None and packet.shape_flow_noise_sample not in packet.inputs:
         raise WitnessPacketError("shape_flow_noise_sample must be one of the staged inputs")
+    canonical_outputs = tuple(_canonical_output_name(output) for output in packet.outputs)
+    if len(set(canonical_outputs)) != len(canonical_outputs):
+        raise WitnessPacketError("declared outputs must be canonically unique")
+    if "kaggle_cuda_witness_receipt.json" in canonical_outputs:
+        raise WitnessPacketError("declared output collides with the witness receipt")
 
 
 def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
@@ -557,6 +776,7 @@ def _kernel_metadata(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
 
 
 def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
     config = {
         "schema": "trellis2mlx.kaggle_cuda_witness.runner_config.v1",
         "dataset_id": packet.dataset_id,
@@ -566,11 +786,15 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
         "outputs": list(packet.outputs),
+        "output_json": packet.output_json,
+        "output_npz": packet.output_npz,
         "output_ply": packet.output_ply,
         "output_mesh_state": packet.output_mesh_state,
         "output_shape_slat": packet.output_shape_slat,
         "output_shape_flow_step": packet.output_shape_flow_step,
         "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+        "manifest_sha256": sha256_file(manifest_path),
+        "manifest_identity": _manifest_identity(packet),
         "source_identity": {
             "dataset_sources": [packet.dataset_id],
             "competition_sources": [],
@@ -601,19 +825,30 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_receipt(status: str, *, phase: str, message: str | None, extra: dict | None = None) -> None:
-    cuda_available = None
-    cuda_device = None
+def cuda_snapshot() -> dict:
+    available = False
+    device = None
     torch_version = None
     try:
         import torch
 
         torch_version = torch.__version__
-        cuda_available = bool(torch.cuda.is_available())
-        if cuda_available:
-            cuda_device = torch.cuda.get_device_name(0)
+        available = bool(torch.cuda.is_available())
+        if available:
+            device = torch.cuda.get_device_name(0)
     except Exception as exc:
         torch_version = f"unavailable: {{type(exc).__name__}}: {{exc}}"
+    return {{
+        "cuda_available": available,
+        "cuda_device": device,
+        "torch": torch_version,
+    }}
+
+
+CUDA = cuda_snapshot()
+
+
+def write_receipt(status: str, *, phase: str, message: str | None, extra: dict | None = None) -> None:
     payload = {{
         "schema": "trellis2mlx.kaggle_cuda_witness.receipt.v1",
         "status": status,
@@ -623,9 +858,7 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
         "requested_kernel_id": CONFIG["kernel_id"],
         "requested_accelerator": CONFIG["accelerator"],
         "source_identity": CONFIG["source_identity"],
-        "cuda_available": cuda_available,
-        "cuda_device": cuda_device,
-        "torch": torch_version,
+        **CUDA,
         "timestamp": time.time(),
     }}
     if extra:
@@ -674,7 +907,59 @@ def main() -> int:
         write_receipt("failed", phase="input_mount", message=f"missing {{expected}}", extra=mounted_input_snapshot())
         return 2
     dataset_dir = manifest_path.parent
+    actual_manifest_sha256 = sha256_file(manifest_path)
+    if actual_manifest_sha256 != CONFIG["manifest_sha256"]:
+        write_receipt(
+            "failed",
+            phase="input_manifest_digest",
+            message="mounted witness manifest digest mismatch",
+            extra={{
+                "expected_manifest_sha256": CONFIG["manifest_sha256"],
+                "actual_manifest_sha256": actual_manifest_sha256,
+                "manifest_path": str(manifest_path),
+                "mounted_input_snapshot": mounted_input_snapshot(),
+            }},
+        )
+        return 3
     manifest = json.loads(manifest_path.read_text())
+    actual_manifest_identity = {{
+        field: manifest.get(field)
+        for field in CONFIG["manifest_identity"]
+    }}
+    if actual_manifest_identity != CONFIG["manifest_identity"]:
+        write_receipt(
+            "failed",
+            phase="input_manifest_identity",
+            message="mounted witness manifest identity mismatch",
+            extra={{
+                "expected_manifest_identity": CONFIG["manifest_identity"],
+                "actual_manifest_identity": actual_manifest_identity,
+                "input_manifest": {{
+                    "sha256": actual_manifest_sha256,
+                    "size_bytes": manifest_path.stat().st_size,
+                }},
+                "mounted_input_snapshot": mounted_input_snapshot(),
+            }},
+        )
+        return 3
+    if (
+        CUDA["cuda_available"] is not True
+        or not isinstance(CUDA["cuda_device"], str)
+        or not CUDA["cuda_device"].strip()
+    ):
+        write_receipt(
+            "failed",
+            phase="cuda_route",
+            message="CUDA route is unavailable",
+            extra={{
+                "input_manifest": {{
+                    "sha256": actual_manifest_sha256,
+                    "size_bytes": manifest_path.stat().st_size,
+                }},
+                "mounted_input_snapshot": mounted_input_snapshot(),
+            }},
+        )
+        return 6
     copied = {{}}
     for relative_name, record in manifest["files"].items():
         if relative_name == "witness-manifest.json":
@@ -699,7 +984,9 @@ def main() -> int:
         shutil.copy2(source, destination)
         copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
 
-    command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["outputs"][0], "--output-npz", CONFIG["outputs"][1]]
+    command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["output_json"]]
+    if CONFIG["output_npz"]:
+        command += ["--output-npz", CONFIG["output_npz"]]
     command += CONFIG.get("entrypoint_args", [])
     if CONFIG["output_ply"]:
         command += ["--output-ply", CONFIG["output_ply"]]
@@ -748,6 +1035,45 @@ def _bool_metadata(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() == "true"
     return bool(value)
+
+
+def _canonical_output_name(output: str) -> str:
+    if not isinstance(output, str) or not output:
+        raise WitnessPacketError("output name must be a nonempty string")
+    output_path = PurePosixPath(output)
+    canonical = output_path.as_posix()
+    if output_path.is_absolute() or ".." in output_path.parts:
+        raise WitnessPacketError(
+            f"output must be relative inside the kernel output directory: {output!r}"
+        )
+    if canonical in {"", "."} or canonical != output:
+        raise WitnessPacketError(
+            f"output name must use canonical relative POSIX syntax: {output!r}"
+        )
+    return canonical
+
+
+def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
+    return {
+        "schema": "trellis2mlx.kaggle_cuda_witness.inputs.v1",
+        "dataset_id": packet.dataset_id,
+        "kernel_id": packet.kernel_id,
+        "title": packet.title,
+        "entrypoint": packet.entrypoint,
+        "entrypoint_args": list(packet.entrypoint_args),
+        "accelerator": packet.accelerator,
+        "enable_internet": packet.enable_internet,
+        "outputs": list(packet.outputs),
+        "output_roles": {
+            "json": packet.output_json,
+            "npz": packet.output_npz,
+            "ply": packet.output_ply,
+            "mesh_state": packet.output_mesh_state,
+            "shape_slat": packet.output_shape_slat,
+            "shape_flow_step": packet.output_shape_flow_step,
+            "expected": list(packet.expected_outputs),
+        },
+    }
 
 
 def _legacy_output_by_suffix(outputs: Sequence[str], suffix: str) -> str | None:
