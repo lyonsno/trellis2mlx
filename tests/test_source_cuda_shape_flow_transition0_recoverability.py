@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -39,6 +40,151 @@ def _write_transition_capture(tmp_path, *, omit=None):
     return path
 
 
+def _write_external_transition_capture(tmp_path, *, break_euler=False):
+    from scripts.source_cuda_shape_flow_suffix_ladder import _schedule_pairs
+
+    shape = (2, 3)
+    coords = np.arange(shape[0] * 4, dtype=np.int32).reshape(shape[0], 4)
+    noise = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 10.0
+    pred_final = np.full(shape, 0.25, dtype=np.float32)
+    t, t_prev = np.asarray(_schedule_pairs(8, 3.0)[0], dtype=np.float32)
+    sample_next = noise - (t - t_prev) * pred_final
+    if break_euler:
+        sample_next = sample_next.copy()
+        sample_next[0, 0] += np.float32(0.01)
+    path = tmp_path / "external-shape-flow-step.npz"
+    np.savez(
+        path,
+        noise=noise,
+        sample_feats=noise,
+        coords=coords,
+        coords_3d=coords[:, 1:],
+        pred_pos=np.full(shape, 0.1, dtype=np.float32),
+        pred_neg=np.full(shape, -0.1, dtype=np.float32),
+        pred_cfg=np.full(shape, 0.2, dtype=np.float32),
+        x0_pos=np.full(shape, 0.3, dtype=np.float32),
+        x0_cfg=np.full(shape, 0.4, dtype=np.float32),
+        std_pos=np.asarray(1.0, dtype=np.float32),
+        std_cfg=np.asarray(2.0, dtype=np.float32),
+        ratio_raw=np.asarray(0.5, dtype=np.float32),
+        std_ratio=np.asarray(0.5, dtype=np.float32),
+        ratio_effective=np.asarray(0.5, dtype=np.float32),
+        x0_rescaled=np.full(shape, 0.5, dtype=np.float32),
+        x0_after_rescale=np.full(shape, 0.5, dtype=np.float32),
+        pred_final=pred_final,
+        pred_v_feats=pred_final,
+        sample_next=sample_next.astype(np.float32),
+        t=t,
+        t_prev=t_prev,
+        steps=np.asarray(8, dtype=np.int32),
+        guidance_strength=np.asarray(7.5, dtype=np.float32),
+        guidance_rescale=np.asarray(0.5, dtype=np.float32),
+        guidance_interval=np.asarray([0.6, 1.0], dtype=np.float32),
+        rescale_t=np.asarray(3.0, dtype=np.float32),
+        shape_flow_block_injection_json=np.asarray(""),
+        shape_flow_layernorm_backend=np.asarray("cuda-welford-metal"),
+    )
+    trajectory = {
+        "noise": noise,
+        "sample_in": np.stack([noise] * 8),
+        "coords": coords,
+        "t": np.asarray([pair[0] for pair in _schedule_pairs(8, 3.0)], dtype=np.float32),
+        "t_prev": np.asarray(
+            [pair[1] for pair in _schedule_pairs(8, 3.0)], dtype=np.float32
+        ),
+    }
+    return path, trajectory
+
+
+def _write_external_transition_report(
+    tmp_path,
+    capture,
+    *,
+    expected_commit,
+    layernorm_backend="cuda-welford-metal",
+):
+    conditioning_sha = "1" * 64
+    noise_sha = "2" * 64
+    support_sha = "3" * 64
+    repo_identity = {
+        "commit_effective": expected_commit,
+        "commit_requested": expected_commit,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    report = {
+        "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+        "status": "done",
+        "exit_code": 0,
+        "failure_phase": None,
+        "last_trustworthy_phase": "shape_flow_step_saved",
+        "primary_output_status": "written",
+        "artifacts": {
+            "shape_flow_step.npz": {
+                "path": str(capture),
+                "sha256": _sha256(capture),
+                "size_bytes": capture.stat().st_size,
+            }
+        },
+        "repo_identity_preflight": dict(repo_identity),
+        "repo_identity_postflight": dict(repo_identity),
+        "repo_identity_postflight_error": None,
+        "route_identity": {
+            "schema": "trellis2mlx.mlx_stage_capture_route.v1",
+            "env": {
+                "MLX_METAL_PATH": None,
+                "PYTHONPATH": ".",
+                "TRELLIS2MLX_ATTENTION_BACKEND": "fast",
+            },
+            "requested_stop": "shape_flow_step",
+            "requested_outputs": {
+                "conditioning": False,
+                "decoder_output": False,
+                "mesh_clean": False,
+                "mesh_raw": False,
+                "mesh_uv": False,
+                "shape_flow_block_trace": False,
+                "shape_flow_step": True,
+                "shape_flow_steps": False,
+                "shape_slat": False,
+                "sparse_coords": False,
+                "sparse_flow_block_trace": False,
+                "sparse_flow_step": False,
+                "sparse_flow_steps": False,
+                "sparse_internals": False,
+            },
+            "route": {
+                "family": "trellis2mlx/mlx",
+                "backend": "mlx-metal",
+                "attention_backend": "fast",
+                "steps": 8,
+                "cascade": False,
+                "conditioning_sample_sha256": conditioning_sha,
+                "shape_flow_noise_sample_sha256": noise_sha,
+                "shape_slat_support_sample_sha256": support_sha,
+                "shape_flow_layernorm_backend_requested": layernorm_backend,
+                "shape_flow_layernorm_backend_effective": layernorm_backend,
+                "repo_commit_requested": expected_commit,
+                "repo_commit_effective": expected_commit,
+                "repo_dirty": False,
+                "repo_status_porcelain": "",
+                "repo_identity_postflight": dict(repo_identity),
+                "repo_identity_postflight_error": None,
+                "shape_flow_block_injection_trace_path": None,
+                "shape_flow_block_injection_manifest_path": None,
+            },
+        },
+    }
+    path = tmp_path / "external-run-report.json"
+    path.write_text(json.dumps(report))
+    identity = {
+        "conditioning_sha256": conditioning_sha,
+        "shape_flow_noise_sample_sha256": noise_sha,
+        "shape_slat_support_sample_sha256": support_sha,
+    }
+    return path, identity
+
+
 def _matrix_artifact_fixture():
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
         MLX_COMPONENT_NAMES,
@@ -76,6 +222,43 @@ def _matrix_artifact_fixture():
     return arrays, candidates
 
 
+def _external_artifact_fixture():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        EXTERNAL_CANDIDATE_NAMES,
+    )
+
+    shape = (2, 3)
+    arrays = {
+        "coords": np.zeros((shape[0], 4), dtype=np.int32),
+        "source_anchor_shape_slat": np.full(shape, 1.0, dtype=np.float32),
+        "mlx_anchor_shape_slat": np.full(shape, 2.0, dtype=np.float32),
+        "accepted_switch_1_shape_slat": np.full(shape, 3.0, dtype=np.float32),
+        "source_transition0_pred_pos": np.full(shape, 4.0, dtype=np.float32),
+        "source_transition0_pred_neg": np.full(shape, 5.0, dtype=np.float32),
+        "external_transition0_sample_next": np.full(shape, 6.0, dtype=np.float32),
+    }
+    candidates = []
+    for index, name in enumerate(EXTERNAL_CANDIDATE_NAMES):
+        start_key = f"candidate_{index}_transition0_sample_next"
+        output_key = f"candidate_{index}_shape_slat"
+        arrays[start_key] = (
+            arrays["external_transition0_sample_next"].copy()
+            if index == 1
+            else np.full(shape, 10.0, dtype=np.float32)
+        )
+        value = np.full(shape, 20.0 + index, dtype=np.float32)
+        arrays[output_key] = value
+        candidates.append(
+            {
+                "name": name,
+                "output_key": output_key,
+                "shape": list(shape),
+                "sha256": hashlib.sha256(value.tobytes()).hexdigest(),
+            }
+        )
+    return arrays, candidates
+
+
 def test_transition0_candidate_specs_are_complete_and_nonredundant():
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
         transition0_candidate_specs,
@@ -97,6 +280,27 @@ def test_transition0_candidate_specs_are_complete_and_nonredundant():
         "post": "source-guidance-rescale-euler",
     }
     assert specs[-1]["post"] == "mlx-final-source-euler"
+
+
+def test_external_transition0_candidate_specs_are_exact_and_ordered():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        external_transition0_candidate_specs,
+    )
+
+    assert external_transition0_candidate_specs() == [
+        {
+            "name": "source-native-control",
+            "positive": "source",
+            "negative": "source",
+            "post": "source-guidance-rescale-euler",
+        },
+        {
+            "name": "external-cuda-welford-metal",
+            "positive": "external-captured",
+            "negative": "external-captured",
+            "post": "external-captured-sample-next",
+        },
+    ]
 
 
 def test_load_transition0_components_requires_complete_float32_intermediates(tmp_path):
@@ -211,6 +415,146 @@ def test_validate_result_requires_cuda_route_all_candidates_and_exact_control():
         validate_result_manifest(payload)
 
 
+def test_external_request_is_all_or_none():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        external_transition_request,
+    )
+
+    empty = SimpleNamespace(
+        external_transition0_step=None,
+        external_transition0_step_sha256=None,
+        external_transition0_report=None,
+        external_transition0_report_sha256=None,
+        expected_external_repo_commit=None,
+    )
+    assert external_transition_request(empty) is None
+
+    partial = SimpleNamespace(**vars(empty))
+    partial.external_transition0_step = "step.npz"
+    with pytest.raises(ValueError, match="must be supplied together"):
+        external_transition_request(partial)
+
+
+def test_external_transition_loader_binds_route_repo_and_step_semantics(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        load_external_transition0_start,
+    )
+
+    expected_commit = "a" * 40
+    capture, trajectory = _write_external_transition_capture(tmp_path)
+    report, expected_identity = _write_external_transition_report(
+        tmp_path,
+        capture,
+        expected_commit=expected_commit,
+    )
+    arrays, identity = load_external_transition0_start(
+        capture,
+        report,
+        expected_step_sha256=_sha256(capture),
+        expected_report_sha256=_sha256(report),
+        expected_repo_commit=expected_commit,
+        trajectory=trajectory,
+        expected_mlx_identity=expected_identity,
+    )
+    assert np.array_equal(arrays["sample_next"], np.load(capture)["sample_next"])
+    assert identity["layernorm_backend"] == "cuda-welford-metal"
+    assert identity["repo_commit"] == expected_commit
+
+    payload = json.loads(report.read_text())
+    payload["route_identity"]["route"]["shape_flow_layernorm_backend_effective"] = (
+        "default"
+    )
+    report.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="layernorm backend"):
+        load_external_transition0_start(
+            capture,
+            report,
+            expected_step_sha256=_sha256(capture),
+            expected_report_sha256=_sha256(report),
+            expected_repo_commit=expected_commit,
+            trajectory=trajectory,
+            expected_mlx_identity=expected_identity,
+        )
+
+    broken, trajectory = _write_external_transition_capture(
+        tmp_path, break_euler=True
+    )
+    report, expected_identity = _write_external_transition_report(
+        tmp_path,
+        broken,
+        expected_commit=expected_commit,
+    )
+    with pytest.raises(ValueError, match="Euler recurrence"):
+        load_external_transition0_start(
+            broken,
+            report,
+            expected_step_sha256=_sha256(broken),
+            expected_report_sha256=_sha256(report),
+            expected_repo_commit=expected_commit,
+            trajectory=trajectory,
+            expected_mlx_identity=expected_identity,
+        )
+
+
+def test_external_result_requires_two_candidates_and_fourteen_source_steps():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        EXTERNAL_CANDIDATE_NAMES,
+        validate_external_result_manifest,
+    )
+
+    candidates = []
+    for index, name in enumerate(EXTERNAL_CANDIDATE_NAMES):
+        candidates.append(
+            {
+                "name": name,
+                "output_key": f"candidate_{index}_shape_slat",
+                "transition0_sample_next_sha256": (
+                    "1" * 64 if index == 0 else "2" * 64
+                ),
+                "source_step_indices": list(range(1, 8)),
+                "source_step_count": 7,
+                "step_elapsed_seconds": [1.0] * 7,
+                "vs_source_anchor": {
+                    "exact": index == 0,
+                    "nonzero": 0 if index == 0 else 1,
+                },
+            }
+        )
+    payload = {
+        "status": "done",
+        "effective_route": {
+            "device_type": "cuda",
+            "attention_backend": "sdpa",
+            "conv_backend": "none",
+            "steps": 8,
+            "one_model_load": True,
+            "candidate_names": list(EXTERNAL_CANDIDATE_NAMES),
+            "comparison_class": "external-transition0-plus-source-cuda-suffix",
+        },
+        "inputs": {
+            "external_transition": {
+                "sample_next_sha256": "2" * 64,
+            }
+        },
+        "candidates": candidates,
+        "timing": {
+            "source_steps_completed": 14,
+            "source_steps_requested": 14,
+            "candidates_completed": 2,
+            "candidates_requested": 2,
+        },
+    }
+
+    validate_external_result_manifest(payload)
+    payload["timing"]["source_steps_completed"] = 7
+    with pytest.raises(ValueError, match="source_steps_completed"):
+        validate_external_result_manifest(payload)
+    payload["timing"]["source_steps_completed"] = 14
+    payload["candidates"][1]["transition0_sample_next_sha256"] = "3" * 64
+    with pytest.raises(ValueError, match="external transition digest"):
+        validate_external_result_manifest(payload)
+
+
 def test_saved_artifact_binds_every_candidate_array_and_metadata(tmp_path):
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
         build_artifact_metadata,
@@ -219,7 +563,10 @@ def test_saved_artifact_binds_every_candidate_array_and_metadata(tmp_path):
 
     arrays, candidates = _matrix_artifact_fixture()
     report = {
-        "effective_route": {"device_type": "cuda"},
+        "effective_route": {
+            "device_type": "cuda",
+            "candidate_names": [candidate["name"] for candidate in candidates],
+        },
         "inputs": {"expected_digests": {}},
         "candidate_specs": [
             {key: candidate[key] for key in ("name", "positive", "negative", "post")}
@@ -252,6 +599,44 @@ def test_saved_artifact_binds_every_candidate_array_and_metadata(tmp_path):
     )
     np.savez(output, **arrays)
     with pytest.raises(ValueError, match="candidate_3_transition0_sample_next digest"):
+        validate_saved_artifact(output, candidates=candidates)
+
+
+def test_external_saved_artifact_binds_both_candidates_and_intervention(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_artifact_metadata,
+        validate_saved_artifact,
+    )
+
+    arrays, candidates = _external_artifact_fixture()
+    report = {
+        "effective_route": {
+            "candidate_names": [candidate["name"] for candidate in candidates]
+        },
+        "inputs": {
+            "external_transition": {
+                "sample_next_sha256": hashlib.sha256(
+                    arrays["external_transition0_sample_next"].tobytes()
+                ).hexdigest()
+            }
+        },
+        "candidate_specs": [{"name": candidate["name"]} for candidate in candidates],
+        "candidates": candidates,
+        "anchors": {},
+    }
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(build_artifact_metadata(report, arrays), sort_keys=True)
+    )
+    output = tmp_path / "external-result.npz"
+    np.savez(output, **arrays)
+
+    validation = validate_saved_artifact(output, candidates=candidates)
+    assert validation["candidate_count"] == 2
+    assert validation["all_matrix_arrays_bound"] is True
+
+    arrays.pop("external_transition0_sample_next")
+    np.savez(output, **arrays)
+    with pytest.raises(ValueError, match="external_transition0_sample_next"):
         validate_saved_artifact(output, candidates=candidates)
 
 
@@ -525,6 +910,33 @@ def test_cli_rejects_substituted_input_digest_before_stale_output_mutation(tmp_p
     assert output_npz.read_bytes() == b"stale"
 
 
+def test_cli_partial_external_request_fails_before_stale_output_mutation(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import main
+
+    output_json = tmp_path / "result.json"
+    output_npz = tmp_path / "result.npz"
+    output_npz.write_bytes(b"stale")
+    args, _ = _matrix_cli_args(tmp_path)
+    status = main(
+        [
+            "--output-json",
+            str(output_json),
+            "--output-npz",
+            str(output_npz),
+            *args,
+            "--external-transition0-step",
+            str(tmp_path / "external-step.npz"),
+        ]
+    )
+
+    assert status == 1
+    report = json.loads(output_json.read_text())
+    assert report["failure_phase"] == "request_validation"
+    assert "must be supplied together" in report["error"]
+    assert report["primary_output_status"] == "preexisting_untrusted_preserved"
+    assert output_npz.read_bytes() == b"stale"
+
+
 def test_cli_report_collision_preserves_input_and_writes_safe_failure_report(tmp_path):
     from scripts.source_cuda_shape_flow_transition0_recoverability import main
 
@@ -550,3 +962,35 @@ def test_cli_report_collision_preserves_input_and_writes_safe_failure_report(tmp
     assert report["requested_output_json"] == str(paths["source_report"])
     assert report["effective_failure_report"] == str(fallback)
     assert "collides" in report["error"]
+
+
+def test_cli_report_collision_precedes_partial_external_request_error(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import main
+
+    output_npz = tmp_path / "result.npz"
+    output_npz.write_bytes(b"stale")
+    args, paths = _matrix_cli_args(tmp_path)
+    source_report_bytes = paths["source_report"].read_bytes()
+    status = main(
+        [
+            "--output-json",
+            str(paths["source_report"]),
+            "--output-npz",
+            str(output_npz),
+            *args,
+            "--external-transition0-step",
+            str(tmp_path / "external-step.npz"),
+        ]
+    )
+
+    fallback = paths["source_report"].with_name(
+        paths["source_report"].name
+        + ".transition0-recoverability.failure.json"
+    )
+    assert status == 1
+    assert paths["source_report"].read_bytes() == source_report_bytes
+    assert output_npz.read_bytes() == b"stale"
+    report = json.loads(fallback.read_text())
+    assert report["failure_phase"] == "request_validation"
+    assert report["primary_output_status"] == "preexisting_untrusted_preserved"
+    assert "collides with protected paths: accepted source report" in report["error"]

@@ -54,6 +54,10 @@ EXPECTED_CANDIDATE_NAMES = (
     "mlx-both-source-post",
     "mlx-final-source-euler",
 )
+EXTERNAL_CANDIDATE_NAMES = (
+    "source-native-control",
+    "external-cuda-welford-metal",
+)
 MLX_COMPONENT_NAMES = (
     "noise",
     "sample_in",
@@ -100,6 +104,23 @@ def transition0_candidate_specs() -> list[dict[str, str]]:
             "positive": "mlx",
             "negative": "mlx",
             "post": "mlx-final-source-euler",
+        },
+    ]
+
+
+def external_transition0_candidate_specs() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "source-native-control",
+            "positive": "source",
+            "negative": "source",
+            "post": "source-guidance-rescale-euler",
+        },
+        {
+            "name": "external-cuda-welford-metal",
+            "positive": "external-captured",
+            "negative": "external-captured",
+            "post": "external-captured-sample-next",
         },
     ]
 
@@ -182,6 +203,298 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _array_sha256(array: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
+def external_transition_request(args: Any) -> dict[str, Any] | None:
+    values = {
+        "step": getattr(args, "external_transition0_step", None),
+        "step_sha256": getattr(args, "external_transition0_step_sha256", None),
+        "report": getattr(args, "external_transition0_report", None),
+        "report_sha256": getattr(args, "external_transition0_report_sha256", None),
+        "expected_repo_commit": getattr(
+            args, "expected_external_repo_commit", None
+        ),
+    }
+    present = {key for key, value in values.items() if value is not None}
+    if not present:
+        return None
+    if present != set(values):
+        missing = sorted(set(values) - present)
+        raise ValueError(
+            "external transition arguments must be supplied together; "
+            f"missing {missing}"
+        )
+    commit = str(values["expected_repo_commit"]).lower()
+    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+        raise ValueError(
+            "expected external repo commit must be a full lowercase Git SHA"
+        )
+    return {
+        **values,
+        "step": Path(values["step"]),
+        "report": Path(values["report"]),
+        "step_sha256": _validate_sha256(
+            str(values["step_sha256"]), label="external transition step SHA256"
+        ),
+        "report_sha256": _validate_sha256(
+            str(values["report_sha256"]), label="external transition report SHA256"
+        ),
+        "expected_repo_commit": commit,
+    }
+
+
+def _external_scalar(
+    archive: Any, name: str, *, dtype: np.dtype
+) -> Any:
+    if name not in archive.files:
+        raise ValueError(f"external transition is missing {name}")
+    value = np.asarray(archive[name])
+    if value.shape != () or value.dtype != dtype:
+        raise ValueError(f"external transition {name} must be a {dtype} scalar")
+    return value.item()
+
+
+def load_external_transition0_start(
+    step_path: Path,
+    report_path: Path,
+    *,
+    expected_step_sha256: str,
+    expected_report_sha256: str,
+    expected_repo_commit: str,
+    trajectory: dict[str, np.ndarray],
+    expected_mlx_identity: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    expected_step_sha256 = _validate_sha256(
+        expected_step_sha256, label="external transition step SHA256"
+    )
+    expected_report_sha256 = _validate_sha256(
+        expected_report_sha256, label="external transition report SHA256"
+    )
+    if _sha256(step_path) != expected_step_sha256:
+        raise ValueError("external transition step SHA256 mismatch")
+    if _sha256(report_path) != expected_report_sha256:
+        raise ValueError("external transition report SHA256 mismatch")
+
+    report = json.loads(report_path.read_text())
+    if report.get("schema") != "trellis2mlx.mlx_stage_capture_run_report.v1":
+        raise ValueError("external transition report schema is invalid")
+    if report.get("status") != "done":
+        raise ValueError("external transition report is not done")
+    if report.get("exit_code") != 0:
+        raise ValueError("external transition report exit code is not zero")
+    if report.get("failure_phase") is not None:
+        raise ValueError("external transition report carries a failure phase")
+    if report.get("last_trustworthy_phase") != "shape_flow_step_saved":
+        raise ValueError("external transition report did not save shape_flow_step")
+    if report.get("primary_output_status") != "written":
+        raise ValueError("external transition report does not admit a written output")
+    artifact = report.get("artifacts", {}).get("shape_flow_step.npz", {})
+    if artifact.get("sha256") != expected_step_sha256:
+        raise ValueError("external transition artifact digest differs from report")
+    if artifact.get("size_bytes") != step_path.stat().st_size:
+        raise ValueError("external transition artifact size differs from report")
+
+    expected_repo_identity = {
+        "commit_effective": expected_repo_commit,
+        "commit_requested": expected_repo_commit,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    for phase in ("repo_identity_preflight", "repo_identity_postflight"):
+        if report.get(phase) != expected_repo_identity:
+            raise ValueError(f"external transition {phase} is not exact clean repo identity")
+    if report.get("repo_identity_postflight_error") is not None:
+        raise ValueError("external transition postflight repo identity has an error")
+
+    route_identity = report.get("route_identity", {})
+    if route_identity.get("schema") != "trellis2mlx.mlx_stage_capture_route.v1":
+        raise ValueError("external transition route identity schema is invalid")
+    if route_identity.get("requested_stop") != "shape_flow_step":
+        raise ValueError("external transition route did not stop at shape_flow_step")
+    expected_requested_outputs = {
+        "conditioning": False,
+        "decoder_output": False,
+        "mesh_clean": False,
+        "mesh_raw": False,
+        "mesh_uv": False,
+        "shape_flow_block_trace": False,
+        "shape_flow_step": True,
+        "shape_flow_steps": False,
+        "shape_slat": False,
+        "sparse_coords": False,
+        "sparse_flow_block_trace": False,
+        "sparse_flow_step": False,
+        "sparse_flow_steps": False,
+        "sparse_internals": False,
+    }
+    if route_identity.get("requested_outputs") != expected_requested_outputs:
+        raise ValueError("external transition route output selection is invalid")
+    expected_env = {
+        "MLX_METAL_PATH": None,
+        "PYTHONPATH": ".",
+        "TRELLIS2MLX_ATTENTION_BACKEND": "fast",
+    }
+    if route_identity.get("env") != expected_env:
+        raise ValueError("external transition route environment is invalid")
+    route = route_identity.get("route", {})
+    required_route = {
+        "family": "trellis2mlx/mlx",
+        "backend": "mlx-metal",
+        "attention_backend": "fast",
+        "steps": STEPS,
+        "cascade": False,
+        "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+        "shape_flow_layernorm_backend_effective": "cuda-welford-metal",
+        "repo_commit_requested": expected_repo_commit,
+        "repo_commit_effective": expected_repo_commit,
+        "repo_dirty": False,
+        "repo_status_porcelain": "",
+    }
+    for key, expected in required_route.items():
+        if route.get(key) != expected:
+            label = (
+                "layernorm backend"
+                if key.startswith("shape_flow_layernorm_backend")
+                else key
+            )
+            raise ValueError(f"external transition route {label} must be {expected!r}")
+    if route.get("repo_identity_postflight") != expected_repo_identity:
+        raise ValueError("external transition embedded postflight repo identity differs")
+    if route.get("repo_identity_postflight_error") is not None:
+        raise ValueError("external transition embedded postflight identity has an error")
+    for route_key, identity_key in (
+        ("conditioning_sample_sha256", "conditioning_sha256"),
+        ("shape_flow_noise_sample_sha256", "shape_flow_noise_sample_sha256"),
+        ("shape_slat_support_sample_sha256", "shape_slat_support_sample_sha256"),
+    ):
+        expected = expected_mlx_identity.get(identity_key)
+        if not expected or route.get(route_key) != expected:
+            raise ValueError(
+                f"external transition route {route_key} identity mismatch"
+            )
+    for key in (
+        "shape_flow_block_injection_trace_path",
+        "shape_flow_block_injection_manifest_path",
+    ):
+        if route.get(key) is not None:
+            raise ValueError(f"external transition unexpectedly sets {key}")
+
+    required_float_arrays = {
+        "noise",
+        "sample_feats",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+    }
+    arrays: dict[str, np.ndarray] = {}
+    with np.load(step_path, allow_pickle=False) as archive:
+        required = required_float_arrays | {
+            "coords",
+            "coords_3d",
+            "guidance_interval",
+            "shape_flow_block_injection_json",
+            "shape_flow_layernorm_backend",
+        }
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(f"external transition is missing arrays: {missing}")
+        for name in required:
+            arrays[name] = np.asarray(archive[name])
+        scalar_values = {
+            "steps": _external_scalar(
+                archive, "steps", dtype=np.dtype(np.int32)
+            ),
+            "guidance_strength": _external_scalar(
+                archive, "guidance_strength", dtype=np.dtype(np.float32)
+            ),
+            "guidance_rescale": _external_scalar(
+                archive, "guidance_rescale", dtype=np.dtype(np.float32)
+            ),
+            "rescale_t": _external_scalar(
+                archive, "rescale_t", dtype=np.dtype(np.float32)
+            ),
+            "t": _external_scalar(archive, "t", dtype=np.dtype(np.float32)),
+            "t_prev": _external_scalar(
+                archive, "t_prev", dtype=np.dtype(np.float32)
+            ),
+        }
+    if scalar_values != {
+        "steps": STEPS,
+        "guidance_strength": np.float32(7.5),
+        "guidance_rescale": np.float32(0.5),
+        "rescale_t": np.float32(3.0),
+        "t": np.float32(trajectory["t"][0]),
+        "t_prev": np.float32(trajectory["t_prev"][0]),
+    }:
+        raise ValueError(f"unsupported external transition scalars: {scalar_values}")
+    if not np.array_equal(
+        arrays["guidance_interval"], np.asarray([0.6, 1.0], dtype=np.float32)
+    ):
+        raise ValueError("external transition guidance interval is invalid")
+    injection = arrays["shape_flow_block_injection_json"]
+    if (
+        injection.shape != ()
+        or injection.dtype.kind not in {"U", "S"}
+        or str(injection.item())
+    ):
+        raise ValueError("external transition carries unexpected injection identity")
+    backend = arrays["shape_flow_layernorm_backend"]
+    if (
+        backend.shape != ()
+        or backend.dtype.kind not in {"U", "S"}
+        or str(backend.item()) != "cuda-welford-metal"
+    ):
+        raise ValueError("external transition layernorm backend array is invalid")
+
+    sample_shape = tuple(int(value) for value in trajectory["noise"].shape)
+    for name in required_float_arrays:
+        value = arrays[name]
+        if (
+            value.dtype != np.float32
+            or value.shape != sample_shape
+            or not np.isfinite(value).all()
+        ):
+            raise ValueError(
+                f"external transition {name} has invalid shape, dtype, or values"
+            )
+    coords = arrays["coords"]
+    if coords.dtype != np.int32 or not np.array_equal(coords, trajectory["coords"]):
+        raise ValueError("external transition coordinates differ from admitted trajectory")
+    coords_3d = arrays["coords_3d"]
+    if coords_3d.dtype != np.int32 or not np.array_equal(coords_3d, coords[:, 1:]):
+        raise ValueError("external transition coords_3d differ from coordinates")
+    if not np.array_equal(arrays["noise"], trajectory["noise"]):
+        raise ValueError("external transition noise differs from admitted trajectory")
+    if not np.array_equal(arrays["sample_feats"], trajectory["sample_in"][0]):
+        raise ValueError("external transition input sample differs from admitted trajectory")
+    if not np.array_equal(arrays["noise"], arrays["sample_feats"]):
+        raise ValueError("external transition input sample differs from noise")
+    if not np.array_equal(arrays["pred_v_feats"], arrays["pred_final"]):
+        raise ValueError("external transition pred_v_feats differs from pred_final")
+    expected_next = arrays["sample_feats"] - (
+        scalar_values["t"] - scalar_values["t_prev"]
+    ) * arrays["pred_final"]
+    euler_residual = float(np.max(np.abs(expected_next - arrays["sample_next"])))
+    if euler_residual > 2e-5:
+        raise ValueError(
+            f"external transition Euler recurrence residual is {euler_residual}"
+        )
+    return arrays, {
+        "step_sha256": expected_step_sha256,
+        "report_sha256": expected_report_sha256,
+        "repo_commit": expected_repo_commit,
+        "layernorm_backend": "cuda-welford-metal",
+        "sample_next_sha256": _array_sha256(arrays["sample_next"]),
+        "euler_transition_max_abs_residual": euler_residual,
+        "route": route,
+    }
 
 
 def _paths_alias(left: Path, right: Path) -> bool:
@@ -369,21 +682,86 @@ def validate_result_manifest(payload: dict[str, Any]) -> None:
             raise ValueError(f"transition-0 timing {key} must be {expected}")
 
 
+def validate_external_result_manifest(payload: dict[str, Any]) -> None:
+    if payload.get("status") != "done":
+        raise ValueError("external transition-0 result is not done")
+    route = payload.get("effective_route", {})
+    required_route = {
+        "device_type": "cuda",
+        "attention_backend": "sdpa",
+        "conv_backend": "none",
+        "steps": STEPS,
+        "one_model_load": True,
+        "candidate_names": list(EXTERNAL_CANDIDATE_NAMES),
+        "comparison_class": "external-transition0-plus-source-cuda-suffix",
+    }
+    for key, expected in required_route.items():
+        if route.get(key) != expected:
+            raise ValueError(f"external transition-0 route {key} must be {expected!r}")
+    candidates = payload.get("candidates", [])
+    if [candidate.get("name") for candidate in candidates] != list(
+        EXTERNAL_CANDIDATE_NAMES
+    ):
+        raise ValueError("external transition-0 candidates are incomplete or out of order")
+    if len({candidate.get("output_key") for candidate in candidates}) != len(candidates):
+        raise ValueError("external transition-0 candidate output keys are not distinct")
+    for candidate in candidates:
+        if candidate.get("source_step_indices") != list(range(1, STEPS)):
+            raise ValueError(f"candidate {candidate.get('name')} has wrong source steps")
+        if candidate.get("source_step_count") != STEPS - 1:
+            raise ValueError(f"candidate {candidate.get('name')} has wrong step count")
+        if len(candidate.get("step_elapsed_seconds", [])) != STEPS - 1:
+            raise ValueError(f"candidate {candidate.get('name')} has wrong timing count")
+    require_exact_source_control(
+        candidate_index=0,
+        metrics=candidates[0].get("vs_source_anchor", {}),
+    )
+    expected_external_digest = (
+        payload.get("inputs", {})
+        .get("external_transition", {})
+        .get("sample_next_sha256")
+    )
+    if (
+        not expected_external_digest
+        or candidates[1].get("transition0_sample_next_sha256")
+        != expected_external_digest
+    ):
+        raise ValueError("external transition digest differs from intervention candidate")
+    expected_steps = len(EXTERNAL_CANDIDATE_NAMES) * (STEPS - 1)
+    expected_timing = {
+        "source_steps_completed": expected_steps,
+        "source_steps_requested": expected_steps,
+        "candidates_completed": len(EXTERNAL_CANDIDATE_NAMES),
+        "candidates_requested": len(EXTERNAL_CANDIDATE_NAMES),
+    }
+    timing = payload.get("timing", {})
+    for key, expected in expected_timing.items():
+        if timing.get(key) != expected:
+            raise ValueError(f"external transition-0 timing {key} must be {expected}")
+
+
 def _required_matrix_array_keys(candidates: list[dict[str, Any]]) -> set[str]:
-    return {
+    names = tuple(str(candidate.get("name")) for candidate in candidates)
+    common = {
         "coords",
         "source_anchor_shape_slat",
         "mlx_anchor_shape_slat",
         "accepted_switch_1_shape_slat",
         "source_transition0_pred_pos",
         "source_transition0_pred_neg",
-        *(f"mlx_transition0_{name}" for name in MLX_COMPONENT_NAMES),
         *(
             f"candidate_{index}_transition0_sample_next"
-            for index in range(len(EXPECTED_CANDIDATE_NAMES))
+            for index in range(len(candidates))
         ),
         *(str(candidate["output_key"]) for candidate in candidates),
     }
+    if names == EXPECTED_CANDIDATE_NAMES:
+        return common | {
+            *(f"mlx_transition0_{name}" for name in MLX_COMPONENT_NAMES),
+        }
+    if names == EXTERNAL_CANDIDATE_NAMES:
+        return common | {"external_transition0_sample_next"}
+    raise ValueError(f"unsupported transition-0 artifact candidate contract: {names}")
 
 
 def build_artifact_metadata(
@@ -435,13 +813,29 @@ def validate_saved_artifact(
                 "saved transition-0 artifact metadata must require the external report"
             )
         metadata_candidates = metadata.get("candidates", [])
-        if [candidate.get("name") for candidate in metadata_candidates] != list(
-            EXPECTED_CANDIDATE_NAMES
-        ):
+        candidate_names = tuple(
+            str(candidate.get("name")) for candidate in candidates
+        )
+        if candidate_names not in {
+            EXPECTED_CANDIDATE_NAMES,
+            EXTERNAL_CANDIDATE_NAMES,
+        }:
+            raise ValueError(
+                f"saved transition-0 candidate contract is invalid: {candidate_names}"
+            )
+        if [
+            candidate.get("name") for candidate in metadata_candidates
+        ] != list(candidate_names):
             raise ValueError("saved transition-0 metadata omits candidates")
         if metadata_candidates != candidates:
             raise ValueError(
                 "saved transition-0 metadata candidates differ from external report"
+            )
+        if metadata.get("effective_route", {}).get("candidate_names") != list(
+            candidate_names
+        ):
+            raise ValueError(
+                "saved transition-0 metadata route candidate names differ"
             )
         manifest = metadata.get("arrays")
         if not isinstance(manifest, dict):
@@ -491,6 +885,24 @@ def validate_saved_artifact(
                 raise ValueError(f"{name} digest differs from manifest")
             if array.dtype != np.float32 or not np.isfinite(array).all():
                 raise ValueError(f"{name} has invalid dtype or values")
+        if candidate_names == EXTERNAL_CANDIDATE_NAMES:
+            external = np.asarray(archive["external_transition0_sample_next"])
+            expected_external_digest = (
+                metadata.get("inputs", {})
+                .get("external_transition", {})
+                .get("sample_next_sha256")
+            )
+            if _array_sha256(external) != expected_external_digest:
+                raise ValueError(
+                    "external_transition0_sample_next digest differs from input identity"
+                )
+            intervention = np.asarray(
+                archive["candidate_1_transition0_sample_next"]
+            )
+            if not np.array_equal(intervention, external):
+                raise ValueError(
+                    "external intervention candidate differs from admitted sample_next"
+                )
     return {
         "schema": f"{SCHEMA}.saved_artifact",
         "candidate_count": len(candidates),
@@ -716,6 +1128,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accepted-suffix-report-sha256", required=True)
     parser.add_argument("--source-tar", required=True, type=Path)
     parser.add_argument("--source-tar-sha256", required=True)
+    parser.add_argument("--external-transition0-step", type=Path)
+    parser.add_argument("--external-transition0-step-sha256")
+    parser.add_argument("--external-transition0-report", type=Path)
+    parser.add_argument("--external-transition0-report-sha256")
+    parser.add_argument("--expected-external-repo-commit")
     parser.add_argument("--model-repo", default="microsoft/TRELLIS.2-4B")
     parser.add_argument("--pipeline-config", default="pipeline.json")
     parser.add_argument("--sparse-conv-backend", default="none")
@@ -729,10 +1146,25 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     phase = "arguments_parsed"
     last_trustworthy_phase: str | None = phase
+    external_request: dict[str, Any] | None = None
+    external_request_error: ValueError | None = None
+    try:
+        external_request = external_transition_request(args)
+    except ValueError as exc:
+        external_request_error = exc
+    candidate_specs = (
+        external_transition0_candidate_specs()
+        if external_request is not None or external_request_error is not None
+        else transition0_candidate_specs()
+    )
     requested_route = {
-        "route": "official-source-cuda-transition0-recoverability-matrix",
+        "route": (
+            "official-source-cuda-external-transition0-recoverability"
+            if external_request is not None or external_request_error is not None
+            else "official-source-cuda-transition0-recoverability-matrix"
+        ),
         "steps": STEPS,
-        "candidate_specs": transition0_candidate_specs(),
+        "candidate_specs": candidate_specs,
         "attention_backend": args.sparse_attn_backend,
         "conv_backend": args.sparse_conv_backend,
     }
@@ -746,6 +1178,10 @@ def main(argv: list[str] | None = None) -> int:
         "accepted suffix report": args.accepted_suffix_report,
         "source tar": args.source_tar,
     }
+    if args.external_transition0_step is not None:
+        input_paths["external transition step"] = args.external_transition0_step
+    if args.external_transition0_report is not None:
+        input_paths["external transition report"] = args.external_transition0_report
     failure_report_path, report_collisions = _report_path_guard(
         args.output_json, args.output_npz, input_paths
     )
@@ -764,13 +1200,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         phase = "request_validation"
         phase_started = time.perf_counter()
+        if args.output_npz.exists():
+            report["primary_output_status"] = "preexisting_untrusted_preserved"
         if report_collisions:
             raise ValueError(
                 "output JSON collides with protected paths: "
                 + ", ".join(report_collisions)
             )
-        if args.output_npz.exists():
-            report["primary_output_status"] = "preexisting_untrusted_preserved"
+        if external_request_error is not None:
+            raise external_request_error
         digest_args = {
             "MLX shape-flow steps": args.mlx_shape_flow_steps_sha256,
             "MLX run report": args.mlx_run_report_sha256,
@@ -781,6 +1219,13 @@ def main(argv: list[str] | None = None) -> int:
             "accepted suffix report": args.accepted_suffix_report_sha256,
             "source tar": args.source_tar_sha256,
         }
+        if external_request is not None:
+            digest_args.update(
+                {
+                    "external transition step": external_request["step_sha256"],
+                    "external transition report": external_request["report_sha256"],
+                }
+            )
         expected_digests = {
             label: _validate_sha256(value, label=f"{label} SHA256")
             for label, value in digest_args.items()
@@ -800,17 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
             }
         _invalidate_primary_output(
             args.output_npz,
-            protected={
-                "output report": args.output_json,
-                "MLX shape-flow steps": args.mlx_shape_flow_steps,
-                "MLX run report": args.mlx_run_report,
-                "conditioning": args.conditioning,
-                "accepted source baseline": args.accepted_source_baseline,
-                "accepted source report": args.accepted_source_report,
-                "accepted suffix result": args.accepted_suffix_result,
-                "accepted suffix report": args.accepted_suffix_report,
-                "source tar": args.source_tar,
-            },
+            protected={"output report": args.output_json, **input_paths},
         )
         report["primary_output_status"] = "missing"
         report["physical_inputs"] = physical_inputs
@@ -849,6 +1284,18 @@ def main(argv: list[str] | None = None) -> int:
             expected_source_tar_sha256=expected_digests["source tar"],
         )
         cond_np, neg_cond_np = _load_conditioning(args.conditioning)
+        external_arrays: dict[str, np.ndarray] | None = None
+        external_identity: dict[str, Any] | None = None
+        if external_request is not None:
+            external_arrays, external_identity = load_external_transition0_start(
+                external_request["step"],
+                external_request["report"],
+                expected_step_sha256=external_request["step_sha256"],
+                expected_report_sha256=external_request["report_sha256"],
+                expected_repo_commit=external_request["expected_repo_commit"],
+                trajectory=trajectory,
+                expected_mlx_identity=mlx_identity,
+            )
         report["inputs"] = {
             "expected_digests": expected_digests,
             "mlx": mlx_identity,
@@ -857,6 +1304,8 @@ def main(argv: list[str] | None = None) -> int:
             "coords_shape": [int(value) for value in trajectory["coords"].shape],
             "sample_shape": list(shape),
         }
+        if external_identity is not None:
+            report["inputs"]["external_transition"] = external_identity
         report["phase_timings"][phase] = time.perf_counter() - phase_started
         last_trustworthy_phase = phase
         if args.no_download:
@@ -977,16 +1426,26 @@ def main(argv: list[str] | None = None) -> int:
             "source_transition0_pred_pos": source_pos_np,
             "source_transition0_pred_neg": source_neg_np,
         }
-        for name in MLX_COMPONENT_NAMES:
-            arrays[f"mlx_transition0_{name}"] = mlx_components[name]
-        direct_metrics = {
-            "source_vs_mlx_pred_pos": _compare_arrays(
-                source_pos_np, mlx_components["pred_pos"]
-            ),
-            "source_vs_mlx_pred_neg": _compare_arrays(
-                source_neg_np, mlx_components["pred_neg"]
-            ),
-        }
+        if external_arrays is None:
+            for name in MLX_COMPONENT_NAMES:
+                arrays[f"mlx_transition0_{name}"] = mlx_components[name]
+            direct_metrics = {
+                "source_vs_mlx_pred_pos": _compare_arrays(
+                    source_pos_np, mlx_components["pred_pos"]
+                ),
+                "source_vs_mlx_pred_neg": _compare_arrays(
+                    source_neg_np, mlx_components["pred_neg"]
+                ),
+            }
+        else:
+            arrays["external_transition0_sample_next"] = np.ascontiguousarray(
+                external_arrays["sample_next"]
+            )
+            direct_metrics = {
+                "external_vs_mlx_sample_next": _compare_arrays(
+                    external_arrays["sample_next"], mlx_components["sample_next"]
+                ),
+            }
         continuation_seconds = 0.0
 
         def build_starts(
@@ -1063,11 +1522,47 @@ def main(argv: list[str] | None = None) -> int:
             torch.cuda.empty_cache()
             return candidate_result
 
-        candidate_results = run_control_gated_candidates(
-            specs=transition0_candidate_specs(),
-            build_starts=build_starts,
-            execute_candidate=execute_candidate,
-        )
+        if external_arrays is None:
+            candidate_results = run_control_gated_candidates(
+                specs=candidate_specs,
+                build_starts=build_starts,
+                execute_candidate=execute_candidate,
+            )
+            expected_candidate_names = EXPECTED_CANDIDATE_NAMES
+            comparison_class = (
+                "transition0-component-substitution-plus-source-cuda-suffix"
+            )
+        else:
+            control_starts, control_first_steps = build_starts(
+                ("source-native-control",)
+            )
+            control_result = execute_candidate(
+                0,
+                candidate_specs[0],
+                control_starts["source-native-control"],
+                control_first_steps["source-native-control"],
+            )
+            require_exact_source_control(
+                candidate_index=0,
+                metrics=control_result.get("vs_source_anchor", {}),
+            )
+            external_start = sample.replace(
+                torch.from_numpy(external_arrays["sample_next"]).to(
+                    device=sample.device, dtype=sample.dtype
+                )
+            )
+            external_result = execute_candidate(
+                1,
+                candidate_specs[1],
+                external_start,
+                {
+                    "pred_final": external_arrays["pred_final"],
+                    "sample_next": external_arrays["sample_next"],
+                },
+            )
+            candidate_results = [control_result, external_result]
+            expected_candidate_names = EXTERNAL_CANDIDATE_NAMES
+            comparison_class = "external-transition0-plus-source-cuda-suffix"
         effective_route = {
             "route": requested_route["route"],
             "device_type": next(flow_model.parameters()).device.type,
@@ -1077,14 +1572,14 @@ def main(argv: list[str] | None = None) -> int:
             "steps": STEPS,
             "one_model_load": True,
             "model_ref": model_ref,
-            "candidate_names": list(EXPECTED_CANDIDATE_NAMES),
-            "comparison_class": "transition0-component-substitution-plus-source-cuda-suffix",
+            "candidate_names": list(expected_candidate_names),
+            "comparison_class": comparison_class,
         }
         report.update(
             {
                 "status": "done",
                 "effective_route": effective_route,
-                "candidate_specs": transition0_candidate_specs(),
+                "candidate_specs": candidate_specs,
                 "candidates": candidate_results,
                 "direct_transition0_metrics": direct_metrics,
                 "anchors": {
@@ -1097,12 +1592,12 @@ def main(argv: list[str] | None = None) -> int:
                 "timing": {
                     "model_load_seconds": model_load_seconds,
                     "continuation_seconds": continuation_seconds,
-                    "source_steps_completed": len(EXPECTED_CANDIDATE_NAMES)
+                    "source_steps_completed": len(expected_candidate_names)
                     * (STEPS - 1),
-                    "source_steps_requested": len(EXPECTED_CANDIDATE_NAMES)
+                    "source_steps_requested": len(expected_candidate_names)
                     * (STEPS - 1),
                     "candidates_completed": len(candidate_results),
-                    "candidates_requested": len(EXPECTED_CANDIDATE_NAMES),
+                    "candidates_requested": len(expected_candidate_names),
                     "t4_compute_seconds_through_matrix": time.perf_counter() - started,
                 },
                 "forbidden_inferences": [
@@ -1113,7 +1608,10 @@ def main(argv: list[str] | None = None) -> int:
                 ],
             }
         )
-        validate_result_manifest(report)
+        if external_arrays is None:
+            validate_result_manifest(report)
+        else:
+            validate_external_result_manifest(report)
         arrays["metadata_json"] = np.asarray(
             json.dumps(
                 build_artifact_metadata(report, arrays),
