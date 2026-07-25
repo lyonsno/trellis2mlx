@@ -53,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
+        "--expected-repo-commit",
+        help=(
+            "Require the effective trellis2mlx checkout to be this commit and "
+            "clean before generation."
+        ),
+    )
+    parser.add_argument(
         "--stop-after-stage",
         required=True,
         choices=[
@@ -170,11 +177,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[str, Any]:
+def _git_output(*args: str) -> str:
+    process = subprocess.Popen(
+        ["git", "-C", str(REPO_ROOT), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate()
+    if process.returncode:
+        raise subprocess.CalledProcessError(
+            process.returncode,
+            process.args,
+            output=stdout,
+            stderr=stderr,
+        )
+    return stdout
+
+
+def _read_repo_identity(expected_commit: str | None) -> dict[str, Any]:
+    effective_commit = _git_output("rev-parse", "HEAD").strip()
+    status_porcelain = _git_output(
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    )
+    return {
+        "commit_requested": expected_commit,
+        "commit_effective": effective_commit,
+        "dirty": bool(status_porcelain),
+        "status_porcelain": status_porcelain,
+    }
+
+
+def build_route_identity(
+    args: argparse.Namespace,
+    command: list[str],
+    *,
+    repo_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     image_path = str(Path(args.image))
     output_dir = str(Path(args.output_dir))
     target_faces = _resolve_target_faces(args)
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
+    if repo_identity is None:
+        repo_identity = _read_repo_identity(args.expected_repo_commit)
     return {
         "schema": SCHEMA,
         "route": {
@@ -182,6 +229,10 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "backend": "mlx-metal",
             "attention_backend": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND", "fast"),
             "repo_root": str(REPO_ROOT),
+            "repo_commit_requested": repo_identity["commit_requested"],
+            "repo_commit_effective": repo_identity["commit_effective"],
+            "repo_dirty": repo_identity["dirty"],
+            "repo_status_porcelain": repo_identity["status_porcelain"],
             "seed": args.seed,
             "steps": args.steps,
             "resolution": args.resolution,
@@ -362,6 +413,42 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     command = _build_generate_command(args, checkpoint_dir)
+    try:
+        repo_identity = _read_repo_identity(args.expected_repo_commit)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_repo_identity",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "repo_identity": None,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
+    if args.expected_repo_commit and (
+        repo_identity["commit_effective"] != args.expected_repo_commit
+        or repo_identity["dirty"]
+    ):
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_repo_identity",
+                "last_trustworthy_phase": "effective_repo_identity_read",
+                "primary_output_status": "not_started",
+                "repo_identity": repo_identity,
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     requested_inputs, invalid_inputs = _preflight_input_paths(args)
     if invalid_inputs:
         _write_json(
@@ -403,7 +490,11 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         return 2
-    route_identity = build_route_identity(args, command)
+    route_identity = build_route_identity(
+        args,
+        command,
+        repo_identity=repo_identity,
+    )
     _write_json(output_dir / "route_identity.json", route_identity)
     _write_json(
         output_dir / "run_report.json",

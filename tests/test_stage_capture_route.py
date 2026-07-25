@@ -89,6 +89,235 @@ def test_stage_capture_wrapper_builds_generate_stop_route(tmp_path):
     assert "--no-rembg" in command
 
 
+def test_stage_capture_parser_accepts_expected_repo_commit(tmp_path):
+    from scripts.run_mlx_stage_capture import build_parser
+
+    expected_commit = "a" * 40
+    args, unknown = build_parser().parse_known_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+
+    assert unknown == []
+    assert args.expected_repo_commit == expected_commit
+
+
+def test_stage_capture_route_records_requested_and_effective_repo_identity(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    expected_commit = "d" * 40
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(
+        args,
+        command,
+        repo_identity={
+            "commit_requested": expected_commit,
+            "commit_effective": expected_commit,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+
+    assert route_identity["route"]["repo_commit_requested"] == expected_commit
+    assert route_identity["route"]["repo_commit_effective"] == expected_commit
+    assert route_identity["route"]["repo_dirty"] is False
+    assert route_identity["route"]["repo_status_porcelain"] == ""
+
+
+def test_stage_capture_reports_repo_identity_read_failure_before_generate(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    expected_commit = "e" * 40
+
+    def unreadable_repo(_requested):
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "rev-parse", "HEAD"],
+            stderr="fatal: not a git repository",
+        )
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        unreadable_repo,
+    )
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("generation must not start without repo identity")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_repo_identity"
+    assert report["primary_output_status"] == "not_started"
+    assert report["repo_identity"] is None
+    assert report["exit_code"] == 2
+
+
+def test_stage_capture_rejects_substituted_repo_commit_before_generate(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    expected_commit = "a" * 40
+    effective_commit = "b" * 40
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda requested: {
+            "commit_requested": requested,
+            "commit_effective": effective_commit,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("generation must not start under a substituted commit")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_repo_identity"
+    assert report["primary_output_status"] == "not_started"
+    assert report["repo_identity"] == {
+        "commit_requested": expected_commit,
+        "commit_effective": effective_commit,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+
+
+def test_stage_capture_rejects_dirty_expected_repo_before_generate(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    expected_commit = "c" * 40
+    dirty_status = " M trellmlx/models/slat_flow.py\n"
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda requested: {
+            "commit_requested": requested,
+            "commit_effective": expected_commit,
+            "dirty": True,
+            "status_porcelain": dirty_status,
+        },
+    )
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("generation must not start from a dirty checkout")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_repo_identity"
+    assert report["primary_output_status"] == "not_started"
+    assert report["repo_identity"] == {
+        "commit_requested": expected_commit,
+        "commit_effective": expected_commit,
+        "dirty": True,
+        "status_porcelain": dirty_status,
+    }
+
+
 def test_stage_capture_rejects_missing_manifest_before_generate_and_reports(
     tmp_path, monkeypatch
 ):
