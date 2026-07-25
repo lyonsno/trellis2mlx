@@ -531,15 +531,14 @@ def main(argv: list[str] | None = None) -> int:
             repo_identity_postflight = _read_repo_identity(args.expected_repo_commit)
         except (OSError, subprocess.CalledProcessError) as exc:
             repo_identity_postflight_error = str(exc)
-            postflight_repo_invalid = bool(args.expected_repo_commit)
+            postflight_repo_invalid = True
         else:
             postflight_repo_invalid = bool(
-                args.expected_repo_commit
-                and (
-                    repo_identity_postflight["commit_effective"]
-                    != args.expected_repo_commit
-                    or repo_identity_postflight["dirty"]
-                )
+                repo_identity_postflight["commit_effective"]
+                != repo_identity["commit_effective"]
+                or repo_identity_postflight["dirty"] != repo_identity["dirty"]
+                or repo_identity_postflight["status_porcelain"]
+                != repo_identity["status_porcelain"]
             )
         route_identity["route"]["repo_identity_postflight"] = repo_identity_postflight
         route_identity["route"]["repo_identity_postflight_error"] = (

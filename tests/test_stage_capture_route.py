@@ -384,6 +384,136 @@ def test_stage_capture_rejects_repo_mutation_during_successful_generate(
     assert report["repo_identity_postflight"] == dirty
 
 
+def test_stage_capture_rejects_unpinned_repo_movement_during_generate(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    clean_a = {
+        "commit_requested": None,
+        "commit_effective": "a" * 40,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    clean_b = {
+        "commit_requested": None,
+        "commit_effective": "b" * 40,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    identities = iter((clean_a, clean_b))
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda _requested: next(identities),
+    )
+
+    def successful_generate(command, **_kwargs):
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(checkpoint_dir / "conditioning.npz", cond=np.zeros((1, 1)))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        successful_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "conditioning",
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "postflight_repo_identity"
+    assert report["primary_output_status"] == "invalid"
+    assert report["repo_identity_preflight"] == clean_a
+    assert report["repo_identity_postflight"] == clean_b
+
+
+def test_stage_capture_rejects_unreadable_unpinned_postflight_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    clean = {
+        "commit_requested": None,
+        "commit_effective": "a" * 40,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    calls = 0
+
+    def read_identity(_requested):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return clean
+        raise subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        read_identity,
+    )
+
+    def successful_generate(command, **_kwargs):
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(checkpoint_dir / "conditioning.npz", cond=np.zeros((1, 1)))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        successful_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "conditioning",
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "postflight_repo_identity"
+    assert report["primary_output_status"] == "invalid"
+    assert report["repo_identity_preflight"] == clean
+    assert report["repo_identity_postflight"] is None
+    assert "rev-parse" in report["repo_identity_postflight_error"]
+    assert "exit status 128" in report["repo_identity_postflight_error"]
+
+
 def test_stage_capture_rejects_missing_manifest_before_generate_and_reports(
     tmp_path, monkeypatch
 ):
