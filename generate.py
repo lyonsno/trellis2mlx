@@ -1672,7 +1672,7 @@ def main():
     TEX_SAMPLER = dict(steps=n_steps, guidance_strength=1.0, guidance_rescale=0.0,
                        guidance_interval=(0.6, 0.9), rescale_t=3.0)
 
-    lr_slat_flow = SLatFlowModel()
+    lr_slat_flow = SLatFlowModel.for_shape()
     load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(lr_slat_flow, bits=args.quantize)
@@ -2031,7 +2031,7 @@ def main():
         # === Stage 2c: HR Shape Latent (second SLat pass) ===
         print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
 
-        hr_slat_flow = SLatFlowModel()
+        hr_slat_flow = SLatFlowModel.for_shape()
         load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
         if args.quantize:
             quantize_model(hr_slat_flow, bits=args.quantize)
@@ -2183,7 +2183,7 @@ def main():
     print("\n=== Stage 4: Texture SLat ===", flush=True)
 
     # Load texture flow model (same architecture, in_channels=64)
-    tex_flow = SLatFlowModel(in_channels=64, out_channels=32)
+    tex_flow = SLatFlowModel.for_texture()
     load_weights(tex_flow, HF_4B + "slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(tex_flow, bits=args.quantize)

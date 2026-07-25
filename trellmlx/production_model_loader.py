@@ -387,7 +387,7 @@ def _default_constructor_for_role(role_id: str) -> ModelConstructor:
     if role_id in {"shape_flow_lr", "shape_flow_hr"}:
         from .models.slat_flow import SLatFlowModel
 
-        return SLatFlowModel
+        return SLatFlowModel.for_shape
     if role_id == "shape_decoder":
         from .models.shape_slat_decoder import SLatDecoder
 
@@ -395,7 +395,7 @@ def _default_constructor_for_role(role_id: str) -> ModelConstructor:
     if role_id == "texture_flow":
         from .models.slat_flow import SLatFlowModel
 
-        return lambda: SLatFlowModel(in_channels=64, out_channels=32)
+        return SLatFlowModel.for_texture
     if role_id == "texture_decoder":
         from .models.shape_slat_decoder import SLatDecoder
 

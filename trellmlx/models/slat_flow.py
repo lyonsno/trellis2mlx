@@ -26,8 +26,13 @@ from .sparse_structure_flow import (
     _cast_block_linears,
     _source_shared_modulation,
     _injections_for_block,
+    _layernorm_noaffine,
 )
-from ..shape_flow_layernorm import layernorm_noaffine as _layernorm_noaffine
+from ..shape_flow_layernorm import (
+    CUDA_WELFORD_METAL_BACKEND,
+    get_shape_flow_layernorm_backend,
+    layernorm_noaffine as _shape_flow_layernorm_noaffine,
+)
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
 from ..modules.rope import build_rope_phases, apply_rope
@@ -59,6 +64,7 @@ class SLatFlowModel(nn.Module):
         num_blocks: int = 30,
         mlp_hidden: int = 8192,
         context_channels: int = 1024,
+        shape_flow_layernorm: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -66,6 +72,7 @@ class SLatFlowModel(nn.Module):
         self.model_channels = model_channels
         self.num_heads = num_heads
         self.head_dim = model_channels // num_heads
+        self.shape_flow_layernorm = shape_flow_layernorm
 
         # Timestep embedder
         self.t_embedder = TimestepEmbedder(model_channels)
@@ -87,7 +94,7 @@ class SLatFlowModel(nn.Module):
                 num_heads,
                 context_channels,
                 mlp_hidden,
-                shape_flow_layernorm=True,
+                shape_flow_layernorm=shape_flow_layernorm,
             )
             for _ in range(num_blocks)
         ]
@@ -97,6 +104,19 @@ class SLatFlowModel(nn.Module):
         # Compilation state (call .compile() to enable)
         self._compiled = False
         self._run_blocks = self._run_blocks_impl
+
+    @classmethod
+    def for_shape(cls, **kwargs) -> "SLatFlowModel":
+        return cls(shape_flow_layernorm=True, **kwargs)
+
+    @classmethod
+    def for_texture(cls, **kwargs) -> "SLatFlowModel":
+        return cls(
+            in_channels=64,
+            out_channels=32,
+            shape_flow_layernorm=False,
+            **kwargs,
+        )
 
     def build_cross_kv_cache(self, cond: mx.array) -> list[tuple]:
         """Precompute cross-attention K, V for all blocks.
@@ -175,9 +195,22 @@ class SLatFlowModel(nn.Module):
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 
-        # Output projection
-        x = x.astype(input_dtype)
-        x = _layernorm_noaffine(x, eps=1e-5)
+        # The CUDA-Welford experiment is authenticated only for the internal
+        # BF16 shape-flow width. Restore the sampler dtype after normalization.
+        if (
+            self.shape_flow_layernorm
+            and get_shape_flow_layernorm_backend() == CUDA_WELFORD_METAL_BACKEND
+        ):
+            x = _shape_flow_layernorm_noaffine(x, eps=1e-5)
+            x = x.astype(input_dtype)
+        else:
+            x = x.astype(input_dtype)
+            layernorm = (
+                _shape_flow_layernorm_noaffine
+                if self.shape_flow_layernorm
+                else _layernorm_noaffine
+            )
+            x = layernorm(x, eps=1e-5)
         x = self.out_layer(x)  # [N, out_channels]
 
         return x

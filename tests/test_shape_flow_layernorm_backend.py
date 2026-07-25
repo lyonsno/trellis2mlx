@@ -121,5 +121,138 @@ def test_slat_flow_uses_shape_specific_layernorm_without_rebinding_sparse_flow()
     import trellmlx.models.sparse_structure_flow as sparse_flow
     from trellmlx.shape_flow_layernorm import layernorm_noaffine
 
-    assert slat_flow._layernorm_noaffine is layernorm_noaffine
-    assert sparse_flow._layernorm_noaffine is not layernorm_noaffine
+    assert slat_flow._shape_flow_layernorm_noaffine is layernorm_noaffine
+    assert slat_flow._layernorm_noaffine is sparse_flow._layernorm_noaffine
+
+
+def test_cuda_welford_shape_model_normalizes_bfloat16_and_returns_sampler_dtype(
+    monkeypatch,
+):
+    import trellmlx.models.slat_flow as slat_flow
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_METAL_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    configure_shape_flow_layernorm_backend(CUDA_WELFORD_METAL_BACKEND)
+    model = slat_flow.SLatFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=1536,
+        num_heads=12,
+        num_blocks=0,
+        mlp_hidden=4,
+        context_channels=4,
+        shape_flow_layernorm=True,
+    )
+    monkeypatch.setattr(slat_flow, "_infer_compute_dtype", lambda _model: mx.bfloat16)
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_shared_modulation",
+        lambda *_args, **_kwargs: mx.zeros((1, 6 * 1536), dtype=mx.bfloat16),
+    )
+    seen_dtypes = []
+    original_layernorm = slat_flow._shape_flow_layernorm_noaffine
+
+    def capture_layernorm(x, eps):
+        seen_dtypes.append(x.dtype)
+        return original_layernorm(x, eps=eps)
+
+    monkeypatch.setattr(slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm)
+    x = mx.zeros((1, 2), dtype=mx.float32)
+    out = model(
+        x,
+        mx.zeros((1,), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+    )
+    mx.eval(out)
+
+    assert seen_dtypes == [mx.bfloat16]
+    assert out.dtype == mx.float32
+
+
+def test_default_shape_model_preserves_float32_final_layernorm_order(monkeypatch):
+    import trellmlx.models.slat_flow as slat_flow
+
+    model = slat_flow.SLatFlowModel.for_shape(
+        in_channels=2,
+        out_channels=2,
+        model_channels=12,
+        num_heads=3,
+        num_blocks=0,
+        mlp_hidden=16,
+        context_channels=4,
+    )
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_shared_modulation",
+        lambda *_args, **_kwargs: mx.zeros((1, 6 * 12), dtype=mx.float32),
+    )
+    seen_dtypes = []
+    original_layernorm = slat_flow._shape_flow_layernorm_noaffine
+
+    def capture_layernorm(x, eps):
+        seen_dtypes.append(x.dtype)
+        return original_layernorm(x, eps=eps)
+
+    monkeypatch.setattr(slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm)
+    out = model(
+        mx.zeros((1, 2), dtype=mx.float32),
+        mx.zeros((1,), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+    )
+    mx.eval(out)
+
+    assert seen_dtypes == [mx.float32]
+    assert out.dtype == mx.float32
+
+
+def test_slat_flow_role_constructors_isolate_shape_backend_from_texture():
+    from trellmlx.models.slat_flow import SLatFlowModel
+
+    shared = {
+        "model_channels": 12,
+        "num_heads": 3,
+        "num_blocks": 1,
+        "mlp_hidden": 16,
+        "context_channels": 4,
+    }
+    shape = SLatFlowModel.for_shape(**shared)
+    texture = SLatFlowModel.for_texture(**shared)
+
+    assert shape.shape_flow_layernorm is True
+    assert all(block.shape_flow_layernorm is True for block in shape.blocks)
+    assert texture.shape_flow_layernorm is False
+    assert all(block.shape_flow_layernorm is False for block in texture.blocks)
+
+
+def test_texture_role_keeps_default_layernorm_under_shape_experiment(monkeypatch):
+    import trellmlx.models.slat_flow as slat_flow
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_METAL_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    configure_shape_flow_layernorm_backend(CUDA_WELFORD_METAL_BACKEND)
+    model = slat_flow.SLatFlowModel.for_texture(
+        model_channels=12,
+        num_heads=3,
+        num_blocks=0,
+        mlp_hidden=16,
+        context_channels=4,
+    )
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_shared_modulation",
+        lambda *_args, **_kwargs: mx.zeros((1, 6 * 12), dtype=mx.float32),
+    )
+    x = mx.zeros((1, 64), dtype=mx.float32)
+    out = model(
+        x,
+        mx.zeros((1,), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+    )
+    mx.eval(out)
+
+    assert out.shape == (1, 32)
+    assert out.dtype == mx.float32

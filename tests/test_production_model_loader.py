@@ -265,3 +265,28 @@ def test_production_model_loader_closer_uses_injected_cleanup(tmp_path):
     ]
     assert report.close_reports[0].handle_id == "shape_flow_lr"
     assert report.close_reports[0].metadata["requested_loader_route"] == "mlx"
+
+
+def test_default_slat_constructors_bind_shape_and_texture_roles(monkeypatch):
+    import trellmlx.models.slat_flow as slat_flow
+    from trellmlx.production_model_loader import _default_constructor_for_role
+
+    calls = []
+
+    class FakeSLatFlowModel:
+        @classmethod
+        def for_shape(cls):
+            calls.append(("shape",))
+            return "shape-model"
+
+        @classmethod
+        def for_texture(cls):
+            calls.append(("texture",))
+            return "texture-model"
+
+    monkeypatch.setattr(slat_flow, "SLatFlowModel", FakeSLatFlowModel)
+
+    assert _default_constructor_for_role("shape_flow_lr")() == "shape-model"
+    assert _default_constructor_for_role("shape_flow_hr")() == "shape-model"
+    assert _default_constructor_for_role("texture_flow")() == "texture-model"
+    assert calls == [("shape",), ("shape",), ("texture",)]
