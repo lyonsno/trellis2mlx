@@ -126,6 +126,80 @@ def test_intervention_specs_are_complete_ordered_and_quotient_distinct():
     ]
 
 
+def test_axis_transverse_specs_are_complete_uncapped_and_ordered():
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        axis_transverse_candidate_specs,
+    )
+
+    specs = axis_transverse_candidate_specs()
+    assert [spec["name"] for spec in specs] == [
+        "source-native-control",
+        "source-pos-neg-block0-norm1-axis",
+        "source-pos-neg-block0-norm1-transverse",
+        "source-pos-neg-block0-attention-raw-axis",
+        "source-pos-neg-block0-attention-raw-transverse",
+        "source-pos-neg-block0-after-mlp-axis",
+        "source-pos-neg-block0-after-mlp-transverse",
+    ]
+    assert [
+        (spec.get("intervention_stage"), spec.get("intervention_component"))
+        for spec in specs
+    ] == [
+        (None, None),
+        ("norm1", "axis"),
+        ("norm1", "transverse"),
+        ("attention_raw", "axis"),
+        ("attention_raw", "transverse"),
+        ("after_mlp", "axis"),
+        ("after_mlp", "transverse"),
+    ]
+
+
+def test_axis_transverse_decomposition_reconstructs_each_intervention():
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        decompose_negative_interventions,
+    )
+
+    source = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
+    mlx = np.asarray([[3.0, 2.0, 1.0]], dtype=np.float32)
+    interventions = {
+        "norm1": np.asarray([[2.0, 4.0, 2.0]], dtype=np.float32),
+        "attention_raw": np.asarray([[1.5, 0.0, 2.5]], dtype=np.float32),
+        "after_mlp": np.asarray([[2.5, 3.0, 1.5]], dtype=np.float32),
+    }
+
+    components, geometry = decompose_negative_interventions(
+        source_pred_neg=source,
+        mlx_pred_neg=mlx,
+        interventions=interventions,
+    )
+
+    assert set(components) == {
+        (stage, component)
+        for stage in interventions
+        for component in ("axis", "transverse")
+    }
+    axis = (mlx.astype(np.float64) - source.astype(np.float64)).reshape(-1)
+    axis_sq = float(np.dot(axis, axis))
+    for stage, intervention in interventions.items():
+        axis_pred = components[(stage, "axis")]
+        transverse_pred = components[(stage, "transverse")]
+        assert axis_pred.dtype == np.float32
+        assert transverse_pred.dtype == np.float32
+        reconstructed = (
+            axis_pred.astype(np.float64)
+            + transverse_pred.astype(np.float64)
+            - source.astype(np.float64)
+        )
+        assert np.allclose(reconstructed, intervention, rtol=0.0, atol=2e-7)
+        transverse_delta = (
+            transverse_pred.astype(np.float64) - source.astype(np.float64)
+        ).reshape(-1)
+        assert abs(float(np.dot(transverse_delta, axis)) / axis_sq) < 1e-7
+        assert geometry[stage]["reconstruction_max_abs"] <= 2e-7
+        assert geometry[stage]["transverse_axis_projection_abs"] < 1e-7
+
+
 def test_load_negative_intervention_binds_route_and_unchanged_witness(tmp_path):
     from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
         load_negative_intervention,
@@ -249,6 +323,39 @@ def test_control_gate_prevents_intervention_execution():
     assert events == [(0, "source-native-control")]
 
 
+def test_control_gate_accepts_axis_transverse_candidate_set():
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        axis_transverse_candidate_specs,
+        run_control_gated_interventions,
+    )
+
+    specs = axis_transverse_candidate_specs()
+    events = []
+
+    def execute(index, spec):
+        events.append((index, spec["name"]))
+        return {
+            "name": spec["name"],
+            "vs_source_anchor": {
+                "exact": index == 0,
+                "mean_abs": 0.0 if index == 0 else 1.0,
+                "max_abs": 0.0 if index == 0 else 1.0,
+                "nonzero": 0 if index == 0 else 1,
+            },
+        }
+
+    results = run_control_gated_interventions(
+        specs=specs,
+        execute_candidate=execute,
+    )
+    assert [result["name"] for result in results] == [
+        spec["name"] for spec in specs
+    ]
+    assert events == [
+        (index, spec["name"]) for index, spec in enumerate(specs)
+    ]
+
+
 def _result_fixture():
     from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
         intervention_candidate_specs,
@@ -302,6 +409,65 @@ def _result_fixture():
     }
 
 
+def _axis_transverse_result_fixture():
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        axis_transverse_candidate_specs,
+    )
+
+    report = _result_fixture()
+    specs = axis_transverse_candidate_specs()
+    candidates = []
+    for index, spec in enumerate(specs):
+        candidates.append(
+            {
+                **spec,
+                "output_key": f"candidate_{index}_shape_slat",
+                "shape": [2, 3],
+                "sha256": "0" * 64,
+                "source_step_indices": list(range(1, 8)),
+                "source_step_count": 7,
+                "step_elapsed_seconds": [1.0] * 7,
+                "vs_source_anchor": {
+                    "exact": index == 0,
+                    "mean_abs": 0.0 if index == 0 else 1.0,
+                    "max_abs": 0.0 if index == 0 else 1.0,
+                    "nonzero": 0 if index == 0 else 1,
+                },
+                "vs_mlx_anchor": {
+                    "exact": False,
+                    "mean_abs": 1.0,
+                    "max_abs": 1.0,
+                    "nonzero": 1,
+                },
+            }
+        )
+    report["candidate_mode"] = "axis-transverse"
+    report["candidate_specs"] = specs
+    report["candidates"] = candidates
+    report["decomposition_geometry"] = {
+        stage: {
+            "source_to_mlx_projection": 0.5,
+            "axis_l2_ratio": 0.5,
+            "transverse_l2_ratio": 0.5,
+            "transverse_axis_projection_abs": 0.0,
+            "reconstruction_mean_abs": 0.0,
+            "reconstruction_max_abs": 0.0,
+        }
+        for stage in ("norm1", "attention_raw", "after_mlp")
+    }
+    report["effective_route"]["candidate_mode"] = "axis-transverse"
+    report["effective_route"]["candidate_names"] = [
+        candidate["name"] for candidate in candidates
+    ]
+    report["timing"] = {
+        "source_steps_completed": 49,
+        "source_steps_requested": 49,
+        "candidates_completed": 7,
+        "candidates_requested": 7,
+    }
+    return report
+
+
 def _artifact_arrays(report):
     from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
         INTERVENTION_STAGES,
@@ -319,6 +485,11 @@ def _artifact_arrays(report):
         arrays[f"intervention_{stage}_pred_neg"] = np.full(
             shape, 5.0, dtype=np.float32
         )
+        if report.get("candidate_mode") == "axis-transverse":
+            for component in ("axis", "transverse"):
+                arrays[f"component_{stage}_{component}_pred_neg"] = np.full(
+                    shape, 5.5, dtype=np.float32
+                )
     for index, candidate in enumerate(report["candidates"]):
         arrays[f"candidate_{index}_transition0_sample_next"] = np.full(
             shape, 6.0 + index, dtype=np.float32
@@ -327,6 +498,59 @@ def _artifact_arrays(report):
         arrays[candidate["output_key"]] = output
         candidate["sha256"] = hashlib.sha256(output.tobytes()).hexdigest()
     return arrays
+
+
+def test_result_and_saved_artifact_bind_all_seven_component_continuations(
+    tmp_path,
+):
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        _artifact_metadata,
+        validate_result_manifest,
+        validate_saved_artifact,
+    )
+
+    report = _axis_transverse_result_fixture()
+    arrays = _artifact_arrays(report)
+    validate_result_manifest(report)
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(_artifact_metadata(report, arrays), sort_keys=True)
+    )
+    output = tmp_path / "components.npz"
+    np.savez(output, **arrays)
+
+    validation = validate_saved_artifact(
+        output, candidates=report["candidates"]
+    )
+    assert validation["candidate_count"] == 7
+    assert validation["all_arrays_bound"] is True
+    assert validation["array_count"] == 28
+
+    with np.load(output, allow_pickle=False) as archive:
+        corrupted = {key: np.asarray(archive[key]) for key in archive.files}
+    corrupted.pop("component_attention_raw_transverse_pred_neg")
+    np.savez(output, **corrupted)
+    with pytest.raises(ValueError, match="attention_raw_transverse"):
+        validate_saved_artifact(output, candidates=report["candidates"])
+
+    arrays = _artifact_arrays(report)
+    arrays.pop("candidate_6_transition0_sample_next")
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(_artifact_metadata(report, arrays), sort_keys=True)
+    )
+    np.savez(output, **arrays)
+    with pytest.raises(ValueError, match="candidate_6_transition0"):
+        validate_saved_artifact(output, candidates=report["candidates"])
+
+
+def test_result_rejects_effective_route_mode_that_differs_from_full_payload():
+    from scripts.source_cuda_shape_flow_negative_intervention_suffix import (
+        validate_result_manifest,
+    )
+
+    report = _result_fixture()
+    report["effective_route"]["candidate_mode"] = "axis-transverse"
+    with pytest.raises(ValueError, match="candidate_mode"):
+        validate_result_manifest(report)
 
 
 def test_result_and_saved_artifact_bind_all_four_cuda_continuations(tmp_path):

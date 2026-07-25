@@ -65,6 +65,7 @@ except ImportError:
 SCHEMA = "trellis2mlx.source_cuda_shape_flow_negative_intervention_suffix.v1"
 ARTIFACT_SCHEMA = f"{SCHEMA}.artifact"
 INTERVENTION_STAGES = ("norm1", "attention_raw", "after_mlp")
+INTERVENTION_COMPONENTS = ("axis", "transverse")
 EXPECTED_CANDIDATE_NAMES = (
     "source-native-control",
     "source-pos-neg-block0-norm1",
@@ -93,6 +94,130 @@ def intervention_candidate_specs() -> list[dict[str, Any]]:
             for stage in INTERVENTION_STAGES
         ],
     ]
+
+
+def axis_transverse_candidate_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "source-native-control",
+            "positive": "source",
+            "negative": "source",
+            "post": "source-guidance-rescale-euler",
+            "intervention_stage": None,
+            "intervention_component": None,
+        },
+        *[
+            {
+                "name": (
+                    f"source-pos-neg-block0-{stage.replace('_', '-')}-{component}"
+                ),
+                "positive": "source",
+                "negative": (
+                    "mlx-after-source-block0-stage-"
+                    f"{component}-component"
+                ),
+                "post": "source-guidance-rescale-euler",
+                "intervention_stage": stage,
+                "intervention_component": component,
+            }
+            for stage in INTERVENTION_STAGES
+            for component in INTERVENTION_COMPONENTS
+        ],
+    ]
+
+
+def candidate_specs_for_mode(mode: str) -> list[dict[str, Any]]:
+    if mode == "full":
+        return intervention_candidate_specs()
+    if mode == "axis-transverse":
+        return axis_transverse_candidate_specs()
+    raise ValueError(f"unsupported intervention candidate mode: {mode!r}")
+
+
+def decompose_negative_interventions(
+    *,
+    source_pred_neg: np.ndarray,
+    mlx_pred_neg: np.ndarray,
+    interventions: dict[str, np.ndarray],
+) -> tuple[dict[tuple[str, str], np.ndarray], dict[str, dict[str, float]]]:
+    source = np.asarray(source_pred_neg)
+    mlx = np.asarray(mlx_pred_neg)
+    if (
+        source.dtype != np.float32
+        or mlx.dtype != np.float32
+        or source.shape != mlx.shape
+        or not np.isfinite(source).all()
+        or not np.isfinite(mlx).all()
+    ):
+        raise ValueError(
+            "source and MLX negative predictions must be shape-matched finite float32"
+        )
+    if set(interventions) != set(INTERVENTION_STAGES):
+        raise ValueError("negative interventions are incomplete")
+
+    source64 = source.astype(np.float64)
+    mlx64 = mlx.astype(np.float64)
+    axis = (mlx64 - source64).reshape(-1)
+    axis_sq = float(np.dot(axis, axis))
+    axis_l2 = float(np.sqrt(axis_sq))
+    if not np.isfinite(axis_sq) or axis_sq <= 0.0:
+        raise ValueError("source-to-MLX negative-prediction axis is invalid")
+
+    components: dict[tuple[str, str], np.ndarray] = {}
+    geometry: dict[str, dict[str, float]] = {}
+    for stage in INTERVENTION_STAGES:
+        intervention = np.asarray(interventions[stage])
+        if (
+            intervention.dtype != np.float32
+            or intervention.shape != source.shape
+            or not np.isfinite(intervention).all()
+        ):
+            raise ValueError(
+                f"{stage} intervention must match the finite float32 witness"
+            )
+        intervention64 = intervention.astype(np.float64)
+        relative = (intervention64 - source64).reshape(-1)
+        projection = float(np.dot(relative, axis) / axis_sq)
+        axis_delta64 = (projection * axis).reshape(source.shape)
+        residual64 = intervention64 - source64 - axis_delta64
+        axis_pred = np.ascontiguousarray(
+            (source64 + axis_delta64).astype(np.float32)
+        )
+        transverse_pred = np.ascontiguousarray(
+            (source64 + residual64).astype(np.float32)
+        )
+        components[(stage, "axis")] = axis_pred
+        components[(stage, "transverse")] = transverse_pred
+
+        axis_delta = (axis_pred.astype(np.float64) - source64).reshape(-1)
+        transverse_delta = (
+            transverse_pred.astype(np.float64) - source64
+        ).reshape(-1)
+        reconstructed = (
+            axis_pred.astype(np.float64)
+            + transverse_pred.astype(np.float64)
+            - source64
+        )
+        reconstruction_delta = reconstructed - intervention64
+        geometry[stage] = {
+            "source_to_mlx_projection": projection,
+            "axis_l2_ratio": float(np.linalg.norm(axis_delta) / axis_l2),
+            "transverse_l2_ratio": float(
+                np.linalg.norm(transverse_delta) / axis_l2
+            ),
+            "transverse_axis_projection_abs": abs(
+                float(np.dot(transverse_delta, axis) / axis_sq)
+            ),
+            "reconstruction_mean_abs": float(
+                np.mean(np.abs(reconstruction_delta))
+            ),
+            "reconstruction_max_abs": float(
+                np.max(np.abs(reconstruction_delta))
+            ),
+        }
+        if not all(np.isfinite(value) for value in geometry[stage].values()):
+            raise ValueError(f"{stage} decomposition geometry is non-finite")
+    return components, geometry
 
 
 def _require_equal(actual: Any, expected: Any, *, label: str) -> None:
@@ -349,7 +474,12 @@ def run_control_gated_interventions(
     specs: list[dict[str, Any]],
     execute_candidate: Callable[[int, dict[str, Any]], dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    if tuple(spec["name"] for spec in specs) != EXPECTED_CANDIDATE_NAMES:
+    names = [spec.get("name") for spec in specs]
+    if (
+        not names
+        or names[0] != "source-native-control"
+        or len(set(names)) != len(names)
+    ):
         raise ValueError("intervention candidate specs are incomplete or out of order")
     control = execute_candidate(0, specs[0])
     require_exact_source_control(
@@ -364,6 +494,9 @@ def run_control_gated_interventions(
 def validate_result_manifest(payload: dict[str, Any]) -> None:
     if payload.get("status") != "done":
         raise ValueError("negative intervention suffix result is not done")
+    candidate_mode = payload.get("candidate_mode", "full")
+    expected_specs = candidate_specs_for_mode(candidate_mode)
+    expected_names = [spec["name"] for spec in expected_specs]
     route = payload.get("effective_route", {})
     required_route = {
         "device_type": "cuda",
@@ -371,17 +504,27 @@ def validate_result_manifest(payload: dict[str, Any]) -> None:
         "conv_backend": "none",
         "steps": STEPS,
         "one_model_load": True,
-        "candidate_names": list(EXPECTED_CANDIDATE_NAMES),
+        "candidate_names": expected_names,
     }
     for key, expected in required_route.items():
         if route.get(key) != expected:
             raise ValueError(
                 f"negative intervention suffix route {key} must be {expected!r}"
             )
+    route_mode = route.get("candidate_mode")
+    if route_mode is None:
+        if candidate_mode != "full":
+            raise ValueError(
+                "negative intervention suffix route candidate_mode is missing"
+            )
+    elif route_mode != candidate_mode:
+        raise ValueError(
+            "negative intervention suffix route candidate_mode must match payload"
+        )
+    if payload.get("candidate_specs") != expected_specs:
+        raise ValueError("negative intervention candidate specs differ from mode")
     candidates = payload.get("candidates", [])
-    if [candidate.get("name") for candidate in candidates] != list(
-        EXPECTED_CANDIDATE_NAMES
-    ):
+    if [candidate.get("name") for candidate in candidates] != expected_names:
         raise ValueError("negative intervention candidates are incomplete or out of order")
     if len({candidate.get("output_key") for candidate in candidates}) != len(candidates):
         raise ValueError("negative intervention output keys are not distinct")
@@ -395,13 +538,29 @@ def validate_result_manifest(payload: dict[str, Any]) -> None:
     control = candidates[0].get("vs_source_anchor", {})
     if not control.get("exact") or control.get("nonzero") != 0:
         raise ValueError("source-native control does not exactly reproduce source anchor")
-    expected_steps = len(EXPECTED_CANDIDATE_NAMES) * (STEPS - 1)
+    if candidate_mode == "axis-transverse":
+        geometry = payload.get("decomposition_geometry")
+        if not isinstance(geometry, dict) or set(geometry) != set(
+            INTERVENTION_STAGES
+        ):
+            raise ValueError("negative intervention decomposition geometry is incomplete")
+        for stage, record in geometry.items():
+            if not isinstance(record, dict) or not all(
+                isinstance(value, (int, float)) and np.isfinite(value)
+                for value in record.values()
+            ):
+                raise ValueError(f"{stage} decomposition geometry is invalid")
+            if record.get("reconstruction_max_abs", float("inf")) > 1e-6:
+                raise ValueError(f"{stage} decomposition does not reconstruct")
+            if record.get("transverse_axis_projection_abs", float("inf")) > 1e-6:
+                raise ValueError(f"{stage} transverse component is not orthogonal")
+    expected_steps = len(expected_names) * (STEPS - 1)
     timing = payload.get("timing", {})
     for key, expected in {
         "source_steps_completed": expected_steps,
         "source_steps_requested": expected_steps,
-        "candidates_completed": len(EXPECTED_CANDIDATE_NAMES),
-        "candidates_requested": len(EXPECTED_CANDIDATE_NAMES),
+        "candidates_completed": len(expected_names),
+        "candidates_requested": len(expected_names),
     }.items():
         if timing.get(key) != expected:
             raise ValueError(f"negative intervention timing {key} must be {expected}")
@@ -416,8 +575,10 @@ def _artifact_metadata(
         "external_report_required": True,
         "effective_route": report["effective_route"],
         "inputs": report["inputs"],
+        "candidate_mode": report.get("candidate_mode", "full"),
         "candidate_specs": report["candidate_specs"],
         "candidates": report["candidates"],
+        "decomposition_geometry": report.get("decomposition_geometry"),
         "anchors": report["anchors"],
         "arrays": {
             name: {
@@ -434,6 +595,14 @@ def validate_saved_artifact(
     path: Path, *, candidates: list[dict[str, Any]]
 ) -> dict[str, Any]:
     with np.load(path, allow_pickle=False) as archive:
+        component_keys = {
+            (
+                f"component_{candidate['intervention_stage']}_"
+                f"{candidate['intervention_component']}_pred_neg"
+            )
+            for candidate in candidates
+            if candidate.get("intervention_component") is not None
+        }
         required = {
             "coords",
             "source_anchor_shape_slat",
@@ -443,13 +612,14 @@ def validate_saved_artifact(
             "metadata_json",
             *(
                 f"candidate_{index}_transition0_sample_next"
-                for index in range(len(EXPECTED_CANDIDATE_NAMES))
+                for index in range(len(candidates))
             ),
             *(str(candidate["output_key"]) for candidate in candidates),
             *(
                 f"intervention_{stage}_pred_neg"
                 for stage in INTERVENTION_STAGES
             ),
+            *component_keys,
         }
         missing = sorted(required - set(archive.files))
         if missing:
@@ -580,6 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pipeline-config", default="pipeline.json")
     parser.add_argument("--sparse-conv-backend", default="none")
     parser.add_argument("--sparse-attn-backend", default="sdpa")
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("full", "axis-transverse"),
+        default="full",
+    )
     parser.add_argument("--no-download", action="store_true")
     return parser
 
@@ -593,10 +768,12 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     phase = "arguments_parsed"
     last_trustworthy_phase: str | None = phase
+    candidate_specs = candidate_specs_for_mode(args.candidate_mode)
     requested_route = {
         "route": "official-source-cuda-negative-intervention-suffix",
         "steps": STEPS,
-        "candidate_specs": intervention_candidate_specs(),
+        "candidate_mode": args.candidate_mode,
+        "candidate_specs": candidate_specs,
         "attention_backend": args.sparse_attn_backend,
         "conv_backend": args.sparse_conv_backend,
     }
@@ -619,6 +796,7 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "status": "failed",
+        "candidate_mode": args.candidate_mode,
         "requested_route": requested_route,
         "effective_route": "not-established",
         "primary_output_status": "missing",
@@ -887,8 +1065,24 @@ def main(argv: list[str] | None = None) -> int:
                 for stage, value in interventions.items()
             },
         }
+        component_predictions: dict[tuple[str, str], np.ndarray] = {}
+        decomposition_geometry: dict[str, dict[str, float]] | None = None
+        if args.candidate_mode == "axis-transverse":
+            component_predictions, decomposition_geometry = (
+                decompose_negative_interventions(
+                    source_pred_neg=source_neg_np,
+                    mlx_pred_neg=mlx_components["pred_neg"],
+                    interventions=interventions,
+                )
+            )
+            arrays.update(
+                {
+                    f"component_{stage}_{component}_pred_neg": value
+                    for (stage, component), value in component_predictions.items()
+                }
+            )
         continuation_seconds = 0.0
-        specs = intervention_candidate_specs()
+        specs = candidate_specs
 
         def execute_candidate(
             index: int, spec: dict[str, Any]
@@ -899,8 +1093,14 @@ def main(argv: list[str] | None = None) -> int:
             if stage is None:
                 pred_neg = source_neg
             else:
+                component = spec.get("intervention_component")
+                candidate_pred_neg = (
+                    interventions[stage]
+                    if component is None
+                    else component_predictions[(stage, component)]
+                )
                 pred_neg = sample.replace(
-                    torch.from_numpy(interventions[stage]).to(
+                    torch.from_numpy(candidate_pred_neg).to(
                         device=sample.device, dtype=sample.dtype
                     )
                 )
@@ -989,10 +1189,11 @@ def main(argv: list[str] | None = None) -> int:
             "steps": STEPS,
             "one_model_load": True,
             "model_ref": model_ref,
-            "candidate_names": list(EXPECTED_CANDIDATE_NAMES),
+            "candidate_mode": args.candidate_mode,
+            "candidate_names": [spec["name"] for spec in specs],
             "comparison_class": (
-                "source-positive-negative-block0-intervention-"
-                "source-post-and-cuda-suffix"
+                "source-positive-negative-block0-"
+                f"{args.candidate_mode}-intervention-source-post-and-cuda-suffix"
             ),
         }
         report.update(
@@ -1001,6 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
                 "effective_route": effective_route,
                 "candidate_specs": specs,
                 "candidates": candidate_results,
+                "decomposition_geometry": decomposition_geometry,
                 "direct_transition0_metrics": {
                     "source_vs_mlx_pred_pos": _compare_arrays(
                         source_pos_np, mlx_components["pred_pos"]
@@ -1028,12 +1230,12 @@ def main(argv: list[str] | None = None) -> int:
                 "timing": {
                     "model_load_seconds": model_load_seconds,
                     "continuation_seconds": continuation_seconds,
-                    "source_steps_completed": len(EXPECTED_CANDIDATE_NAMES)
+                    "source_steps_completed": len(specs)
                     * (STEPS - 1),
-                    "source_steps_requested": len(EXPECTED_CANDIDATE_NAMES)
+                    "source_steps_requested": len(specs)
                     * (STEPS - 1),
                     "candidates_completed": len(candidate_results),
-                    "candidates_requested": len(EXPECTED_CANDIDATE_NAMES),
+                    "candidates_requested": len(specs),
                     "t4_compute_seconds_through_matrix": time.perf_counter()
                     - started,
                 },
