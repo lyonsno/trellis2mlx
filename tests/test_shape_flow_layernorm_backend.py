@@ -98,6 +98,33 @@ def test_cuda_welford_shape_flow_layernorm_executes_authenticated_geometry():
     )
 
 
+def test_cuda_welford_diagnostics_expose_stats_that_reconstruct_output():
+    from trellmlx.shape_flow_layernorm import cuda_welford_layernorm_with_stats
+
+    values = np.linspace(-3.0, 5.0, 2 * 1536, dtype=np.float32).reshape(
+        2, 1536
+    )
+    x = mx.array(values).astype(mx.bfloat16)
+
+    out, mean, variance, rstd = cuda_welford_layernorm_with_stats(
+        x, eps=1e-5
+    )
+    reconstructed = (
+        (x.astype(mx.float32) - mean) * rstd
+    ).astype(mx.bfloat16)
+    mx.eval(out, mean, variance, rstd, reconstructed)
+
+    assert out.shape == x.shape
+    assert mean.shape == (2, 1)
+    assert variance.shape == (2, 1)
+    assert rstd.shape == (2, 1)
+    assert out.dtype == mx.bfloat16
+    assert mean.dtype == mx.float32
+    assert variance.dtype == mx.float32
+    assert rstd.dtype == mx.float32
+    assert mx.array_equal(out, reconstructed).item()
+
+
 def test_cuda_welford_backend_identity_names_residual_instead_of_claiming_cuda_exactness():
     from trellmlx.shape_flow_layernorm import (
         CUDA_WELFORD_METAL_BACKEND,

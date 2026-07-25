@@ -19,6 +19,7 @@ SUPPORTED_BACKENDS = (DEFAULT_BACKEND, CUDA_WELFORD_METAL_BACKEND)
 
 _backend = DEFAULT_BACKEND
 _cuda_welford_kernel = None
+_cuda_welford_stats_kernel = None
 
 
 def configure_shape_flow_layernorm_backend(name: str) -> None:
@@ -94,6 +95,24 @@ def layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     return _cuda_welford_layernorm(x, eps)
 
 
+def cuda_welford_layernorm_with_stats(
+    x: mx.array, eps: float = 1e-6
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Run the authenticated Metal schedule and expose pre/post-rsqrt stats."""
+    if x.dtype != mx.bfloat16:
+        raise ValueError(
+            f"{CUDA_WELFORD_METAL_BACKEND} diagnostics require bfloat16 input, "
+            f"got {x.dtype}"
+        )
+    if not x.shape or x.shape[-1] != 1536:
+        width = x.shape[-1] if x.shape else None
+        raise ValueError(
+            f"{CUDA_WELFORD_METAL_BACKEND} diagnostics require hidden width "
+            f"1536, got {width}"
+        )
+    return _cuda_welford_layernorm_with_stats(x, eps)
+
+
 def _mlx_two_pass_layernorm(x: mx.array, eps: float) -> mx.array:
     if x.dtype in (mx.bfloat16, mx.float16):
         input_dtype = x.dtype
@@ -121,7 +140,35 @@ def _cuda_welford_layernorm(x: mx.array, eps: float) -> mx.array:
     )[0]
 
 
-def _build_cuda_welford_kernel():
+def _cuda_welford_layernorm_with_stats(
+    x: mx.array, eps: float
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    global _cuda_welford_stats_kernel
+    if _cuda_welford_stats_kernel is None:
+        _cuda_welford_stats_kernel = _build_cuda_welford_kernel(
+            include_stats=True
+        )
+
+    rows = x.size // 1536
+    eps_array = mx.array([eps], dtype=mx.float32)
+    stats_shape = (*x.shape[:-1], 1)
+    out, mean, variance, rstd = _cuda_welford_stats_kernel(
+        inputs=[x, eps_array],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape, stats_shape, stats_shape, stats_shape],
+        output_dtypes=[
+            mx.bfloat16,
+            mx.float32,
+            mx.float32,
+            mx.float32,
+        ],
+    )
+    return out, mean, variance, rstd
+
+
+def _build_cuda_welford_kernel(*, include_stats: bool = False):
     header = r"""
         struct WelfordDataLN {
             float mean;
@@ -221,6 +268,7 @@ def _build_cuda_welford_kernel():
 
         float mean = mean_sigma[0];
         float rstd = metal::precise::rsqrt(mean_sigma[1] + eps[0]);
+        __WRITE_STATS__
         for (uint vector_index = thread_index;
              vector_index < width / vector_width;
              vector_index += warp_width * warp_count) {
@@ -235,10 +283,24 @@ def _build_cuda_welford_kernel():
                 (static_cast<float>(inp[offset + 3]) - mean) * rstd);
         }
     """
+    stats_write = ""
+    output_names = ["out"]
+    kernel_name = "shape_flow_cuda_welford_layernorm_bf16_1536"
+    if include_stats:
+        stats_write = """
+        if (lane == 0 && warp == 0) {
+            mean_out[row] = mean;
+            variance_out[row] = mean_sigma[1];
+            rstd_out[row] = rstd;
+        }
+        """
+        output_names.extend(["mean_out", "variance_out", "rstd_out"])
+        kernel_name += "_with_stats"
+    source = source.replace("__WRITE_STATS__", stats_write)
     return mx.fast.metal_kernel(
-        name="shape_flow_cuda_welford_layernorm_bf16_1536",
+        name=kernel_name,
         input_names=["inp", "eps"],
-        output_names=["out"],
+        output_names=output_names,
         header=header,
         source=source,
     )
