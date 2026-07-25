@@ -137,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-keys")
+    parser.add_argument(
+        "--shape-flow-layernorm-backend",
+        choices=["mlx-two-pass", "cuda-welford-metal"],
+        default="mlx-two-pass",
+    )
     parser.add_argument("--shape-flow-noise-sample")
     parser.add_argument("--shape-flow-block-injection-trace")
     parser.add_argument("--shape-flow-block-injection-manifest")
@@ -276,6 +281,7 @@ def build_route_identity(args: argparse.Namespace, command: list[str]) -> dict[s
             "shape_flow_trace_keys": (
                 shape_flow_trace_requested_keys if shape_flow_trace_requested_keys else None
             ),
+            "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -434,26 +440,40 @@ def main(argv: list[str] | None = None) -> int:
         failure_phase = "generate_subprocess"
     elif not output_written:
         failure_phase = "missing_primary_output"
-    elif args.stop_after_stage == "shape_flow_block_trace":
+    elif args.stop_after_stage in {
+        "shape_flow_step",
+        "shape_flow_steps",
+        "shape_flow_block_trace",
+    }:
         try:
-            _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
-            _write_json(output_dir / "route_identity.json", route_identity)
-        except (OSError, ValueError) as exc:
-            status = "failed"
-            failure_phase = "bind_effective_route_identity"
-            route_binding_error = str(exc)
-    elif args.stop_after_stage == "shape_flow_steps":
-        try:
-            primary_output_validation = _validate_shape_flow_steps_checkpoint(
-                checkpoint_npz,
-                expected_steps=args.steps,
-                expected_route=route_identity["route"],
+            if args.stop_after_stage == "shape_flow_steps":
+                primary_output_validation = _validate_shape_flow_steps_checkpoint(
+                    checkpoint_npz,
+                    expected_steps=args.steps,
+                    expected_route=route_identity["route"],
+                )
+                route_identity["route"]["shape_flow_steps_output"] = primary_output_validation
+                effective_backend = primary_output_validation["sampler"][
+                    "shape_flow_layernorm_backend"
+                ]
+            else:
+                effective_backend = _bind_effective_shape_flow_layernorm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            if args.stop_after_stage == "shape_flow_block_trace":
+                _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
+            route_identity["route"]["shape_flow_layernorm_backend_effective"] = (
+                effective_backend
             )
-            route_identity["route"]["shape_flow_steps_output"] = primary_output_validation
             _write_json(output_dir / "route_identity.json", route_identity)
         except (OSError, ValueError) as exc:
             status = "failed"
-            failure_phase = "validate_primary_output"
+            failure_phase = (
+                "validate_primary_output"
+                if args.stop_after_stage == "shape_flow_steps"
+                else "bind_effective_route_identity"
+            )
             route_binding_error = str(exc)
 
     _write_json(
@@ -554,6 +574,37 @@ def _bind_effective_shape_flow_trace_keys(
     route["shape_flow_trace_keys"] = effective_keys
 
 
+def _bind_effective_shape_flow_layernorm_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("shape_flow_layernorm_backend_requested")
+    if requested not in {"mlx-two-pass", "cuda-welford-metal"}:
+        raise ValueError(
+            f"route identity has unsupported requested shape-flow LayerNorm backend {requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "shape_flow_layernorm_backend" not in checkpoint:
+            raise ValueError(
+                "shape-flow checkpoint omits effective LayerNorm backend metadata"
+            )
+        backend_array = np.asarray(checkpoint["shape_flow_layernorm_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape-flow effective LayerNorm backend must be a string scalar"
+            )
+        effective = str(backend_array.item())
+    if effective != requested:
+        raise ValueError(
+            f"shape-flow effective LayerNorm backend {effective!r} "
+            f"does not match requested {requested!r}"
+        )
+    return effective
+
+
 def _validate_shape_flow_steps_checkpoint(
     checkpoint_path: Path,
     *,
@@ -590,6 +641,7 @@ def _validate_shape_flow_steps_checkpoint(
         "rescale_t",
         "sigma_min",
         "shape_flow_block_injection_json",
+        "shape_flow_layernorm_backend",
     }
     stepped_tensor_names = (
         "sample_in",
@@ -769,6 +821,21 @@ def _validate_shape_flow_steps_checkpoint(
             injection_identity,
             expected_route=expected_route or {},
         )
+        backend_array = np.asarray(checkpoint["shape_flow_layernorm_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape_flow_steps shape_flow_layernorm_backend must be a string scalar"
+            )
+        effective_backend = str(backend_array.item())
+        requested_backend = (expected_route or {}).get(
+            "shape_flow_layernorm_backend_requested",
+            "mlx-two-pass",
+        )
+        if effective_backend != requested_backend:
+            raise ValueError(
+                f"shape_flow_steps effective LayerNorm backend {effective_backend!r} "
+                f"does not match requested {requested_backend!r}"
+            )
 
         schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
         rescale_t = sampler_scalars["rescale_t"]
@@ -807,6 +874,7 @@ def _validate_shape_flow_steps_checkpoint(
             "guidance_interval": [float(value) for value in guidance_interval],
             "shape_flow_block_injection_json": injection_json,
             "shape_flow_block_injection_route": injection_route,
+            "shape_flow_layernorm_backend": effective_backend,
         },
         "finite": True,
     }
@@ -1029,6 +1097,10 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         ])
         if args.shape_flow_trace_keys:
             command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
+    command.extend([
+        "--shape-flow-layernorm-backend",
+        args.shape_flow_layernorm_backend,
+    ])
     if args.shape_flow_noise_sample:
         command.extend([
             "--shape-flow-noise-sample",

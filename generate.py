@@ -21,6 +21,12 @@ import mlx.core as mx
 import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+from trellmlx.shape_flow_layernorm import (
+    DEFAULT_BACKEND as DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
+    SUPPORTED_BACKENDS as SHAPE_FLOW_LAYERNORM_BACKENDS,
+    configure_shape_flow_layernorm_backend,
+    get_shape_flow_layernorm_backend,
+)
 
 # SLat normalization from pipeline.json
 SHAPE_SLAT_MEAN = np.array([
@@ -703,6 +709,12 @@ def main():
     parser.add_argument("--shape-flow-trace-keys",
                         help="Diagnostic: comma-separated final shape-flow block-trace payload keys "
                              "to save. Omit to save the full block trace.")
+    parser.add_argument(
+        "--shape-flow-layernorm-backend",
+        choices=SHAPE_FLOW_LAYERNORM_BACKENDS,
+        default=DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
+        help="Shape SLat no-affine LayerNorm backend.",
+    )
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
@@ -794,6 +806,7 @@ def main():
         parser.error("--compile is not supported with shape-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
+    configure_shape_flow_layernorm_backend(args.shape_flow_layernorm_backend)
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1852,6 +1865,7 @@ def main():
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
         )
         print(
             f"  Stop after stage: shape_flow_block_trace step={shape_trace_step_index} "
@@ -1906,6 +1920,7 @@ def main():
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
         )
         print("  Stop after stage: shape_flow_step", flush=True)
         return
@@ -1957,6 +1972,7 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             sigma_min=np.array(1e-5, dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
         )
         print("  Stop after stage: shape_flow_steps", flush=True)
         return

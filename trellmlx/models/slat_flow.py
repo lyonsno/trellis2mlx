@@ -22,12 +22,12 @@ from .sparse_structure_flow import (
     MultiHeadAttention,
     FeedForward,
     ModulatedBlock,
-    _layernorm_noaffine,
     _infer_compute_dtype,
     _cast_block_linears,
     _source_shared_modulation,
     _injections_for_block,
 )
+from ..shape_flow_layernorm import layernorm_noaffine as _layernorm_noaffine
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
 from ..modules.rope import build_rope_phases, apply_rope
@@ -82,7 +82,13 @@ class SLatFlowModel(nn.Module):
 
         # Transformer blocks (same as SparseStructureFlowModel)
         self.blocks = [
-            ModulatedBlock(model_channels, num_heads, context_channels, mlp_hidden)
+            ModulatedBlock(
+                model_channels,
+                num_heads,
+                context_channels,
+                mlp_hidden,
+                shape_flow_layernorm=True,
+            )
             for _ in range(num_blocks)
         ]
         for block in self.blocks:

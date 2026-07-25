@@ -407,6 +407,37 @@ def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_steps"
 
 
+def test_stage_capture_forwards_and_records_shape_flow_layernorm_backend(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-metal",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    option = command.index("--shape-flow-layernorm-backend")
+    assert command[option + 1] == "cuda-welford-metal"
+    assert (
+        route_identity["route"]["shape_flow_layernorm_backend_requested"]
+        == "cuda-welford-metal"
+    )
+
+
 def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channels=4):
     import numpy as np
 
@@ -461,6 +492,7 @@ def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channel
         rescale_t=rescale_t,
         sigma_min=np.array(1e-5, dtype=np.float32),
         shape_flow_block_injection_json=np.array(""),
+        shape_flow_layernorm_backend=np.array("mlx-two-pass"),
     )
 
 
@@ -471,6 +503,58 @@ def _rewrite_npz_array(path, name, value):
         payload = {key: np.asarray(checkpoint[key]) for key in checkpoint.files}
     payload[name] = value
     np.savez(path, **payload)
+
+
+def test_shape_flow_steps_missing_effective_layernorm_backend_fails_loud(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as loaded:
+        payload = {
+            key: np.asarray(loaded[key])
+            for key in loaded.files
+            if key != "shape_flow_layernorm_backend"
+        }
+    np.savez(checkpoint, **payload)
+
+    with pytest.raises(ValueError, match="missing required arrays.*shape_flow_layernorm_backend"):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+            },
+        )
+
+
+def test_shape_flow_steps_layernorm_backend_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "shape_flow_steps effective LayerNorm backend 'mlx-two-pass' "
+            "does not match requested 'cuda-welford-metal'"
+        ),
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+            },
+        )
 
 
 def test_shape_flow_steps_partial_checkpoint_fails_loud(tmp_path, monkeypatch):

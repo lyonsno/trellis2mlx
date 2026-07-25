@@ -309,9 +309,12 @@ class ModulatedBlock(nn.Module):
         num_heads: int,
         context_channels: int,
         mlp_hidden: int,
+        *,
+        shape_flow_layernorm: bool = False,
     ):
         super().__init__()
         self.channels = channels
+        self.shape_flow_layernorm = shape_flow_layernorm
 
         # Self-attention (no separate norm — adaLN handles it)
         self.self_attn = MultiHeadAttention(channels, num_heads)
@@ -347,7 +350,7 @@ class ModulatedBlock(nn.Module):
         gate_mlp  = mod[5*C:6*C]
 
         # Self-attention with adaLN-Zero + RoPE
-        h = _layernorm_noaffine(x)
+        h = self._layernorm_noaffine(x)
         h = h * (1 + scale_msa) + shift_msa
         h = self.self_attn(h, rope_phases=rope_phases)
         h = h * gate_msa
@@ -362,7 +365,7 @@ class ModulatedBlock(nn.Module):
         x = x + h
 
         # FFN with adaLN-Zero
-        h = _layernorm_noaffine(x)
+        h = self._layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
@@ -399,7 +402,7 @@ class ModulatedBlock(nn.Module):
                 eps=1e-6,
             )
         else:
-            h = _layernorm_noaffine(x)
+            h = self._layernorm_noaffine(x)
         norm1_injection = _injection_at_stage(injection, "norm1")
         if norm1_injection is not None:
             h = _injected_tensor_like(norm1_injection, h, branch=branch)
@@ -452,7 +455,7 @@ class ModulatedBlock(nn.Module):
         if after_cross_injection is not None:
             x = _injected_tensor_like(after_cross_injection, x, branch=branch)
 
-        h = _layernorm_noaffine(x)
+        h = self._layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
@@ -500,7 +503,7 @@ class ModulatedBlock(nn.Module):
                 eps=1e-6,
             )
         else:
-            h = _layernorm_noaffine(x)
+            h = self._layernorm_noaffine(x)
         norm1_injection = _injection_at_stage(injection, "norm1")
         if norm1_injection is not None:
             h = _injected_tensor_like(norm1_injection, h, branch=branch)
@@ -558,7 +561,7 @@ class ModulatedBlock(nn.Module):
             x = _injected_tensor_like(after_cross_injection, x, branch=branch)
         trace[f"{trace_prefix}_after_cross"] = x
 
-        h = _layernorm_noaffine(x)
+        h = self._layernorm_noaffine(x)
         h = h * (1 + scale_mlp) + shift_mlp
         trace[f"{trace_prefix}_mlp_input"] = h
         h_fc1 = self.mlp.mlp_0(h)
@@ -577,6 +580,13 @@ class ModulatedBlock(nn.Module):
         trace[f"{trace_prefix}_after_mlp"] = x
 
         return x, trace
+
+    def _layernorm_noaffine(self, x: mx.array, eps: float = 1e-6) -> mx.array:
+        if self.shape_flow_layernorm:
+            from ..shape_flow_layernorm import layernorm_noaffine
+
+            return layernorm_noaffine(x, eps=eps)
+        return _layernorm_noaffine(x, eps=eps)
 
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
