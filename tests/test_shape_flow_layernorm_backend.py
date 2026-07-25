@@ -207,6 +207,51 @@ def test_default_shape_model_preserves_float32_final_layernorm_order(monkeypatch
     assert out.dtype == mx.float32
 
 
+def test_terminal_shape_trace_matches_public_cuda_welford_output(monkeypatch):
+    import trellmlx.models.slat_flow as slat_flow
+    import trellmlx.shape_flow_layernorm as shape_layernorm
+
+    shape_layernorm.configure_shape_flow_layernorm_backend(
+        shape_layernorm.CUDA_WELFORD_METAL_BACKEND
+    )
+    model = slat_flow.SLatFlowModel.for_shape(
+        in_channels=2,
+        out_channels=2,
+        model_channels=1536,
+        num_heads=12,
+        num_blocks=1,
+        mlp_hidden=4,
+        context_channels=4,
+    )
+    monkeypatch.setattr(slat_flow, "_infer_compute_dtype", lambda _model: mx.bfloat16)
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_shared_modulation",
+        lambda *_args, **_kwargs: mx.zeros((1, 6 * 1536), dtype=mx.bfloat16),
+    )
+    final_norm_dtypes = []
+    original_layernorm = shape_layernorm.layernorm_noaffine
+
+    def capture_layernorm(x, eps):
+        if eps == 1e-5:
+            final_norm_dtypes.append(x.dtype)
+        return original_layernorm(x, eps=eps)
+
+    monkeypatch.setattr(shape_layernorm, "layernorm_noaffine", capture_layernorm)
+    monkeypatch.setattr(slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm)
+    mx.random.seed(83)
+    x = mx.random.normal((1, 2), dtype=mx.float32)
+    t = mx.array([1000.0], dtype=mx.float32)
+    cond = mx.random.normal((1, 2, 4), dtype=mx.float32)
+
+    expected = model(x, t, cond)
+    trace = model.trace_block(x, t, cond, block_index=0)
+    mx.eval(expected, trace["final_output"])
+
+    assert final_norm_dtypes == [mx.bfloat16, mx.bfloat16]
+    assert mx.array_equal(trace["final_output"], expected).item()
+
+
 def test_slat_flow_role_constructors_isolate_shape_backend_from_texture():
     from trellmlx.models.slat_flow import SLatFlowModel
 

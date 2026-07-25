@@ -195,6 +195,16 @@ class SLatFlowModel(nn.Module):
                 if (i + 1) % 6 == 0:
                     mx.eval(x)
 
+        _, x = self._final_projection(x, input_dtype)
+        return x
+
+    def _final_projection(
+        self,
+        x: mx.array,
+        input_dtype,
+    ) -> tuple[mx.array, mx.array]:
+        """Return the normalized final state and projected sampler output."""
+
         # The CUDA-Welford experiment is authenticated only for the internal
         # BF16 shape-flow width. Restore the sampler dtype after normalization.
         if (
@@ -211,9 +221,7 @@ class SLatFlowModel(nn.Module):
                 else _layernorm_noaffine
             )
             x = layernorm(x, eps=1e-5)
-        x = self.out_layer(x)  # [N, out_channels]
-
-        return x
+        return x, self.out_layer(x)
 
     def _run_blocks_impl(self, x, mod, cond, rope_phases):
         """Pure forward pass through all blocks (no mx.eval)."""
@@ -292,12 +300,13 @@ class SLatFlowModel(nn.Module):
                 trace.update(block_trace)
                 if i == len(self.blocks) - 1:
                     trace["final_input"] = x_after
-                    x_final = x_after.astype(input_dtype)
-                    x_final = _layernorm_noaffine(x_final, eps=1e-5)
-                    trace["final_norm"] = x_final
-                    x_final = self.out_layer(x_final)
-                    trace["final_out_flat"] = x_final
-                    trace["final_output"] = x_final
+                    final_norm, final_output = self._final_projection(
+                        x_after,
+                        input_dtype,
+                    )
+                    trace["final_norm"] = final_norm
+                    trace["final_out_flat"] = final_output
+                    trace["final_output"] = final_output
                 break
             block_injection = None
             if shape_block_injection is not None:
