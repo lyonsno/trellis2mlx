@@ -523,7 +523,34 @@ def main(argv: list[str] | None = None) -> int:
     (output_dir / "stderr.log").write_text(result.stderr)
 
     output_written = checkpoint_npz.exists() or checkpoint_json.exists()
-    status = "done" if result.returncode == 0 and output_written else "failed"
+    repo_identity_postflight = None
+    repo_identity_postflight_error = None
+    postflight_repo_invalid = False
+    if result.returncode == 0:
+        try:
+            repo_identity_postflight = _read_repo_identity(args.expected_repo_commit)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            repo_identity_postflight_error = str(exc)
+            postflight_repo_invalid = bool(args.expected_repo_commit)
+        else:
+            postflight_repo_invalid = bool(
+                args.expected_repo_commit
+                and (
+                    repo_identity_postflight["commit_effective"]
+                    != args.expected_repo_commit
+                    or repo_identity_postflight["dirty"]
+                )
+            )
+        route_identity["route"]["repo_identity_postflight"] = repo_identity_postflight
+        route_identity["route"]["repo_identity_postflight_error"] = (
+            repo_identity_postflight_error
+        )
+
+    status = (
+        "done"
+        if result.returncode == 0 and output_written and not postflight_repo_invalid
+        else "failed"
+    )
     failure_phase = None
     route_binding_error = None
     primary_output_validation = None
@@ -531,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
         failure_phase = "generate_subprocess"
     elif not output_written:
         failure_phase = "missing_primary_output"
+    elif postflight_repo_invalid:
+        failure_phase = "postflight_repo_identity"
     elif args.stop_after_stage in {
         "shape_flow_step",
         "shape_flow_steps",
@@ -567,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             route_binding_error = str(exc)
 
+    _write_json(output_dir / "route_identity.json", route_identity)
     _write_json(
         output_dir / "run_report.json",
         {
@@ -582,12 +612,19 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "primary_output_status": (
                 "invalid"
-                if failure_phase == "validate_primary_output"
+                if failure_phase
+                in {
+                    "validate_primary_output",
+                    "postflight_repo_identity",
+                }
                 else "written"
                 if output_written
                 else "missing"
             ),
             "primary_output_validation": primary_output_validation,
+            "repo_identity_preflight": repo_identity,
+            "repo_identity_postflight": repo_identity_postflight,
+            "repo_identity_postflight_error": repo_identity_postflight_error,
             "failure_phase": failure_phase,
             "error": route_binding_error,
             "exit_code": result.returncode,

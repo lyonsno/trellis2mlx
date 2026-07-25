@@ -318,6 +318,72 @@ def test_stage_capture_rejects_dirty_expected_repo_before_generate(
     }
 
 
+def test_stage_capture_rejects_repo_mutation_during_successful_generate(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    expected_commit = "f" * 40
+    clean = {
+        "commit_requested": expected_commit,
+        "commit_effective": expected_commit,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    dirty = {
+        "commit_requested": expected_commit,
+        "commit_effective": expected_commit,
+        "dirty": True,
+        "status_porcelain": " M generate.py\n",
+    }
+    identities = iter((clean, dirty))
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda _requested: next(identities),
+    )
+
+    def successful_generate(command, **_kwargs):
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(checkpoint_dir / "conditioning.npz", cond=np.zeros((1, 1)))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        successful_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "conditioning",
+            "--expected-repo-commit",
+            expected_commit,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "postflight_repo_identity"
+    assert report["primary_output_status"] == "invalid"
+    assert report["repo_identity_preflight"] == clean
+    assert report["repo_identity_postflight"] == dirty
+
+
 def test_stage_capture_rejects_missing_manifest_before_generate_and_reports(
     tmp_path, monkeypatch
 ):
