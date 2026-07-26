@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,10 +23,12 @@ import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
 from trellmlx.shape_flow_layernorm import (
+    CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
     SUPPORTED_BACKENDS as SHAPE_FLOW_LAYERNORM_BACKENDS,
     configure_shape_flow_layernorm_backend,
     get_shape_flow_layernorm_backend,
+    get_shape_flow_turing_rsqrt_lut_sha256,
 )
 
 # SLat normalization from pipeline.json
@@ -558,6 +561,31 @@ def _cleanup_and_simplify_mesh(
     return vertices, faces
 
 
+def _load_turing_rsqrt_lut(
+    path: str | Path,
+    expected_sha256: str,
+) -> tuple[mx.array, str]:
+    path = Path(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError(
+            "Turing rsqrt LUT SHA256 mismatch: "
+            f"expected {expected_sha256}, got {digest}"
+        )
+    with np.load(path, allow_pickle=False) as loaded:
+        if "normalized_delta" not in loaded.files:
+            raise ValueError(
+                "Turing rsqrt LUT NPZ omits normalized_delta"
+            )
+        correction = np.asarray(loaded["normalized_delta"])
+    if correction.dtype != np.int8 or correction.shape != (1 << 24,):
+        raise ValueError(
+            "Turing rsqrt LUT normalized_delta must be int8[16777216], "
+            f"got {correction.dtype}{correction.shape}"
+        )
+    return mx.array(correction), digest
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -715,6 +743,20 @@ def main():
         default=DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
         help="Shape SLat no-affine LayerNorm backend.",
     )
+    parser.add_argument(
+        "--turing-rsqrt-lut",
+        metavar="NPZ",
+        help=(
+            "Required with cuda-welford-turing-t4: NPZ containing the "
+            "normalized T4 MUFU.RSQ signed-ULP LUT."
+        ),
+    )
+    parser.add_argument(
+        "--expected-turing-rsqrt-lut-sha256",
+        help=(
+            "Require the Turing rsqrt LUT NPZ to match this exact SHA256."
+        ),
+    )
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
@@ -806,7 +848,41 @@ def main():
         parser.error("--compile is not supported with shape-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
-    configure_shape_flow_layernorm_backend(args.shape_flow_layernorm_backend)
+    if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
+        if (
+            not args.turing_rsqrt_lut
+            or not args.expected_turing_rsqrt_lut_sha256
+        ):
+            parser.error(
+                f"--shape-flow-layernorm-backend "
+                f"{CUDA_WELFORD_TURING_T4_BACKEND} requires "
+                "--turing-rsqrt-lut and "
+                "--expected-turing-rsqrt-lut-sha256"
+            )
+        try:
+            turing_lut, turing_lut_sha256 = _load_turing_rsqrt_lut(
+                args.turing_rsqrt_lut,
+                args.expected_turing_rsqrt_lut_sha256,
+            )
+            configure_shape_flow_layernorm_backend(
+                args.shape_flow_layernorm_backend,
+                turing_rsqrt_delta_lut=turing_lut,
+                turing_rsqrt_lut_sha256=turing_lut_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    else:
+        if (
+            args.turing_rsqrt_lut
+            or args.expected_turing_rsqrt_lut_sha256
+        ):
+            parser.error(
+                "--turing-rsqrt-lut and its expected SHA256 only apply to "
+                f"{CUDA_WELFORD_TURING_T4_BACKEND}"
+            )
+        configure_shape_flow_layernorm_backend(
+            args.shape_flow_layernorm_backend
+        )
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1866,6 +1942,9 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            shape_flow_turing_rsqrt_lut_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
         )
         print(
             f"  Stop after stage: shape_flow_block_trace step={shape_trace_step_index} "
@@ -1921,6 +2000,9 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            shape_flow_turing_rsqrt_lut_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
         )
         print("  Stop after stage: shape_flow_step", flush=True)
         return
@@ -1973,6 +2055,9 @@ def main():
             sigma_min=np.array(1e-5, dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            shape_flow_turing_rsqrt_lut_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
         )
         print("  Stop after stage: shape_flow_steps", flush=True)
         return

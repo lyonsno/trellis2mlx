@@ -17,6 +17,7 @@ import numpy as np
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TURING_T4_BACKEND = "cuda-welford-turing-t4"
 STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
     "standard": 350_000,
     "source-quality": 500_000,
@@ -34,6 +35,7 @@ INPUT_PATH_FIELDS = (
     "sparse_flow_block_injection_manifest",
     "sparse_flow_layernorm_correction_report",
     "shape_flow_noise_sample",
+    "turing_rsqrt_lut",
     "shape_flow_block_injection_trace",
     "shape_flow_block_injection_manifest",
 )
@@ -146,9 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-keys")
     parser.add_argument(
         "--shape-flow-layernorm-backend",
-        choices=["mlx-two-pass", "cuda-welford-metal"],
+        choices=[
+            "mlx-two-pass",
+            "cuda-welford-metal",
+            TURING_T4_BACKEND,
+        ],
         default="mlx-two-pass",
     )
+    parser.add_argument("--turing-rsqrt-lut")
+    parser.add_argument("--expected-turing-rsqrt-lut-sha256")
     parser.add_argument("--shape-flow-noise-sample")
     parser.add_argument("--shape-flow-block-injection-trace")
     parser.add_argument("--shape-flow-block-injection-manifest")
@@ -220,6 +228,7 @@ def build_route_identity(
     output_dir = str(Path(args.output_dir))
     target_faces = _resolve_target_faces(args)
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
+    turing_lut_identity = _validate_turing_rsqrt_route_args(args)
     if repo_identity is None:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
     return {
@@ -333,6 +342,13 @@ def build_route_identity(
                 shape_flow_trace_requested_keys if shape_flow_trace_requested_keys else None
             ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
+            "turing_rsqrt_lut_path": turing_lut_identity["path"],
+            "turing_rsqrt_lut_sha256_requested": turing_lut_identity[
+                "sha256_requested"
+            ],
+            "turing_rsqrt_lut_sha256_effective": turing_lut_identity[
+                "sha256_effective"
+            ],
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -450,6 +466,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     requested_inputs, invalid_inputs = _preflight_input_paths(args)
+    turing_lut_identity = _describe_turing_rsqrt_route_args(args)
+    try:
+        _validate_turing_rsqrt_route_args(args)
+    except (OSError, ValueError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_turing_rsqrt_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "turing_rsqrt_lut_identity": turing_lut_identity,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     if invalid_inputs:
         _write_json(
             output_dir / "run_report.json",
@@ -709,7 +746,11 @@ def _bind_effective_shape_flow_layernorm_backend(
     if not isinstance(route, dict):
         raise ValueError("route identity has no route object")
     requested = route.get("shape_flow_layernorm_backend_requested")
-    if requested not in {"mlx-two-pass", "cuda-welford-metal"}:
+    if requested not in {
+        "mlx-two-pass",
+        "cuda-welford-metal",
+        TURING_T4_BACKEND,
+    }:
         raise ValueError(
             f"route identity has unsupported requested shape-flow LayerNorm backend {requested!r}"
         )
@@ -724,12 +765,70 @@ def _bind_effective_shape_flow_layernorm_backend(
                 "shape-flow effective LayerNorm backend must be a string scalar"
             )
         effective = str(backend_array.item())
+        effective_turing_lut_sha256 = _checkpoint_turing_lut_sha256(
+            checkpoint,
+            backend=effective,
+            expected_route=route,
+            context="shape-flow checkpoint",
+        )
     if effective != requested:
         raise ValueError(
             f"shape-flow effective LayerNorm backend {effective!r} "
             f"does not match requested {requested!r}"
         )
+    if requested == TURING_T4_BACKEND:
+        route["shape_flow_turing_rsqrt_lut_sha256_effective"] = (
+            effective_turing_lut_sha256
+        )
     return effective
+
+
+def _checkpoint_turing_lut_sha256(
+    checkpoint: Any,
+    *,
+    backend: str,
+    expected_route: dict[str, Any],
+    context: str,
+) -> str | None:
+    key = "shape_flow_turing_rsqrt_lut_sha256"
+    if backend == TURING_T4_BACKEND:
+        if key not in checkpoint:
+            raise ValueError(
+                f"{context} omits effective Turing rsqrt LUT SHA256"
+            )
+        value = np.asarray(checkpoint[key])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                f"{context} effective Turing rsqrt LUT SHA256 "
+                "must be a string scalar"
+            )
+        effective = str(value.item())
+        expected = expected_route.get(
+            "turing_rsqrt_lut_sha256_effective"
+        )
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or effective != expected
+        ):
+            raise ValueError(
+                f"{context} effective Turing rsqrt LUT SHA256 "
+                f"{effective!r} does not match requested/effective route "
+                f"{expected!r}"
+            )
+        return effective
+    if key in checkpoint:
+        value = np.asarray(checkpoint[key])
+        if (
+            value.shape != ()
+            or value.dtype.kind not in {"U", "S"}
+            or str(value.item())
+        ):
+            raise ValueError(
+                f"{context} carries Turing rsqrt LUT identity under "
+                f"non-Turing backend {backend!r}"
+            )
+    return None
 
 
 def _validate_shape_flow_steps_checkpoint(
@@ -963,6 +1062,12 @@ def _validate_shape_flow_steps_checkpoint(
                 f"shape_flow_steps effective LayerNorm backend {effective_backend!r} "
                 f"does not match requested {requested_backend!r}"
             )
+        effective_turing_lut_sha256 = _checkpoint_turing_lut_sha256(
+            checkpoint,
+            backend=effective_backend,
+            expected_route=expected_route or {},
+            context="shape_flow_steps",
+        )
 
         schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
         rescale_t = sampler_scalars["rescale_t"]
@@ -1002,6 +1107,9 @@ def _validate_shape_flow_steps_checkpoint(
             "shape_flow_block_injection_json": injection_json,
             "shape_flow_block_injection_route": injection_route,
             "shape_flow_layernorm_backend": effective_backend,
+            "shape_flow_turing_rsqrt_lut_sha256": (
+                effective_turing_lut_sha256
+            ),
         },
         "finite": True,
     }
@@ -1228,6 +1336,20 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         "--shape-flow-layernorm-backend",
         args.shape_flow_layernorm_backend,
     ])
+    if args.turing_rsqrt_lut:
+        command.extend(
+            [
+                "--turing-rsqrt-lut",
+                str(Path(args.turing_rsqrt_lut)),
+            ]
+        )
+    if args.expected_turing_rsqrt_lut_sha256:
+        command.extend(
+            [
+                "--expected-turing-rsqrt-lut-sha256",
+                args.expected_turing_rsqrt_lut_sha256,
+            ]
+        )
     if args.shape_flow_noise_sample:
         command.extend([
             "--shape-flow-noise-sample",
@@ -1259,6 +1381,79 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             str(Path(args.shape_flow_block_injection_manifest)),
         ])
     return command
+
+
+def _validate_turing_rsqrt_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    path = getattr(args, "turing_rsqrt_lut", None)
+    expected = getattr(
+        args, "expected_turing_rsqrt_lut_sha256", None
+    )
+    if args.shape_flow_layernorm_backend == TURING_T4_BACKEND:
+        if not path or not expected:
+            raise ValueError(
+                f"{TURING_T4_BACKEND} requires --turing-rsqrt-lut and "
+                "--expected-turing-rsqrt-lut-sha256"
+            )
+        effective = _sha256_file(path)
+        if effective != expected:
+            raise ValueError(
+                "Turing rsqrt LUT SHA256 mismatch: "
+                f"expected {expected}, got {effective}"
+            )
+        _validate_turing_rsqrt_lut_payload(Path(path))
+        return {
+            "path": str(Path(path)),
+            "sha256_requested": expected,
+            "sha256_effective": effective,
+        }
+    if path or expected:
+        raise ValueError(
+            "Turing rsqrt LUT arguments only apply to "
+            f"{TURING_T4_BACKEND}"
+        )
+    return {
+        "path": None,
+        "sha256_requested": None,
+        "sha256_effective": None,
+    }
+
+
+def _describe_turing_rsqrt_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    raw_path = getattr(args, "turing_rsqrt_lut", None)
+    path = Path(raw_path) if raw_path else None
+    effective = None
+    read_error = None
+    if path is not None and path.is_file():
+        try:
+            effective = _sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    identity = {
+        "path": str(path) if path is not None else None,
+        "sha256_requested": getattr(
+            args, "expected_turing_rsqrt_lut_sha256", None
+        ),
+        "sha256_effective": effective,
+    }
+    if read_error is not None:
+        identity["read_error"] = read_error
+    return identity
+
+
+def _validate_turing_rsqrt_lut_payload(path: Path) -> None:
+    with np.load(path, allow_pickle=False) as loaded:
+        if "normalized_delta" not in loaded.files:
+            raise ValueError("Turing rsqrt LUT NPZ omits normalized_delta")
+        correction = np.asarray(loaded["normalized_delta"])
+    if correction.dtype != np.int8 or correction.shape != (1 << 24,):
+        raise ValueError(
+            "Turing rsqrt LUT normalized_delta must be int8[16777216], "
+            f"got {correction.dtype}{correction.shape}"
+        )
 
 
 def _resolve_target_faces(args: argparse.Namespace) -> int:

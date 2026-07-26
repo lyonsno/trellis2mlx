@@ -863,6 +863,314 @@ def test_stage_capture_forwards_and_records_shape_flow_layernorm_backend(tmp_pat
     )
 
 
+def test_stage_capture_forwards_and_records_turing_rsqrt_lut(tmp_path):
+    import hashlib
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            digest,
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--turing-rsqrt-lut") + 1] == str(lut)
+    assert (
+        command[
+            command.index("--expected-turing-rsqrt-lut-sha256") + 1
+        ]
+        == digest
+    )
+    assert (
+        route_identity["route"]["turing_rsqrt_lut_sha256_effective"]
+        == digest
+    )
+    assert (
+        route_identity["route"]["turing_rsqrt_lut_sha256_requested"]
+        == digest
+    )
+
+
+def test_stage_capture_rejects_turing_rsqrt_lut_hash_mismatch(tmp_path):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_turing_rsqrt_route_args,
+        build_parser,
+    )
+
+    lut = tmp_path / "turing-rsqrt.npz"
+    lut.write_bytes(b"substituted-lut")
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            "a" * 64,
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Turing rsqrt LUT SHA256 mismatch"):
+        _validate_turing_rsqrt_route_args(args)
+
+
+def test_stage_capture_reports_turing_lut_substitution_before_generate(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    lut = tmp_path / "turing-rsqrt.npz"
+    lut.write_bytes(b"substituted-lut")
+    effective_digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda requested: {
+            "commit_requested": requested,
+            "commit_effective": "a" * 40,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+
+    def unexpected_generate(*_args, **_kwargs):
+        raise AssertionError("generation must not start with a substituted LUT")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            "a" * 64,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_turing_rsqrt_route"
+    assert report["last_trustworthy_phase"] == "requested_route_parsed"
+    assert report["primary_output_status"] == "not_started"
+    assert report["turing_rsqrt_lut_identity"] == {
+        "path": str(lut),
+        "sha256_requested": "a" * 64,
+        "sha256_effective": effective_digest,
+    }
+    assert report["requested_inputs"]["turing_rsqrt_lut"] == str(lut)
+    assert "Turing rsqrt LUT SHA256 mismatch" in report["error"]
+    assert not (output_dir / "route_identity.json").exists()
+    assert not (output_dir / "stdout.log").exists()
+
+
+def test_stage_capture_reports_unreadable_turing_lut_before_generate(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from scripts import run_mlx_stage_capture as capture
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    lut = tmp_path / "turing-rsqrt.npz"
+    lut.write_bytes(b"unreadable-lut")
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(
+        capture,
+        "_read_repo_identity",
+        lambda requested: {
+            "commit_requested": requested,
+            "commit_effective": "a" * 40,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+    original_sha256_file = capture._sha256_file
+
+    def unreadable_lut(path):
+        if Path(path) == lut:
+            raise PermissionError(f"permission denied: {lut}")
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(capture, "_sha256_file", unreadable_lut)
+
+    def unexpected_generate(*_args, **_kwargs):
+        raise AssertionError("generation must not start with an unreadable LUT")
+
+    monkeypatch.setattr(capture.subprocess, "run", unexpected_generate)
+
+    result = capture.main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            "a" * 64,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["failure_phase"] == "preflight_turing_rsqrt_route"
+    assert report["primary_output_status"] == "not_started"
+    assert report["turing_rsqrt_lut_identity"]["path"] == str(lut)
+    assert report["turing_rsqrt_lut_identity"]["sha256_effective"] is None
+    assert "permission denied" in report["error"]
+    assert not (output_dir / "route_identity.json").exists()
+    assert not (output_dir / "stdout.log").exists()
+
+
+def test_stage_capture_rejects_hash_matched_malformed_turing_lut_before_generate(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts import run_mlx_stage_capture as capture
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez(lut, wrong_key=np.zeros((16,), dtype=np.int8))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(
+        capture,
+        "_read_repo_identity",
+        lambda requested: {
+            "commit_requested": requested,
+            "commit_effective": "a" * 40,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+
+    def unexpected_generate(*_args, **_kwargs):
+        raise AssertionError("generation must not start with a malformed LUT")
+
+    monkeypatch.setattr(capture.subprocess, "run", unexpected_generate)
+
+    result = capture.main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            digest,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["failure_phase"] == "preflight_turing_rsqrt_route"
+    assert report["primary_output_status"] == "not_started"
+    assert report["turing_rsqrt_lut_identity"] == {
+        "path": str(lut),
+        "sha256_requested": digest,
+        "sha256_effective": digest,
+    }
+    assert "omits normalized_delta" in report["error"]
+    assert not (output_dir / "route_identity.json").exists()
+    assert not (output_dir / "stdout.log").exists()
+
+
+def test_generate_turing_rsqrt_lut_loader_rejects_substitution(tmp_path):
+    import generate
+    import pytest
+
+    lut = tmp_path / "turing-rsqrt.npz"
+    lut.write_bytes(b"substituted-lut")
+
+    with pytest.raises(ValueError, match="Turing rsqrt LUT SHA256 mismatch"):
+        generate._load_turing_rsqrt_lut(lut, "a" * 64)
+
+
+def test_generate_turing_rsqrt_lut_loader_rejects_malformed_payload(tmp_path):
+    import hashlib
+
+    import generate
+    import numpy as np
+    import pytest
+
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez(lut, wrong_key=np.zeros((16,), dtype=np.int8))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="omits normalized_delta"):
+        generate._load_turing_rsqrt_lut(lut, digest)
+
+    np.savez(lut, normalized_delta=np.zeros((16,), dtype=np.int8))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match=r"must be int8\[16777216\]"):
+        generate._load_turing_rsqrt_lut(lut, digest)
+
+
 def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channels=4):
     import numpy as np
 
@@ -978,6 +1286,71 @@ def test_shape_flow_steps_layernorm_backend_fallback_cannot_impersonate_requeste
             expected_steps=3,
             expected_route={
                 "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+            },
+        )
+
+
+def test_shape_flow_steps_turing_backend_requires_effective_lut_hash(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_shape_flow_steps_checkpoint,
+    )
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_layernorm_backend",
+        np.array("cuda-welford-turing-t4"),
+    )
+
+    with pytest.raises(
+        ValueError, match="omits effective Turing rsqrt LUT SHA256"
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": (
+                    "cuda-welford-turing-t4"
+                ),
+                "turing_rsqrt_lut_sha256_effective": "a" * 64,
+            },
+        )
+
+
+def test_shape_flow_steps_turing_backend_rejects_lut_hash_mismatch(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_shape_flow_steps_checkpoint,
+    )
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_layernorm_backend",
+        np.array("cuda-welford-turing-t4"),
+    )
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_turing_rsqrt_lut_sha256",
+        np.array("b" * 64),
+    )
+
+    with pytest.raises(ValueError, match="effective Turing rsqrt LUT SHA256"):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": (
+                    "cuda-welford-turing-t4"
+                ),
+                "turing_rsqrt_lut_sha256_effective": "a" * 64,
             },
         )
 

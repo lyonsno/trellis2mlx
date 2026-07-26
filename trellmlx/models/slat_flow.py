@@ -30,6 +30,7 @@ from .sparse_structure_flow import (
 )
 from ..shape_flow_layernorm import (
     CUDA_WELFORD_METAL_BACKEND,
+    CUDA_WELFORD_TURING_T4_BACKEND,
     get_shape_flow_layernorm_backend,
     layernorm_noaffine as _shape_flow_layernorm_noaffine,
 )
@@ -209,7 +210,11 @@ class SLatFlowModel(nn.Module):
         # BF16 shape-flow width. Restore the sampler dtype after normalization.
         if (
             self.shape_flow_layernorm
-            and get_shape_flow_layernorm_backend() == CUDA_WELFORD_METAL_BACKEND
+            and get_shape_flow_layernorm_backend()
+            in {
+                CUDA_WELFORD_METAL_BACKEND,
+                CUDA_WELFORD_TURING_T4_BACKEND,
+            }
         ):
             x = _shape_flow_layernorm_noaffine(x, eps=1e-5)
             x = x.astype(input_dtype)

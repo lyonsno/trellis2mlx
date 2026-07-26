@@ -125,6 +125,115 @@ def test_cuda_welford_diagnostics_expose_stats_that_reconstruct_output():
     assert mx.array_equal(out, reconstructed).item()
 
 
+@pytest.mark.parametrize(
+    ("shape", "dtype", "message"),
+    [
+        ((16,), mx.int8, "requires 16777216 entries"),
+        ((1 << 24,), mx.int32, "requires int8"),
+    ],
+)
+def test_turing_rsqrt_welford_diagnostic_rejects_invalid_lut(
+    shape, dtype, message
+):
+    from trellmlx.shape_flow_layernorm import (
+        cuda_welford_turing_layernorm_with_stats,
+    )
+
+    x = mx.zeros((1, 1536), dtype=mx.bfloat16)
+    correction = mx.zeros(shape, dtype=dtype)
+
+    with pytest.raises(ValueError, match=message):
+        cuda_welford_turing_layernorm_with_stats(x, correction)
+
+
+def test_turing_rsqrt_welford_diagnostic_applies_normalized_ulp_lut():
+    from trellmlx.shape_flow_layernorm import (
+        cuda_welford_layernorm_with_stats,
+        cuda_welford_turing_layernorm_with_stats,
+    )
+
+    values = np.stack(
+        [
+            np.linspace(-3.0, 5.0, 1536, dtype=np.float32),
+            np.linspace(-1.0, 9.0, 1536, dtype=np.float32),
+        ]
+    )
+    x = mx.array(values).astype(mx.bfloat16)
+    _, _, variance, precise_rstd = cuda_welford_layernorm_with_stats(
+        x, eps=1e-5
+    )
+    mx.eval(variance, precise_rstd)
+    variance_np = np.asarray(variance).reshape(-1)
+    rstd_np = np.asarray(precise_rstd).reshape(-1)
+    bits = (variance_np + np.float32(1e-5)).view(np.uint32)
+    exponent_parity = ((((bits >> 23) & 0xFF) - 127) & 1).astype(
+        np.uint32
+    )
+    coordinates = (
+        (bits & np.uint32(0x7FFFFF))
+        | (exponent_parity << np.uint32(23))
+    )
+    assert coordinates[0] != coordinates[1]
+    lut_np = np.zeros((1 << 24,), dtype=np.int8)
+    lut_np[coordinates[0]] = 1
+    lut_np[coordinates[1]] = -1
+    lut = mx.array(lut_np)
+
+    out, mean, corrected_variance, corrected_rstd = (
+        cuda_welford_turing_layernorm_with_stats(x, lut, eps=1e-5)
+    )
+    reconstructed = (
+        (x.astype(mx.float32) - mean) * corrected_rstd
+    ).astype(mx.bfloat16)
+    mx.eval(out, corrected_variance, corrected_rstd, reconstructed)
+
+    expected_bits = rstd_np.view(np.uint32).astype(np.int64)
+    expected_bits += np.asarray([1, -1], dtype=np.int64)
+    expected_rstd = expected_bits.astype(np.uint32).view(np.float32)
+    assert np.array_equal(
+        np.asarray(corrected_variance).reshape(-1), variance_np
+    )
+    assert np.array_equal(
+        np.asarray(corrected_rstd).reshape(-1), expected_rstd
+    )
+    assert mx.array_equal(out, reconstructed).item()
+
+
+def test_turing_backend_requires_explicit_lut_and_hash():
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    with pytest.raises(ValueError, match="requires an explicit correction LUT"):
+        configure_shape_flow_layernorm_backend(
+            CUDA_WELFORD_TURING_T4_BACKEND
+        )
+
+
+def test_turing_backend_identity_records_architecture_and_lut_hash():
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        configure_shape_flow_layernorm_backend,
+        shape_flow_layernorm_backend_identity,
+    )
+
+    correction = mx.zeros((1 << 24,), dtype=mx.int8)
+    configure_shape_flow_layernorm_backend(
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=correction,
+        turing_rsqrt_lut_sha256="a" * 64,
+    )
+
+    identity = shape_flow_layernorm_backend_identity()
+
+    assert identity["backend"] == CUDA_WELFORD_TURING_T4_BACKEND
+    assert identity["cuda_rsqrt_bit_exact"] is True
+    assert identity["cuda_architecture"] == "sm_75"
+    assert identity["rsqrt"] == "Turing MUFU.RSQ normalized signed-ULP LUT"
+    assert identity["turing_rsqrt_lut_sha256"] == "a" * 64
+
+
 def test_cuda_welford_backend_identity_names_residual_instead_of_claiming_cuda_exactness():
     from trellmlx.shape_flow_layernorm import (
         CUDA_WELFORD_METAL_BACKEND,
@@ -189,6 +298,62 @@ def test_cuda_welford_shape_model_normalizes_bfloat16_and_returns_sampler_dtype(
     x = mx.zeros((1, 2), dtype=mx.float32)
     out = model(
         x,
+        mx.zeros((1,), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+    )
+    mx.eval(out)
+
+    assert seen_dtypes == [mx.bfloat16]
+    assert out.dtype == mx.float32
+
+
+def test_turing_shape_model_consumes_configured_lut_and_returns_sampler_dtype(
+    monkeypatch,
+):
+    import trellmlx.models.slat_flow as slat_flow
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    correction = mx.zeros((1 << 24,), dtype=mx.int8)
+    configure_shape_flow_layernorm_backend(
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=correction,
+        turing_rsqrt_lut_sha256="a" * 64,
+    )
+    model = slat_flow.SLatFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=1536,
+        num_heads=12,
+        num_blocks=0,
+        mlp_hidden=4,
+        context_channels=4,
+        shape_flow_layernorm=True,
+    )
+    monkeypatch.setattr(
+        slat_flow, "_infer_compute_dtype", lambda _model: mx.bfloat16
+    )
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_shared_modulation",
+        lambda *_args, **_kwargs: mx.zeros(
+            (1, 6 * 1536), dtype=mx.bfloat16
+        ),
+    )
+    seen_dtypes = []
+    original_layernorm = slat_flow._shape_flow_layernorm_noaffine
+
+    def capture_layernorm(x, eps):
+        seen_dtypes.append(x.dtype)
+        return original_layernorm(x, eps=eps)
+
+    monkeypatch.setattr(
+        slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm
+    )
+    out = model(
+        mx.zeros((1, 2), dtype=mx.float32),
         mx.zeros((1,), dtype=mx.float32),
         mx.zeros((1, 1, 4), dtype=mx.float32),
     )
