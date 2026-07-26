@@ -1,0 +1,118 @@
+import json
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+
+def test_rope_witness_authenticates_phase_grid_and_boundary_cases():
+    from scripts.cuda_rope_semantics_witness import analyze_cuda_results
+
+    phase = np.asarray(
+        [
+            [[1.0, 0.0], [0.5, 0.25]],
+            [[1.0, 0.0], [-0.5, 0.75]],
+        ],
+        dtype=np.float32,
+    )
+    expected = np.asarray(
+        [[[1.0, 2.0], [3.0, 4.0]], [[-1.0, 0.5], [0.25, -0.75]]],
+        dtype=np.float32,
+    )
+
+    report = analyze_cuda_results(
+        phase_pairs=phase,
+        case_output=expected.copy(),
+        expected_case_output=expected,
+        coordinate_count=2,
+        frequency_count=2,
+    )
+
+    assert report["phase_pairs"] == {
+        "shape": [2, 2, 2],
+        "dtype": "float32",
+        "finite": True,
+    }
+    assert report["case_self_authentication"]["nonzero"] == 0
+
+
+def test_rope_witness_rejects_case_output_that_does_not_replay_source():
+    from scripts.cuda_rope_semantics_witness import analyze_cuda_results
+
+    expected = np.zeros((1, 2), dtype=np.float32)
+    actual = expected.copy()
+    actual[0, 0] = np.nextafter(
+        np.float32(0.0), np.float32(np.inf), dtype=np.float32
+    )
+
+    with pytest.raises(
+        ValueError, match="CUDA RoPE cases do not reproduce source outputs"
+    ):
+        analyze_cuda_results(
+            phase_pairs=np.zeros((2, 2, 2), dtype=np.float32),
+            case_output=actual,
+            expected_case_output=expected,
+            coordinate_count=2,
+            frequency_count=2,
+        )
+
+
+@pytest.mark.parametrize("digest", [None, "", "A" * 64, "a" * 63])
+def test_rope_witness_requires_canonical_requested_digest(digest):
+    from scripts.cuda_rope_semantics_witness import requested_witness_identity
+
+    with pytest.raises(
+        ValueError,
+        match="expected witness sha256 must be 64 lowercase hexadecimal",
+    ):
+        requested_witness_identity(digest)
+
+
+def test_rope_witness_rejects_wrong_runtime_route():
+    from scripts.cuda_rope_semantics_witness import validate_runtime
+
+    with pytest.raises(ValueError, match="expected CUDA device Tesla T4"):
+        validate_runtime(
+            torch_version="2.10.0+cu128",
+            cuda_available=True,
+            cuda_device="NVIDIA P100",
+        )
+
+
+def test_rope_witness_failure_removes_stale_primary_and_writes_report(
+    monkeypatch, tmp_path
+):
+    from scripts import cuda_rope_semantics_witness as witness
+
+    output_json = tmp_path / "result.json"
+    output_npz = tmp_path / "result.npz"
+    output_npz.write_bytes(b"stale")
+    fake_torch = SimpleNamespace(
+        __version__="unexpected",
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            get_device_name=lambda _index: None,
+        ),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cuda_rope_semantics_witness.py",
+            "--witness",
+            str(tmp_path / "missing.npz"),
+            "--output-json",
+            str(output_json),
+            "--output-npz",
+            str(output_npz),
+        ],
+    )
+
+    assert witness.main() == 1
+
+    report = json.loads(output_json.read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "runtime_validation"
+    assert report["last_trustworthy_phase"] == "output_paths_validated"
+    assert report["primary_output"]["exists"] is False
+    assert not output_npz.exists()
