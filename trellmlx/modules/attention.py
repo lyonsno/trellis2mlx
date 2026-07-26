@@ -20,6 +20,7 @@ SUPPORTED_QK_NORM_BACKENDS = (
 )
 
 _source_cuda_warp32_norm_kernel = None
+_source_cuda_sequential_value_kernel = None
 
 
 def get_qk_norm_backend() -> str:
@@ -118,6 +119,16 @@ def _manual_scaled_dot_product_attention(
     chunk_size = int(os.environ.get("TRELLIS2MLX_ATTENTION_CHUNK_SIZE", "512"))
     if chunk_size <= 0:
         raise ValueError("TRELLIS2MLX_ATTENTION_CHUNK_SIZE must be positive")
+    value_backend = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "mlx-matmul",
+    ).lower()
+    if value_backend not in {"mlx-matmul", "source-cuda-sequential"}:
+        raise ValueError(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND must be one of "
+            "'mlx-matmul' or 'source-cuda-sequential', "
+            f"got {value_backend!r}"
+        )
 
     scaling_factor = math.sqrt(scale)
     q32 = q.astype(mx.float32)
@@ -131,9 +142,89 @@ def _manual_scaled_dot_product_attention(
         if mask is not None:
             scores = scores + mask[:, :, start:stop, :].astype(mx.float32)
         probs = mx.softmax(scores, axis=-1)
-        out = probs @ v32
+        if value_backend == "source-cuda-sequential":
+            out = _source_cuda_sequential_value_projection(probs, v32)
+        else:
+            out = probs @ v32
         out_chunks.append(out.astype(q.dtype))
     return mx.concatenate(out_chunks, axis=2)
+
+
+def _source_cuda_sequential_value_projection(
+    probs: mx.array,
+    values: mx.array,
+) -> mx.array:
+    """Project values with source CUDA's observed left-to-right FP32 sum."""
+    global _source_cuda_sequential_value_kernel
+
+    if probs.ndim != 4 or values.ndim != 4:
+        raise ValueError("probabilities and values must be rank-4 arrays")
+    if probs.dtype != mx.float32 or values.dtype != mx.float32:
+        raise ValueError("probabilities and values must use float32")
+    if probs.shape[:2] != values.shape[:2]:
+        raise ValueError("probabilities and values must share batch and head axes")
+    if probs.shape[-1] != values.shape[-2]:
+        raise ValueError("probability width must match the value token axis")
+    if probs.shape[-2] <= 0:
+        raise ValueError("probability query axis must be positive")
+    if probs.shape[-1] <= 0:
+        raise ValueError("probability source token axis must be positive")
+    if values.shape[-1] <= 0 or values.shape[-1] > 1024:
+        raise ValueError("value head dimension must be in [1, 1024]")
+
+    if _source_cuda_sequential_value_kernel is None:
+        source = r"""
+            uint component = thread_position_in_threadgroup.x;
+            uint row = threadgroup_position_in_grid.y;
+            uint query_count_value = query_count[0];
+            uint source_width_value = source_width[0];
+            uint head_dim_value = head_dim[0];
+            uint value_matrix = row / query_count_value;
+            uint probability_offset = row * source_width_value;
+            uint value_offset =
+                value_matrix * source_width_value * head_dim_value + component;
+            float accumulator = 0.0f;
+
+            for (uint token = 0; token < source_width_value; ++token) {
+                accumulator = metal::fma(
+                    probs[probability_offset + token],
+                    values[value_offset + token * head_dim_value],
+                    accumulator);
+            }
+            out[row * head_dim_value + component] = accumulator;
+        """
+        _source_cuda_sequential_value_kernel = mx.fast.metal_kernel(
+            name="attention_source_cuda_sequential_value_fp32",
+            input_names=[
+                "probs",
+                "values",
+                "query_count",
+                "source_width",
+                "head_dim",
+            ],
+            output_names=["out"],
+            source=source,
+        )
+
+    query_count = int(probs.shape[-2])
+    source_width = int(probs.shape[-1])
+    head_dim = int(values.shape[-1])
+    row_count = probs.size // source_width
+    output_shape = (*probs.shape[:-1], head_dim)
+    return _source_cuda_sequential_value_kernel(
+        inputs=[
+            probs,
+            values,
+            mx.array([query_count], dtype=mx.uint32),
+            mx.array([source_width], dtype=mx.uint32),
+            mx.array([head_dim], dtype=mx.uint32),
+        ],
+        template=[],
+        grid=(head_dim, row_count, 1),
+        threadgroup=(head_dim, 1, 1),
+        output_shapes=[output_shape],
+        output_dtypes=[mx.float32],
+    )[0]
 
 
 def scaled_dot_product_attention(

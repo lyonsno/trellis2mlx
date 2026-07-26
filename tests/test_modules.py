@@ -175,6 +175,145 @@ class TestScaledDotProductAttention:
         )
         assert float(actual[0, 0, 0, 4]) == 7.4375
 
+    def test_source_cuda_value_projection_accumulates_left_to_right(self):
+        from trellmlx.modules.attention import (
+            _source_cuda_sequential_value_projection,
+        )
+
+        probs = mx.ones((1, 1, 1, 3), dtype=mx.float32)
+        values = mx.array(
+            [
+                [
+                    [
+                        [1e20, -1e20, 3.0, 1.0],
+                        [-1e20, 1e20, 1e20, 2.0],
+                        [3.0, 3.0, -1e20, 4.0],
+                    ]
+                ]
+            ],
+            dtype=mx.float32,
+        )
+
+        actual = _source_cuda_sequential_value_projection(probs, values)
+        mx.eval(actual)
+
+        assert actual.shape == (1, 1, 1, 4)
+        assert actual.dtype == mx.float32
+        assert np.array_equal(
+            np.asarray(actual),
+            np.array([[[[3.0, 3.0, 0.0, 7.0]]]], dtype=np.float32),
+        )
+
+    @pytest.mark.parametrize(
+        ("probs_shape", "values_shape", "message"),
+        [
+            ((1, 1, 0, 3), (1, 1, 3, 4), "query axis must be positive"),
+            (
+                (1, 1, 2, 0),
+                (1, 1, 0, 4),
+                "source token axis must be positive",
+            ),
+        ],
+    )
+    def test_source_cuda_value_projection_rejects_zero_work_axes(
+        self, probs_shape, values_shape, message
+    ):
+        from trellmlx.modules.attention import (
+            _source_cuda_sequential_value_projection,
+        )
+
+        probs = mx.zeros(probs_shape, dtype=mx.float32)
+        values = mx.zeros(values_shape, dtype=mx.float32)
+
+        with pytest.raises(ValueError, match=message):
+            _source_cuda_sequential_value_projection(probs, values)
+
+    def test_source_cuda_value_projection_flattens_batch_head_and_query(self):
+        from trellmlx.modules.attention import (
+            _source_cuda_sequential_value_projection,
+        )
+
+        probs_np = np.arange(1, 2 * 2 * 2 * 3 + 1, dtype=np.float32).reshape(
+            2, 2, 2, 3
+        )
+        values_np = np.arange(1, 2 * 2 * 3 * 4 + 1, dtype=np.float32).reshape(
+            2, 2, 3, 4
+        )
+        expected = np.empty((2, 2, 2, 4), dtype=np.float32)
+        for batch in range(2):
+            for head in range(2):
+                for query in range(2):
+                    for component in range(4):
+                        accumulator = np.float32(0.0)
+                        for token in range(3):
+                            accumulator = np.float32(
+                                accumulator
+                                + np.float32(
+                                    probs_np[batch, head, query, token]
+                                    * values_np[batch, head, token, component]
+                                )
+                            )
+                        expected[batch, head, query, component] = accumulator
+
+        actual = _source_cuda_sequential_value_projection(
+            mx.array(probs_np),
+            mx.array(values_np),
+        )
+        mx.eval(actual)
+
+        assert np.array_equal(np.asarray(actual), expected)
+
+    def test_manual_source_cuda_value_backend_routes_projection(
+        self, monkeypatch
+    ):
+        from trellmlx.modules import attention
+
+        calls = []
+
+        def source_projection(probs, values):
+            calls.append((probs.shape, values.shape))
+            return mx.full(
+                (*probs.shape[:-1], values.shape[-1]),
+                2.5,
+                dtype=mx.float32,
+            )
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+            "source-cuda-sequential",
+        )
+        monkeypatch.setattr(
+            attention,
+            "_source_cuda_sequential_value_projection",
+            source_projection,
+            raising=False,
+        )
+        q = mx.ones((1, 2, 3, 4), dtype=mx.bfloat16)
+
+        actual = attention.scaled_dot_product_attention(q, q, q)
+        mx.eval(actual)
+
+        assert calls == [((1, 2, 3, 3), (1, 2, 3, 4))]
+        assert actual.dtype == mx.bfloat16
+        assert np.array_equal(
+            np.asarray(actual.astype(mx.float32)),
+            np.full((1, 2, 3, 4), 2.5, dtype=np.float32),
+        )
+
+    def test_manual_value_backend_rejects_unknown_route(self, monkeypatch):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "bogus")
+        q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
+
+        with pytest.raises(
+            ValueError,
+            match="TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        ):
+            scaled_dot_product_attention(q, q, q)
+
     def test_invalid_attention_backend_fails_loud(self, monkeypatch):
         from trellmlx.modules.attention import scaled_dot_product_attention
 
