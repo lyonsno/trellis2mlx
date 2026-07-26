@@ -22,6 +22,11 @@ import mlx.core as mx
 import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+from trellmlx.modules.attention import (
+    DEFAULT_QK_NORM_BACKEND,
+    SUPPORTED_QK_NORM_BACKENDS,
+    get_qk_norm_backend,
+)
 from trellmlx.shape_flow_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
@@ -744,6 +749,12 @@ def main():
         help="Shape SLat no-affine LayerNorm backend.",
     )
     parser.add_argument(
+        "--qk-norm-backend",
+        choices=SUPPORTED_QK_NORM_BACKENDS,
+        default=DEFAULT_QK_NORM_BACKEND,
+        help="Q/K per-head L2-normalization reduction backend.",
+    )
+    parser.add_argument(
         "--turing-rsqrt-lut",
         metavar="NPZ",
         help=(
@@ -803,6 +814,7 @@ def main():
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
+    os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
@@ -1942,6 +1954,7 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            qk_norm_backend=np.array(get_qk_norm_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
             ),
@@ -2000,6 +2013,7 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            qk_norm_backend=np.array(get_qk_norm_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
             ),
@@ -2055,6 +2069,7 @@ def main():
             sigma_min=np.array(1e-5, dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
+            qk_norm_backend=np.array(get_qk_norm_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
             ),

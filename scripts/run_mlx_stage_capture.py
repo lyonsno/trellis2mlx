@@ -18,6 +18,11 @@ import numpy as np
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TURING_T4_BACKEND = "cuda-welford-turing-t4"
+DEFAULT_QK_NORM_BACKEND = "source-cuda-warp32"
+SUPPORTED_QK_NORM_BACKENDS = (
+    DEFAULT_QK_NORM_BACKEND,
+    "mlx-sum",
+)
 STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
     "standard": 350_000,
     "source-quality": 500_000,
@@ -154,6 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
             TURING_T4_BACKEND,
         ],
         default="mlx-two-pass",
+    )
+    parser.add_argument(
+        "--qk-norm-backend",
+        choices=SUPPORTED_QK_NORM_BACKENDS,
+        default=DEFAULT_QK_NORM_BACKEND,
     )
     parser.add_argument("--turing-rsqrt-lut")
     parser.add_argument("--expected-turing-rsqrt-lut-sha256")
@@ -342,6 +352,7 @@ def build_route_identity(
                 shape_flow_trace_requested_keys if shape_flow_trace_requested_keys else None
             ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
+            "qk_norm_backend_requested": args.qk_norm_backend,
             "turing_rsqrt_lut_path": turing_lut_identity["path"],
             "turing_rsqrt_lut_sha256_requested": turing_lut_identity[
                 "sha256_requested"
@@ -409,6 +420,9 @@ def build_route_identity(
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
             "MLX_METAL_PATH": os.environ.get("MLX_METAL_PATH"),
             "TRELLIS2MLX_ATTENTION_BACKEND": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND"),
+            "TRELLIS2MLX_QK_NORM_BACKEND": os.environ.get(
+                "TRELLIS2MLX_QK_NORM_BACKEND"
+            ),
         },
         "command": command,
         "script_path": str(Path(__file__).resolve()),
@@ -612,8 +626,15 @@ def main(argv: list[str] | None = None) -> int:
                 effective_backend = primary_output_validation["sampler"][
                     "shape_flow_layernorm_backend"
                 ]
+                effective_qk_backend = primary_output_validation["sampler"][
+                    "qk_norm_backend"
+                ]
             else:
                 effective_backend = _bind_effective_shape_flow_layernorm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+                effective_qk_backend = _bind_effective_qk_norm_backend(
                     route_identity,
                     checkpoint_npz,
                 )
@@ -621,6 +642,9 @@ def main(argv: list[str] | None = None) -> int:
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
             route_identity["route"]["shape_flow_layernorm_backend_effective"] = (
                 effective_backend
+            )
+            route_identity["route"]["qk_norm_backend_effective"] = (
+                effective_qk_backend
             )
             _write_json(output_dir / "route_identity.json", route_identity)
         except (OSError, ValueError) as exc:
@@ -783,6 +807,38 @@ def _bind_effective_shape_flow_layernorm_backend(
     return effective
 
 
+def _bind_effective_qk_norm_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("qk_norm_backend_requested")
+    if requested not in SUPPORTED_QK_NORM_BACKENDS:
+        raise ValueError(
+            f"route identity has unsupported requested Q/K norm backend "
+            f"{requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "qk_norm_backend" not in checkpoint:
+            raise ValueError(
+                "shape-flow checkpoint omits effective Q/K norm backend metadata"
+            )
+        backend_array = np.asarray(checkpoint["qk_norm_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape-flow effective Q/K norm backend must be a string scalar"
+            )
+        effective = str(backend_array.item())
+    if effective != requested:
+        raise ValueError(
+            f"shape-flow effective Q/K norm backend {effective!r} "
+            f"does not match requested {requested!r}"
+        )
+    return effective
+
+
 def _checkpoint_turing_lut_sha256(
     checkpoint: Any,
     *,
@@ -868,6 +924,7 @@ def _validate_shape_flow_steps_checkpoint(
         "sigma_min",
         "shape_flow_block_injection_json",
         "shape_flow_layernorm_backend",
+        "qk_norm_backend",
     }
     stepped_tensor_names = (
         "sample_in",
@@ -1068,6 +1125,25 @@ def _validate_shape_flow_steps_checkpoint(
             expected_route=expected_route or {},
             context="shape_flow_steps",
         )
+        qk_backend_array = np.asarray(checkpoint["qk_norm_backend"])
+        if (
+            qk_backend_array.shape != ()
+            or qk_backend_array.dtype.kind not in {"U", "S"}
+        ):
+            raise ValueError(
+                "shape_flow_steps qk_norm_backend must be a string scalar"
+            )
+        effective_qk_backend = str(qk_backend_array.item())
+        requested_qk_backend = (expected_route or {}).get(
+            "qk_norm_backend_requested",
+            DEFAULT_QK_NORM_BACKEND,
+        )
+        if effective_qk_backend != requested_qk_backend:
+            raise ValueError(
+                "shape_flow_steps effective Q/K norm backend "
+                f"{effective_qk_backend!r} does not match requested "
+                f"{requested_qk_backend!r}"
+            )
 
         schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
         rescale_t = sampler_scalars["rescale_t"]
@@ -1107,6 +1183,7 @@ def _validate_shape_flow_steps_checkpoint(
             "shape_flow_block_injection_json": injection_json,
             "shape_flow_block_injection_route": injection_route,
             "shape_flow_layernorm_backend": effective_backend,
+            "qk_norm_backend": effective_qk_backend,
             "shape_flow_turing_rsqrt_lut_sha256": (
                 effective_turing_lut_sha256
             ),
@@ -1335,6 +1412,8 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
     command.extend([
         "--shape-flow-layernorm-backend",
         args.shape_flow_layernorm_backend,
+        "--qk-norm-backend",
+        args.qk_norm_backend,
     ])
     if args.turing_rsqrt_lut:
         command.extend(

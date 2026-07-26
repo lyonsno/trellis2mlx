@@ -671,6 +671,34 @@ def test_stage_capture_route_identity_records_attention_backend(tmp_path, monkey
     assert route_identity["env"]["TRELLIS2MLX_ATTENTION_BACKEND"] == "manual"
 
 
+def test_stage_capture_forwards_and_records_qk_norm_backend(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--qk-norm-backend",
+            "mlx-sum",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    option = command.index("--qk-norm-backend")
+    assert command[option + 1] == "mlx-sum"
+    assert route_identity["route"]["qk_norm_backend_requested"] == "mlx-sum"
+
+
 def test_stage_capture_wrapper_exposes_sparse_flow_step_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 
@@ -1226,6 +1254,7 @@ def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channel
         sigma_min=np.array(1e-5, dtype=np.float32),
         shape_flow_block_injection_json=np.array(""),
         shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+        qk_norm_backend=np.array("source-cuda-warp32"),
     )
 
 
@@ -1260,6 +1289,68 @@ def test_shape_flow_steps_missing_effective_layernorm_backend_fails_loud(tmp_pat
             expected_steps=3,
             expected_route={
                 "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+            },
+        )
+
+
+def test_shape_flow_steps_missing_effective_qk_norm_backend_fails_loud(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as loaded:
+        payload = {
+            key: np.asarray(loaded[key])
+            for key in loaded.files
+            if key != "qk_norm_backend"
+        }
+    np.savez(checkpoint, **payload)
+
+    with pytest.raises(
+        ValueError, match="missing required arrays.*qk_norm_backend"
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "source-cuda-warp32",
+            },
+        )
+
+
+def test_shape_flow_steps_qk_norm_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "qk_norm_backend",
+        np.array("source-cuda-warp32"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "shape_flow_steps effective Q/K norm backend "
+            "'source-cuda-warp32' does not match requested 'mlx-sum'"
+        ),
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "mlx-sum",
             },
         )
 

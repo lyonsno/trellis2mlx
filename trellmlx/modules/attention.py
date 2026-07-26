@@ -11,6 +11,101 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+DEFAULT_QK_NORM_BACKEND = "source-cuda-warp32"
+MLX_QK_NORM_BACKEND = "mlx-sum"
+SUPPORTED_QK_NORM_BACKENDS = (
+    DEFAULT_QK_NORM_BACKEND,
+    MLX_QK_NORM_BACKEND,
+)
+
+_source_cuda_warp32_norm_kernel = None
+
+
+def get_qk_norm_backend() -> str:
+    backend = os.environ.get(
+        "TRELLIS2MLX_QK_NORM_BACKEND", DEFAULT_QK_NORM_BACKEND
+    ).lower()
+    if backend not in SUPPORTED_QK_NORM_BACKENDS:
+        raise ValueError(
+            "TRELLIS2MLX_QK_NORM_BACKEND must be one of "
+            f"{SUPPORTED_QK_NORM_BACKENDS}, got {backend!r}"
+        )
+    return backend
+
+
+def qk_norm_backend_identity() -> dict:
+    backend = get_qk_norm_backend()
+    if backend == MLX_QK_NORM_BACKEND:
+        return {
+            "backend": backend,
+            "algorithm": "mlx-fp32-sum-sqrt",
+            "experimental": False,
+        }
+    return {
+        "backend": backend,
+        "algorithm": "pytorch-vectorized-cuda-warp32-sum-on-metal",
+        "experimental": True,
+        "cuda_source_tag": "pytorch-v2.10.0",
+        "cuda_source_kernel": "ATen-native-cuda-Reduce.cuh",
+        "authenticated_contract": {
+            "input_dtype": "bfloat16",
+            "head_dim": 128,
+            "accumulator_dtype": "float32",
+            "warp_width": 32,
+            "vector_width": 4,
+            "shuffle_offsets": [16, 8, 4, 2, 1],
+            "cuda_device_anchor": "Tesla T4",
+        },
+        "non_authenticated_geometry": "mlx-fp32-sum-sqrt",
+    }
+
+
+def _source_cuda_warp32_l2_norm(x: mx.array) -> mx.array:
+    global _source_cuda_warp32_norm_kernel
+    if _source_cuda_warp32_norm_kernel is None:
+        source = r"""
+            constexpr uint width = 128;
+            constexpr uint vector_width = 4;
+
+            uint lane = thread_position_in_threadgroup.x;
+            uint row = threadgroup_position_in_grid.z;
+            uint offset = row * width + lane * vector_width;
+
+            float value0 = static_cast<float>(inp[offset]);
+            float value1 = static_cast<float>(inp[offset + 1]);
+            float value2 = static_cast<float>(inp[offset + 2]);
+            float value3 = static_cast<float>(inp[offset + 3]);
+            float sum = value0 * value0;
+            sum += value1 * value1;
+            sum += value2 * value2;
+            sum += value3 * value3;
+
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                sum += simd_shuffle_down(sum, delta);
+            }
+            if (lane == 0) {
+                out[row] = metal::precise::sqrt(sum);
+            }
+        """
+        _source_cuda_warp32_norm_kernel = mx.fast.metal_kernel(
+            name="qk_norm_source_cuda_warp32_bf16_128",
+            input_names=["inp"],
+            output_names=["out"],
+            source=source,
+        )
+
+    rows = x.size // 128
+    norm_shape = (*x.shape[:-1], 1)
+    return _source_cuda_warp32_norm_kernel(
+        inputs=[x],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 1, rows),
+        threadgroup=(32, 1, 1),
+        output_shapes=[norm_shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def _manual_scaled_dot_product_attention(
     q: mx.array,
     k: mx.array,
@@ -130,7 +225,16 @@ class MultiHeadRMSNorm(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         # x: [..., H, D] — L2 normalize along last dim, then scale
         orig_dtype = x.dtype
-        x = x.astype(mx.float32)
-        norm = mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True) + 1e-12)
-        x = (x / norm) * self.gamma * self.scale
-        return x.astype(orig_dtype)
+        xf = x.astype(mx.float32)
+        backend = get_qk_norm_backend()
+        if (
+            backend == DEFAULT_QK_NORM_BACKEND
+            and orig_dtype == mx.bfloat16
+            and x.shape[-1] == 128
+        ):
+            norm = mx.maximum(_source_cuda_warp32_l2_norm(x), 1e-12)
+        else:
+            norm = mx.sqrt(
+                mx.sum(xf * xf, axis=-1, keepdims=True) + 1e-12
+            )
+        return ((xf / norm) * self.gamma * self.scale).astype(orig_dtype)
