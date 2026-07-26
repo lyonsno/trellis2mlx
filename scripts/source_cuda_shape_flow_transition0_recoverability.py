@@ -58,6 +58,10 @@ EXTERNAL_CANDIDATE_NAMES = (
     "source-native-control",
     "external-cuda-welford-metal",
 )
+SUPPORTED_EXTERNAL_LAYERNORM_BACKENDS = (
+    "cuda-welford-metal",
+    "cuda-welford-turing-t4",
+)
 MLX_COMPONENT_NAMES = (
     "noise",
     "sample_in",
@@ -108,16 +112,54 @@ def transition0_candidate_specs() -> list[dict[str, str]]:
     ]
 
 
-def external_transition0_candidate_specs() -> list[dict[str, str]]:
+def external_candidate_names(layernorm_backend: str) -> tuple[str, str]:
+    if layernorm_backend not in SUPPORTED_EXTERNAL_LAYERNORM_BACKENDS:
+        raise ValueError(
+            f"unsupported external LayerNorm backend: {layernorm_backend!r}"
+        )
+    return ("source-native-control", f"external-{layernorm_backend}")
+
+
+def _external_candidate_names_from_identity(
+    identity: dict[str, Any],
+) -> tuple[str, str]:
+    backend = identity.get("layernorm_backend")
+    candidate_names = external_candidate_names(str(backend))
+    candidate_name = identity.get("candidate_name", candidate_names[1])
+    if candidate_name != candidate_names[1]:
+        raise ValueError(
+            "external transition candidate name does not match its LayerNorm backend"
+        )
+    turing_lut_sha256 = identity.get("turing_rsqrt_lut_sha256")
+    if backend == "cuda-welford-turing-t4":
+        if turing_lut_sha256 is None:
+            raise ValueError(
+                "external Turing transition identity is missing its rsqrt LUT SHA256"
+            )
+        _validate_sha256(
+            str(turing_lut_sha256),
+            label="external Turing transition rsqrt LUT SHA256",
+        )
+    elif turing_lut_sha256 is not None:
+        raise ValueError(
+            "external non-Turing transition identity carries a Turing rsqrt LUT SHA256"
+        )
+    return candidate_names
+
+
+def external_transition0_candidate_specs(
+    layernorm_backend: str = "cuda-welford-metal",
+) -> list[dict[str, str]]:
+    candidate_names = external_candidate_names(layernorm_backend)
     return [
         {
-            "name": "source-native-control",
+            "name": candidate_names[0],
             "positive": "source",
             "negative": "source",
             "post": "source-guidance-rescale-euler",
         },
         {
-            "name": "external-cuda-welford-metal",
+            "name": candidate_names[1],
             "positive": "external-captured",
             "negative": "external-captured",
             "post": "external-captured-sample-next",
@@ -214,9 +256,15 @@ def external_transition_request(args: Any) -> dict[str, Any] | None:
         "expected_repo_commit": getattr(
             args, "expected_external_repo_commit", None
         ),
+        "expected_layernorm_backend": getattr(
+            args, "expected_external_layernorm_backend", None
+        ),
     }
+    expected_turing_lut = getattr(
+        args, "expected_external_turing_rsqrt_lut_sha256", None
+    )
     present = {key for key, value in values.items() if value is not None}
-    if not present:
+    if not present and expected_turing_lut is None:
         return None
     if present != set(values):
         missing = sorted(set(values) - present)
@@ -229,6 +277,22 @@ def external_transition_request(args: Any) -> dict[str, Any] | None:
         raise ValueError(
             "expected external repo commit must be a full lowercase Git SHA"
         )
+    backend = str(values["expected_layernorm_backend"])
+    candidate_names = external_candidate_names(backend)
+    if backend == "cuda-welford-turing-t4":
+        if expected_turing_lut is None:
+            raise ValueError(
+                "expected external Turing rsqrt LUT SHA256 is required"
+            )
+        expected_turing_lut = _validate_sha256(
+            str(expected_turing_lut),
+            label="expected external Turing rsqrt LUT SHA256",
+        )
+    elif expected_turing_lut is not None:
+        raise ValueError(
+            "expected external Turing rsqrt LUT SHA256 is only valid for "
+            "cuda-welford-turing-t4"
+        )
     return {
         **values,
         "step": Path(values["step"]),
@@ -240,6 +304,9 @@ def external_transition_request(args: Any) -> dict[str, Any] | None:
             str(values["report_sha256"]), label="external transition report SHA256"
         ),
         "expected_repo_commit": commit,
+        "expected_layernorm_backend": backend,
+        "expected_turing_rsqrt_lut_sha256": expected_turing_lut,
+        "candidate_name": candidate_names[1],
     }
 
 
@@ -261,6 +328,8 @@ def load_external_transition0_start(
     expected_step_sha256: str,
     expected_report_sha256: str,
     expected_repo_commit: str,
+    expected_layernorm_backend: str = "cuda-welford-metal",
+    expected_turing_rsqrt_lut_sha256: str | None = None,
     trajectory: dict[str, np.ndarray],
     expected_mlx_identity: dict[str, Any],
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -270,6 +339,19 @@ def load_external_transition0_start(
     expected_report_sha256 = _validate_sha256(
         expected_report_sha256, label="external transition report SHA256"
     )
+    candidate_names = external_candidate_names(expected_layernorm_backend)
+    if expected_layernorm_backend == "cuda-welford-turing-t4":
+        if expected_turing_rsqrt_lut_sha256 is None:
+            raise ValueError("expected external Turing rsqrt LUT SHA256 is required")
+        expected_turing_rsqrt_lut_sha256 = _validate_sha256(
+            expected_turing_rsqrt_lut_sha256,
+            label="expected external Turing rsqrt LUT SHA256",
+        )
+    elif expected_turing_rsqrt_lut_sha256 is not None:
+        raise ValueError(
+            "expected external Turing rsqrt LUT SHA256 is only valid for "
+            "cuda-welford-turing-t4"
+        )
     if _sha256(step_path) != expected_step_sha256:
         raise ValueError("external transition step SHA256 mismatch")
     if _sha256(report_path) != expected_report_sha256:
@@ -343,8 +425,8 @@ def load_external_transition0_start(
         "attention_backend": "fast",
         "steps": STEPS,
         "cascade": False,
-        "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
-        "shape_flow_layernorm_backend_effective": "cuda-welford-metal",
+        "shape_flow_layernorm_backend_requested": expected_layernorm_backend,
+        "shape_flow_layernorm_backend_effective": expected_layernorm_backend,
         "repo_commit_requested": expected_repo_commit,
         "repo_commit_effective": expected_repo_commit,
         "repo_dirty": False,
@@ -358,6 +440,22 @@ def load_external_transition0_start(
                 else key
             )
             raise ValueError(f"external transition route {label} must be {expected!r}")
+    turing_route_keys = (
+        "shape_flow_turing_rsqrt_lut_sha256_effective",
+        "turing_rsqrt_lut_sha256_requested",
+        "turing_rsqrt_lut_sha256_effective",
+    )
+    if expected_turing_rsqrt_lut_sha256 is not None:
+        for key in turing_route_keys:
+            if route.get(key) != expected_turing_rsqrt_lut_sha256:
+                raise ValueError(
+                    f"external transition route Turing rsqrt LUT {key} must be "
+                    f"{expected_turing_rsqrt_lut_sha256!r}"
+                )
+    elif any(route.get(key) is not None for key in turing_route_keys):
+        raise ValueError(
+            "external non-Turing transition unexpectedly carries Turing rsqrt LUT identity"
+        )
     if route.get("repo_identity_postflight") != expected_repo_identity:
         raise ValueError("external transition embedded postflight repo identity differs")
     if route.get("repo_identity_postflight_error") is not None:
@@ -395,6 +493,15 @@ def load_external_transition0_start(
     }
     arrays: dict[str, np.ndarray] = {}
     with np.load(step_path, allow_pickle=False) as archive:
+        archive_names = set(archive.files)
+        if (
+            expected_turing_rsqrt_lut_sha256 is None
+            and "shape_flow_turing_rsqrt_lut_sha256" in archive_names
+        ):
+            raise ValueError(
+                "external non-Turing checkpoint unexpectedly carries "
+                "Turing rsqrt LUT identity"
+            )
         required = required_float_arrays | {
             "coords",
             "coords_3d",
@@ -402,7 +509,9 @@ def load_external_transition0_start(
             "shape_flow_block_injection_json",
             "shape_flow_layernorm_backend",
         }
-        missing = sorted(required - set(archive.files))
+        if expected_turing_rsqrt_lut_sha256 is not None:
+            required.add("shape_flow_turing_rsqrt_lut_sha256")
+        missing = sorted(required - archive_names)
         if missing:
             raise ValueError(f"external transition is missing arrays: {missing}")
         for name in required:
@@ -449,9 +558,19 @@ def load_external_transition0_start(
     if (
         backend.shape != ()
         or backend.dtype.kind not in {"U", "S"}
-        or str(backend.item()) != "cuda-welford-metal"
+        or str(backend.item()) != expected_layernorm_backend
     ):
         raise ValueError("external transition layernorm backend array is invalid")
+    if expected_turing_rsqrt_lut_sha256 is not None:
+        checkpoint_lut = arrays["shape_flow_turing_rsqrt_lut_sha256"]
+        if (
+            checkpoint_lut.shape != ()
+            or checkpoint_lut.dtype.kind not in {"U", "S"}
+            or str(checkpoint_lut.item()) != expected_turing_rsqrt_lut_sha256
+        ):
+            raise ValueError(
+                "external transition checkpoint Turing rsqrt LUT identity is invalid"
+            )
 
     sample_shape = tuple(int(value) for value in trajectory["noise"].shape)
     for name in required_float_arrays:
@@ -490,7 +609,9 @@ def load_external_transition0_start(
         "step_sha256": expected_step_sha256,
         "report_sha256": expected_report_sha256,
         "repo_commit": expected_repo_commit,
-        "layernorm_backend": "cuda-welford-metal",
+        "layernorm_backend": expected_layernorm_backend,
+        "turing_rsqrt_lut_sha256": expected_turing_rsqrt_lut_sha256,
+        "candidate_name": candidate_names[1],
         "sample_next_sha256": _array_sha256(arrays["sample_next"]),
         "euler_transition_max_abs_residual": euler_residual,
         "route": route,
@@ -685,6 +806,8 @@ def validate_result_manifest(payload: dict[str, Any]) -> None:
 def validate_external_result_manifest(payload: dict[str, Any]) -> None:
     if payload.get("status") != "done":
         raise ValueError("external transition-0 result is not done")
+    external_identity = payload.get("inputs", {}).get("external_transition", {})
+    candidate_names = _external_candidate_names_from_identity(external_identity)
     route = payload.get("effective_route", {})
     required_route = {
         "device_type": "cuda",
@@ -692,7 +815,7 @@ def validate_external_result_manifest(payload: dict[str, Any]) -> None:
         "conv_backend": "none",
         "steps": STEPS,
         "one_model_load": True,
-        "candidate_names": list(EXTERNAL_CANDIDATE_NAMES),
+        "candidate_names": list(candidate_names),
         "comparison_class": "external-transition0-plus-source-cuda-suffix",
     }
     for key, expected in required_route.items():
@@ -700,7 +823,7 @@ def validate_external_result_manifest(payload: dict[str, Any]) -> None:
             raise ValueError(f"external transition-0 route {key} must be {expected!r}")
     candidates = payload.get("candidates", [])
     if [candidate.get("name") for candidate in candidates] != list(
-        EXTERNAL_CANDIDATE_NAMES
+        candidate_names
     ):
         raise ValueError("external transition-0 candidates are incomplete or out of order")
     if len({candidate.get("output_key") for candidate in candidates}) != len(candidates):
@@ -727,12 +850,12 @@ def validate_external_result_manifest(payload: dict[str, Any]) -> None:
         != expected_external_digest
     ):
         raise ValueError("external transition digest differs from intervention candidate")
-    expected_steps = len(EXTERNAL_CANDIDATE_NAMES) * (STEPS - 1)
+    expected_steps = len(candidate_names) * (STEPS - 1)
     expected_timing = {
         "source_steps_completed": expected_steps,
         "source_steps_requested": expected_steps,
-        "candidates_completed": len(EXTERNAL_CANDIDATE_NAMES),
-        "candidates_requested": len(EXTERNAL_CANDIDATE_NAMES),
+        "candidates_completed": len(candidate_names),
+        "candidates_requested": len(candidate_names),
     }
     timing = payload.get("timing", {})
     for key, expected in expected_timing.items():
@@ -759,7 +882,10 @@ def _required_matrix_array_keys(candidates: list[dict[str, Any]]) -> set[str]:
         return common | {
             *(f"mlx_transition0_{name}" for name in MLX_COMPONENT_NAMES),
         }
-    if names == EXTERNAL_CANDIDATE_NAMES:
+    if names in {
+        external_candidate_names(backend)
+        for backend in SUPPORTED_EXTERNAL_LAYERNORM_BACKENDS
+    }:
         return common | {"external_transition0_sample_next"}
     raise ValueError(f"unsupported transition-0 artifact candidate contract: {names}")
 
@@ -816,10 +942,14 @@ def validate_saved_artifact(
         candidate_names = tuple(
             str(candidate.get("name")) for candidate in candidates
         )
-        if candidate_names not in {
-            EXPECTED_CANDIDATE_NAMES,
-            EXTERNAL_CANDIDATE_NAMES,
-        }:
+        valid_external_candidate_names = {
+            external_candidate_names(backend)
+            for backend in SUPPORTED_EXTERNAL_LAYERNORM_BACKENDS
+        }
+        if (
+            candidate_names != EXPECTED_CANDIDATE_NAMES
+            and candidate_names not in valid_external_candidate_names
+        ):
             raise ValueError(
                 f"saved transition-0 candidate contract is invalid: {candidate_names}"
             )
@@ -885,7 +1015,17 @@ def validate_saved_artifact(
                 raise ValueError(f"{name} digest differs from manifest")
             if array.dtype != np.float32 or not np.isfinite(array).all():
                 raise ValueError(f"{name} has invalid dtype or values")
-        if candidate_names == EXTERNAL_CANDIDATE_NAMES:
+        if candidate_names in valid_external_candidate_names:
+            metadata_external_identity = (
+                metadata.get("inputs", {}).get("external_transition", {})
+            )
+            if (
+                _external_candidate_names_from_identity(metadata_external_identity)
+                != candidate_names
+            ):
+                raise ValueError(
+                    "saved transition-0 candidate names differ from external identity"
+                )
             external = np.asarray(archive["external_transition0_sample_next"])
             expected_external_digest = (
                 metadata.get("inputs", {})
@@ -1133,6 +1273,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-transition0-report", type=Path)
     parser.add_argument("--external-transition0-report-sha256")
     parser.add_argument("--expected-external-repo-commit")
+    parser.add_argument("--expected-external-layernorm-backend")
+    parser.add_argument("--expected-external-turing-rsqrt-lut-sha256")
     parser.add_argument("--model-repo", default="microsoft/TRELLIS.2-4B")
     parser.add_argument("--pipeline-config", default="pipeline.json")
     parser.add_argument("--sparse-conv-backend", default="none")
@@ -1153,7 +1295,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         external_request_error = exc
     candidate_specs = (
-        external_transition0_candidate_specs()
+        external_transition0_candidate_specs(
+            external_request["expected_layernorm_backend"]
+            if external_request is not None
+            else "cuda-welford-metal"
+        )
         if external_request is not None or external_request_error is not None
         else transition0_candidate_specs()
     )
@@ -1293,6 +1439,12 @@ def main(argv: list[str] | None = None) -> int:
                 expected_step_sha256=external_request["step_sha256"],
                 expected_report_sha256=external_request["report_sha256"],
                 expected_repo_commit=external_request["expected_repo_commit"],
+                expected_layernorm_backend=external_request[
+                    "expected_layernorm_backend"
+                ],
+                expected_turing_rsqrt_lut_sha256=external_request[
+                    "expected_turing_rsqrt_lut_sha256"
+                ],
                 trajectory=trajectory,
                 expected_mlx_identity=mlx_identity,
             )
@@ -1561,7 +1713,10 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             candidate_results = [control_result, external_result]
-            expected_candidate_names = EXTERNAL_CANDIDATE_NAMES
+            expected_candidate_names = (
+                "source-native-control",
+                str(external_identity["candidate_name"]),
+            )
             comparison_class = "external-transition0-plus-source-cuda-suffix"
         effective_route = {
             "route": requested_route["route"],

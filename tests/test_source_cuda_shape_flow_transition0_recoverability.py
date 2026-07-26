@@ -40,7 +40,13 @@ def _write_transition_capture(tmp_path, *, omit=None):
     return path
 
 
-def _write_external_transition_capture(tmp_path, *, break_euler=False):
+def _write_external_transition_capture(
+    tmp_path,
+    *,
+    break_euler=False,
+    layernorm_backend="cuda-welford-metal",
+    turing_lut_sha256=None,
+):
     from scripts.source_cuda_shape_flow_suffix_ladder import _schedule_pairs
 
     shape = (2, 3)
@@ -53,8 +59,7 @@ def _write_external_transition_capture(tmp_path, *, break_euler=False):
         sample_next = sample_next.copy()
         sample_next[0, 0] += np.float32(0.01)
     path = tmp_path / "external-shape-flow-step.npz"
-    np.savez(
-        path,
+    arrays = dict(
         noise=noise,
         sample_feats=noise,
         coords=coords,
@@ -82,8 +87,13 @@ def _write_external_transition_capture(tmp_path, *, break_euler=False):
         guidance_interval=np.asarray([0.6, 1.0], dtype=np.float32),
         rescale_t=np.asarray(3.0, dtype=np.float32),
         shape_flow_block_injection_json=np.asarray(""),
-        shape_flow_layernorm_backend=np.asarray("cuda-welford-metal"),
+        shape_flow_layernorm_backend=np.asarray(layernorm_backend),
     )
+    if turing_lut_sha256 is not None:
+        arrays["shape_flow_turing_rsqrt_lut_sha256"] = np.asarray(
+            turing_lut_sha256
+        )
+    np.savez(path, **arrays)
     trajectory = {
         "noise": noise,
         "sample_in": np.stack([noise] * 8),
@@ -102,6 +112,7 @@ def _write_external_transition_report(
     *,
     expected_commit,
     layernorm_backend="cuda-welford-metal",
+    turing_lut_sha256=None,
 ):
     conditioning_sha = "1" * 64
     noise_sha = "2" * 64
@@ -112,6 +123,34 @@ def _write_external_transition_report(
         "dirty": False,
         "status_porcelain": "",
     }
+    route = {
+        "family": "trellis2mlx/mlx",
+        "backend": "mlx-metal",
+        "attention_backend": "fast",
+        "steps": 8,
+        "cascade": False,
+        "conditioning_sample_sha256": conditioning_sha,
+        "shape_flow_noise_sample_sha256": noise_sha,
+        "shape_slat_support_sample_sha256": support_sha,
+        "shape_flow_layernorm_backend_requested": layernorm_backend,
+        "shape_flow_layernorm_backend_effective": layernorm_backend,
+        "repo_commit_requested": expected_commit,
+        "repo_commit_effective": expected_commit,
+        "repo_dirty": False,
+        "repo_status_porcelain": "",
+        "repo_identity_postflight": dict(repo_identity),
+        "repo_identity_postflight_error": None,
+        "shape_flow_block_injection_trace_path": None,
+        "shape_flow_block_injection_manifest_path": None,
+    }
+    if turing_lut_sha256 is not None:
+        route.update(
+            {
+                "shape_flow_turing_rsqrt_lut_sha256_effective": turing_lut_sha256,
+                "turing_rsqrt_lut_sha256_requested": turing_lut_sha256,
+                "turing_rsqrt_lut_sha256_effective": turing_lut_sha256,
+            }
+        )
     report = {
         "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
         "status": "done",
@@ -153,26 +192,7 @@ def _write_external_transition_report(
                 "sparse_flow_steps": False,
                 "sparse_internals": False,
             },
-            "route": {
-                "family": "trellis2mlx/mlx",
-                "backend": "mlx-metal",
-                "attention_backend": "fast",
-                "steps": 8,
-                "cascade": False,
-                "conditioning_sample_sha256": conditioning_sha,
-                "shape_flow_noise_sample_sha256": noise_sha,
-                "shape_slat_support_sample_sha256": support_sha,
-                "shape_flow_layernorm_backend_requested": layernorm_backend,
-                "shape_flow_layernorm_backend_effective": layernorm_backend,
-                "repo_commit_requested": expected_commit,
-                "repo_commit_effective": expected_commit,
-                "repo_dirty": False,
-                "repo_status_porcelain": "",
-                "repo_identity_postflight": dict(repo_identity),
-                "repo_identity_postflight_error": None,
-                "shape_flow_block_injection_trace_path": None,
-                "shape_flow_block_injection_manifest_path": None,
-            },
+            "route": route,
         },
     }
     path = tmp_path / "external-run-report.json"
@@ -426,6 +446,8 @@ def test_external_request_is_all_or_none():
         external_transition0_report=None,
         external_transition0_report_sha256=None,
         expected_external_repo_commit=None,
+        expected_external_layernorm_backend=None,
+        expected_external_turing_rsqrt_lut_sha256=None,
     )
     assert external_transition_request(empty) is None
 
@@ -433,6 +455,34 @@ def test_external_request_is_all_or_none():
     partial.external_transition0_step = "step.npz"
     with pytest.raises(ValueError, match="must be supplied together"):
         external_transition_request(partial)
+
+
+def test_external_request_requires_allowlisted_backend_and_turing_lut():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        external_transition_request,
+    )
+
+    base = {
+        "external_transition0_step": "step.npz",
+        "external_transition0_step_sha256": "1" * 64,
+        "external_transition0_report": "report.json",
+        "external_transition0_report_sha256": "2" * 64,
+        "expected_external_repo_commit": "a" * 40,
+        "expected_external_layernorm_backend": "cuda-welford-turing-t4",
+        "expected_external_turing_rsqrt_lut_sha256": None,
+    }
+    with pytest.raises(ValueError, match="Turing rsqrt LUT"):
+        external_transition_request(SimpleNamespace(**base))
+
+    base["expected_external_turing_rsqrt_lut_sha256"] = "3" * 64
+    request = external_transition_request(SimpleNamespace(**base))
+    assert request["expected_layernorm_backend"] == "cuda-welford-turing-t4"
+    assert request["expected_turing_rsqrt_lut_sha256"] == "3" * 64
+    assert request["candidate_name"] == "external-cuda-welford-turing-t4"
+
+    base["expected_external_layernorm_backend"] = "default"
+    with pytest.raises(ValueError, match="unsupported external LayerNorm backend"):
+        external_transition_request(SimpleNamespace(**base))
 
 
 def test_external_transition_loader_binds_route_repo_and_step_semantics(tmp_path):
@@ -496,6 +546,103 @@ def test_external_transition_loader_binds_route_repo_and_step_semantics(tmp_path
         )
 
 
+def test_external_transition_loader_triple_binds_turing_lut_identity(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        load_external_transition0_start,
+    )
+
+    expected_commit = "a" * 40
+    lut_sha256 = "4" * 64
+    capture, trajectory = _write_external_transition_capture(
+        tmp_path,
+        layernorm_backend="cuda-welford-turing-t4",
+        turing_lut_sha256=lut_sha256,
+    )
+    report, expected_identity = _write_external_transition_report(
+        tmp_path,
+        capture,
+        expected_commit=expected_commit,
+        layernorm_backend="cuda-welford-turing-t4",
+        turing_lut_sha256=lut_sha256,
+    )
+    kwargs = {
+        "expected_step_sha256": _sha256(capture),
+        "expected_report_sha256": _sha256(report),
+        "expected_repo_commit": expected_commit,
+        "expected_layernorm_backend": "cuda-welford-turing-t4",
+        "expected_turing_rsqrt_lut_sha256": lut_sha256,
+        "trajectory": trajectory,
+        "expected_mlx_identity": expected_identity,
+    }
+    _, identity = load_external_transition0_start(capture, report, **kwargs)
+    assert identity["layernorm_backend"] == "cuda-welford-turing-t4"
+    assert identity["turing_rsqrt_lut_sha256"] == lut_sha256
+    assert identity["candidate_name"] == "external-cuda-welford-turing-t4"
+
+    payload = json.loads(report.read_text())
+    payload["route_identity"]["route"][
+        "turing_rsqrt_lut_sha256_effective"
+    ] = "5" * 64
+    report.write_text(json.dumps(payload))
+    kwargs["expected_report_sha256"] = _sha256(report)
+    with pytest.raises(ValueError, match="Turing rsqrt LUT"):
+        load_external_transition0_start(capture, report, **kwargs)
+
+    payload["route_identity"]["route"][
+        "turing_rsqrt_lut_sha256_effective"
+    ] = lut_sha256
+    report.write_text(json.dumps(payload))
+    with np.load(capture, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    arrays["shape_flow_turing_rsqrt_lut_sha256"] = np.asarray("6" * 64)
+    np.savez(capture, **arrays)
+    report_payload = json.loads(report.read_text())
+    report_payload["artifacts"]["shape_flow_step.npz"]["sha256"] = _sha256(capture)
+    report_payload["artifacts"]["shape_flow_step.npz"][
+        "size_bytes"
+    ] = capture.stat().st_size
+    report.write_text(json.dumps(report_payload))
+    kwargs["expected_step_sha256"] = _sha256(capture)
+    kwargs["expected_report_sha256"] = _sha256(report)
+    with pytest.raises(ValueError, match="checkpoint Turing rsqrt LUT"):
+        load_external_transition0_start(capture, report, **kwargs)
+
+
+def test_external_transition_loader_rejects_turing_lut_scalar_on_metal(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        load_external_transition0_start,
+    )
+
+    expected_commit = "a" * 40
+    capture, trajectory = _write_external_transition_capture(
+        tmp_path,
+        layernorm_backend="cuda-welford-metal",
+        turing_lut_sha256="4" * 64,
+    )
+    report, expected_identity = _write_external_transition_report(
+        tmp_path,
+        capture,
+        expected_commit=expected_commit,
+        layernorm_backend="cuda-welford-metal",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-Turing checkpoint unexpectedly carries Turing rsqrt LUT identity",
+    ):
+        load_external_transition0_start(
+            capture,
+            report,
+            expected_step_sha256=_sha256(capture),
+            expected_report_sha256=_sha256(report),
+            expected_repo_commit=expected_commit,
+            expected_layernorm_backend="cuda-welford-metal",
+            expected_turing_rsqrt_lut_sha256=None,
+            trajectory=trajectory,
+            expected_mlx_identity=expected_identity,
+        )
+
+
 def test_external_result_requires_two_candidates_and_fourteen_source_steps():
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
         EXTERNAL_CANDIDATE_NAMES,
@@ -533,6 +680,7 @@ def test_external_result_requires_two_candidates_and_fourteen_source_steps():
         },
         "inputs": {
             "external_transition": {
+                "layernorm_backend": "cuda-welford-metal",
                 "sample_next_sha256": "2" * 64,
             }
         },
@@ -554,6 +702,71 @@ def test_external_result_requires_two_candidates_and_fourteen_source_steps():
     with pytest.raises(ValueError, match="external transition digest"):
         validate_external_result_manifest(payload)
 
+
+def test_external_result_propagates_turing_candidate_identity():
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        validate_external_result_manifest,
+    )
+
+    names = [
+        "source-native-control",
+        "external-cuda-welford-turing-t4",
+    ]
+    candidates = []
+    for index, name in enumerate(names):
+        candidates.append(
+            {
+                "name": name,
+                "output_key": f"candidate_{index}_shape_slat",
+                "transition0_sample_next_sha256": (
+                    "1" * 64 if index == 0 else "2" * 64
+                ),
+                "source_step_indices": list(range(1, 8)),
+                "source_step_count": 7,
+                "step_elapsed_seconds": [1.0] * 7,
+                "vs_source_anchor": {
+                    "exact": index == 0,
+                    "nonzero": 0 if index == 0 else 1,
+                },
+            }
+        )
+    payload = {
+        "status": "done",
+        "effective_route": {
+            "device_type": "cuda",
+            "attention_backend": "sdpa",
+            "conv_backend": "none",
+            "steps": 8,
+            "one_model_load": True,
+            "candidate_names": names,
+            "comparison_class": "external-transition0-plus-source-cuda-suffix",
+        },
+        "inputs": {
+            "external_transition": {
+                "candidate_name": names[1],
+                "layernorm_backend": "cuda-welford-turing-t4",
+                "turing_rsqrt_lut_sha256": "3" * 64,
+                "sample_next_sha256": "2" * 64,
+            }
+        },
+        "candidates": candidates,
+        "timing": {
+            "source_steps_completed": 14,
+            "source_steps_requested": 14,
+            "candidates_completed": 2,
+            "candidates_requested": 2,
+        },
+    }
+    validate_external_result_manifest(payload)
+    payload["effective_route"]["candidate_names"][1] = "external-cuda-welford-metal"
+    with pytest.raises(ValueError, match="candidate_names"):
+        validate_external_result_manifest(payload)
+    payload["effective_route"]["candidate_names"] = names
+    payload["inputs"]["external_transition"]["candidate_name"] = (
+        "external-cuda-welford-metal"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        validate_external_result_manifest(payload)
 
 def test_saved_artifact_binds_every_candidate_array_and_metadata(tmp_path):
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
@@ -615,6 +828,7 @@ def test_external_saved_artifact_binds_both_candidates_and_intervention(tmp_path
         },
         "inputs": {
             "external_transition": {
+                "layernorm_backend": "cuda-welford-metal",
                 "sample_next_sha256": hashlib.sha256(
                     arrays["external_transition0_sample_next"].tobytes()
                 ).hexdigest()
@@ -637,6 +851,55 @@ def test_external_saved_artifact_binds_both_candidates_and_intervention(tmp_path
     arrays.pop("external_transition0_sample_next")
     np.savez(output, **arrays)
     with pytest.raises(ValueError, match="external_transition0_sample_next"):
+        validate_saved_artifact(output, candidates=candidates)
+
+
+def test_external_saved_artifact_round_trips_turing_candidate_identity(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_artifact_metadata,
+        validate_saved_artifact,
+    )
+
+    arrays, candidates = _external_artifact_fixture()
+    candidates[1]["name"] = "external-cuda-welford-turing-t4"
+    external_sha256 = hashlib.sha256(
+        arrays["external_transition0_sample_next"].tobytes()
+    ).hexdigest()
+    report = {
+        "effective_route": {
+            "candidate_names": [candidate["name"] for candidate in candidates]
+        },
+        "inputs": {
+            "external_transition": {
+                "candidate_name": "external-cuda-welford-turing-t4",
+                "layernorm_backend": "cuda-welford-turing-t4",
+                "turing_rsqrt_lut_sha256": "3" * 64,
+                "sample_next_sha256": external_sha256,
+            }
+        },
+        "candidate_specs": [{"name": candidate["name"]} for candidate in candidates],
+        "candidates": candidates,
+        "anchors": {},
+    }
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(build_artifact_metadata(report, arrays), sort_keys=True)
+    )
+    output = tmp_path / "external-turing-result.npz"
+    np.savez(output, **arrays)
+
+    validation = validate_saved_artifact(output, candidates=candidates)
+    assert validation["candidate_count"] == 2
+
+    report["inputs"]["external_transition"]["layernorm_backend"] = (
+        "cuda-welford-metal"
+    )
+    report["inputs"]["external_transition"]["turing_rsqrt_lut_sha256"] = None
+    arrays.pop("metadata_json")
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(build_artifact_metadata(report, arrays), sort_keys=True)
+    )
+    np.savez(output, **arrays)
+    with pytest.raises(ValueError, match="does not match"):
         validate_saved_artifact(output, candidates=candidates)
 
 
