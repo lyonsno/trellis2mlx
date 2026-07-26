@@ -301,6 +301,54 @@ class TestScaledDotProductAttention:
             np.full((1, 2, 3, 4), 2.5, dtype=np.float32),
         )
 
+    def test_manual_source_cuda_softmax_backend_routes_probabilities(
+        self, monkeypatch
+    ):
+        from trellmlx.modules import attention
+
+        calls = []
+
+        def source_softmax(scores):
+            calls.append(scores.shape)
+            return mx.full(scores.shape, 1.0 / 7697.0, dtype=mx.float32)
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "source-cuda-turing",
+        )
+        monkeypatch.setattr(
+            attention,
+            "_source_cuda_long_row_softmax",
+            source_softmax,
+        )
+        q = mx.ones((1, 1, 1, 4), dtype=mx.bfloat16)
+        k = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
+        v = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
+
+        actual = attention.scaled_dot_product_attention(q, k, v)
+        mx.eval(actual)
+
+        assert calls == [(1, 1, 1, 7697)]
+        assert actual.shape == q.shape
+        assert actual.dtype == mx.bfloat16
+
+    def test_manual_softmax_backend_rejects_unknown_route(self, monkeypatch):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "bogus",
+        )
+        q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
+
+        with pytest.raises(
+            ValueError,
+            match="TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        ):
+            scaled_dot_product_attention(q, q, q)
+
     def test_manual_value_backend_rejects_unknown_route(self, monkeypatch):
         from trellmlx.modules.attention import scaled_dot_product_attention
 

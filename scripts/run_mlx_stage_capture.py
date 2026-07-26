@@ -257,12 +257,41 @@ def build_route_identity(
     turing_rope_lut_identity = _validate_turing_rope_route_args(args)
     if repo_identity is None:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
+    attention_backend_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_BACKEND",
+        "fast",
+    ).lower()
+    if attention_backend_requested in {"manual", "mlx-manual"}:
+        attention_backend = "manual"
+    elif attention_backend_requested in {"fast", "mlx-fast"}:
+        attention_backend = "fast"
+    else:
+        attention_backend = f"unsupported:{attention_backend_requested}"
+    attention_softmax_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "mlx-softmax",
+    ).lower()
+    attention_value_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "mlx-matmul",
+    ).lower()
+    if attention_backend == "manual":
+        attention_softmax_effective = attention_softmax_requested
+        attention_value_effective = attention_value_requested
+    else:
+        attention_softmax_effective = "fused-fast-attention"
+        attention_value_effective = "fused-fast-attention"
     return {
         "schema": SCHEMA,
         "route": {
             "family": "trellis2mlx/mlx",
             "backend": "mlx-metal",
-            "attention_backend": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND", "fast"),
+            "attention_backend_requested": attention_backend_requested,
+            "attention_backend": attention_backend,
+            "attention_softmax_backend_requested": attention_softmax_requested,
+            "attention_softmax_backend_effective": attention_softmax_effective,
+            "attention_value_backend_requested": attention_value_requested,
+            "attention_value_backend_effective": attention_value_effective,
             "repo_root": str(REPO_ROOT),
             "repo_commit_requested": repo_identity["commit_requested"],
             "repo_commit_effective": repo_identity["commit_effective"],
@@ -444,6 +473,12 @@ def build_route_identity(
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
             "MLX_METAL_PATH": os.environ.get("MLX_METAL_PATH"),
             "TRELLIS2MLX_ATTENTION_BACKEND": os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND"),
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND": os.environ.get(
+                "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"
+            ),
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND": os.environ.get(
+                "TRELLIS2MLX_ATTENTION_VALUE_BACKEND"
+            ),
             "TRELLIS2MLX_QK_NORM_BACKEND": os.environ.get(
                 "TRELLIS2MLX_QK_NORM_BACKEND"
             ),

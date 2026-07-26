@@ -10,6 +10,8 @@ import os
 import mlx.core as mx
 import mlx.nn as nn
 
+from trellmlx.source_cuda_ex2 import SOURCE_CUDA_EX2_METAL_HEADER
+
 
 DEFAULT_QK_NORM_BACKEND = "source-cuda-warp32"
 MLX_QK_NORM_BACKEND = "mlx-sum"
@@ -21,6 +23,7 @@ SUPPORTED_QK_NORM_BACKENDS = (
 
 _source_cuda_warp32_norm_kernel = None
 _source_cuda_sequential_value_kernel = None
+_source_cuda_long_row_softmax_kernel = None
 
 
 def get_qk_norm_backend() -> str:
@@ -123,6 +126,16 @@ def _manual_scaled_dot_product_attention(
         "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
         "mlx-matmul",
     ).lower()
+    softmax_backend = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "mlx-softmax",
+    ).lower()
+    if softmax_backend not in {"mlx-softmax", "source-cuda-turing"}:
+        raise ValueError(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND must be one of "
+            "'mlx-softmax' or 'source-cuda-turing', "
+            f"got {softmax_backend!r}"
+        )
     if value_backend not in {"mlx-matmul", "source-cuda-sequential"}:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_VALUE_BACKEND must be one of "
@@ -141,7 +154,10 @@ def _manual_scaled_dot_product_attention(
         scores = q_chunk @ k_transposed
         if mask is not None:
             scores = scores + mask[:, :, start:stop, :].astype(mx.float32)
-        probs = mx.softmax(scores, axis=-1)
+        if softmax_backend == "source-cuda-turing":
+            probs = _source_cuda_long_row_softmax(scores)
+        else:
+            probs = mx.softmax(scores, axis=-1)
         if value_backend == "source-cuda-sequential":
             out = _source_cuda_sequential_value_projection(probs, v32)
         else:
@@ -223,6 +239,123 @@ def _source_cuda_sequential_value_projection(
         grid=(head_dim, row_count, 1),
         threadgroup=(head_dim, 1, 1),
         output_shapes=[output_shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
+    """Reproduce the source CUDA width-7697 FP32 softmax schedule."""
+    global _source_cuda_long_row_softmax_kernel
+
+    if scores.ndim < 1:
+        raise ValueError("softmax scores must have at least one axis")
+    if scores.dtype != mx.float32:
+        raise ValueError("softmax scores must use float32")
+    if scores.shape[-1] != 7697:
+        raise ValueError("source CUDA long-row softmax requires width 7697")
+    row_count = scores.size // scores.shape[-1]
+    if row_count <= 0:
+        raise ValueError("softmax row count must be positive")
+
+    if _source_cuda_long_row_softmax_kernel is None:
+        source = r"""
+            constexpr uint width = 7697;
+            constexpr uint threads = 1024;
+            constexpr uint warps = 32;
+            constexpr uint registers_per_thread = 8;
+            constexpr float lowest = -3.402823466e+38f;
+
+            uint tid = thread_position_in_threadgroup.x;
+            uint lane = tid & 31;
+            uint warp = tid >> 5;
+            uint row = threadgroup_position_in_grid.y;
+            uint row_offset = row * width;
+            threadgroup float shared[warps];
+            float registers[registers_per_thread];
+            float thread_max = lowest;
+
+            for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                uint offset = tid + reg * threads;
+                if (offset < width) {
+                    float value = scores[row_offset + offset];
+                    registers[reg] = value;
+                    thread_max = thread_max < value ? value : thread_max;
+                }
+            }
+
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                float upper = simd_shuffle_down(thread_max, delta);
+                thread_max = thread_max < upper ? upper : thread_max;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                shared[warp] = thread_max;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float row_max = tid < warps ? shared[lane] : lowest;
+            if (warp == 0) {
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    float upper = simd_shuffle_down(row_max, delta);
+                    row_max = row_max < upper ? upper : row_max;
+                }
+            }
+            if (tid == 0) {
+                shared[0] = row_max;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            row_max = shared[0];
+
+            float thread_sum = 0.0f;
+            for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                uint offset = tid + reg * threads;
+                if (offset < width) {
+                    registers[reg] = source_cuda_expf(
+                        registers[reg] - row_max);
+                    thread_sum = thread_sum + registers[reg];
+                }
+            }
+
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                thread_sum += simd_shuffle_down(thread_sum, delta);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                shared[warp] = thread_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float row_sum = tid < warps ? shared[lane] : 0.0f;
+            if (warp == 0) {
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    row_sum += simd_shuffle_down(row_sum, delta);
+                }
+            }
+            if (tid == 0) {
+                shared[0] = row_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            row_sum = shared[0];
+
+            for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                uint offset = tid + reg * threads;
+                if (offset < width) {
+                    out[row_offset + offset] = registers[reg] / row_sum;
+                }
+            }
+        """
+        _source_cuda_long_row_softmax_kernel = mx.fast.metal_kernel(
+            name="attention_source_cuda_long_row_softmax_fp32_7697",
+            input_names=["scores"],
+            output_names=["out"],
+            header=SOURCE_CUDA_EX2_METAL_HEADER,
+            source=source,
+        )
+
+    return _source_cuda_long_row_softmax_kernel(
+        inputs=[scores],
+        template=[],
+        grid=(1024, row_count, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[scores.shape],
         output_dtypes=[mx.float32],
     )[0]
 

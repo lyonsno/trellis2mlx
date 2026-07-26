@@ -653,6 +653,14 @@ def test_stage_capture_route_identity_records_attention_backend(tmp_path, monkey
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
     monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "source-cuda-turing",
+    )
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "source-cuda-sequential",
+    )
     args = build_parser().parse_args(
         [
             "--image",
@@ -668,7 +676,116 @@ def test_stage_capture_route_identity_records_attention_backend(tmp_path, monkey
     route_identity = build_route_identity(args, command)
 
     assert route_identity["route"]["attention_backend"] == "manual"
+    assert route_identity["route"]["attention_softmax_backend_requested"] == (
+        "source-cuda-turing"
+    )
+    assert route_identity["route"]["attention_softmax_backend_effective"] == (
+        "source-cuda-turing"
+    )
+    assert route_identity["route"]["attention_value_backend_requested"] == (
+        "source-cuda-sequential"
+    )
+    assert route_identity["route"]["attention_value_backend_effective"] == (
+        "source-cuda-sequential"
+    )
     assert route_identity["env"]["TRELLIS2MLX_ATTENTION_BACKEND"] == "manual"
+    assert route_identity["env"][
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"
+    ] == "source-cuda-turing"
+    assert route_identity["env"][
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND"
+    ] == "source-cuda-sequential"
+
+
+def test_stage_capture_route_identity_marks_manual_selectors_ignored_by_fast_backend(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "source-cuda-turing",
+    )
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "source-cuda-sequential",
+    )
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_step",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert route_identity["route"]["attention_backend"] == "fast"
+    assert route_identity["route"]["attention_softmax_backend_requested"] == (
+        "source-cuda-turing"
+    )
+    assert route_identity["route"]["attention_softmax_backend_effective"] == (
+        "fused-fast-attention"
+    )
+    assert route_identity["route"]["attention_value_backend_requested"] == (
+        "source-cuda-sequential"
+    )
+    assert route_identity["route"]["attention_value_backend_effective"] == (
+        "fused-fast-attention"
+    )
+
+
+def test_stage_capture_route_identity_normalizes_mlx_manual_alias(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "mlx-manual")
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "source-cuda-turing",
+    )
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "source-cuda-sequential",
+    )
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_step",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert route_identity["route"]["attention_backend_requested"] == "mlx-manual"
+    assert route_identity["route"]["attention_backend"] == "manual"
+    assert route_identity["route"]["attention_softmax_backend_effective"] == (
+        "source-cuda-turing"
+    )
+    assert route_identity["route"]["attention_value_backend_effective"] == (
+        "source-cuda-sequential"
+    )
 
 
 def test_stage_capture_forwards_and_records_qk_norm_backend(tmp_path):
