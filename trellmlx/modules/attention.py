@@ -119,14 +119,19 @@ def _manual_scaled_dot_product_attention(
     if chunk_size <= 0:
         raise ValueError("TRELLIS2MLX_ATTENTION_CHUNK_SIZE must be positive")
 
+    scaling_factor = math.sqrt(scale)
+    q32 = q.astype(mx.float32)
+    k32 = k.astype(mx.float32) * scaling_factor
+    v32 = v.astype(mx.float32)
+    k_transposed = k32.transpose(0, 1, 3, 2)
     for start in range(0, q.shape[2], chunk_size):
         stop = min(start + chunk_size, q.shape[2])
-        q_chunk = q[:, :, start:stop, :]
-        scores = (q_chunk.astype(mx.float32) @ k.astype(mx.float32).transpose(0, 1, 3, 2)) * scale
+        q_chunk = q32[:, :, start:stop, :] * scaling_factor
+        scores = q_chunk @ k_transposed
         if mask is not None:
             scores = scores + mask[:, :, start:stop, :].astype(mx.float32)
         probs = mx.softmax(scores, axis=-1)
-        out = probs @ v.astype(mx.float32)
+        out = probs @ v32
         out_chunks.append(out.astype(q.dtype))
     return mx.concatenate(out_chunks, axis=2)
 

@@ -4,6 +4,7 @@ import math
 import pytest
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 class TestLayerNorm32:
@@ -142,6 +143,37 @@ class TestScaledDotProductAttention:
         mx.eval(out)
         assert out.shape == q.shape
         assert out.dtype == mx.bfloat16
+
+    def test_manual_backend_scales_q_and_k_before_matmul(self, monkeypatch):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        rng = np.random.default_rng(10)
+        q = mx.array(rng.normal(0, 5, (1, 1, 3, 32)), dtype=mx.bfloat16)
+        k = mx.array(rng.normal(0, 5, (1, 1, 3, 32)), dtype=mx.bfloat16)
+        v = mx.array(rng.normal(0, 20, (1, 1, 3, 32)), dtype=mx.bfloat16)
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        scaling_factor = math.sqrt(scale)
+        q32 = q.astype(mx.float32)
+        k32 = k.astype(mx.float32)
+        v32 = v.astype(mx.float32)
+        expected = (
+            mx.softmax(
+                (q32 * scaling_factor)
+                @ (k32 * scaling_factor).transpose(0, 1, 3, 2),
+                axis=-1,
+            )
+            @ v32
+        ).astype(mx.bfloat16)
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "manual")
+        actual = scaled_dot_product_attention(q, k, v)
+        mx.eval(actual, expected)
+
+        assert np.array_equal(
+            np.asarray(actual.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+        )
+        assert float(actual[0, 0, 0, 4]) == 7.4375
 
     def test_invalid_attention_backend_fails_loud(self, monkeypatch):
         from trellmlx.modules.attention import scaled_dot_product_attention
