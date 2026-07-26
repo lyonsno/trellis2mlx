@@ -147,6 +147,8 @@ def _load_witness(path: Path) -> dict[str, np.ndarray]:
         raise ValueError(
             "coordinate_values must contain the complete 0..63 domain"
         )
+    if coordinates.dtype != np.int32:
+        raise ValueError("coordinate_values must be int32")
     if not np.array_equal(
         coordinates, np.arange(EXPECTED_COORDINATE_COUNT, dtype=np.int32)
     ):
@@ -165,6 +167,11 @@ def _load_witness(path: Path) -> dict[str, np.ndarray]:
         expected_case_output
     ).all():
         raise ValueError("case input and output must be finite")
+    if np.any(
+        np.ascontiguousarray(case_input).view(np.uint32)
+        & np.uint32(0xFFFF)
+    ):
+        raise ValueError("case_input must be exactly BF16-representable")
     case_count = case_input.shape[0]
     if case_count == 0:
         raise ValueError("witness must contain at least one boundary case")
@@ -172,6 +179,10 @@ def _load_witness(path: Path) -> dict[str, np.ndarray]:
         raise ValueError("case_coordinate_index must have shape [N]")
     if case_frequency_index.shape != (case_count,):
         raise ValueError("case_frequency_index must have shape [N]")
+    if not np.issubdtype(case_coordinate_index.dtype, np.integer):
+        raise ValueError("case_coordinate_index must have integer dtype")
+    if not np.issubdtype(case_frequency_index.dtype, np.integer):
+        raise ValueError("case_frequency_index must have integer dtype")
     if np.any(case_coordinate_index < 0) or np.any(
         case_coordinate_index >= EXPECTED_COORDINATE_COUNT
     ):

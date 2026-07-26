@@ -5,6 +5,19 @@ import numpy as np
 import pytest
 
 
+def _write_rope_witness(path, **overrides):
+    arrays = {
+        "coordinate_values": np.arange(64, dtype=np.int32),
+        "frequencies": np.linspace(1.0, 0.01, 21, dtype=np.float32),
+        "case_input": np.asarray([[1.0, 2.0]], dtype=np.float32),
+        "case_coordinate_index": np.asarray([1], dtype=np.int32),
+        "case_frequency_index": np.asarray([2], dtype=np.int32),
+        "expected_case_output": np.asarray([[1.0, 2.0]], dtype=np.float32),
+    }
+    arrays.update(overrides)
+    np.savez(path, **arrays)
+
+
 def test_rope_witness_authenticates_phase_grid_and_boundary_cases():
     from scripts.cuda_rope_semantics_witness import analyze_cuda_results
 
@@ -77,6 +90,55 @@ def test_rope_witness_rejects_wrong_runtime_route():
             cuda_available=True,
             cuda_device="NVIDIA P100",
         )
+
+
+def test_rope_witness_rejects_non_int32_coordinate_domain(tmp_path):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(
+        path,
+        coordinate_values=np.arange(64, dtype=np.float64),
+    )
+
+    with pytest.raises(ValueError, match="coordinate_values must be int32"):
+        _load_witness(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        ("case_coordinate_index", np.asarray([1.9], dtype=np.float32)),
+        ("case_frequency_index", np.asarray([2.0], dtype=np.float32)),
+    ],
+)
+def test_rope_witness_rejects_noninteger_selector_dtype(
+    tmp_path, field, values
+):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(path, **{field: values})
+
+    with pytest.raises(ValueError, match=f"{field} must have integer dtype"):
+        _load_witness(path)
+
+
+def test_rope_witness_rejects_case_input_that_requires_bfloat16_rounding(
+    tmp_path,
+):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(
+        path,
+        case_input=np.asarray([[1.1, 2.0]], dtype=np.float32),
+    )
+
+    with pytest.raises(
+        ValueError, match="case_input must be exactly BF16-representable"
+    ):
+        _load_witness(path)
 
 
 def test_rope_witness_failure_removes_stale_primary_and_writes_report(
