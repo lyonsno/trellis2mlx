@@ -27,6 +27,14 @@ from trellmlx.modules.attention import (
     SUPPORTED_QK_NORM_BACKENDS,
     get_qk_norm_backend,
 )
+from trellmlx.modules.rope import (
+    CUDA_POLAR_TURING_T4_BACKEND,
+    MLX_REAL_BACKEND,
+    SUPPORTED_ROPE_BACKENDS,
+    configure_rope_backend,
+    get_rope_backend,
+    get_turing_phase_lut_sha256,
+)
 from trellmlx.shape_flow_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
@@ -591,6 +599,31 @@ def _load_turing_rsqrt_lut(
     return mx.array(correction), digest
 
 
+def _load_turing_rope_phase_lut(
+    path: str | Path,
+    expected_sha256: str,
+) -> tuple[mx.array, str]:
+    path = Path(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError(
+            "Turing RoPE phase LUT SHA256 mismatch: "
+            f"expected {expected_sha256}, got {digest}"
+        )
+    with np.load(path, allow_pickle=False) as loaded:
+        if "phase_pairs" not in loaded.files:
+            raise ValueError("Turing RoPE phase LUT NPZ omits phase_pairs")
+        phase_pairs = np.asarray(loaded["phase_pairs"])
+    if phase_pairs.dtype != np.float32 or phase_pairs.shape != (64, 21, 2):
+        raise ValueError(
+            "Turing RoPE phase LUT must be float32[64,21,2], "
+            f"got {phase_pairs.dtype}{phase_pairs.shape}"
+        )
+    if not np.isfinite(phase_pairs).all():
+        raise ValueError("Turing RoPE phase LUT contains non-finite values")
+    return mx.array(phase_pairs), digest
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -755,6 +788,24 @@ def main():
         help="Q/K per-head L2-normalization reduction backend.",
     )
     parser.add_argument(
+        "--rope-backend",
+        choices=SUPPORTED_ROPE_BACKENDS,
+        default=MLX_REAL_BACKEND,
+        help="RoPE phase-generation and rotation backend.",
+    )
+    parser.add_argument(
+        "--turing-rope-phase-lut",
+        metavar="NPZ",
+        help=(
+            "Required with cuda-polar-turing-t4: NPZ containing the "
+            "authenticated Tesla T4 torch.polar phase_pairs table."
+        ),
+    )
+    parser.add_argument(
+        "--expected-turing-rope-phase-lut-sha256",
+        help="Require the Turing RoPE phase LUT NPZ to match this exact SHA256.",
+    )
+    parser.add_argument(
         "--turing-rsqrt-lut",
         metavar="NPZ",
         help=(
@@ -895,6 +946,40 @@ def main():
         configure_shape_flow_layernorm_backend(
             args.shape_flow_layernorm_backend
         )
+    if args.rope_backend == CUDA_POLAR_TURING_T4_BACKEND:
+        if (
+            not args.turing_rope_phase_lut
+            or not args.expected_turing_rope_phase_lut_sha256
+        ):
+            parser.error(
+                f"--rope-backend {CUDA_POLAR_TURING_T4_BACKEND} requires "
+                "--turing-rope-phase-lut and "
+                "--expected-turing-rope-phase-lut-sha256"
+            )
+        try:
+            rope_phase_lut, rope_phase_lut_sha256 = (
+                _load_turing_rope_phase_lut(
+                    args.turing_rope_phase_lut,
+                    args.expected_turing_rope_phase_lut_sha256,
+                )
+            )
+            configure_rope_backend(
+                args.rope_backend,
+                turing_phase_lut=rope_phase_lut,
+                turing_phase_lut_sha256=rope_phase_lut_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    else:
+        if (
+            args.turing_rope_phase_lut
+            or args.expected_turing_rope_phase_lut_sha256
+        ):
+            parser.error(
+                "--turing-rope-phase-lut and its expected SHA256 only apply "
+                f"to {CUDA_POLAR_TURING_T4_BACKEND}"
+            )
+        configure_rope_backend(args.rope_backend)
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1955,8 +2040,12 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
+            rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
+            shape_flow_turing_rope_phase_lut_sha256=np.array(
+                get_turing_phase_lut_sha256() or ""
             ),
         )
         print(
@@ -2014,8 +2103,12 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
+            rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
+            shape_flow_turing_rope_phase_lut_sha256=np.array(
+                get_turing_phase_lut_sha256() or ""
             ),
         )
         print("  Stop after stage: shape_flow_step", flush=True)
@@ -2070,8 +2163,12 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
+            rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
                 get_shape_flow_turing_rsqrt_lut_sha256() or ""
+            ),
+            shape_flow_turing_rope_phase_lut_sha256=np.array(
+                get_turing_phase_lut_sha256() or ""
             ),
         )
         print("  Stop after stage: shape_flow_steps", flush=True)

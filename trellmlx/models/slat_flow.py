@@ -36,7 +36,7 @@ from ..shape_flow_layernorm import (
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
-from ..modules.rope import build_rope_phases, apply_rope
+from ..modules.rope import build_sparse_rope_phases
 
 
 class SLatFlowModel(nn.Module):
@@ -358,29 +358,4 @@ class SLatFlowModel(nn.Module):
         Returns:
             [N, head_dim//2, 2] cos/sin pairs
         """
-        import math
-
-        freq_dim = self.head_dim // 2 // 3  # 3D coordinates
-        freqs = np.arange(freq_dim, dtype=np.float32) / freq_dim
-        freqs = 1.0 / (10000.0 ** freqs)
-        freqs = mx.array(freqs)
-
-        coords_f = coords.astype(mx.float32)
-
-        # Compute phases for each spatial dimension
-        all_angles = []
-        for d in range(3):
-            angles = coords_f[:, d:d+1] * freqs[None, :]  # [N, freq_dim]
-            all_angles.append(angles)
-        angles = mx.concatenate(all_angles, axis=-1)  # [N, 3*freq_dim]
-
-        # Pad to head_dim//2 if needed
-        target = self.head_dim // 2
-        if angles.shape[-1] < target:
-            pad = mx.zeros((angles.shape[0], target - angles.shape[-1]))
-            angles = mx.concatenate([angles, pad], axis=-1)
-
-        # Return as cos/sin pairs
-        cos_p = mx.cos(angles)
-        sin_p = mx.sin(angles)
-        return mx.stack([cos_p, sin_p], axis=-1)  # [N, head_dim//2, 2]
+        return build_sparse_rope_phases(coords, head_dim=self.head_dim)

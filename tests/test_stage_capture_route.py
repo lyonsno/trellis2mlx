@@ -1199,6 +1199,184 @@ def test_generate_turing_rsqrt_lut_loader_rejects_malformed_payload(tmp_path):
         generate._load_turing_rsqrt_lut(lut, digest)
 
 
+def test_stage_capture_forwards_and_records_turing_rope_phase_lut(tmp_path):
+    import hashlib
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    lut = tmp_path / "turing-rope.npz"
+    phases = np.zeros((64, 21, 2), dtype=np.float32)
+    phases[..., 0] = 1.0
+    np.savez(lut, phase_pairs=phases)
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--rope-backend",
+            "cuda-polar-turing-t4",
+            "--turing-rope-phase-lut",
+            str(lut),
+            "--expected-turing-rope-phase-lut-sha256",
+            digest,
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--rope-backend") + 1] == "cuda-polar-turing-t4"
+    assert command[command.index("--turing-rope-phase-lut") + 1] == str(lut)
+    assert (
+        command[
+            command.index("--expected-turing-rope-phase-lut-sha256") + 1
+        ]
+        == digest
+    )
+    assert route_identity["route"]["rope_backend_requested"] == (
+        "cuda-polar-turing-t4"
+    )
+    assert route_identity["route"]["turing_rope_phase_lut_path"] == str(lut)
+    assert (
+        route_identity["route"]["turing_rope_phase_lut_sha256_requested"]
+        == digest
+    )
+    assert (
+        route_identity["route"]["turing_rope_phase_lut_sha256_effective"]
+        == digest
+    )
+
+
+def test_stage_capture_rejects_hash_matched_malformed_turing_rope_lut(tmp_path):
+    import hashlib
+
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_turing_rope_route_args,
+        build_parser,
+    )
+
+    lut = tmp_path / "turing-rope.npz"
+    np.savez(lut, phase_pairs=np.zeros((64, 20, 2), dtype=np.float32))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--rope-backend",
+            "cuda-polar-turing-t4",
+            "--turing-rope-phase-lut",
+            str(lut),
+            "--expected-turing-rope-phase-lut-sha256",
+            digest,
+        ]
+    )
+
+    with pytest.raises(
+        ValueError, match=r"Turing RoPE phase LUT must be float32\[64,21,2\]"
+    ):
+        _validate_turing_rope_route_args(args)
+
+
+def test_generate_turing_rope_phase_lut_loader_rejects_substitution_and_malformed(
+    tmp_path,
+):
+    import hashlib
+
+    import generate
+    import numpy as np
+    import pytest
+
+    lut = tmp_path / "turing-rope.npz"
+    lut.write_bytes(b"substituted-lut")
+    with pytest.raises(ValueError, match="Turing RoPE phase LUT SHA256 mismatch"):
+        generate._load_turing_rope_phase_lut(lut, "a" * 64)
+
+    np.savez(lut, wrong_key=np.zeros((64, 21, 2), dtype=np.float32))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="omits phase_pairs"):
+        generate._load_turing_rope_phase_lut(lut, digest)
+
+    np.savez(lut, phase_pairs=np.zeros((64, 21, 2), dtype=np.float16))
+    digest = hashlib.sha256(lut.read_bytes()).hexdigest()
+    with pytest.raises(
+        ValueError, match=r"must be float32\[64,21,2\]"
+    ):
+        generate._load_turing_rope_phase_lut(lut, digest)
+
+
+def test_shape_flow_checkpoint_rope_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _bind_effective_rope_backend
+
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        rope_backend=np.array("mlx-real"),
+        shape_flow_turing_rope_phase_lut_sha256=np.array(""),
+    )
+    route_identity = {
+        "route": {
+            "rope_backend_requested": "cuda-polar-turing-t4",
+            "turing_rope_phase_lut_sha256_effective": "a" * 64,
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "shape-flow effective RoPE backend 'mlx-real' does not match "
+            "requested 'cuda-polar-turing-t4'"
+        ),
+    ):
+        _bind_effective_rope_backend(route_identity, checkpoint)
+
+
+def test_shape_flow_turing_rope_checkpoint_requires_effective_lut_hash(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _bind_effective_rope_backend
+
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        rope_backend=np.array("cuda-polar-turing-t4"),
+    )
+    route_identity = {
+        "route": {
+            "rope_backend_requested": "cuda-polar-turing-t4",
+            "turing_rope_phase_lut_sha256_effective": "a" * 64,
+        }
+    }
+
+    with pytest.raises(
+        ValueError, match="omits effective Turing RoPE phase LUT SHA256"
+    ):
+        _bind_effective_rope_backend(route_identity, checkpoint)
+
+
 def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channels=4):
     import numpy as np
 
@@ -1255,6 +1433,8 @@ def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channel
         shape_flow_block_injection_json=np.array(""),
         shape_flow_layernorm_backend=np.array("mlx-two-pass"),
         qk_norm_backend=np.array("source-cuda-warp32"),
+        rope_backend=np.array("mlx-real"),
+        shape_flow_turing_rope_phase_lut_sha256=np.array(""),
     )
 
 
@@ -1318,6 +1498,64 @@ def test_shape_flow_steps_missing_effective_qk_norm_backend_fails_loud(tmp_path)
             expected_route={
                 "shape_flow_layernorm_backend_requested": "mlx-two-pass",
                 "qk_norm_backend_requested": "source-cuda-warp32",
+            },
+        )
+
+
+def test_shape_flow_steps_missing_effective_rope_backend_fails_loud(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as loaded:
+        payload = {
+            key: np.asarray(loaded[key])
+            for key in loaded.files
+            if key != "rope_backend"
+        }
+    np.savez(checkpoint, **payload)
+
+    with pytest.raises(
+        ValueError, match="missing required arrays.*rope_backend"
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "source-cuda-warp32",
+                "rope_backend_requested": "mlx-real",
+            },
+        )
+
+
+def test_shape_flow_steps_rope_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "shape_flow_steps effective RoPE backend 'mlx-real' does not "
+            "match requested 'source-complex'"
+        ),
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "source-cuda-warp32",
+                "rope_backend_requested": "source-complex",
             },
         )
 

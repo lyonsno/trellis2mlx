@@ -18,6 +18,13 @@ import numpy as np
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TURING_T4_BACKEND = "cuda-welford-turing-t4"
+TURING_T4_ROPE_BACKEND = "cuda-polar-turing-t4"
+DEFAULT_ROPE_BACKEND = "mlx-real"
+SUPPORTED_ROPE_BACKENDS = (
+    DEFAULT_ROPE_BACKEND,
+    "source-complex",
+    TURING_T4_ROPE_BACKEND,
+)
 DEFAULT_QK_NORM_BACKEND = "source-cuda-warp32"
 SUPPORTED_QK_NORM_BACKENDS = (
     DEFAULT_QK_NORM_BACKEND,
@@ -41,6 +48,7 @@ INPUT_PATH_FIELDS = (
     "sparse_flow_layernorm_correction_report",
     "shape_flow_noise_sample",
     "turing_rsqrt_lut",
+    "turing_rope_phase_lut",
     "shape_flow_block_injection_trace",
     "shape_flow_block_injection_manifest",
 )
@@ -165,6 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_QK_NORM_BACKENDS,
         default=DEFAULT_QK_NORM_BACKEND,
     )
+    parser.add_argument(
+        "--rope-backend",
+        choices=SUPPORTED_ROPE_BACKENDS,
+        default=DEFAULT_ROPE_BACKEND,
+    )
+    parser.add_argument("--turing-rope-phase-lut")
+    parser.add_argument("--expected-turing-rope-phase-lut-sha256")
     parser.add_argument("--turing-rsqrt-lut")
     parser.add_argument("--expected-turing-rsqrt-lut-sha256")
     parser.add_argument("--shape-flow-noise-sample")
@@ -239,6 +254,7 @@ def build_route_identity(
     target_faces = _resolve_target_faces(args)
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
     turing_lut_identity = _validate_turing_rsqrt_route_args(args)
+    turing_rope_lut_identity = _validate_turing_rope_route_args(args)
     if repo_identity is None:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
     return {
@@ -353,6 +369,14 @@ def build_route_identity(
             ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
             "qk_norm_backend_requested": args.qk_norm_backend,
+            "rope_backend_requested": args.rope_backend,
+            "turing_rope_phase_lut_path": turing_rope_lut_identity["path"],
+            "turing_rope_phase_lut_sha256_requested": (
+                turing_rope_lut_identity["sha256_requested"]
+            ),
+            "turing_rope_phase_lut_sha256_effective": (
+                turing_rope_lut_identity["sha256_effective"]
+            ),
             "turing_rsqrt_lut_path": turing_lut_identity["path"],
             "turing_rsqrt_lut_sha256_requested": turing_lut_identity[
                 "sha256_requested"
@@ -481,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     requested_inputs, invalid_inputs = _preflight_input_paths(args)
     turing_lut_identity = _describe_turing_rsqrt_route_args(args)
+    turing_rope_lut_identity = _describe_turing_rope_route_args(args)
     try:
         _validate_turing_rsqrt_route_args(args)
     except (OSError, ValueError) as exc:
@@ -495,6 +520,26 @@ def main(argv: list[str] | None = None) -> int:
                 "requested_inputs": requested_inputs,
                 "invalid_inputs": invalid_inputs,
                 "turing_rsqrt_lut_identity": turing_lut_identity,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
+    try:
+        _validate_turing_rope_route_args(args)
+    except (OSError, ValueError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_turing_rope_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "turing_rope_phase_lut_identity": turing_rope_lut_identity,
                 "error": str(exc),
                 "command": command,
                 "exit_code": 2,
@@ -629,12 +674,25 @@ def main(argv: list[str] | None = None) -> int:
                 effective_qk_backend = primary_output_validation["sampler"][
                     "qk_norm_backend"
                 ]
+                effective_rope_backend = primary_output_validation["sampler"][
+                    "rope_backend"
+                ]
+                if effective_rope_backend == TURING_T4_ROPE_BACKEND:
+                    route_identity["route"][
+                        "shape_flow_turing_rope_phase_lut_sha256_effective"
+                    ] = primary_output_validation["sampler"][
+                        "shape_flow_turing_rope_phase_lut_sha256"
+                    ]
             else:
                 effective_backend = _bind_effective_shape_flow_layernorm_backend(
                     route_identity,
                     checkpoint_npz,
                 )
                 effective_qk_backend = _bind_effective_qk_norm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+                effective_rope_backend = _bind_effective_rope_backend(
                     route_identity,
                     checkpoint_npz,
                 )
@@ -645,6 +703,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             route_identity["route"]["qk_norm_backend_effective"] = (
                 effective_qk_backend
+            )
+            route_identity["route"]["rope_backend_effective"] = (
+                effective_rope_backend
             )
             _write_json(output_dir / "route_identity.json", route_identity)
         except (OSError, ValueError) as exc:
@@ -839,6 +900,96 @@ def _bind_effective_qk_norm_backend(
     return effective
 
 
+def _bind_effective_rope_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("rope_backend_requested")
+    if requested not in SUPPORTED_ROPE_BACKENDS:
+        raise ValueError(
+            f"route identity has unsupported requested RoPE backend "
+            f"{requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "rope_backend" not in checkpoint:
+            raise ValueError(
+                "shape-flow checkpoint omits effective RoPE backend metadata"
+            )
+        backend_array = np.asarray(checkpoint["rope_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape-flow effective RoPE backend must be a string scalar"
+            )
+        effective = str(backend_array.item())
+        effective_lut_sha256 = _checkpoint_turing_rope_lut_sha256(
+            checkpoint,
+            backend=effective,
+            expected_route=route,
+            context="shape-flow checkpoint",
+        )
+    if effective != requested:
+        raise ValueError(
+            f"shape-flow effective RoPE backend {effective!r} "
+            f"does not match requested {requested!r}"
+        )
+    if requested == TURING_T4_ROPE_BACKEND:
+        route["shape_flow_turing_rope_phase_lut_sha256_effective"] = (
+            effective_lut_sha256
+        )
+    return effective
+
+
+def _checkpoint_turing_rope_lut_sha256(
+    checkpoint: Any,
+    *,
+    backend: str,
+    expected_route: dict[str, Any],
+    context: str,
+) -> str | None:
+    key = "shape_flow_turing_rope_phase_lut_sha256"
+    if backend == TURING_T4_ROPE_BACKEND:
+        if key not in checkpoint:
+            raise ValueError(
+                f"{context} omits effective Turing RoPE phase LUT SHA256"
+            )
+        value = np.asarray(checkpoint[key])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                f"{context} effective Turing RoPE phase LUT SHA256 "
+                "must be a string scalar"
+            )
+        effective = str(value.item())
+        expected = expected_route.get(
+            "turing_rope_phase_lut_sha256_effective"
+        )
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or effective != expected
+        ):
+            raise ValueError(
+                f"{context} effective Turing RoPE phase LUT SHA256 "
+                f"{effective!r} does not match requested/effective route "
+                f"{expected!r}"
+            )
+        return effective
+    if key in checkpoint:
+        value = np.asarray(checkpoint[key])
+        if (
+            value.shape != ()
+            or value.dtype.kind not in {"U", "S"}
+            or str(value.item())
+        ):
+            raise ValueError(
+                f"{context} carries Turing RoPE phase LUT identity under "
+                f"non-Turing backend {backend!r}"
+            )
+    return None
+
+
 def _checkpoint_turing_lut_sha256(
     checkpoint: Any,
     *,
@@ -925,6 +1076,7 @@ def _validate_shape_flow_steps_checkpoint(
         "shape_flow_block_injection_json",
         "shape_flow_layernorm_backend",
         "qk_norm_backend",
+        "rope_backend",
     }
     stepped_tensor_names = (
         "sample_in",
@@ -1144,6 +1296,33 @@ def _validate_shape_flow_steps_checkpoint(
                 f"{effective_qk_backend!r} does not match requested "
                 f"{requested_qk_backend!r}"
             )
+        rope_backend_array = np.asarray(checkpoint["rope_backend"])
+        if (
+            rope_backend_array.shape != ()
+            or rope_backend_array.dtype.kind not in {"U", "S"}
+        ):
+            raise ValueError(
+                "shape_flow_steps rope_backend must be a string scalar"
+            )
+        effective_rope_backend = str(rope_backend_array.item())
+        requested_rope_backend = (expected_route or {}).get(
+            "rope_backend_requested",
+            DEFAULT_ROPE_BACKEND,
+        )
+        if effective_rope_backend != requested_rope_backend:
+            raise ValueError(
+                "shape_flow_steps effective RoPE backend "
+                f"{effective_rope_backend!r} does not match requested "
+                f"{requested_rope_backend!r}"
+            )
+        effective_turing_rope_lut_sha256 = (
+            _checkpoint_turing_rope_lut_sha256(
+                checkpoint,
+                backend=effective_rope_backend,
+                expected_route=expected_route or {},
+                context="shape_flow_steps",
+            )
+        )
 
         schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
         rescale_t = sampler_scalars["rescale_t"]
@@ -1184,8 +1363,12 @@ def _validate_shape_flow_steps_checkpoint(
             "shape_flow_block_injection_route": injection_route,
             "shape_flow_layernorm_backend": effective_backend,
             "qk_norm_backend": effective_qk_backend,
+            "rope_backend": effective_rope_backend,
             "shape_flow_turing_rsqrt_lut_sha256": (
                 effective_turing_lut_sha256
+            ),
+            "shape_flow_turing_rope_phase_lut_sha256": (
+                effective_turing_rope_lut_sha256
             ),
         },
         "finite": True,
@@ -1414,7 +1597,23 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         args.shape_flow_layernorm_backend,
         "--qk-norm-backend",
         args.qk_norm_backend,
+        "--rope-backend",
+        args.rope_backend,
     ])
+    if args.turing_rope_phase_lut:
+        command.extend(
+            [
+                "--turing-rope-phase-lut",
+                str(Path(args.turing_rope_phase_lut)),
+            ]
+        )
+    if args.expected_turing_rope_phase_lut_sha256:
+        command.extend(
+            [
+                "--expected-turing-rope-phase-lut-sha256",
+                args.expected_turing_rope_phase_lut_sha256,
+            ]
+        )
     if args.turing_rsqrt_lut:
         command.extend(
             [
@@ -1533,6 +1732,82 @@ def _validate_turing_rsqrt_lut_payload(path: Path) -> None:
             "Turing rsqrt LUT normalized_delta must be int8[16777216], "
             f"got {correction.dtype}{correction.shape}"
         )
+
+
+def _validate_turing_rope_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    path = getattr(args, "turing_rope_phase_lut", None)
+    expected = getattr(
+        args, "expected_turing_rope_phase_lut_sha256", None
+    )
+    if args.rope_backend == TURING_T4_ROPE_BACKEND:
+        if not path or not expected:
+            raise ValueError(
+                f"{TURING_T4_ROPE_BACKEND} requires "
+                "--turing-rope-phase-lut and "
+                "--expected-turing-rope-phase-lut-sha256"
+            )
+        effective = _sha256_file(path)
+        if effective != expected:
+            raise ValueError(
+                "Turing RoPE phase LUT SHA256 mismatch: "
+                f"expected {expected}, got {effective}"
+            )
+        _validate_turing_rope_phase_lut_payload(Path(path))
+        return {
+            "path": str(Path(path)),
+            "sha256_requested": expected,
+            "sha256_effective": effective,
+        }
+    if path or expected:
+        raise ValueError(
+            "Turing RoPE phase LUT arguments only apply to "
+            f"{TURING_T4_ROPE_BACKEND}"
+        )
+    return {
+        "path": None,
+        "sha256_requested": None,
+        "sha256_effective": None,
+    }
+
+
+def _describe_turing_rope_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    raw_path = getattr(args, "turing_rope_phase_lut", None)
+    path = Path(raw_path) if raw_path else None
+    effective = None
+    read_error = None
+    if path is not None and path.is_file():
+        try:
+            effective = _sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    identity = {
+        "path": str(path) if path is not None else None,
+        "sha256_requested": getattr(
+            args, "expected_turing_rope_phase_lut_sha256", None
+        ),
+        "sha256_effective": effective,
+    }
+    if read_error is not None:
+        identity["read_error"] = read_error
+    return identity
+
+
+def _validate_turing_rope_phase_lut_payload(path: Path) -> None:
+    with np.load(path, allow_pickle=False) as loaded:
+        if "phase_pairs" not in loaded.files:
+            raise ValueError("Turing RoPE phase LUT NPZ omits phase_pairs")
+        phase_pairs = np.asarray(loaded["phase_pairs"])
+    if phase_pairs.dtype != np.float32 or phase_pairs.shape != (64, 21, 2):
+        raise ValueError(
+            "Turing RoPE phase LUT must be float32[64,21,2], "
+            f"got {phase_pairs.dtype}{phase_pairs.shape}"
+        )
+    if not np.isfinite(phase_pairs).all():
+        raise ValueError("Turing RoPE phase LUT contains non-finite values")
 
 
 def _resolve_target_faces(args: argparse.Namespace) -> int:
