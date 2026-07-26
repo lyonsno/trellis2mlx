@@ -94,6 +94,78 @@ def test_sparse_flow_block_trace_comparison_reports_dynamic_block_arrays(tmp_pat
     assert report["arrays"]["neg_block5_after_mlp"]["max_abs_diff"] == 3.0
 
 
+def test_shape_flow_block_trace_compares_logically_equivalent_attention_layouts(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    source_layout = np.arange(24, dtype=np.float32).reshape(1, 2, 3, 4)
+    mlx_layout = source_layout.reshape(1, 2, 12).copy()
+    mlx_layout[0, 1, 7] += 0.5
+    np.savez(
+        reference,
+        pos_block0_attention_raw=source_layout,
+        neg_block0_cross_attention_raw=source_layout,
+    )
+    np.savez(
+        candidate,
+        pos_block0_attention_raw=mlx_layout,
+        neg_block0_cross_attention_raw=source_layout.reshape(1, 2, 12),
+    )
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    attention = report["arrays"]["pos_block0_attention_raw"]
+    assert attention["logical_shape_match"] is True
+    assert attention["layout_normalized"] is True
+    assert attention["max_abs_diff"] == 0.5
+    assert report["arrays"]["neg_block0_cross_attention_raw"]["max_abs_diff"] == 0.0
+
+
+def test_shape_flow_block_trace_rejects_unrelated_same_size_layouts(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    values = np.arange(24, dtype=np.float32)
+    np.savez(
+        reference,
+        pos_block0_attention_raw=values.reshape(1, 2, 2, 6),
+        pos_block0_self_attn=values.reshape(1, 2, 2, 6),
+    )
+    np.savez(
+        candidate,
+        pos_block0_attention_raw=values.reshape(1, 2, 3, 4),
+        pos_block0_self_attn=values.reshape(1, 2, 3, 4),
+    )
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    for name in ("pos_block0_attention_raw", "pos_block0_self_attn"):
+        delta = report["arrays"][name]
+        assert delta["shape_match"] is False
+        assert "logical_shape_match" not in delta
+        assert "layout_normalized" not in delta
+        assert "max_abs_diff" not in delta
+
+
+def test_shape_flow_block_trace_normalizes_attention_layouts_in_either_orientation(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    values = np.arange(24, dtype=np.float32)
+    np.savez(reference, pos_block0_attention_raw=values.reshape(1, 2, 12))
+    np.savez(candidate, pos_block0_attention_raw=values.reshape(1, 2, 3, 4))
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    delta = report["arrays"]["pos_block0_attention_raw"]
+    assert delta["logical_shape_match"] is True
+    assert delta["layout_normalized"] is True
+    assert delta["max_abs_diff"] == 0.0
+
+
 def test_sparse_flow_steps_comparison_reports_step_arrays(tmp_path):
     from scripts.compare_stage_artifacts import compare_stage
 

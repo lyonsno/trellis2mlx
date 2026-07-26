@@ -90,7 +90,11 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
             return report
         if stage in {"sparse_flow_block_trace", "shape_flow_block_trace"}:
             report["arrays"] = {
-                name: _array_delta(ref[name], cand[name])
+                name: (
+                    _shape_block_trace_array_delta(name, ref[name], cand[name])
+                    if stage == "shape_flow_block_trace"
+                    else _array_delta(ref[name], cand[name])
+                )
                 for name in sorted(set(ref.files) & set(cand.files))
             }
             return report
@@ -140,6 +144,38 @@ def _array_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]
     diff = np.abs(reference.astype(np.float64) - candidate.astype(np.float64))
     summary.update(_diff_summary(diff))
     return summary
+
+
+def _shape_block_trace_array_delta(
+    name: str,
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> dict[str, Any]:
+    dimensions = {reference.ndim, candidate.ndim}
+    rank_four = reference if reference.ndim == 4 else candidate
+    rank_three = reference if reference.ndim == 3 else candidate
+    if (
+        name.endswith("_attention_raw")
+        and dimensions == {3, 4}
+        and rank_four.shape[:2] == rank_three.shape[:2]
+        and rank_four.shape[2] * rank_four.shape[3] == rank_three.shape[2]
+    ):
+        canonical_shape = (*reference.shape[:2], -1)
+        summary = _array_delta(
+            reference.reshape(canonical_shape),
+            candidate.reshape(canonical_shape),
+        )
+        summary.update(
+            {
+                "reference_shape": list(reference.shape),
+                "candidate_shape": list(candidate.shape),
+                "shape_match": reference.shape == candidate.shape,
+                "logical_shape_match": True,
+                "layout_normalized": reference.shape != candidate.shape,
+            }
+        )
+        return summary
+    return _array_delta(reference, candidate)
 
 
 def _coord_overlap(
