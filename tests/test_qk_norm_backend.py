@@ -28,11 +28,11 @@ def _run_fixture(monkeypatch, backend=None):
         )
 
 
-def test_default_qk_norm_matches_authenticated_source_cuda_row(monkeypatch):
+def test_library_default_preserves_previous_mlx_sum_route(monkeypatch):
     actual, expected, ordinary_mlx = _run_fixture(monkeypatch)
 
     assert np.count_nonzero(ordinary_mlx - expected) == 1
-    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual, ordinary_mlx)
 
 
 def test_cuda_warp32_qk_norm_matches_authenticated_source_cuda_row(monkeypatch):
@@ -55,6 +55,30 @@ def test_qk_norm_rejects_an_unknown_backend(monkeypatch):
     x = mx.zeros((1, 1, 128), dtype=mx.bfloat16)
 
     with pytest.raises(ValueError, match="TRELLIS2MLX_QK_NORM_BACKEND"):
+        norm(x)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype"),
+    [
+        (64, mx.bfloat16),
+        (128, mx.float32),
+    ],
+)
+def test_cuda_warp32_qk_norm_rejects_unauthenticated_geometry(
+    monkeypatch,
+    head_dim,
+    dtype,
+):
+    from trellmlx.modules.attention import MultiHeadRMSNorm
+
+    monkeypatch.setenv(
+        "TRELLIS2MLX_QK_NORM_BACKEND", "source-cuda-warp32"
+    )
+    norm = MultiHeadRMSNorm(head_dim=head_dim, num_heads=1)
+    x = mx.zeros((1, 1, head_dim), dtype=dtype)
+
+    with pytest.raises(ValueError, match="requires bfloat16.*head dimension 128"):
         norm(x)
 
 

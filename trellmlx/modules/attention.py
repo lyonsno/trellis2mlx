@@ -13,6 +13,7 @@ import mlx.nn as nn
 
 DEFAULT_QK_NORM_BACKEND = "source-cuda-warp32"
 MLX_QK_NORM_BACKEND = "mlx-sum"
+LIBRARY_DEFAULT_QK_NORM_BACKEND = MLX_QK_NORM_BACKEND
 SUPPORTED_QK_NORM_BACKENDS = (
     DEFAULT_QK_NORM_BACKEND,
     MLX_QK_NORM_BACKEND,
@@ -23,7 +24,7 @@ _source_cuda_warp32_norm_kernel = None
 
 def get_qk_norm_backend() -> str:
     backend = os.environ.get(
-        "TRELLIS2MLX_QK_NORM_BACKEND", DEFAULT_QK_NORM_BACKEND
+        "TRELLIS2MLX_QK_NORM_BACKEND", LIBRARY_DEFAULT_QK_NORM_BACKEND
     ).lower()
     if backend not in SUPPORTED_QK_NORM_BACKENDS:
         raise ValueError(
@@ -56,7 +57,6 @@ def qk_norm_backend_identity() -> dict:
             "shuffle_offsets": [16, 8, 4, 2, 1],
             "cuda_device_anchor": "Tesla T4",
         },
-        "non_authenticated_geometry": "mlx-fp32-sum-sqrt",
     }
 
 
@@ -227,11 +227,13 @@ class MultiHeadRMSNorm(nn.Module):
         orig_dtype = x.dtype
         xf = x.astype(mx.float32)
         backend = get_qk_norm_backend()
-        if (
-            backend == DEFAULT_QK_NORM_BACKEND
-            and orig_dtype == mx.bfloat16
-            and x.shape[-1] == 128
-        ):
+        if backend == DEFAULT_QK_NORM_BACKEND:
+            if orig_dtype != mx.bfloat16 or x.shape[-1] != 128:
+                raise ValueError(
+                    f"{DEFAULT_QK_NORM_BACKEND} requires bfloat16 input with "
+                    f"head dimension 128, got dtype {orig_dtype} and "
+                    f"head dimension {x.shape[-1]}"
+                )
             norm = mx.maximum(_source_cuda_warp32_l2_norm(x), 1e-12)
         else:
             norm = mx.sqrt(
