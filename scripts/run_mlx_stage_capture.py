@@ -30,6 +30,17 @@ SUPPORTED_QK_NORM_BACKENDS = (
     DEFAULT_QK_NORM_BACKEND,
     "mlx-sum",
 )
+SUPPORTED_ATTENTION_BACKENDS = ("fast", "mlx-fast", "manual", "mlx-manual")
+SUPPORTED_ATTENTION_SOFTMAX_BACKENDS = ("mlx-softmax", "source-cuda-turing")
+SUPPORTED_ATTENTION_VALUE_BACKENDS = ("mlx-matmul", "source-cuda-sequential")
+SHAPE_FLOW_ATTENTION_ROUTE_FIELDS = (
+    "shape_flow_attention_backend_requested",
+    "shape_flow_attention_backend_effective",
+    "shape_flow_attention_softmax_backend_requested",
+    "shape_flow_attention_softmax_backend_effective",
+    "shape_flow_attention_value_backend_requested",
+    "shape_flow_attention_value_backend_effective",
+)
 STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
     "standard": 350_000,
     "source-quality": 500_000,
@@ -160,6 +171,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-keys")
     parser.add_argument(
+        "--shape-flow-attention-backend",
+        choices=SUPPORTED_ATTENTION_BACKENDS,
+    )
+    parser.add_argument(
+        "--shape-flow-attention-softmax-backend",
+        choices=SUPPORTED_ATTENTION_SOFTMAX_BACKENDS,
+    )
+    parser.add_argument(
+        "--shape-flow-attention-value-backend",
+        choices=SUPPORTED_ATTENTION_VALUE_BACKENDS,
+    )
+    parser.add_argument(
         "--shape-flow-layernorm-backend",
         choices=[
             "mlx-two-pass",
@@ -281,6 +304,24 @@ def build_route_identity(
     else:
         attention_softmax_effective = "fused-fast-attention"
         attention_value_effective = "fused-fast-attention"
+    shape_attention_backend_requested = (
+        args.shape_flow_attention_backend or attention_backend_requested
+    ).lower()
+    shape_attention_backend = _normalize_attention_backend(
+        shape_attention_backend_requested
+    )
+    shape_attention_softmax_requested = (
+        args.shape_flow_attention_softmax_backend or attention_softmax_requested
+    ).lower()
+    shape_attention_value_requested = (
+        args.shape_flow_attention_value_backend or attention_value_requested
+    ).lower()
+    if shape_attention_backend == "manual":
+        shape_attention_softmax_effective = shape_attention_softmax_requested
+        shape_attention_value_effective = shape_attention_value_requested
+    else:
+        shape_attention_softmax_effective = "fused-fast-attention"
+        shape_attention_value_effective = "fused-fast-attention"
     return {
         "schema": SCHEMA,
         "route": {
@@ -396,6 +437,22 @@ def build_route_identity(
             "shape_flow_trace_keys": (
                 shape_flow_trace_requested_keys if shape_flow_trace_requested_keys else None
             ),
+            "shape_flow_attention_backend_requested": (
+                shape_attention_backend_requested
+            ),
+            "shape_flow_attention_backend_effective": shape_attention_backend,
+            "shape_flow_attention_softmax_backend_requested": (
+                shape_attention_softmax_requested
+            ),
+            "shape_flow_attention_softmax_backend_effective": (
+                shape_attention_softmax_effective
+            ),
+            "shape_flow_attention_value_backend_requested": (
+                shape_attention_value_requested
+            ),
+            "shape_flow_attention_value_backend_effective": (
+                shape_attention_value_effective
+            ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
             "qk_norm_backend_requested": args.qk_norm_backend,
             "rope_backend_requested": args.rope_backend,
@@ -501,7 +558,30 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint_dir = output_dir / "checkpoints"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    command = _build_generate_command(args, checkpoint_dir)
+    try:
+        command = _build_generate_command(args, checkpoint_dir)
+    except ValueError as exc:
+        checkpoint_npz = checkpoint_dir / f"{args.stop_after_stage}.npz"
+        checkpoint_json = checkpoint_dir / f"{args.stop_after_stage}.json"
+        preexisting_primary = checkpoint_npz.exists() or checkpoint_json.exists()
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_shape_flow_attention_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": (
+                    "preexisting_untrusted_preserved"
+                    if preexisting_primary
+                    else "not_started"
+                ),
+                "error": str(exc),
+                "command": None,
+                "exit_code": 2,
+            },
+        )
+        return 2
     try:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -733,6 +813,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.stop_after_stage == "shape_flow_block_trace":
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
+                _bind_effective_shape_flow_attention_route(
+                    route_identity,
+                    checkpoint_npz,
+                )
             route_identity["route"]["shape_flow_layernorm_backend_effective"] = (
                 effective_backend
             )
@@ -770,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
                 "invalid"
                 if failure_phase
                 in {
+                    "bind_effective_route_identity",
                     "validate_primary_output",
                     "postflight_repo_identity",
                 }
@@ -901,6 +986,69 @@ def _bind_effective_shape_flow_layernorm_backend(
             effective_turing_lut_sha256
         )
     return effective
+
+
+def _bind_effective_shape_flow_attention_route(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        missing = [
+            field for field in SHAPE_FLOW_ATTENTION_ROUTE_FIELDS
+            if field not in checkpoint
+        ]
+        if missing:
+            raise ValueError(
+                "shape-flow checkpoint omits shape-flow attention route metadata: "
+                f"{missing}"
+            )
+        effective = {}
+        for field in SHAPE_FLOW_ATTENTION_ROUTE_FIELDS:
+            value = np.asarray(checkpoint[field])
+            if value.shape != () or value.dtype.kind not in {"U", "S"}:
+                raise ValueError(
+                    f"shape-flow attention route field {field!r} must be a string scalar"
+                )
+            effective[field] = str(value.item())
+
+    labels = {
+        "shape_flow_attention_backend_requested": (
+            "requested shape-flow attention backend"
+        ),
+        "shape_flow_attention_backend_effective": (
+            "effective shape-flow attention backend"
+        ),
+        "shape_flow_attention_softmax_backend_requested": (
+            "requested shape-flow attention softmax backend"
+        ),
+        "shape_flow_attention_softmax_backend_effective": (
+            "effective shape-flow attention softmax backend"
+        ),
+        "shape_flow_attention_value_backend_requested": (
+            "requested shape-flow attention value backend"
+        ),
+        "shape_flow_attention_value_backend_effective": (
+            "effective shape-flow attention value backend"
+        ),
+    }
+    for field in SHAPE_FLOW_ATTENTION_ROUTE_FIELDS:
+        expected = route.get(field)
+        if effective[field] != expected:
+            raise ValueError(
+                f"{labels[field]} {effective[field]!r} "
+                f"does not match requested route {expected!r}"
+            )
+
+
+def _normalize_attention_backend(requested: str) -> str:
+    if requested in {"manual", "mlx-manual"}:
+        return "manual"
+    if requested in {"fast", "mlx-fast"}:
+        return "fast"
+    return f"unsupported:{requested}"
 
 
 def _bind_effective_qk_norm_backend(
@@ -1518,6 +1666,15 @@ def _validate_shape_flow_injection_identity(
 
 
 def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> list[str]:
+    if (
+        args.shape_flow_attention_backend
+        or args.shape_flow_attention_softmax_backend
+        or args.shape_flow_attention_value_backend
+    ) and args.stop_after_stage != "shape_flow_block_trace":
+        raise ValueError(
+            "shape-flow attention selectors require "
+            "--stop-after-stage shape_flow_block_trace"
+        )
     command = [
         sys.executable,
         "-u",
@@ -1627,6 +1784,27 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         ])
         if args.shape_flow_trace_keys:
             command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
+        if args.shape_flow_attention_backend:
+            command.extend(
+                [
+                    "--shape-flow-attention-backend",
+                    args.shape_flow_attention_backend,
+                ]
+            )
+        if args.shape_flow_attention_softmax_backend:
+            command.extend(
+                [
+                    "--shape-flow-attention-softmax-backend",
+                    args.shape_flow_attention_softmax_backend,
+                ]
+            )
+        if args.shape_flow_attention_value_backend:
+            command.extend(
+                [
+                    "--shape-flow-attention-value-backend",
+                    args.shape_flow_attention_value_backend,
+                ]
+            )
     command.extend([
         "--shape-flow-layernorm-backend",
         args.shape_flow_layernorm_backend,

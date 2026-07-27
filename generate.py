@@ -121,6 +121,77 @@ def _parse_shape_flow_trace_keys(value: str | None) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+def _shape_flow_attention_route_from_env() -> dict[str, str]:
+    backend_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_BACKEND",
+        "fast",
+    ).lower()
+    if backend_requested in {"manual", "mlx-manual"}:
+        backend_effective = "manual"
+    elif backend_requested in {"fast", "mlx-fast"}:
+        backend_effective = "fast"
+    else:
+        raise ValueError(
+            "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
+            "'fast', 'mlx-fast', 'manual', or 'mlx-manual', "
+            f"got {backend_requested!r}"
+        )
+    softmax_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "mlx-softmax",
+    ).lower()
+    if softmax_requested not in {"mlx-softmax", "source-cuda-turing"}:
+        raise ValueError(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND must be one of "
+            "'mlx-softmax' or 'source-cuda-turing', "
+            f"got {softmax_requested!r}"
+        )
+    value_requested = os.environ.get(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "mlx-matmul",
+    ).lower()
+    if value_requested not in {"mlx-matmul", "source-cuda-sequential"}:
+        raise ValueError(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND must be one of "
+            "'mlx-matmul' or 'source-cuda-sequential', "
+            f"got {value_requested!r}"
+        )
+    if backend_effective == "manual":
+        softmax_effective = softmax_requested
+        value_effective = value_requested
+    else:
+        softmax_effective = "fused-fast-attention"
+        value_effective = "fused-fast-attention"
+    return {
+        "shape_flow_attention_backend_requested": backend_requested,
+        "shape_flow_attention_backend_effective": backend_effective,
+        "shape_flow_attention_softmax_backend_requested": softmax_requested,
+        "shape_flow_attention_softmax_backend_effective": softmax_effective,
+        "shape_flow_attention_value_backend_requested": value_requested,
+        "shape_flow_attention_value_backend_effective": value_effective,
+    }
+
+
+def _configure_shape_flow_attention_route(
+    args: argparse.Namespace,
+) -> dict[str, str] | None:
+    if args.stop_after_stage != "shape_flow_block_trace":
+        return None
+    if args.shape_flow_attention_backend:
+        os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] = (
+            args.shape_flow_attention_backend
+        )
+    if args.shape_flow_attention_softmax_backend:
+        os.environ["TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"] = (
+            args.shape_flow_attention_softmax_backend
+        )
+    if args.shape_flow_attention_value_backend:
+        os.environ["TRELLIS2MLX_ATTENTION_VALUE_BACKEND"] = (
+            args.shape_flow_attention_value_backend
+        )
+    return _shape_flow_attention_route_from_env()
+
+
 def _filter_shape_flow_trace_payload(
     payload: dict[str, np.ndarray], selected_keys: list[str]
 ) -> dict[str, np.ndarray]:
@@ -776,6 +847,30 @@ def main():
                         help="Diagnostic: comma-separated final shape-flow block-trace payload keys "
                              "to save. Omit to save the full block trace.")
     parser.add_argument(
+        "--shape-flow-attention-backend",
+        choices=["fast", "mlx-fast", "manual", "mlx-manual"],
+        help=(
+            "Diagnostic: shape-flow-only attention backend for "
+            "--stop-after-stage shape_flow_block_trace."
+        ),
+    )
+    parser.add_argument(
+        "--shape-flow-attention-softmax-backend",
+        choices=["mlx-softmax", "source-cuda-turing"],
+        help=(
+            "Diagnostic: shape-flow-only manual softmax backend for "
+            "--stop-after-stage shape_flow_block_trace."
+        ),
+    )
+    parser.add_argument(
+        "--shape-flow-attention-value-backend",
+        choices=["mlx-matmul", "source-cuda-sequential"],
+        help=(
+            "Diagnostic: shape-flow-only manual value projection backend for "
+            "--stop-after-stage shape_flow_block_trace."
+        ),
+    )
+    parser.add_argument(
         "--shape-flow-layernorm-backend",
         choices=SHAPE_FLOW_LAYERNORM_BACKENDS,
         default=DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
@@ -911,6 +1006,15 @@ def main():
         parser.error("--compile is not supported with shape-flow block injection")
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
+    if (
+        args.shape_flow_attention_backend
+        or args.shape_flow_attention_softmax_backend
+        or args.shape_flow_attention_value_backend
+    ) and args.stop_after_stage != "shape_flow_block_trace":
+        parser.error(
+            "shape-flow attention selectors require "
+            "--stop-after-stage shape_flow_block_trace"
+        )
     if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
         if (
             not args.turing_rsqrt_lut
@@ -1837,6 +1941,7 @@ def main():
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
+    shape_flow_attention_route = _configure_shape_flow_attention_route(args)
     from trellmlx.models.slat_flow import SLatFlowModel
 
     # Sampler params from pipeline.json
@@ -1924,6 +2029,8 @@ def main():
     shape_step_capture = {} if args.stop_after_stage == "shape_flow_step" else None
     shape_step_captures = [] if args.stop_after_stage == "shape_flow_steps" else None
     if args.stop_after_stage == "shape_flow_block_trace":
+        if shape_flow_attention_route is None:
+            raise RuntimeError("shape-flow attention route was not configured")
         shape_trace_step_index = args.shape_flow_trace_step_index
         if shape_trace_step_index < 0 or shape_trace_step_index >= n_steps:
             raise ValueError(
@@ -2030,6 +2137,10 @@ def main():
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
             shape_flow_trace_requested_keys=np.array(requested_trace_keys, dtype=str),
             shape_flow_trace_selected_keys=np.array(effective_trace_keys, dtype=str),
+            **{
+                field: np.array(value)
+                for field, value in shape_flow_attention_route.items()
+            },
             shape_slat_support_sample_path=np.array(args.shape_slat_support_sample or ""),
             t=np.array(1000.0 * shape_trace_t, dtype=np.float32),
             steps=np.array(n_steps, dtype=np.int32),

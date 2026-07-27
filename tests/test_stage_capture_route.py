@@ -2376,7 +2376,11 @@ def test_shape_flow_steps_rejects_truncated_manifest_site_identity(tmp_path):
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
-    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
 
     support_path = tmp_path / "reference_shape_slat.npz"
     support_path.write_bytes(b"shape-slat-support")
@@ -2399,10 +2403,17 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
             "7",
             "--shape-flow-trace-step-index",
             "3",
+            "--shape-flow-attention-backend",
+            "mlx-manual",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
         ]
     )
 
     command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
 
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_block_trace"
     assert "--shape-flow-trace-block-index" in command
@@ -2411,6 +2422,324 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     assert command[command.index("--shape-flow-trace-step-index") + 1] == "3"
     assert "--shape-flow-noise-sample" in command
     assert command[command.index("--shape-flow-noise-sample") + 1] == str(noise_path)
+    assert command[command.index("--shape-flow-attention-backend") + 1] == "mlx-manual"
+    assert command[
+        command.index("--shape-flow-attention-softmax-backend") + 1
+    ] == "source-cuda-turing"
+    assert command[
+        command.index("--shape-flow-attention-value-backend") + 1
+    ] == "source-cuda-sequential"
+    assert route_identity["route"]["shape_flow_attention_backend_requested"] == (
+        "mlx-manual"
+    )
+    assert route_identity["route"]["shape_flow_attention_backend_effective"] == (
+        "manual"
+    )
+    assert route_identity["route"][
+        "shape_flow_attention_softmax_backend_requested"
+    ] == "source-cuda-turing"
+    assert route_identity["route"][
+        "shape_flow_attention_softmax_backend_effective"
+    ] == "source-cuda-turing"
+    assert route_identity["route"][
+        "shape_flow_attention_value_backend_requested"
+    ] == "source-cuda-sequential"
+    assert route_identity["route"][
+        "shape_flow_attention_value_backend_effective"
+    ] == "source-cuda-sequential"
+
+
+def test_shape_flow_attention_selectors_are_trace_only(tmp_path):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-attention-backend",
+            "manual",
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="shape-flow attention selectors require --stop-after-stage shape_flow_block_trace",
+    ):
+        _build_generate_command(args, tmp_path / "checkpoints")
+
+
+def test_shape_flow_attention_trace_preflight_preserves_stale_primary_as_untrusted(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    stale = output_dir / "checkpoints" / "shape_flow_steps.npz"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("invalid trace-only selectors must not launch generation")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-attention-backend",
+            "manual",
+        ]
+    )
+
+    assert result == 2
+    assert stale.read_bytes() == b"stale"
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_shape_flow_attention_route"
+    assert report["last_trustworthy_phase"] == "requested_route_parsed"
+    assert report["primary_output_status"] == "preexisting_untrusted_preserved"
+
+
+def test_shape_flow_fast_attention_records_manual_subroutes_as_ineffective(
+    tmp_path,
+):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-attention-backend",
+            "mlx-fast",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+    route = route_identity["route"]
+
+    assert route["shape_flow_attention_backend_requested"] == "mlx-fast"
+    assert route["shape_flow_attention_backend_effective"] == "fast"
+    assert route["shape_flow_attention_softmax_backend_requested"] == (
+        "source-cuda-turing"
+    )
+    assert route["shape_flow_attention_softmax_backend_effective"] == (
+        "fused-fast-attention"
+    )
+    assert route["shape_flow_attention_value_backend_requested"] == (
+        "source-cuda-sequential"
+    )
+    assert route["shape_flow_attention_value_backend_effective"] == (
+        "fused-fast-attention"
+    )
+
+
+def test_shape_flow_attention_primary_identity_is_required_and_route_bound(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_attention_route,
+    )
+
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(checkpoint, pos_final_output=np.zeros((1, 2, 3), dtype=np.float32))
+    route_identity = {
+        "route": {
+            "shape_flow_attention_backend_requested": "mlx-manual",
+            "shape_flow_attention_backend_effective": "manual",
+            "shape_flow_attention_softmax_backend_requested": "source-cuda-turing",
+            "shape_flow_attention_softmax_backend_effective": "source-cuda-turing",
+            "shape_flow_attention_value_backend_requested": "source-cuda-sequential",
+            "shape_flow_attention_value_backend_effective": "source-cuda-sequential",
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="omits shape-flow attention route metadata",
+    ):
+        _bind_effective_shape_flow_attention_route(route_identity, checkpoint)
+
+    np.savez(
+        checkpoint,
+        shape_flow_attention_backend_requested=np.array("mlx-manual"),
+        shape_flow_attention_backend_effective=np.array("manual"),
+        shape_flow_attention_softmax_backend_requested=np.array("source-cuda-turing"),
+        shape_flow_attention_softmax_backend_effective=np.array("mlx-softmax"),
+        shape_flow_attention_value_backend_requested=np.array("source-cuda-sequential"),
+        shape_flow_attention_value_backend_effective=np.array("source-cuda-sequential"),
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "effective shape-flow attention softmax backend 'mlx-softmax' "
+            "does not match requested route 'source-cuda-turing'"
+        ),
+    ):
+        _bind_effective_shape_flow_attention_route(route_identity, checkpoint)
+
+
+def test_shape_flow_attention_matching_primary_completes_route_binding(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_matching_trace(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_block_trace.npz"
+        checkpoint.parent.mkdir(parents=True)
+        np.savez(
+            checkpoint,
+            pos_final_output=np.zeros((1, 2, 3), dtype=np.float32),
+            shape_flow_trace_selected_keys=np.array(["pos_final_output"]),
+            shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+            qk_norm_backend=np.array("source-cuda-warp32"),
+            rope_backend=np.array("mlx-real"),
+            shape_flow_attention_backend_requested=np.array("mlx-manual"),
+            shape_flow_attention_backend_effective=np.array("manual"),
+            shape_flow_attention_softmax_backend_requested=np.array(
+                "source-cuda-turing"
+            ),
+            shape_flow_attention_softmax_backend_effective=np.array(
+                "source-cuda-turing"
+            ),
+            shape_flow_attention_value_backend_requested=np.array(
+                "source-cuda-sequential"
+            ),
+            shape_flow_attention_value_backend_effective=np.array(
+                "source-cuda-sequential"
+            ),
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        write_matching_trace,
+    )
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-flow-attention-backend",
+            "mlx-manual",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+        ]
+    )
+
+    assert result == 0
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "done"
+    assert report["primary_output_status"] == "written"
+    assert report["failure_phase"] is None
+    assert report["route_identity"]["route"][
+        "shape_flow_attention_backend_effective"
+    ] == "manual"
+
+
+def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path):
+    import subprocess
+    import sys
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(GENERATE_SOURCE),
+            "--image",
+            str(image),
+            "--output",
+            str(tmp_path / "output.glb"),
+            "--save-checkpoints",
+            str(tmp_path / "checkpoints"),
+            "--stop-after-stage",
+            "shape_flow_steps",
+            "--shape-flow-attention-backend",
+            "manual",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert (
+        "shape-flow attention selectors require "
+        "--stop-after-stage shape_flow_block_trace"
+    ) in result.stderr
+
+
+def test_generate_shape_flow_attention_route_does_not_touch_non_trace_stages(
+    monkeypatch,
+):
+    import argparse
+    import os
+    import generate
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "stale-ignored")
+    args = argparse.Namespace(
+        stop_after_stage="shape_flow_steps",
+        shape_flow_attention_backend=None,
+        shape_flow_attention_softmax_backend=None,
+        shape_flow_attention_value_backend=None,
+    )
+
+    assert generate._configure_shape_flow_attention_route(args) is None
+    assert (
+        os.environ["TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"]
+        == "stale-ignored"
+    )
 
 
 def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path):
