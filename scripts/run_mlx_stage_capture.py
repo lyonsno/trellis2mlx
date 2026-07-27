@@ -506,6 +506,9 @@ def build_route_identity(
             "turing_rsqrt_lut_sha256_effective": turing_lut_identity[
                 "sha256_effective"
             ],
+            "turing_rsqrt_lut_content_sha256_effective": (
+                turing_lut_identity["content_sha256_effective"]
+            ),
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -1010,7 +1013,10 @@ def _bind_effective_shape_flow_layernorm_backend(
                 "shape-flow effective LayerNorm backend must be a string scalar"
             )
         effective = str(backend_array.item())
-        effective_turing_lut_sha256 = _checkpoint_turing_lut_sha256(
+        (
+            effective_turing_lut_sha256,
+            effective_turing_lut_content_sha256,
+        ) = _checkpoint_turing_lut_sha256(
             checkpoint,
             backend=effective,
             expected_route=route,
@@ -1024,6 +1030,9 @@ def _bind_effective_shape_flow_layernorm_backend(
     if requested == TURING_T4_BACKEND:
         route["shape_flow_turing_rsqrt_lut_sha256_effective"] = (
             effective_turing_lut_sha256
+        )
+        route["shape_flow_turing_rsqrt_lut_content_sha256_effective"] = (
+            effective_turing_lut_content_sha256
         )
     return effective
 
@@ -1262,12 +1271,17 @@ def _checkpoint_turing_lut_sha256(
     backend: str,
     expected_route: dict[str, Any],
     context: str,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     key = "shape_flow_turing_rsqrt_lut_sha256"
+    content_key = "shape_flow_turing_rsqrt_lut_content_sha256"
     if backend == TURING_T4_BACKEND:
         if key not in checkpoint:
             raise ValueError(
                 f"{context} omits effective Turing rsqrt LUT SHA256"
+            )
+        if content_key not in checkpoint:
+            raise ValueError(
+                f"{context} omits effective Turing rsqrt LUT content SHA256"
             )
         value = np.asarray(checkpoint[key])
         if value.shape != () or value.dtype.kind not in {"U", "S"}:
@@ -1289,19 +1303,43 @@ def _checkpoint_turing_lut_sha256(
                 f"{effective!r} does not match requested/effective route "
                 f"{expected!r}"
             )
-        return effective
-    if key in checkpoint:
-        value = np.asarray(checkpoint[key])
+        content_value = np.asarray(checkpoint[content_key])
         if (
-            value.shape != ()
-            or value.dtype.kind not in {"U", "S"}
-            or str(value.item())
+            content_value.shape != ()
+            or content_value.dtype.kind not in {"U", "S"}
         ):
             raise ValueError(
-                f"{context} carries Turing rsqrt LUT identity under "
-                f"non-Turing backend {backend!r}"
+                f"{context} effective Turing rsqrt LUT content SHA256 "
+                "must be a string scalar"
             )
-    return None
+        content_effective = str(content_value.item())
+        content_expected = expected_route.get(
+            "turing_rsqrt_lut_content_sha256_effective"
+        )
+        if (
+            not isinstance(content_expected, str)
+            or len(content_expected) != 64
+            or content_effective != content_expected
+        ):
+            raise ValueError(
+                f"{context} effective Turing rsqrt LUT content SHA256 "
+                f"{content_effective!r} does not match requested/effective route "
+                f"{content_expected!r}"
+            )
+        return effective, content_effective
+    for identity_key in (key, content_key):
+        if identity_key in checkpoint:
+            value = np.asarray(checkpoint[identity_key])
+            if (
+                value.shape != ()
+                or value.dtype.kind not in {"U", "S"}
+                or str(value.item())
+            ):
+                raise ValueError(
+                    f"{context} carries Turing rsqrt LUT identity under "
+                    f"non-Turing backend {backend!r}"
+                )
+    return None, None
 
 
 def _validate_shape_flow_steps_checkpoint(
@@ -1537,7 +1575,10 @@ def _validate_shape_flow_steps_checkpoint(
                 f"shape_flow_steps effective LayerNorm backend {effective_backend!r} "
                 f"does not match requested {requested_backend!r}"
             )
-        effective_turing_lut_sha256 = _checkpoint_turing_lut_sha256(
+        (
+            effective_turing_lut_sha256,
+            effective_turing_lut_content_sha256,
+        ) = _checkpoint_turing_lut_sha256(
             checkpoint,
             backend=effective_backend,
             expected_route=expected_route or {},
@@ -1632,6 +1673,9 @@ def _validate_shape_flow_steps_checkpoint(
             "rope_backend": effective_rope_backend,
             "shape_flow_turing_rsqrt_lut_sha256": (
                 effective_turing_lut_sha256
+            ),
+            "shape_flow_turing_rsqrt_lut_content_sha256": (
+                effective_turing_lut_content_sha256
             ),
             "shape_flow_turing_rope_phase_lut_sha256": (
                 effective_turing_rope_lut_sha256
@@ -1976,11 +2020,12 @@ def _validate_turing_rsqrt_route_args(
                 "Turing rsqrt LUT SHA256 mismatch: "
                 f"expected {expected}, got {effective}"
             )
-        _validate_turing_rsqrt_lut_payload(Path(path))
+        content_sha256 = _validate_turing_rsqrt_lut_payload(Path(path))
         return {
             "path": str(Path(path)),
             "sha256_requested": expected,
             "sha256_effective": effective,
+            "content_sha256_effective": content_sha256,
         }
     if path or expected:
         raise ValueError(
@@ -1991,6 +2036,7 @@ def _validate_turing_rsqrt_route_args(
         "path": None,
         "sha256_requested": None,
         "sha256_effective": None,
+        "content_sha256_effective": None,
     }
 
 
@@ -2000,6 +2046,7 @@ def _describe_turing_rsqrt_route_args(
     raw_path = getattr(args, "turing_rsqrt_lut", None)
     path = Path(raw_path) if raw_path else None
     effective = None
+    content_effective = None
     read_error = None
     if path is not None and path.is_file():
         try:
@@ -2012,13 +2059,14 @@ def _describe_turing_rsqrt_route_args(
             args, "expected_turing_rsqrt_lut_sha256", None
         ),
         "sha256_effective": effective,
+        "content_sha256_effective": content_effective,
     }
     if read_error is not None:
         identity["read_error"] = read_error
     return identity
 
 
-def _validate_turing_rsqrt_lut_payload(path: Path) -> None:
+def _validate_turing_rsqrt_lut_payload(path: Path) -> str:
     with np.load(path, allow_pickle=False) as loaded:
         if "normalized_delta" not in loaded.files:
             raise ValueError("Turing rsqrt LUT NPZ omits normalized_delta")
@@ -2028,6 +2076,9 @@ def _validate_turing_rsqrt_lut_payload(path: Path) -> None:
             "Turing rsqrt LUT normalized_delta must be int8[16777216], "
             f"got {correction.dtype}{correction.shape}"
         )
+    return hashlib.sha256(
+        np.ascontiguousarray(correction).tobytes()
+    ).hexdigest()
 
 
 def _validate_turing_rope_route_args(

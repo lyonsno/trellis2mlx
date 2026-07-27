@@ -9,9 +9,11 @@ measured residual; the other applies an explicitly hash-bound Tesla T4
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 
 DEFAULT_BACKEND = "mlx-two-pass"
@@ -26,11 +28,14 @@ TURING_RSQRT_LUT_SIZE = 1 << 24
 
 _backend = DEFAULT_BACKEND
 _turing_rsqrt_delta_lut = None
-_turing_rsqrt_lut_sha256 = None
+_turing_rsqrt_lut_artifact_sha256_attested = None
+_turing_rsqrt_lut_content_sha256 = None
 _cuda_welford_kernel = None
 _cuda_welford_stats_kernel = None
+_cuda_welford_float32_output_kernel = None
 _cuda_welford_turing_kernel = None
 _cuda_welford_turing_stats_kernel = None
+_cuda_welford_turing_float32_output_kernel = None
 _cuda_welford_affine_kernel = None
 _cuda_welford_turing_affine_kernel = None
 
@@ -39,9 +44,12 @@ def configure_shape_flow_layernorm_backend(
     name: str,
     *,
     turing_rsqrt_delta_lut: mx.array | None = None,
-    turing_rsqrt_lut_sha256: str | None = None,
+    turing_rsqrt_lut_artifact_sha256_attested: str | None = None,
 ) -> None:
-    global _backend, _turing_rsqrt_delta_lut, _turing_rsqrt_lut_sha256
+    global _backend
+    global _turing_rsqrt_delta_lut
+    global _turing_rsqrt_lut_artifact_sha256_attested
+    global _turing_rsqrt_lut_content_sha256
     if name not in SUPPORTED_BACKENDS:
         raise ValueError(
             f"unsupported shape-flow LayerNorm backend {name!r}; "
@@ -50,35 +58,41 @@ def configure_shape_flow_layernorm_backend(
     if name == CUDA_WELFORD_TURING_T4_BACKEND:
         if (
             turing_rsqrt_delta_lut is None
-            or turing_rsqrt_lut_sha256 is None
+            or turing_rsqrt_lut_artifact_sha256_attested is None
         ):
             raise ValueError(
                 f"{name} requires an explicit correction LUT and SHA256"
             )
         _validate_turing_rsqrt_lut(turing_rsqrt_delta_lut)
         if (
-            len(turing_rsqrt_lut_sha256) != 64
+            len(turing_rsqrt_lut_artifact_sha256_attested) != 64
             or any(
                 character not in "0123456789abcdef"
-                for character in turing_rsqrt_lut_sha256
+                for character in turing_rsqrt_lut_artifact_sha256_attested
             )
         ):
             raise ValueError(
-                f"{name} requires a lowercase hexadecimal LUT SHA256"
+                f"{name} requires a lowercase hexadecimal attested artifact SHA256"
             )
         _turing_rsqrt_delta_lut = turing_rsqrt_delta_lut
-        _turing_rsqrt_lut_sha256 = turing_rsqrt_lut_sha256
+        _turing_rsqrt_lut_artifact_sha256_attested = (
+            turing_rsqrt_lut_artifact_sha256_attested
+        )
+        _turing_rsqrt_lut_content_sha256 = _turing_rsqrt_lut_content_digest(
+            turing_rsqrt_delta_lut
+        )
     else:
         if (
             turing_rsqrt_delta_lut is not None
-            or turing_rsqrt_lut_sha256 is not None
+            or turing_rsqrt_lut_artifact_sha256_attested is not None
         ):
             raise ValueError(
                 "Turing rsqrt correction state is only valid for "
                 f"{CUDA_WELFORD_TURING_T4_BACKEND}"
             )
         _turing_rsqrt_delta_lut = None
-        _turing_rsqrt_lut_sha256 = None
+        _turing_rsqrt_lut_artifact_sha256_attested = None
+        _turing_rsqrt_lut_content_sha256 = None
     _backend = name
 
 
@@ -86,8 +100,12 @@ def get_shape_flow_layernorm_backend() -> str:
     return _backend
 
 
-def get_shape_flow_turing_rsqrt_lut_sha256() -> str | None:
-    return _turing_rsqrt_lut_sha256
+def get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested() -> str | None:
+    return _turing_rsqrt_lut_artifact_sha256_attested
+
+
+def get_shape_flow_turing_rsqrt_lut_content_sha256() -> str | None:
+    return _turing_rsqrt_lut_content_sha256
 
 
 def shape_flow_layernorm_backend_identity(name: str | None = None) -> dict[str, Any]:
@@ -114,6 +132,13 @@ def shape_flow_layernorm_backend_identity(name: str | None = None) -> dict[str, 
             "hidden_width": 1536,
             "affine": False,
         },
+        "authenticated_terminal_contract": {
+            "input_storage_dtype": "bfloat16",
+            "source_input_dtype": "float32",
+            "output_dtype": "float32",
+            "hidden_width": 1536,
+            "affine": False,
+        },
         "authenticated_affine_contract": {
             "input_dtype": "bfloat16",
             "parameter_dtype": "float32",
@@ -129,7 +154,10 @@ def shape_flow_layernorm_backend_identity(name: str | None = None) -> dict[str, 
         },
     }
     if backend == CUDA_WELFORD_TURING_T4_BACKEND:
-        if _turing_rsqrt_lut_sha256 is None:
+        if (
+            _turing_rsqrt_lut_artifact_sha256_attested is None
+            or _turing_rsqrt_lut_content_sha256 is None
+        ):
             raise ValueError(
                 f"{backend} has no configured Turing rsqrt LUT identity"
             )
@@ -137,9 +165,14 @@ def shape_flow_layernorm_backend_identity(name: str | None = None) -> dict[str, 
             **identity,
             "cuda_architecture": "sm_75",
             "cuda_device_anchor": "Tesla T4",
-            "cuda_rsqrt_bit_exact": True,
+            "cuda_rsqrt_bit_exact_for_configured_lut": True,
             "rsqrt": "Turing MUFU.RSQ normalized signed-ULP LUT",
-            "turing_rsqrt_lut_sha256": _turing_rsqrt_lut_sha256,
+            "turing_rsqrt_lut_artifact_sha256_attested": (
+                _turing_rsqrt_lut_artifact_sha256_attested
+            ),
+            "turing_rsqrt_lut_content_sha256": (
+                _turing_rsqrt_lut_content_sha256
+            ),
             "turing_rsqrt_lut_entries": TURING_RSQRT_LUT_SIZE,
         }
     return {
@@ -178,6 +211,36 @@ def layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
             x, _turing_rsqrt_delta_lut, eps
         )
     return _cuda_welford_layernorm(x, eps)
+
+
+def layernorm_noaffine_float32_output(
+    x: mx.array, eps: float = 1e-6
+) -> mx.array:
+    """Normalize the BF16 hidden state while preserving source FP32 output."""
+    if _backend == DEFAULT_BACKEND:
+        return mx.fast.layer_norm(
+            x.astype(mx.float32), None, None, eps
+        )
+    if x.dtype != mx.bfloat16:
+        raise ValueError(
+            f"{_backend} terminal LayerNorm requires bfloat16 input, "
+            f"got {x.dtype}"
+        )
+    if not x.shape or x.shape[-1] != 1536:
+        width = x.shape[-1] if x.shape else None
+        raise ValueError(
+            f"{_backend} terminal LayerNorm requires hidden width 1536, "
+            f"got {width}"
+        )
+    if _backend == CUDA_WELFORD_TURING_T4_BACKEND:
+        if _turing_rsqrt_delta_lut is None:
+            raise RuntimeError(
+                f"{_backend} correction LUT is not configured"
+            )
+        return _cuda_welford_turing_layernorm_float32_output(
+            x, _turing_rsqrt_delta_lut, eps
+        )
+    return _cuda_welford_layernorm_float32_output(x, eps)
 
 
 def layernorm_affine(
@@ -262,6 +325,11 @@ def _validate_turing_rsqrt_lut(rsqrt_delta_lut: mx.array) -> None:
         )
 
 
+def _turing_rsqrt_lut_content_digest(rsqrt_delta_lut: mx.array) -> str:
+    payload = np.ascontiguousarray(np.asarray(rsqrt_delta_lut))
+    return hashlib.sha256(payload.tobytes()).hexdigest()
+
+
 def _validate_affine_contract(
     x: mx.array,
     weight: mx.array,
@@ -344,6 +412,27 @@ def _cuda_welford_layernorm_with_stats(
     return out, mean, variance, rstd
 
 
+def _cuda_welford_layernorm_float32_output(
+    x: mx.array, eps: float
+) -> mx.array:
+    global _cuda_welford_float32_output_kernel
+    if _cuda_welford_float32_output_kernel is None:
+        _cuda_welford_float32_output_kernel = _build_cuda_welford_kernel(
+            float32_output=True
+        )
+
+    rows = x.size // 1536
+    eps_array = mx.array([eps], dtype=mx.float32)
+    return _cuda_welford_float32_output_kernel(
+        inputs=[x, eps_array],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def _cuda_welford_turing_layernorm(
     x: mx.array,
     rsqrt_delta_lut: mx.array,
@@ -396,6 +485,32 @@ def _cuda_welford_turing_layernorm_with_stats(
         ],
     )
     return out, mean, variance, rstd
+
+
+def _cuda_welford_turing_layernorm_float32_output(
+    x: mx.array,
+    rsqrt_delta_lut: mx.array,
+    eps: float,
+) -> mx.array:
+    global _cuda_welford_turing_float32_output_kernel
+    if _cuda_welford_turing_float32_output_kernel is None:
+        _cuda_welford_turing_float32_output_kernel = (
+            _build_cuda_welford_kernel(
+                turing_rsqrt=True,
+                float32_output=True,
+            )
+        )
+
+    rows = x.size // 1536
+    eps_array = mx.array([eps], dtype=mx.float32)
+    return _cuda_welford_turing_float32_output_kernel(
+        inputs=[x, eps_array, rsqrt_delta_lut],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
+    )[0]
 
 
 def _cuda_welford_affine_layernorm(
@@ -453,7 +568,10 @@ def _build_cuda_welford_kernel(
     include_stats: bool = False,
     turing_rsqrt: bool = False,
     affine: bool = False,
+    float32_output: bool = False,
 ):
+    if affine and float32_output:
+        raise ValueError("float32 output is only supported without affine parameters")
     header = r"""
         struct WelfordDataLN {
             float mean;
@@ -571,6 +689,21 @@ def _build_cuda_welford_kernel(
                 (static_cast<float>(inp[offset + 3]) - mean) * rstd);
         }
     """
+    float32_output_source = r"""
+        for (uint vector_index = thread_index;
+             vector_index < width / vector_width;
+             vector_index += warp_width * warp_count) {
+            uint offset = row_offset + vector_index * vector_width;
+            out[offset] =
+                (static_cast<float>(inp[offset]) - mean) * rstd;
+            out[offset + 1] =
+                (static_cast<float>(inp[offset + 1]) - mean) * rstd;
+            out[offset + 2] =
+                (static_cast<float>(inp[offset + 2]) - mean) * rstd;
+            out[offset + 3] =
+                (static_cast<float>(inp[offset + 3]) - mean) * rstd;
+        }
+    """
     affine_output = r"""
         for (uint vector_index = thread_index;
              vector_index < width / vector_width;
@@ -611,6 +744,8 @@ def _build_cuda_welford_kernel(
     if affine:
         input_names.extend(["weight", "bias"])
         kernel_name += "_affine_fp32"
+    elif float32_output:
+        kernel_name += "_fp32_output"
     rsqrt_source = (
         "float rstd = metal::precise::rsqrt(mean_sigma[1] + eps[0]);"
     )
@@ -644,7 +779,15 @@ def _build_cuda_welford_kernel(
     source = source.replace("__WRITE_STATS__", stats_write)
     source = source.replace(
         "__WRITE_OUTPUT__",
-        affine_output if affine else noaffine_output,
+        (
+            affine_output
+            if affine
+            else (
+                float32_output_source
+                if float32_output
+                else noaffine_output
+            )
+        ),
     )
     return mx.fast.metal_kernel(
         name=kernel_name,

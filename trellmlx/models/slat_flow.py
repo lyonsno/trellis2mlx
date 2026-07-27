@@ -33,10 +33,24 @@ from ..shape_flow_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND,
     get_shape_flow_layernorm_backend,
     layernorm_noaffine as _shape_flow_layernorm_noaffine,
+    layernorm_noaffine_float32_output as _shape_flow_terminal_layernorm,
 )
 from ..modules.norm import LayerNorm32
 from ..modules.attention import MultiHeadRMSNorm
 from ..modules.rope import build_sparse_rope_phases
+
+
+def _source_cuda_terminal_linear(
+    x: mx.array,
+    linear: nn.Linear,
+) -> mx.array:
+    """Use the FP32 BLAS schedule observed exact to source CUDA's out layer."""
+    x_np = np.array(x, dtype=np.float32)
+    weight_np = np.array(linear.weight, dtype=np.float32)
+    output = x_np @ weight_np.T
+    if linear.bias is not None:
+        output = output + np.array(linear.bias, dtype=np.float32)
+    return mx.array(output.astype(np.float32, copy=False))
 
 
 class SLatFlowModel(nn.Module):
@@ -206,18 +220,17 @@ class SLatFlowModel(nn.Module):
     ) -> tuple[mx.array, mx.array]:
         """Return the normalized final state and projected sampler output."""
 
-        # The CUDA-Welford experiment is authenticated only for the internal
-        # BF16 shape-flow width. Restore the sampler dtype after normalization.
-        if (
+        # Source casts the terminal BF16 hidden state to FP32 before LayerNorm.
+        source_cuda_terminal = (
             self.shape_flow_layernorm
             and get_shape_flow_layernorm_backend()
             in {
                 CUDA_WELFORD_METAL_BACKEND,
                 CUDA_WELFORD_TURING_T4_BACKEND,
             }
-        ):
-            x = _shape_flow_layernorm_noaffine(x, eps=1e-5)
-            x = x.astype(input_dtype)
+        )
+        if source_cuda_terminal:
+            x = _shape_flow_terminal_layernorm(x, eps=1e-5)
         else:
             x = x.astype(input_dtype)
             layernorm = (
@@ -226,6 +239,8 @@ class SLatFlowModel(nn.Module):
                 else _layernorm_noaffine
             )
             x = layernorm(x, eps=1e-5)
+        if source_cuda_terminal:
+            return x, _source_cuda_terminal_linear(x, self.out_layer)
         return x, self.out_layer(x)
 
     def _run_blocks_impl(self, x, mod, cond, rope_phases):

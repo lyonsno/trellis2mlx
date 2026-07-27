@@ -41,7 +41,8 @@ from trellmlx.shape_flow_layernorm import (
     SUPPORTED_BACKENDS as SHAPE_FLOW_LAYERNORM_BACKENDS,
     configure_shape_flow_layernorm_backend,
     get_shape_flow_layernorm_backend,
-    get_shape_flow_turing_rsqrt_lut_sha256,
+    get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested,
+    get_shape_flow_turing_rsqrt_lut_content_sha256,
 )
 from trellmlx.source_cuda_gelu import (
     SOURCE_CUDA_BF16_GELU_TANH_BACKEND,
@@ -1068,7 +1069,7 @@ def main():
             configure_shape_flow_layernorm_backend(
                 args.shape_flow_layernorm_backend,
                 turing_rsqrt_delta_lut=turing_lut,
-                turing_rsqrt_lut_sha256=turing_lut_sha256,
+                turing_rsqrt_lut_artifact_sha256_attested=turing_lut_sha256,
             )
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
@@ -2187,7 +2188,10 @@ def main():
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
-                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+                get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+            ),
+            shape_flow_turing_rsqrt_lut_content_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_content_sha256() or ""
             ),
             shape_flow_turing_rope_phase_lut_sha256=np.array(
                 get_turing_phase_lut_sha256() or ""
@@ -2250,7 +2254,10 @@ def main():
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
-                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+                get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+            ),
+            shape_flow_turing_rsqrt_lut_content_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_content_sha256() or ""
             ),
             shape_flow_turing_rope_phase_lut_sha256=np.array(
                 get_turing_phase_lut_sha256() or ""
@@ -2310,7 +2317,10 @@ def main():
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
             shape_flow_turing_rsqrt_lut_sha256=np.array(
-                get_shape_flow_turing_rsqrt_lut_sha256() or ""
+                get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+            ),
+            shape_flow_turing_rsqrt_lut_content_sha256=np.array(
+                get_shape_flow_turing_rsqrt_lut_content_sha256() or ""
             ),
             shape_flow_turing_rope_phase_lut_sha256=np.array(
                 get_turing_phase_lut_sha256() or ""

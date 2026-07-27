@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +71,28 @@ def test_cuda_welford_shape_flow_layernorm_fails_outside_authenticated_contract(
 
     with pytest.raises(ValueError, match=message):
         layernorm_noaffine(x)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "message"),
+    [
+        ((2, 1536), mx.float32, "requires bfloat16 input"),
+        ((2, 512), mx.bfloat16, "requires hidden width 1536"),
+    ],
+)
+def test_cuda_welford_terminal_layernorm_fails_outside_authenticated_contract(
+    shape, dtype, message
+):
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_METAL_BACKEND,
+        configure_shape_flow_layernorm_backend,
+        layernorm_noaffine_float32_output,
+    )
+
+    configure_shape_flow_layernorm_backend(CUDA_WELFORD_METAL_BACKEND)
+
+    with pytest.raises(ValueError, match=message):
+        layernorm_noaffine_float32_output(mx.zeros(shape, dtype=dtype))
 
 
 def test_cuda_welford_shape_flow_layernorm_executes_authenticated_geometry():
@@ -216,27 +239,41 @@ def test_turing_backend_requires_explicit_lut_and_hash():
         )
 
 
-def test_turing_backend_identity_records_architecture_and_lut_hash():
+def test_turing_backend_identity_distinguishes_attested_artifact_from_lut_contents():
     from trellmlx.shape_flow_layernorm import (
         CUDA_WELFORD_TURING_T4_BACKEND,
         configure_shape_flow_layernorm_backend,
         shape_flow_layernorm_backend_identity,
     )
 
-    correction = mx.zeros((1 << 24,), dtype=mx.int8)
+    correction_np = np.zeros((1 << 24,), dtype=np.int8)
+    correction = mx.array(correction_np)
+    attested_artifact_sha256 = (
+        "d2520d24f5e372fab03ff3b642af724485ad985d03d235c4bb5ef351398998e3"
+    )
     configure_shape_flow_layernorm_backend(
         CUDA_WELFORD_TURING_T4_BACKEND,
         turing_rsqrt_delta_lut=correction,
-        turing_rsqrt_lut_sha256="a" * 64,
+        turing_rsqrt_lut_artifact_sha256_attested=attested_artifact_sha256,
     )
 
     identity = shape_flow_layernorm_backend_identity()
 
     assert identity["backend"] == CUDA_WELFORD_TURING_T4_BACKEND
-    assert identity["cuda_rsqrt_bit_exact"] is True
+    assert identity["cuda_rsqrt_bit_exact_for_configured_lut"] is True
     assert identity["cuda_architecture"] == "sm_75"
     assert identity["rsqrt"] == "Turing MUFU.RSQ normalized signed-ULP LUT"
-    assert identity["turing_rsqrt_lut_sha256"] == "a" * 64
+    assert identity["turing_rsqrt_lut_artifact_sha256_attested"] == (
+        attested_artifact_sha256
+    )
+    assert identity["turing_rsqrt_lut_content_sha256"] == hashlib.sha256(
+        correction_np.tobytes()
+    ).hexdigest()
+    assert identity["turing_rsqrt_lut_content_sha256"] != (
+        "7f06db366f8eb4064c782d6d957edeb7d94f0146d41b6588ede3fd9992856de6"
+    )
+    assert "turing_rsqrt_lut_sha256" not in identity
+    assert "cuda_rsqrt_bit_exact" not in identity
 
 
 def test_cuda_welford_backend_identity_names_residual_instead_of_claiming_cuda_exactness():
@@ -260,9 +297,15 @@ def test_cuda_welford_backend_identity_names_residual_instead_of_claiming_cuda_e
 def test_slat_flow_uses_shape_specific_layernorm_without_rebinding_sparse_flow():
     import trellmlx.models.slat_flow as slat_flow
     import trellmlx.models.sparse_structure_flow as sparse_flow
-    from trellmlx.shape_flow_layernorm import layernorm_noaffine
+    from trellmlx.shape_flow_layernorm import (
+        layernorm_noaffine,
+        layernorm_noaffine_float32_output,
+    )
 
     assert slat_flow._shape_flow_layernorm_noaffine is layernorm_noaffine
+    assert slat_flow._shape_flow_terminal_layernorm is (
+        layernorm_noaffine_float32_output
+    )
     assert slat_flow._layernorm_noaffine is sparse_flow._layernorm_noaffine
 
 
@@ -293,13 +336,15 @@ def test_cuda_welford_shape_model_normalizes_bfloat16_and_returns_sampler_dtype(
         lambda *_args, **_kwargs: mx.zeros((1, 6 * 1536), dtype=mx.bfloat16),
     )
     seen_dtypes = []
-    original_layernorm = slat_flow._shape_flow_layernorm_noaffine
+    original_layernorm = slat_flow._shape_flow_terminal_layernorm
 
     def capture_layernorm(x, eps):
         seen_dtypes.append(x.dtype)
         return original_layernorm(x, eps=eps)
 
-    monkeypatch.setattr(slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm)
+    monkeypatch.setattr(
+        slat_flow, "_shape_flow_terminal_layernorm", capture_layernorm
+    )
     x = mx.zeros((1, 2), dtype=mx.float32)
     out = model(
         x,
@@ -325,7 +370,7 @@ def test_turing_shape_model_consumes_configured_lut_and_returns_sampler_dtype(
     configure_shape_flow_layernorm_backend(
         CUDA_WELFORD_TURING_T4_BACKEND,
         turing_rsqrt_delta_lut=correction,
-        turing_rsqrt_lut_sha256="a" * 64,
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
     )
     model = slat_flow.SLatFlowModel(
         in_channels=2,
@@ -348,14 +393,14 @@ def test_turing_shape_model_consumes_configured_lut_and_returns_sampler_dtype(
         ),
     )
     seen_dtypes = []
-    original_layernorm = slat_flow._shape_flow_layernorm_noaffine
+    original_layernorm = slat_flow._shape_flow_terminal_layernorm
 
     def capture_layernorm(x, eps):
         seen_dtypes.append(x.dtype)
         return original_layernorm(x, eps=eps)
 
     monkeypatch.setattr(
-        slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm
+        slat_flow, "_shape_flow_terminal_layernorm", capture_layernorm
     )
     out = model(
         mx.zeros((1, 2), dtype=mx.float32),
@@ -391,7 +436,7 @@ def test_turing_shape_block_affine_norm2_matches_source_cuda_rows():
     configure_shape_flow_layernorm_backend(
         CUDA_WELFORD_TURING_T4_BACKEND,
         turing_rsqrt_delta_lut=mx.array(correction),
-        turing_rsqrt_lut_sha256="a" * 64,
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
     )
     block = ModulatedBlock(
         1536,
@@ -447,7 +492,82 @@ def test_default_shape_model_preserves_float32_final_layernorm_order(monkeypatch
     assert out.dtype == mx.float32
 
 
-def test_terminal_shape_trace_matches_public_cuda_welford_output(monkeypatch):
+def test_turing_terminal_layernorm_matches_source_cuda_float32_rows():
+    import trellmlx.models.slat_flow as slat_flow
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    with np.load(
+        FIXTURES / "source_cuda_shape_terminal_layernorm_rows.npz",
+        allow_pickle=False,
+    ) as fixture:
+        block29_after_mlp = np.asarray(fixture["block29_after_mlp"])
+        expected_final_norm = np.asarray(fixture["expected_final_norm"])
+        expected_final_out_flat = np.asarray(
+            fixture["expected_final_out_flat"]
+        )
+        expected_final_output = np.asarray(fixture["expected_final_output"])
+        out_layer_weight = np.asarray(fixture["out_layer_weight"])
+        out_layer_bias = np.asarray(fixture["out_layer_bias"])
+        coordinates = np.asarray(fixture["rsqrt_coordinates"])
+        deltas = np.asarray(fixture["rsqrt_deltas"])
+        source_artifact_sha256 = str(fixture["source_artifact_sha256"])
+        source_route = str(fixture["source_route"])
+        source_weight_artifact = str(fixture["source_weight_artifact"])
+
+    assert hashlib.sha256(
+        (FIXTURES / "source_cuda_shape_terminal_layernorm_rows.npz").read_bytes()
+    ).hexdigest() == (
+        "19fc6867b88ffab57e6957c6d7b745131a4ac313c151060d4492fe22c3e2f970"
+    )
+    assert source_artifact_sha256 == (
+        "8aca6f6efb61154082dd86dba5eef713c58cf2774a348607b1b89f04bbe7a950"
+    )
+    assert source_route == "official-trellis2-source-cuda-shape-flow-block-trace"
+    assert source_weight_artifact == (
+        "microsoft/TRELLIS.2-4B/ckpts/"
+        "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors"
+    )
+    np.testing.assert_array_equal(
+        expected_final_out_flat, expected_final_output
+    )
+    correction = np.zeros((1 << 24,), dtype=np.int8)
+    correction[coordinates] = deltas
+    configure_shape_flow_layernorm_backend(
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=mx.array(correction),
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
+    )
+    model = slat_flow.SLatFlowModel(
+        in_channels=2,
+        out_channels=2,
+        model_channels=1536,
+        num_heads=12,
+        num_blocks=0,
+        mlp_hidden=4,
+        context_channels=4,
+        shape_flow_layernorm=True,
+    )
+    model.out_layer.weight = mx.array(out_layer_weight)
+    model.out_layer.bias = mx.array(out_layer_bias)
+
+    actual, actual_output = model._final_projection(
+        mx.array(block29_after_mlp).astype(mx.bfloat16),
+        mx.float32,
+    )
+    mx.eval(actual, actual_output)
+
+    assert actual.dtype == mx.float32
+    assert actual_output.dtype == mx.float32
+    np.testing.assert_array_equal(np.asarray(actual), expected_final_norm)
+    np.testing.assert_array_equal(
+        np.asarray(actual_output), expected_final_out_flat
+    )
+
+
+def test_terminal_shape_trace_matches_forward_cuda_welford_output(monkeypatch):
     import trellmlx.models.slat_flow as slat_flow
     import trellmlx.shape_flow_layernorm as shape_layernorm
 
@@ -470,15 +590,19 @@ def test_terminal_shape_trace_matches_public_cuda_welford_output(monkeypatch):
         lambda *_args, **_kwargs: mx.zeros((1, 6 * 1536), dtype=mx.bfloat16),
     )
     final_norm_dtypes = []
-    original_layernorm = shape_layernorm.layernorm_noaffine
+    original_layernorm = shape_layernorm.layernorm_noaffine_float32_output
 
     def capture_layernorm(x, eps):
         if eps == 1e-5:
             final_norm_dtypes.append(x.dtype)
         return original_layernorm(x, eps=eps)
 
-    monkeypatch.setattr(shape_layernorm, "layernorm_noaffine", capture_layernorm)
-    monkeypatch.setattr(slat_flow, "_shape_flow_layernorm_noaffine", capture_layernorm)
+    monkeypatch.setattr(
+        shape_layernorm, "layernorm_noaffine_float32_output", capture_layernorm
+    )
+    monkeypatch.setattr(
+        slat_flow, "_shape_flow_terminal_layernorm", capture_layernorm
+    )
     mx.random.seed(83)
     x = mx.random.normal((1, 2), dtype=mx.float32)
     t = mx.array([1000.0], dtype=mx.float32)

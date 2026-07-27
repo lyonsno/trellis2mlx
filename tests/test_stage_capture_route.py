@@ -1060,6 +1060,9 @@ def test_stage_capture_forwards_and_records_turing_rsqrt_lut(tmp_path):
         route_identity["route"]["turing_rsqrt_lut_sha256_requested"]
         == digest
     )
+    assert route_identity["route"][
+        "turing_rsqrt_lut_content_sha256_effective"
+    ] == hashlib.sha256(np.zeros((1 << 24,), dtype=np.int8).tobytes()).hexdigest()
 
 
 def test_stage_capture_rejects_turing_rsqrt_lut_hash_mismatch(tmp_path):
@@ -1152,6 +1155,7 @@ def test_stage_capture_reports_turing_lut_substitution_before_generate(
         "path": str(lut),
         "sha256_requested": "a" * 64,
         "sha256_effective": effective_digest,
+        "content_sha256_effective": None,
     }
     assert report["requested_inputs"]["turing_rsqrt_lut"] == str(lut)
     assert "Turing rsqrt LUT SHA256 mismatch" in report["error"]
@@ -1280,6 +1284,7 @@ def test_stage_capture_rejects_hash_matched_malformed_turing_lut_before_generate
         "path": str(lut),
         "sha256_requested": digest,
         "sha256_effective": digest,
+        "content_sha256_effective": None,
     }
     assert "omits normalized_delta" in report["error"]
     assert not (output_dir / "route_identity.json").exists()
@@ -1787,6 +1792,11 @@ def test_shape_flow_steps_turing_backend_rejects_lut_hash_mismatch(tmp_path):
         "shape_flow_turing_rsqrt_lut_sha256",
         np.array("b" * 64),
     )
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_turing_rsqrt_lut_content_sha256",
+        np.array("a" * 64),
+    )
 
     with pytest.raises(ValueError, match="effective Turing rsqrt LUT SHA256"):
         _validate_shape_flow_steps_checkpoint(
@@ -1797,6 +1807,51 @@ def test_shape_flow_steps_turing_backend_rejects_lut_hash_mismatch(tmp_path):
                     "cuda-welford-turing-t4"
                 ),
                 "turing_rsqrt_lut_sha256_effective": "a" * 64,
+                "turing_rsqrt_lut_content_sha256_effective": "a" * 64,
+            },
+        )
+
+
+def test_shape_flow_steps_turing_backend_rejects_lut_content_hash_mismatch(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_shape_flow_steps_checkpoint,
+    )
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_layernorm_backend",
+        np.array("cuda-welford-turing-t4"),
+    )
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_turing_rsqrt_lut_sha256",
+        np.array("a" * 64),
+    )
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_turing_rsqrt_lut_content_sha256",
+        np.array("b" * 64),
+    )
+
+    with pytest.raises(
+        ValueError, match="effective Turing rsqrt LUT content SHA256"
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": (
+                    "cuda-welford-turing-t4"
+                ),
+                "turing_rsqrt_lut_sha256_effective": "a" * 64,
+                "turing_rsqrt_lut_content_sha256_effective": "a" * 64,
             },
         )
 
