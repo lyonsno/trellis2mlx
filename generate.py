@@ -43,6 +43,10 @@ from trellmlx.shape_flow_layernorm import (
     get_shape_flow_layernorm_backend,
     get_shape_flow_turing_rsqrt_lut_sha256,
 )
+from trellmlx.source_cuda_gelu import (
+    SOURCE_CUDA_BF16_GELU_TANH_BACKEND,
+    SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256,
+)
 
 # SLat normalization from pipeline.json
 SHAPE_SLAT_MEAN = np.array([
@@ -131,7 +135,7 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     elif backend_requested in {"fast", "mlx-fast"}:
         backend_effective = "fast"
     elif backend_requested == "source-cuda-self":
-        backend_effective = "source-cuda-self-width-7697-fast-otherwise"
+        backend_effective = "source-cuda-self-widths-1029-7697-fast-otherwise"
     else:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
@@ -171,8 +175,12 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
                 "source-cuda-self requires source-cuda-turing softmax and "
                 "source-cuda-sequential value projection"
             )
-        softmax_effective = "source-cuda-turing-width-7697-fast-otherwise"
-        value_effective = "source-cuda-sequential-width-7697-fast-otherwise"
+        softmax_effective = (
+            "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        )
+        value_effective = (
+            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+        )
     else:
         softmax_effective = "fused-fast-attention"
         value_effective = "fused-fast-attention"
@@ -183,6 +191,12 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
         "shape_flow_attention_softmax_backend_effective": softmax_effective,
         "shape_flow_attention_value_backend_requested": value_requested,
         "shape_flow_attention_value_backend_effective": value_effective,
+        "shape_flow_gelu_backend_effective": (
+            SOURCE_CUDA_BF16_GELU_TANH_BACKEND
+        ),
+        "shape_flow_gelu_table_bits_sha256_effective": (
+            SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256
+        ),
     }
 
 

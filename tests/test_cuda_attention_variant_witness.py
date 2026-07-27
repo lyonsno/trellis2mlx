@@ -44,6 +44,30 @@ def test_load_witness_rejects_reference_with_different_element_count(tmp_path):
         raise AssertionError("expected mismatched reference attention to fail")
 
 
+def test_load_witness_accepts_rectangular_cross_attention(tmp_path):
+    path = tmp_path / "witness.npz"
+    q = np.zeros((1, 7, 2, 4), dtype=np.float32)
+    k = np.zeros((1, 5, 2, 4), dtype=np.float32)
+    v = np.zeros_like(k)
+    reference = np.zeros_like(q)
+    np.savez(
+        path,
+        pos_q=q,
+        pos_k=k,
+        pos_v=v,
+        pos_reference_attention_raw=reference,
+        pos_source_chunked_attention_raw=reference,
+        route_identity_json=np.array(json.dumps({"branch": "pos"})),
+    )
+
+    loaded = witness.load_witness(path)
+
+    assert loaded["branches"]["pos"]["q"].shape == (7, 2, 4)
+    assert loaded["branches"]["pos"]["k"].shape == (5, 2, 4)
+    assert loaded["branches"]["pos"]["v"].shape == (5, 2, 4)
+    assert loaded["branches"]["pos"]["reference_attention_raw"].shape == (7, 2, 4)
+
+
 def test_cli_failure_writes_report_before_primary_npz(tmp_path):
     script = Path(witness.__file__)
     report = tmp_path / "report.json"
@@ -102,6 +126,28 @@ def test_build_stage_selection_preserves_every_residual_and_adds_controls():
     assert selection["selection_policy"]["residual_rows_requested"] == "all"
     assert selection["selection_policy"]["residual_rows_selected"] == 3
     assert selection["selection_policy"]["controls_selected"] == 4
+
+
+def test_build_stage_selection_records_distinct_cross_attention_source_width():
+    residual = {
+        "schema": "trellis2mlx.block0_split_sqrt_residual_rows.v1",
+        "witness_sha256": "a" * 64,
+        "rows": [{"token": 1, "head": 0, "max_abs": 0.25, "nonzero": 1}],
+    }
+
+    selection = witness.build_stage_selection(
+        residual,
+        residual_report_sha256="b" * 64,
+        token_count=7,
+        source_token_count=5,
+        head_count=2,
+        head_dim=4,
+        chunk_size=4,
+        control_count=1,
+    )
+
+    assert selection["token_count"] == 7
+    assert selection["source_token_count"] == 5
 
 
 def test_group_stage_rows_retains_input_order_and_full_chunk_bounds():
@@ -204,6 +250,48 @@ def test_validate_stage_outputs_rejects_selected_row_matmul_disguised_as_full_ch
             arrays=arrays,
             chunk_receipts=chunk_receipts,
             token_count=10,
+            head_dim=4,
+        )
+
+
+def test_validate_stage_outputs_uses_cross_attention_source_width():
+    selection = {
+        "rows": [{"token": 1, "head": 0, "kind": "residual"}],
+    }
+    arrays = {
+        "row_tokens": np.array([1], dtype=np.int32),
+        "row_heads": np.array([0], dtype=np.int32),
+        "scores_fp32": np.zeros((1, 5), dtype=np.float32),
+        "probs_fp32": np.zeros((1, 5), dtype=np.float32),
+        "output_fp32": np.zeros((1, 4), dtype=np.float32),
+        "output_bf16_as_fp32": np.zeros((1, 4), dtype=np.float32),
+        "source_cuda_bf16_as_fp32": np.zeros((1, 4), dtype=np.float32),
+    }
+    receipt = {
+        "chunk_start": 0,
+        "chunk_stop": 4,
+        "computed_query_count": 4,
+        "selection_applied_after_full_chunk": True,
+        "stage_evaluation_mode": "independent_prefix_replays",
+    }
+
+    witness.validate_stage_outputs(
+        selection=selection,
+        arrays=arrays,
+        chunk_receipts=[receipt],
+        token_count=7,
+        source_token_count=5,
+        head_dim=4,
+    )
+
+    arrays["scores_fp32"] = np.zeros((1, 7), dtype=np.float32)
+    with pytest.raises(ValueError, match="scores_fp32"):
+        witness.validate_stage_outputs(
+            selection=selection,
+            arrays=arrays,
+            chunk_receipts=[receipt],
+            token_count=7,
+            source_token_count=5,
             head_dim=4,
         )
 

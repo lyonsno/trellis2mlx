@@ -11,6 +11,11 @@ FIXTURE = (
     / "fixtures"
     / "source_cuda_softmax_rows_7697.npz"
 )
+CROSS_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "source_cuda_softmax_rows_1029.npz"
+)
 BOUNDARY_FIXTURE = (
     Path(__file__).parent
     / "fixtures"
@@ -50,6 +55,10 @@ SOURCE_ORACLE_SCRIPT_SHA256 = (
 SOURCE_ORACLE_CUDA_SHA256 = (
     "c338b2dbbec7e3adc7f88a6fb07d3df7"
     "74fea39c7162c59c9dd42c7830966464"
+)
+CROSS_FIXTURE_SHA256 = (
+    "2f8e3e9c6d932128680b8b5283d5e63a"
+    "806be6790ff1f55792445388e64e8e80"
 )
 BOUNDARY_FIXTURE_SHA256 = {
     BOUNDARY_FIXTURE.name: (
@@ -144,6 +153,67 @@ def test_source_cuda_long_row_softmax_matches_authenticated_fixture():
     assert actual.shape == (4, 7697)
     assert actual.dtype == mx.float32
     assert np.array_equal(np.asarray(actual), fixture["probs_fp32"])
+
+
+def test_source_cuda_warp_softmax_matches_authenticated_cross_fixture():
+    from trellmlx.modules import attention
+
+    assert hashlib.sha256(CROSS_FIXTURE.read_bytes()).hexdigest() == (
+        CROSS_FIXTURE_SHA256
+    )
+    with np.load(CROSS_FIXTURE, allow_pickle=False) as loaded:
+        assert set(loaded.files) == {
+            "scores_fp32",
+            "probs_fp32",
+            "route_identity_json",
+        }
+        scores = loaded["scores_fp32"].copy()
+        expected = loaded["probs_fp32"].copy()
+        identity = json.loads(str(loaded["route_identity_json"].item()))
+
+    assert identity == {
+        "schema": "trellis2mlx.source_cuda_softmax_fixture.v1",
+        "source_stage_sha256": (
+            "2170a74d970da09aa242853cf0f3e4c9"
+            "52eaeac0150005e89eb7e8fb0dc74bb9"
+        ),
+        "source_report_sha256": (
+            "d4472d4b5c49f324b49e4dce1ba774e"
+            "548345b4cd3e9121d4c44161faf0b1282"
+        ),
+        "witness_sha256": (
+            "2068dd5db21e26ec1cf50f6a83558bc"
+            "eadd04d9205aa96ffc87618755b1f27c2"
+        ),
+        "selection_sha256": (
+            "e9aee9373852d0ca28e4ffe7f2319ef"
+            "c9864642577ddedfcd1ca40cf49e00316"
+        ),
+        "selected_rows": [654, 3, 1662, 2242],
+        "query_tokens": [2319, 15, 6035, 7696],
+        "heads": [6, 10, 8, 11],
+        "selection": [
+            "max_abs",
+            "max_nonzero",
+            "min_nonzero",
+            "last_selected",
+        ],
+        "width": 1029,
+        "cuda_schedule": {
+            "next_power_of_two": 2048,
+            "warp_size": 32,
+            "warp_iterations": 64,
+            "warps_per_block": 4,
+            "reduction": "xor",
+        },
+    }
+    assert scores.shape == (4, 1029)
+    assert expected.shape == scores.shape
+
+    actual = attention._source_cuda_long_row_softmax(mx.array(scores))
+    mx.eval(actual)
+
+    assert np.array_equal(np.asarray(actual), expected)
 
 
 def test_source_cuda_softmax_matches_directed_rounding_boundary_row():

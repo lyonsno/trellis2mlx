@@ -14,6 +14,11 @@ from typing import Any
 
 import numpy as np
 
+from trellmlx.source_cuda_gelu import (
+    SOURCE_CUDA_BF16_GELU_TANH_BACKEND,
+    SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256,
+)
+
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +51,10 @@ SHAPE_FLOW_ATTENTION_ROUTE_FIELDS = (
     "shape_flow_attention_softmax_backend_effective",
     "shape_flow_attention_value_backend_requested",
     "shape_flow_attention_value_backend_effective",
+)
+SHAPE_FLOW_GELU_ROUTE_FIELDS = (
+    "shape_flow_gelu_backend_effective",
+    "shape_flow_gelu_table_bits_sha256_effective",
 )
 STAGE_CAPTURE_SMOKE_PROFILE_TARGET_FACES = {
     "standard": 350_000,
@@ -335,10 +344,10 @@ def build_route_identity(
                 "source-cuda-sequential value projection"
             )
         shape_attention_softmax_effective = (
-            "source-cuda-turing-width-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-7697-fast-otherwise"
         )
         shape_attention_value_effective = (
-            "source-cuda-sequential-width-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
         )
     else:
         shape_attention_softmax_effective = "fused-fast-attention"
@@ -473,6 +482,12 @@ def build_route_identity(
             ),
             "shape_flow_attention_value_backend_effective": (
                 shape_attention_value_effective
+            ),
+            "shape_flow_gelu_backend_effective": (
+                SOURCE_CUDA_BF16_GELU_TANH_BACKEND
+            ),
+            "shape_flow_gelu_table_bits_sha256_effective": (
+                SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256
             ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
             "qk_norm_backend_requested": args.qk_norm_backend,
@@ -838,6 +853,10 @@ def main(argv: list[str] | None = None) -> int:
                     route_identity,
                     checkpoint_npz,
                 )
+                _bind_effective_shape_flow_gelu_route(
+                    route_identity,
+                    checkpoint_npz,
+                )
             route_identity["route"]["shape_flow_layernorm_backend_effective"] = (
                 effective_backend
             )
@@ -1064,13 +1083,54 @@ def _bind_effective_shape_flow_attention_route(
             )
 
 
+def _bind_effective_shape_flow_gelu_route(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        missing = [
+            field for field in SHAPE_FLOW_GELU_ROUTE_FIELDS
+            if field not in checkpoint
+        ]
+        if missing:
+            raise ValueError(
+                "shape-flow checkpoint omits shape-flow GELU route metadata: "
+                f"{missing}"
+            )
+        effective = {}
+        for field in SHAPE_FLOW_GELU_ROUTE_FIELDS:
+            value = np.asarray(checkpoint[field])
+            if value.shape != () or value.dtype.kind not in {"U", "S"}:
+                raise ValueError(
+                    f"shape-flow GELU route field {field!r} must be a string scalar"
+                )
+            effective[field] = str(value.item())
+
+    labels = {
+        "shape_flow_gelu_backend_effective": "effective shape-flow GELU backend",
+        "shape_flow_gelu_table_bits_sha256_effective": (
+            "effective shape-flow GELU table bits SHA256"
+        ),
+    }
+    for field in SHAPE_FLOW_GELU_ROUTE_FIELDS:
+        expected = route.get(field)
+        if effective[field] != expected:
+            raise ValueError(
+                f"{labels[field]} {effective[field]!r} "
+                f"does not match requested route {expected!r}"
+            )
+
+
 def _normalize_attention_backend(requested: str) -> str:
     if requested in {"manual", "mlx-manual"}:
         return "manual"
     if requested in {"fast", "mlx-fast"}:
         return "fast"
     if requested == "source-cuda-self":
-        return "source-cuda-self-width-7697-fast-otherwise"
+        return "source-cuda-self-widths-1029-7697-fast-otherwise"
     return f"unsupported:{requested}"
 
 

@@ -24,6 +24,7 @@ SUPPORTED_QK_NORM_BACKENDS = (
 _source_cuda_warp32_norm_kernel = None
 _source_cuda_sequential_value_kernel = None
 _source_cuda_long_row_softmax_kernel = None
+_source_cuda_warp_softmax_kernel = None
 
 
 def get_qk_norm_backend() -> str:
@@ -244,18 +245,96 @@ def _source_cuda_sequential_value_projection(
 
 
 def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
-    """Reproduce the source CUDA width-7697 FP32 softmax schedule."""
+    """Reproduce authenticated source CUDA FP32 softmax schedules."""
     global _source_cuda_long_row_softmax_kernel
+    global _source_cuda_warp_softmax_kernel
 
     if scores.ndim < 1:
         raise ValueError("softmax scores must have at least one axis")
     if scores.dtype != mx.float32:
         raise ValueError("softmax scores must use float32")
-    if scores.shape[-1] != 7697:
-        raise ValueError("source CUDA long-row softmax requires width 7697")
+    width = int(scores.shape[-1])
+    if width not in {1029, 7697}:
+        raise ValueError(
+            "source CUDA softmax requires an authenticated width of 1029 or 7697"
+        )
     row_count = scores.size // scores.shape[-1]
     if row_count <= 0:
         raise ValueError("softmax row count must be positive")
+
+    if width == 1029:
+        if _source_cuda_warp_softmax_kernel is None:
+            source = r"""
+                constexpr uint width = 1029;
+                constexpr uint warp_size = 32;
+                constexpr uint warp_iterations = 64;
+                constexpr uint warps_per_threadgroup = 4;
+                constexpr float lowest = -3.402823466e+38f;
+
+                uint tid = thread_position_in_threadgroup.x;
+                uint lane = tid & 31;
+                uint warp = tid >> 5;
+                uint row =
+                    threadgroup_position_in_grid.y * warps_per_threadgroup + warp;
+                uint row_count_value = row_count[0];
+                if (row >= row_count_value) {
+                    return;
+                }
+                uint row_offset = row * width;
+                float elements[warp_iterations];
+
+                for (uint iteration = 0; iteration < warp_iterations; ++iteration) {
+                    uint offset = lane + iteration * warp_size;
+                    elements[iteration] =
+                        offset < width ? scores[row_offset + offset] : lowest;
+                }
+
+                float row_max = elements[0];
+                for (uint iteration = 0; iteration < warp_iterations; ++iteration) {
+                    float value = elements[iteration];
+                    row_max = row_max > value ? row_max : value;
+                }
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    float peer = simd_shuffle_xor(row_max, delta);
+                    row_max = row_max < peer ? peer : row_max;
+                }
+
+                float row_sum = 0.0f;
+                for (uint iteration = 0; iteration < warp_iterations; ++iteration) {
+                    elements[iteration] = source_cuda_expf(
+                        elements[iteration] - row_max);
+                    row_sum = row_sum + elements[iteration];
+                }
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    row_sum = row_sum + simd_shuffle_xor(row_sum, delta);
+                }
+
+                for (uint iteration = 0; iteration < warp_iterations; ++iteration) {
+                    uint offset = lane + iteration * warp_size;
+                    if (offset < width) {
+                        out[row_offset + offset] =
+                            elements[iteration] / row_sum;
+                    }
+                }
+            """
+            _source_cuda_warp_softmax_kernel = mx.fast.metal_kernel(
+                name="attention_source_cuda_warp_softmax_fp32_1029",
+                input_names=["scores", "row_count"],
+                output_names=["out"],
+                header=SOURCE_CUDA_EX2_METAL_HEADER,
+                source=source,
+            )
+        return _source_cuda_warp_softmax_kernel(
+            inputs=[
+                scores,
+                mx.array([row_count], dtype=mx.uint32),
+            ],
+            template=[],
+            grid=(128, math.ceil(row_count / 4), 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[scores.shape],
+            output_dtypes=[mx.float32],
+        )[0]
 
     if _source_cuda_long_row_softmax_kernel is None:
         source = r"""
@@ -394,7 +473,7 @@ def scaled_dot_product_attention(
                 "source-cuda-self requires source-cuda-turing softmax and "
                 "source-cuda-sequential value projection"
             )
-        if k.shape[-2] == 7697:
+        if k.shape[-2] in {1029, 7697}:
             return _manual_scaled_dot_product_attention(
                 q,
                 k,

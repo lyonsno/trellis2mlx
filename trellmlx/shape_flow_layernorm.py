@@ -31,6 +31,8 @@ _cuda_welford_kernel = None
 _cuda_welford_stats_kernel = None
 _cuda_welford_turing_kernel = None
 _cuda_welford_turing_stats_kernel = None
+_cuda_welford_affine_kernel = None
+_cuda_welford_turing_affine_kernel = None
 
 
 def configure_shape_flow_layernorm_backend(
@@ -112,6 +114,12 @@ def shape_flow_layernorm_backend_identity(name: str | None = None) -> dict[str, 
             "hidden_width": 1536,
             "affine": False,
         },
+        "authenticated_affine_contract": {
+            "input_dtype": "bfloat16",
+            "parameter_dtype": "float32",
+            "hidden_width": 1536,
+            "affine": True,
+        },
         "reduction": {
             "threads": 128,
             "warps": 4,
@@ -172,6 +180,30 @@ def layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
     return _cuda_welford_layernorm(x, eps)
 
 
+def layernorm_affine(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    eps: float = 1e-6,
+) -> mx.array:
+    if _backend == DEFAULT_BACKEND:
+        return mx.fast.layer_norm(x, weight, bias, eps).astype(x.dtype)
+    _validate_affine_contract(x, weight, bias)
+    if _backend == CUDA_WELFORD_TURING_T4_BACKEND:
+        if _turing_rsqrt_delta_lut is None:
+            raise RuntimeError(
+                f"{_backend} correction LUT is not configured"
+            )
+        return _cuda_welford_turing_affine_layernorm(
+            x,
+            weight,
+            bias,
+            _turing_rsqrt_delta_lut,
+            eps,
+        )
+    return _cuda_welford_affine_layernorm(x, weight, bias, eps)
+
+
 def cuda_welford_layernorm_with_stats(
     x: mx.array, eps: float = 1e-6
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
@@ -228,6 +260,33 @@ def _validate_turing_rsqrt_lut(rsqrt_delta_lut: mx.array) -> None:
             f"{TURING_RSQRT_LUT_SIZE} entries, "
             f"got shape {rsqrt_delta_lut.shape}"
         )
+
+
+def _validate_affine_contract(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+) -> None:
+    if x.dtype != mx.bfloat16:
+        raise ValueError(
+            f"{_backend} affine LayerNorm requires bfloat16 input, got {x.dtype}"
+        )
+    if not x.shape or x.shape[-1] != 1536:
+        width = x.shape[-1] if x.shape else None
+        raise ValueError(
+            f"{_backend} affine LayerNorm requires hidden width 1536, got {width}"
+        )
+    for name, parameter in (("weight", weight), ("bias", bias)):
+        if parameter.dtype != mx.float32:
+            raise ValueError(
+                f"{_backend} affine LayerNorm requires float32 {name}, "
+                f"got {parameter.dtype}"
+            )
+        if parameter.shape != (1536,):
+            raise ValueError(
+                f"{_backend} affine LayerNorm requires {name} shape (1536,), "
+                f"got {parameter.shape}"
+            )
 
 
 def _mlx_two_pass_layernorm(x: mx.array, eps: float) -> mx.array:
@@ -339,10 +398,61 @@ def _cuda_welford_turing_layernorm_with_stats(
     return out, mean, variance, rstd
 
 
+def _cuda_welford_affine_layernorm(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    eps: float,
+) -> mx.array:
+    global _cuda_welford_affine_kernel
+    if _cuda_welford_affine_kernel is None:
+        _cuda_welford_affine_kernel = _build_cuda_welford_kernel(
+            affine=True
+        )
+
+    rows = x.size // 1536
+    eps_array = mx.array([eps], dtype=mx.float32)
+    return _cuda_welford_affine_kernel(
+        inputs=[x, eps_array, weight, bias],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+def _cuda_welford_turing_affine_layernorm(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    rsqrt_delta_lut: mx.array,
+    eps: float,
+) -> mx.array:
+    global _cuda_welford_turing_affine_kernel
+    if _cuda_welford_turing_affine_kernel is None:
+        _cuda_welford_turing_affine_kernel = _build_cuda_welford_kernel(
+            affine=True,
+            turing_rsqrt=True,
+        )
+
+    rows = x.size // 1536
+    eps_array = mx.array([eps], dtype=mx.float32)
+    return _cuda_welford_turing_affine_kernel(
+        inputs=[x, eps_array, weight, bias, rsqrt_delta_lut],
+        template=[("T", mx.bfloat16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 def _build_cuda_welford_kernel(
     *,
     include_stats: bool = False,
     turing_rsqrt: bool = False,
+    affine: bool = False,
 ):
     header = r"""
         struct WelfordDataLN {
@@ -444,6 +554,9 @@ def _build_cuda_welford_kernel(
         float mean = mean_sigma[0];
         __RSQRT__
         __WRITE_STATS__
+        __WRITE_OUTPUT__
+    """
+    noaffine_output = r"""
         for (uint vector_index = thread_index;
              vector_index < width / vector_width;
              vector_index += warp_width * warp_count) {
@@ -458,10 +571,46 @@ def _build_cuda_welford_kernel(
                 (static_cast<float>(inp[offset + 3]) - mean) * rstd);
         }
     """
+    affine_output = r"""
+        for (uint vector_index = thread_index;
+             vector_index < width / vector_width;
+             vector_index += warp_width * warp_count) {
+            uint channel = vector_index * vector_width;
+            uint offset = row_offset + channel;
+            float normalized0 =
+                rstd * (static_cast<float>(inp[offset]) - mean);
+            float normalized1 =
+                rstd * (static_cast<float>(inp[offset + 1]) - mean);
+            float normalized2 =
+                rstd * (static_cast<float>(inp[offset + 2]) - mean);
+            float normalized3 =
+                rstd * (static_cast<float>(inp[offset + 3]) - mean);
+            out[offset] = static_cast<T>(
+                metal::fma(weight[channel], normalized0, bias[channel]));
+            out[offset + 1] = static_cast<T>(
+                metal::fma(
+                    weight[channel + 1],
+                    normalized1,
+                    bias[channel + 1]));
+            out[offset + 2] = static_cast<T>(
+                metal::fma(
+                    weight[channel + 2],
+                    normalized2,
+                    bias[channel + 2]));
+            out[offset + 3] = static_cast<T>(
+                metal::fma(
+                    weight[channel + 3],
+                    normalized3,
+                    bias[channel + 3]));
+        }
+    """
     stats_write = ""
     output_names = ["out"]
     input_names = ["inp", "eps"]
     kernel_name = "shape_flow_cuda_welford_layernorm_bf16_1536"
+    if affine:
+        input_names.extend(["weight", "bias"])
+        kernel_name += "_affine_fp32"
     rsqrt_source = (
         "float rstd = metal::precise::rsqrt(mean_sigma[1] + eps[0]);"
     )
@@ -493,6 +642,10 @@ def _build_cuda_welford_kernel(
         kernel_name += "_with_stats"
     source = source.replace("__RSQRT__", rsqrt_source)
     source = source.replace("__WRITE_STATS__", stats_write)
+    source = source.replace(
+        "__WRITE_OUTPUT__",
+        affine_output if affine else noaffine_output,
+    )
     return mx.fast.metal_kernel(
         name=kernel_name,
         input_names=input_names,

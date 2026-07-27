@@ -2599,13 +2599,53 @@ def test_shape_flow_source_cuda_self_route_records_width_scoped_effective_identi
     )
     assert route["shape_flow_attention_backend_requested"] == "source-cuda-self"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-width-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-width-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_value_backend_effective"] == (
-        "source-cuda-sequential-width-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+    )
+    assert route["shape_flow_gelu_backend_effective"] == (
+        "source-cuda-bf16-table-formula-otherwise"
+    )
+    assert route["shape_flow_gelu_table_bits_sha256_effective"] == (
+        "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+    )
+
+
+def test_generate_source_cuda_self_route_records_authenticated_widths(
+    monkeypatch,
+):
+    import generate
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "source-cuda-self")
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+        "source-cuda-turing",
+    )
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+        "source-cuda-sequential",
+    )
+
+    route = generate._shape_flow_attention_route_from_env()
+
+    assert route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
+    )
+    assert route["shape_flow_attention_softmax_backend_effective"] == (
+        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+    )
+    assert route["shape_flow_attention_value_backend_effective"] == (
+        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+    )
+    assert route["shape_flow_gelu_backend_effective"] == (
+        "source-cuda-bf16-table-formula-otherwise"
+    )
+    assert route["shape_flow_gelu_table_bits_sha256_effective"] == (
+        "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
     )
 
 
@@ -2689,6 +2729,48 @@ def test_shape_flow_attention_primary_identity_is_required_and_route_bound(
         _bind_effective_shape_flow_attention_route(route_identity, checkpoint)
 
 
+def test_shape_flow_gelu_primary_identity_is_required_and_route_bound(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _bind_effective_shape_flow_gelu_route
+
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    route_identity = {
+        "route": {
+            "shape_flow_gelu_backend_effective": (
+                "source-cuda-bf16-table-formula-otherwise"
+            ),
+            "shape_flow_gelu_table_bits_sha256_effective": (
+                "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+            ),
+        }
+    }
+
+    np.savez(checkpoint, pos_final_output=np.zeros((1, 2, 3), dtype=np.float32))
+    with pytest.raises(
+        ValueError,
+        match="omits shape-flow GELU route metadata",
+    ):
+        _bind_effective_shape_flow_gelu_route(route_identity, checkpoint)
+
+    np.savez(
+        checkpoint,
+        shape_flow_gelu_backend_effective=np.array(
+            "source-cuda-bf16-table-formula-otherwise"
+        ),
+        shape_flow_gelu_table_bits_sha256_effective=np.array("substituted"),
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "effective shape-flow GELU table bits SHA256 'substituted' "
+            "does not match requested route"
+        ),
+    ):
+        _bind_effective_shape_flow_gelu_route(route_identity, checkpoint)
+
+
 def test_shape_flow_attention_matching_primary_completes_route_binding(
     tmp_path,
     monkeypatch,
@@ -2727,6 +2809,12 @@ def test_shape_flow_attention_matching_primary_completes_route_binding(
             ),
             shape_flow_attention_value_backend_effective=np.array(
                 "source-cuda-sequential"
+            ),
+            shape_flow_gelu_backend_effective=np.array(
+                "source-cuda-bf16-table-formula-otherwise"
+            ),
+            shape_flow_gelu_table_bits_sha256_effective=np.array(
+                "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
             ),
         )
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")

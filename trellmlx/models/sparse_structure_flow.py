@@ -9,7 +9,9 @@ The "sparse" in the name refers to the output being thresholded into
 sparse occupancy coordinates — the model itself operates on a dense grid.
 """
 
+import hashlib
 import math
+from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
@@ -20,6 +22,9 @@ import numpy as np
 from ..modules.norm import LayerNorm32
 from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
 from ..modules.rope import apply_rope, build_rope_phases
+from ..source_cuda_gelu import SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256
+
+_SOURCE_CUDA_BF16_GELU_TANH_TABLE: mx.array | None = None
 
 
 class TimestepEmbedder(nn.Module):
@@ -279,11 +284,35 @@ class FeedForward(nn.Module):
 def _gelu_tanh(x: mx.array) -> mx.array:
     """PyTorch nn.GELU(approximate="tanh") with source dtype restoration."""
     orig_dtype = x.dtype
+    if orig_dtype == mx.bfloat16:
+        table = _source_cuda_bf16_gelu_tanh_table()
+        indices = mx.view(x, mx.uint16).astype(mx.uint32)
+        return mx.view(mx.take(table, indices), mx.bfloat16)
     x = x.astype(mx.float32)
     tanh_scale = math.sqrt(2.0 / math.pi)
     cubic_scale = 0.044715
     x = 0.5 * x * (1.0 + mx.tanh(tanh_scale * (x + cubic_scale * x * x * x)))
     return x.astype(orig_dtype)
+
+
+def _source_cuda_bf16_gelu_tanh_table() -> mx.array:
+    global _SOURCE_CUDA_BF16_GELU_TANH_TABLE
+    if _SOURCE_CUDA_BF16_GELU_TANH_TABLE is None:
+        table_path = Path(__file__).with_name("source_cuda_bf16_gelu_tanh_table.npy")
+        bits = np.load(table_path, allow_pickle=False)
+        if bits.shape != (65536,) or bits.dtype != np.uint16:
+            raise ValueError(
+                "source CUDA BF16 GELU table must contain 65,536 uint16 entries"
+            )
+        digest = hashlib.sha256(bits.tobytes()).hexdigest()
+        if digest != SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256:
+            raise ValueError(
+                "source CUDA BF16 GELU table digest mismatch: "
+                f"expected {SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256}, got {digest}"
+            )
+        _SOURCE_CUDA_BF16_GELU_TANH_TABLE = mx.array(bits)
+        mx.eval(_SOURCE_CUDA_BF16_GELU_TANH_TABLE)
+    return _SOURCE_CUDA_BF16_GELU_TANH_TABLE
 
 
 class ModulatedBlock(nn.Module):
@@ -320,7 +349,11 @@ class ModulatedBlock(nn.Module):
         self.self_attn = MultiHeadAttention(channels, num_heads)
 
         # Cross-attention with its own affine LayerNorm (fp32 accumulation)
-        self.norm2 = LayerNorm32(channels, affine=True)
+        self.norm2 = LayerNorm32(
+            channels,
+            affine=True,
+            shape_flow_layernorm=shape_flow_layernorm,
+        )
         self.cross_attn = MultiHeadAttention(channels, num_heads, context_channels)
 
         # FFN

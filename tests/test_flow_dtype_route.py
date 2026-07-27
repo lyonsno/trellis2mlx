@@ -1,9 +1,11 @@
 """Source-parity contracts for TRELLIS.2 flow model dtype routing."""
 
+import hashlib
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 class _TinyWeights(nn.Module):
@@ -197,6 +199,32 @@ def test_feedforward_uses_source_tanh_gelu_for_bfloat16_torso():
 
     assert out.dtype == mx.bfloat16
     assert mx.allclose(out, expected, atol=0.0, rtol=0.0).item()
+
+
+def test_bfloat16_gelu_matches_exhaustive_source_cuda_table():
+    from trellmlx.models.sparse_structure_flow import _gelu_tanh
+
+    table_path = (
+        Path(__file__).resolve().parents[1]
+        / "trellmlx"
+        / "models"
+        / "source_cuda_bf16_gelu_tanh_table.npy"
+    )
+    expected_bits = np.load(table_path, allow_pickle=False)
+
+    assert expected_bits.shape == (65536,)
+    assert expected_bits.dtype == np.uint16
+    assert (
+        hashlib.sha256(expected_bits.tobytes()).hexdigest()
+        == "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+    )
+
+    input_bits = np.arange(65536, dtype=np.uint16)
+    inputs = mx.view(mx.array(input_bits), mx.bfloat16)
+    actual_bits = mx.view(_gelu_tanh(inputs), mx.uint16)
+    mx.eval(actual_bits)
+
+    np.testing.assert_array_equal(np.asarray(actual_bits), expected_bits)
 
 
 def test_sparse_structure_flow_casts_block_inputs_to_checkpoint_dtype():

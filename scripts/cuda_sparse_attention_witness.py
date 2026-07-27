@@ -79,7 +79,8 @@ def _normalize_attention(array: np.ndarray, *, key: str, shape: tuple[int, ...])
     value = np.asarray(array, dtype=np.float32)
     if value.size != int(np.prod(shape)):
         raise ValueError(
-            f"{key} element count {value.size} does not match Q/K/V element count {int(np.prod(shape))}"
+            f"{key} element count {value.size} does not match query output "
+            f"element count {int(np.prod(shape))}"
         )
     return np.ascontiguousarray(value.reshape(shape))
 
@@ -98,9 +99,14 @@ def load_witness(path: Path) -> dict[str, Any]:
             q = _normalize_qkv(_require(data, f"{branch}_q"), key=f"{branch}_q")
             k = _normalize_qkv(_require(data, f"{branch}_k"), key=f"{branch}_k")
             v = _normalize_qkv(_require(data, f"{branch}_v"), key=f"{branch}_v")
-            if q.shape != k.shape or q.shape != v.shape:
+            if k.shape != v.shape:
                 raise ValueError(
-                    f"{branch} Q/K/V shape mismatch: q={q.shape}, k={k.shape}, v={v.shape}"
+                    f"{branch} K/V shape mismatch: k={k.shape}, v={v.shape}"
+                )
+            if q.shape[1:] != k.shape[1:]:
+                raise ValueError(
+                    f"{branch} Q and K/V must share head axes: "
+                    f"q={q.shape}, k={k.shape}, v={v.shape}"
                 )
             arrays[branch] = {
                 "q": q,
@@ -130,14 +136,25 @@ def build_stage_selection(
     *,
     residual_report_sha256: str,
     token_count: int,
+    source_token_count: int | None = None,
     head_count: int,
     chunk_size: int,
     control_count: int,
     head_dim: int | None = None,
     branch: str = "pos",
 ) -> dict[str, Any]:
-    if token_count <= 0 or head_count <= 0 or chunk_size <= 0:
-        raise ValueError("token_count, head_count, and chunk_size must be positive")
+    if source_token_count is None:
+        source_token_count = token_count
+    if (
+        token_count <= 0
+        or source_token_count <= 0
+        or head_count <= 0
+        or chunk_size <= 0
+    ):
+        raise ValueError(
+            "token_count, source_token_count, head_count, and chunk_size "
+            "must be positive"
+        )
     if control_count < 0:
         raise ValueError("control_count must be nonnegative")
     if residual_report.get("schema") != RESIDUAL_ROWS_SCHEMA:
@@ -214,6 +231,8 @@ def build_stage_selection(
     }
     if head_dim is not None:
         selection["head_dim"] = int(head_dim)
+    if source_token_count != token_count:
+        selection["source_token_count"] = int(source_token_count)
     group_stage_rows(
         rows,
         token_count=token_count,
@@ -305,13 +324,16 @@ def load_stage_selection(
     if branch not in loaded["branches"]:
         raise ValueError(f"selection branch {branch!r} is absent from the witness")
     token_count, head_count, head_dim = loaded["branches"][branch]["q"].shape
+    source_token_count = loaded["branches"][branch]["k"].shape[0]
     expected_dimensions = {
         "token_count": token_count,
+        "source_token_count": source_token_count,
         "head_count": head_count,
         "head_dim": head_dim,
     }
     for key, expected in expected_dimensions.items():
-        if int(selection.get(key, -1)) != expected:
+        default = token_count if key == "source_token_count" else -1
+        if int(selection.get(key, default)) != expected:
             raise ValueError(
                 f"selection {key} {selection.get(key)!r} does not match witness {expected}"
             )
@@ -344,6 +366,7 @@ def load_stage_selection(
         residual_report,
         residual_report_sha256=effective_residual_sha256,
         token_count=token_count,
+        source_token_count=source_token_count,
         head_count=head_count,
         head_dim=head_dim,
         chunk_size=expected_chunk_size,
@@ -370,8 +393,11 @@ def validate_stage_outputs(
     arrays: dict[str, np.ndarray],
     chunk_receipts: list[dict[str, Any]],
     token_count: int,
+    source_token_count: int | None = None,
     head_dim: int,
 ) -> None:
+    if source_token_count is None:
+        source_token_count = token_count
     for receipt in chunk_receipts:
         expected_query_count = int(receipt["chunk_stop"]) - int(receipt["chunk_start"])
         if int(receipt.get("computed_query_count", -1)) != expected_query_count:
@@ -392,8 +418,8 @@ def validate_stage_outputs(
     expected_shapes = {
         "row_tokens": (row_count,),
         "row_heads": (row_count,),
-        "scores_fp32": (row_count, token_count),
-        "probs_fp32": (row_count, token_count),
+        "scores_fp32": (row_count, source_token_count),
+        "probs_fp32": (row_count, source_token_count),
         "output_fp32": (row_count, head_dim),
         "output_bf16_as_fp32": (row_count, head_dim),
         "source_cuda_bf16_as_fp32": (row_count, head_dim),
@@ -475,6 +501,9 @@ def validate_persisted_stage_admission(
         arrays=arrays,
         chunk_receipts=chunk_receipts,
         token_count=int(selection["token_count"]),
+        source_token_count=int(
+            selection.get("source_token_count", selection["token_count"])
+        ),
         head_dim=int(selection["head_dim"]),
     )
     if persisted_route != expected_route:
@@ -694,13 +723,13 @@ def _variant_matrix(
 
 
 def _empty_stage_arrays(
-    *, row_count: int, token_count: int, head_dim: int
+    *, row_count: int, source_token_count: int, head_dim: int
 ) -> dict[str, np.ndarray]:
     return {
         "row_tokens": np.empty((row_count,), dtype=np.int32),
         "row_heads": np.empty((row_count,), dtype=np.int32),
-        "scores_fp32": np.empty((row_count, token_count), dtype=np.float32),
-        "probs_fp32": np.empty((row_count, token_count), dtype=np.float32),
+        "scores_fp32": np.empty((row_count, source_token_count), dtype=np.float32),
+        "probs_fp32": np.empty((row_count, source_token_count), dtype=np.float32),
         "output_fp32": np.empty((row_count, head_dim), dtype=np.float32),
         "output_bf16_as_fp32": np.empty((row_count, head_dim), dtype=np.float32),
         "source_cuda_bf16_as_fp32": np.empty((row_count, head_dim), dtype=np.float32),
@@ -740,10 +769,11 @@ def _capture_stage_rows_cuda(
     v32 = v.float()
 
     token_count = int(q.shape[2])
+    source_token_count = int(k.shape[2])
     head_dim = int(q.shape[3])
     result = _empty_stage_arrays(
         row_count=len(selection["rows"]),
-        token_count=token_count,
+        source_token_count=source_token_count,
         head_dim=head_dim,
     )
     receipts: list[dict[str, Any]] = []
@@ -879,10 +909,11 @@ def _capture_stage_rows_mlx(
     mx.eval(q32, k_transposed, v32)
 
     token_count = int(q.shape[2])
+    source_token_count = int(k.shape[2])
     head_dim = int(q.shape[3])
     result = _empty_stage_arrays(
         row_count=len(selection["rows"]),
-        token_count=token_count,
+        source_token_count=source_token_count,
         head_dim=head_dim,
     )
     receipts: list[dict[str, Any]] = []
@@ -1010,11 +1041,13 @@ def _capture_residual_stages(
     else:
         raise ValueError(f"unsupported stage backend {backend!r}")
     token_count, _head_count, head_dim = arrays["q"].shape
+    source_token_count = arrays["k"].shape[0]
     validate_stage_outputs(
         selection=selection,
         arrays=outputs,
         chunk_receipts=receipts,
         token_count=token_count,
+        source_token_count=source_token_count,
         head_dim=head_dim,
     )
     route_identity = {
@@ -1223,11 +1256,14 @@ def main() -> int:
                 raise ValueError(
                     f"stage branch {args.stage_branch!r} is absent from the witness"
                 )
-            token_count, head_count, head_dim = loaded["branches"][args.stage_branch]["q"].shape
+            branch_arrays = loaded["branches"][args.stage_branch]
+            token_count, head_count, head_dim = branch_arrays["q"].shape
+            source_token_count = branch_arrays["k"].shape[0]
             selection = build_stage_selection(
                 residual_report,
                 residual_report_sha256=_sha256_file(args.build_stage_selection_from),
                 token_count=token_count,
+                source_token_count=source_token_count,
                 head_count=head_count,
                 head_dim=head_dim,
                 chunk_size=args.stage_chunk_size,

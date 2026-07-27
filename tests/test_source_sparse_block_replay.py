@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -374,6 +375,140 @@ def test_cuda_sparse_mlp_witness_requires_named_arrays():
 
     with pytest.raises(KeyError, match="captured_mlp_input"):
         _require({}, "captured_mlp_input")
+
+
+def test_cuda_sparse_mlp_witness_accepts_core_only_stage_anchor(tmp_path, monkeypatch):
+    from scripts import cuda_sparse_mlp_witness as witness
+
+    route_identity = {
+        "requested_route": "source-cuda-shape-block0-mlp-core",
+        "effective_route": "official-trellis2-source-cuda-shape-block0-mlp-core",
+    }
+    witness_path = tmp_path / "core-only.npz"
+    np.savez_compressed(
+        witness_path,
+        route_identity_json=np.asarray(json.dumps(route_identity, sort_keys=True)),
+        source_mlp_input=np.ones((2, 3), dtype=np.float32),
+        source_mlp_fc1_weight=np.ones((5, 3), dtype=np.float32),
+        source_mlp_fc1_bias=np.ones((5,), dtype=np.float32),
+        source_mlp_fc2_weight=np.ones((3, 5), dtype=np.float32),
+        source_mlp_fc2_bias=np.ones((3,), dtype=np.float32),
+        source_mlp=np.ones((2, 3), dtype=np.float32) * 4,
+    )
+    outputs = {
+        "cuda_mlp_fc1": np.ones((2, 5), dtype=np.float32) * 2,
+        "cuda_mlp_gelu": np.ones((2, 5), dtype=np.float32) * 3,
+        "cuda_mlp": np.ones((2, 3), dtype=np.float32) * 4,
+    }
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Fake CUDA",
+        ),
+        __version__="test",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(witness, "_mlp_forward", lambda **_kwargs: outputs)
+
+    report, actual_outputs = witness._run(SimpleNamespace(witness=witness_path))
+
+    assert report["status"] == "done"
+    assert report["route_identity"] == route_identity
+    assert report["mlp_input_key"] == "source_mlp_input"
+    assert report["input_shapes"] == {
+        "mlp_input": [2, 3],
+        "fc1_weight": [5, 3],
+        "fc2_weight": [3, 5],
+    }
+    assert report["comparison_status"] == "exact"
+    assert report["cuda_vs_source_mlp"]["exact"] is True
+    assert "cuda_vs_captured_mlp" not in report
+    assert "cuda_vs_captured_after_mlp" not in report
+    assert set(actual_outputs) == {"cuda_mlp_fc1", "cuda_mlp_gelu", "cuda_mlp"}
+
+
+def test_cuda_sparse_mlp_witness_marks_authoritative_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import cuda_sparse_mlp_witness as witness
+
+    witness_path = tmp_path / "mismatched-core.npz"
+    np.savez_compressed(
+        witness_path,
+        route_identity_json=np.asarray(
+            json.dumps({"requested_route": "source-cuda-shape-block0-mlp-core"})
+        ),
+        source_mlp_input=np.ones((2, 3), dtype=np.float32),
+        source_mlp_fc1_weight=np.ones((5, 3), dtype=np.float32),
+        source_mlp_fc1_bias=np.ones((5,), dtype=np.float32),
+        source_mlp_fc2_weight=np.ones((3, 5), dtype=np.float32),
+        source_mlp_fc2_bias=np.ones((3,), dtype=np.float32),
+        source_mlp=np.zeros((2, 3), dtype=np.float32),
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Fake CUDA",
+        ),
+        __version__="test",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        witness,
+        "_mlp_forward",
+        lambda **_kwargs: {
+            "cuda_mlp_fc1": np.ones((2, 5), dtype=np.float32),
+            "cuda_mlp_gelu": np.ones((2, 5), dtype=np.float32),
+            "cuda_mlp": np.ones((2, 3), dtype=np.float32),
+        },
+    )
+
+    report, _outputs = witness._run(SimpleNamespace(witness=witness_path))
+
+    assert report["status"] == "mismatch"
+    assert report["comparison_status"] == "mismatch"
+    assert report["cuda_vs_source_mlp"]["exact"] is False
+
+
+def test_cuda_sparse_mlp_witness_rejects_core_without_authoritative_output(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import cuda_sparse_mlp_witness as witness
+
+    witness_path = tmp_path / "unvalidated-core.npz"
+    np.savez_compressed(
+        witness_path,
+        route_identity_json=np.asarray(
+            json.dumps({"requested_route": "source-cuda-shape-block0-mlp-core"})
+        ),
+        source_mlp_input=np.ones((2, 3), dtype=np.float32),
+        source_mlp_fc1_weight=np.ones((5, 3), dtype=np.float32),
+        source_mlp_fc1_bias=np.ones((5,), dtype=np.float32),
+        source_mlp_fc2_weight=np.ones((3, 5), dtype=np.float32),
+        source_mlp_fc2_bias=np.ones((3,), dtype=np.float32),
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Fake CUDA",
+        ),
+        __version__="test",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        witness,
+        "_mlp_forward",
+        lambda **_kwargs: {
+            "cuda_mlp_fc1": np.ones((2, 5), dtype=np.float32),
+            "cuda_mlp_gelu": np.ones((2, 5), dtype=np.float32),
+            "cuda_mlp": np.ones((2, 3), dtype=np.float32),
+        },
+    )
+
+    with pytest.raises(KeyError, match="source_mlp"):
+        witness._run(SimpleNamespace(witness=witness_path))
 
 
 def test_cuda_sparse_mlp_witness_schema_and_failure_phase_are_stable():

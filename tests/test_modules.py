@@ -333,7 +333,7 @@ class TestScaledDotProductAttention:
         assert actual.shape == q.shape
         assert actual.dtype == mx.bfloat16
 
-    def test_source_cuda_self_backend_uses_exact_route_only_at_width_7697(
+    def test_source_cuda_self_backend_uses_exact_route_at_authenticated_widths(
         self, monkeypatch
     ):
         from trellmlx.modules import attention
@@ -361,19 +361,31 @@ class TestScaledDotProductAttention:
         monkeypatch.setattr(attention.mx.fast, "scaled_dot_product_attention", fast)
         q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
         self_kv = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
-        cross_kv = mx.ones((1, 1, 16, 4), dtype=mx.bfloat16)
+        cross_kv = mx.ones((1, 1, 1029, 4), dtype=mx.bfloat16)
+        unsupported_kv = mx.ones((1, 1, 16, 4), dtype=mx.bfloat16)
 
         self_out = attention.scaled_dot_product_attention(q, self_kv, self_kv)
         cross_out = attention.scaled_dot_product_attention(q, cross_kv, cross_kv)
-        mx.eval(self_out, cross_out)
+        unsupported_out = attention.scaled_dot_product_attention(
+            q, unsupported_kv, unsupported_kv
+        )
+        mx.eval(self_out, cross_out, unsupported_out)
 
-        assert calls == [("manual", 7697), ("fast", 16)]
+        assert calls == [
+            ("manual", 7697),
+            ("manual", 1029),
+            ("fast", 16),
+        ]
         assert np.array_equal(
             np.asarray(self_out.astype(mx.float32)),
             np.full(q.shape, 2.0, dtype=np.float32),
         )
         assert np.array_equal(
             np.asarray(cross_out.astype(mx.float32)),
+            np.full(q.shape, 2.0, dtype=np.float32),
+        )
+        assert np.array_equal(
+            np.asarray(unsupported_out.astype(mx.float32)),
             np.full(q.shape, 3.0, dtype=np.float32),
         )
 

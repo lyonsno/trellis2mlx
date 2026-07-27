@@ -1,7 +1,12 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 import mlx.core as mx
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture(autouse=True)
@@ -363,6 +368,49 @@ def test_turing_shape_model_consumes_configured_lut_and_returns_sampler_dtype(
     assert out.dtype == mx.float32
 
 
+def test_turing_shape_block_affine_norm2_matches_source_cuda_rows():
+    from trellmlx.models.sparse_structure_flow import ModulatedBlock
+    from trellmlx.shape_flow_layernorm import (
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        configure_shape_flow_layernorm_backend,
+    )
+
+    with np.load(
+        FIXTURES / "source_cuda_shape_block0_norm2_rows.npz",
+        allow_pickle=False,
+    ) as fixture:
+        after_self = np.asarray(fixture["after_self"])
+        weight = np.asarray(fixture["weight"])
+        bias = np.asarray(fixture["bias"])
+        expected = np.asarray(fixture["expected_norm2"])
+        coordinates = np.asarray(fixture["rsqrt_coordinates"])
+        deltas = np.asarray(fixture["rsqrt_deltas"])
+
+    correction = np.zeros((1 << 24,), dtype=np.int8)
+    correction[coordinates] = deltas
+    configure_shape_flow_layernorm_backend(
+        CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=mx.array(correction),
+        turing_rsqrt_lut_sha256="a" * 64,
+    )
+    block = ModulatedBlock(
+        1536,
+        12,
+        4,
+        4,
+        shape_flow_layernorm=True,
+    )
+    block.norm2.weight = mx.array(weight)
+    block.norm2.bias = mx.array(bias)
+
+    actual = block.norm2(
+        mx.array(after_self).astype(mx.bfloat16)
+    ).astype(mx.float32)
+    mx.eval(actual)
+
+    np.testing.assert_array_equal(np.asarray(actual), expected)
+
+
 def test_default_shape_model_preserves_float32_final_layernorm_order(monkeypatch):
     import trellmlx.models.slat_flow as slat_flow
 
@@ -459,8 +507,10 @@ def test_slat_flow_role_constructors_isolate_shape_backend_from_texture():
 
     assert shape.shape_flow_layernorm is True
     assert all(block.shape_flow_layernorm is True for block in shape.blocks)
+    assert all(block.norm2.shape_flow_layernorm is True for block in shape.blocks)
     assert texture.shape_flow_layernorm is False
     assert all(block.shape_flow_layernorm is False for block in texture.blocks)
+    assert all(block.norm2.shape_flow_layernorm is False for block in texture.blocks)
 
 
 def test_texture_role_keeps_default_layernorm_under_shape_experiment(monkeypatch):
