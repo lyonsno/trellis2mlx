@@ -130,10 +130,13 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
         backend_effective = "manual"
     elif backend_requested in {"fast", "mlx-fast"}:
         backend_effective = "fast"
+    elif backend_requested == "source-cuda-self":
+        backend_effective = "source-cuda-self-width-7697-fast-otherwise"
     else:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
-            "'fast', 'mlx-fast', 'manual', or 'mlx-manual', "
+            "'fast', 'mlx-fast', 'manual', 'mlx-manual', or "
+            "'source-cuda-self', "
             f"got {backend_requested!r}"
         )
     softmax_requested = os.environ.get(
@@ -159,6 +162,17 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     if backend_effective == "manual":
         softmax_effective = softmax_requested
         value_effective = value_requested
+    elif backend_requested == "source-cuda-self":
+        if (
+            softmax_requested != "source-cuda-turing"
+            or value_requested != "source-cuda-sequential"
+        ):
+            raise ValueError(
+                "source-cuda-self requires source-cuda-turing softmax and "
+                "source-cuda-sequential value projection"
+            )
+        softmax_effective = "source-cuda-turing-width-7697-fast-otherwise"
+        value_effective = "source-cuda-sequential-width-7697-fast-otherwise"
     else:
         softmax_effective = "fused-fast-attention"
         value_effective = "fused-fast-attention"
@@ -848,7 +862,13 @@ def main():
                              "to save. Omit to save the full block trace.")
     parser.add_argument(
         "--shape-flow-attention-backend",
-        choices=["fast", "mlx-fast", "manual", "mlx-manual"],
+        choices=[
+            "fast",
+            "mlx-fast",
+            "manual",
+            "mlx-manual",
+            "source-cuda-self",
+        ],
         help=(
             "Diagnostic: shape-flow-only attention backend for "
             "--stop-after-stage shape_flow_block_trace."

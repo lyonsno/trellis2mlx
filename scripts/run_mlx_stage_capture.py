@@ -30,7 +30,13 @@ SUPPORTED_QK_NORM_BACKENDS = (
     DEFAULT_QK_NORM_BACKEND,
     "mlx-sum",
 )
-SUPPORTED_ATTENTION_BACKENDS = ("fast", "mlx-fast", "manual", "mlx-manual")
+SUPPORTED_ATTENTION_BACKENDS = (
+    "fast",
+    "mlx-fast",
+    "manual",
+    "mlx-manual",
+    "source-cuda-self",
+)
 SUPPORTED_ATTENTION_SOFTMAX_BACKENDS = ("mlx-softmax", "source-cuda-turing")
 SUPPORTED_ATTENTION_VALUE_BACKENDS = ("mlx-matmul", "source-cuda-sequential")
 SHAPE_FLOW_ATTENTION_ROUTE_FIELDS = (
@@ -319,6 +325,21 @@ def build_route_identity(
     if shape_attention_backend == "manual":
         shape_attention_softmax_effective = shape_attention_softmax_requested
         shape_attention_value_effective = shape_attention_value_requested
+    elif shape_attention_backend_requested == "source-cuda-self":
+        if (
+            shape_attention_softmax_requested != "source-cuda-turing"
+            or shape_attention_value_requested != "source-cuda-sequential"
+        ):
+            raise ValueError(
+                "source-cuda-self requires source-cuda-turing softmax and "
+                "source-cuda-sequential value projection"
+            )
+        shape_attention_softmax_effective = (
+            "source-cuda-turing-width-7697-fast-otherwise"
+        )
+        shape_attention_value_effective = (
+            "source-cuda-sequential-width-7697-fast-otherwise"
+        )
     else:
         shape_attention_softmax_effective = "fused-fast-attention"
         shape_attention_value_effective = "fused-fast-attention"
@@ -1048,6 +1069,8 @@ def _normalize_attention_backend(requested: str) -> str:
         return "manual"
     if requested in {"fast", "mlx-fast"}:
         return "fast"
+    if requested == "source-cuda-self":
+        return "source-cuda-self-width-7697-fast-otherwise"
     return f"unsupported:{requested}"
 
 

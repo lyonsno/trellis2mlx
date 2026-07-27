@@ -2565,6 +2565,82 @@ def test_shape_flow_fast_attention_records_manual_subroutes_as_ineffective(
     )
 
 
+def test_shape_flow_source_cuda_self_route_records_width_scoped_effective_identity(
+    tmp_path,
+):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(args, command)["route"]
+
+    assert command[command.index("--shape-flow-attention-backend") + 1] == (
+        "source-cuda-self"
+    )
+    assert route["shape_flow_attention_backend_requested"] == "source-cuda-self"
+    assert route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-width-7697-fast-otherwise"
+    )
+    assert route["shape_flow_attention_softmax_backend_effective"] == (
+        "source-cuda-turing-width-7697-fast-otherwise"
+    )
+    assert route["shape_flow_attention_value_backend_effective"] == (
+        "source-cuda-sequential-width-7697-fast-otherwise"
+    )
+
+
+def test_shape_flow_source_cuda_self_route_requires_both_source_subroutes(
+    tmp_path,
+):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import build_parser, build_route_identity
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "mlx-matmul",
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="source-cuda-self requires source-cuda-turing softmax and "
+        "source-cuda-sequential value projection",
+    ):
+        build_route_identity(args, ["generate.py"])
+
+
 def test_shape_flow_attention_primary_identity_is_required_and_route_bound(
     tmp_path,
 ):

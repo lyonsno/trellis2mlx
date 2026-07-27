@@ -94,6 +94,109 @@ def test_sparse_flow_block_trace_comparison_reports_dynamic_block_arrays(tmp_pat
     assert report["arrays"]["neg_block5_after_mlp"]["max_abs_diff"] == 3.0
 
 
+def test_shape_flow_block_trace_comparison_separates_metadata_and_reports_key_coverage(
+    tmp_path,
+):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        reference,
+        route_identity_json=np.array('{"route":"source-cuda"}'),
+        trace_block_index=np.array(0, dtype=np.int32),
+        pos_block0_attention_raw=np.array([[1.0, 2.0]], dtype=np.float32),
+        source_only_final=np.array([[3.0]], dtype=np.float32),
+    )
+    np.savez(
+        candidate,
+        route_identity_json=np.array('{"route":"mlx-source-cuda-attention"}'),
+        trace_block_index=np.array(0, dtype=np.int32),
+        pos_block0_attention_raw=np.array([[1.0, 2.5]], dtype=np.float32),
+        candidate_only_route=np.array("manual"),
+    )
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    assert sorted(report["arrays"]) == [
+        "pos_block0_attention_raw",
+        "trace_block_index",
+    ]
+    assert report["arrays"]["pos_block0_attention_raw"]["max_abs_diff"] == 0.5
+    assert report["metadata"]["route_identity_json"] == {
+        "reference_shape": [],
+        "candidate_shape": [],
+        "shape_match": True,
+        "reference_dtype": "<U23",
+        "candidate_dtype": "<U37",
+        "dtype_match": False,
+        "reference": '{"route":"source-cuda"}',
+        "candidate": '{"route":"mlx-source-cuda-attention"}',
+        "exact_match": False,
+    }
+    assert report["keys"] == {
+        "common": [
+            "pos_block0_attention_raw",
+            "route_identity_json",
+            "trace_block_index",
+        ],
+        "reference_only": ["source_only_final"],
+        "candidate_only": ["candidate_only_route"],
+    }
+
+
+def test_shape_flow_block_trace_comparison_reports_singleton_route_values(tmp_path):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        reference,
+        route_identity_json=np.array(['{"route":"source-cuda"}']),
+    )
+    np.savez(
+        candidate,
+        route_identity_json=np.array(['{"route":"mlx-source-self"}']),
+    )
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    assert report["metadata"]["route_identity_json"]["reference"] == (
+        '{"route":"source-cuda"}'
+    )
+    assert report["metadata"]["route_identity_json"]["candidate"] == (
+        '{"route":"mlx-source-self"}'
+    )
+    assert report["metadata"]["route_identity_json"]["exact_match"] is False
+
+
+def test_shape_flow_block_trace_metadata_is_json_serializable_for_numpy_temporals(
+    tmp_path,
+):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        reference,
+        captured_on=np.array(np.datetime64("2026-07-27")),
+        duration=np.array(np.timedelta64(3, "D")),
+    )
+    np.savez(
+        candidate,
+        captured_on=np.array(np.datetime64("2026-07-28")),
+        duration=np.array(np.timedelta64(4, "D")),
+    )
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+
+    json.dumps(report)
+    assert report["metadata"]["captured_on"]["reference"] == "2026-07-27"
+    assert report["metadata"]["captured_on"]["candidate"] == "2026-07-28"
+    assert report["metadata"]["duration"]["reference"] == "3 days"
+    assert report["metadata"]["duration"]["candidate"] == "4 days"
+
+
 def test_sparse_flow_steps_comparison_reports_step_arrays(tmp_path):
     from scripts.compare_stage_artifacts import compare_stage
 

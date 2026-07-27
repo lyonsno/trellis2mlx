@@ -366,7 +366,7 @@ def scaled_dot_product_attention(
     v: mx.array,  # [B, H, S, D]
     mask: mx.array = None,  # [B, 1, T, S] or None
 ) -> mx.array:
-    """Scaled dot-product attention using MLX's fused Flash Attention kernel.
+    """Scaled dot-product attention using the selected diagnostic backend.
 
     MLX's mx.fast.scaled_dot_product_attention uses tiled online softmax
     and never materializes the full N×N attention matrix (O(N) memory).
@@ -377,8 +377,35 @@ def scaled_dot_product_attention(
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
     if backend in {"manual", "mlx-manual"}:
         return _manual_scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    if backend == "source-cuda-self":
+        softmax_backend = os.environ.get(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "mlx-softmax",
+        ).lower()
+        value_backend = os.environ.get(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+            "mlx-matmul",
+        ).lower()
+        if (
+            softmax_backend != "source-cuda-turing"
+            or value_backend != "source-cuda-sequential"
+        ):
+            raise ValueError(
+                "source-cuda-self requires source-cuda-turing softmax and "
+                "source-cuda-sequential value projection"
+            )
+        if k.shape[-2] == 7697:
+            return _manual_scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                mask=mask,
+            )
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
     raise ValueError(
-        "TRELLIS2MLX_ATTENTION_BACKEND must be one of 'fast' or 'manual', "
+        "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
+        "'fast', 'manual', or 'source-cuda-self', "
         f"got {backend!r}"
     )
 

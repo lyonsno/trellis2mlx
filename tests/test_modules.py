@@ -333,6 +333,73 @@ class TestScaledDotProductAttention:
         assert actual.shape == q.shape
         assert actual.dtype == mx.bfloat16
 
+    def test_source_cuda_self_backend_uses_exact_route_only_at_width_7697(
+        self, monkeypatch
+    ):
+        from trellmlx.modules import attention
+
+        calls = []
+
+        def manual(q, k, v, scale, mask=None):
+            calls.append(("manual", k.shape[-2]))
+            return mx.full(q.shape, 2.0, dtype=q.dtype)
+
+        def fast(q, k, v, scale, mask=None):
+            calls.append(("fast", k.shape[-2]))
+            return mx.full(q.shape, 3.0, dtype=q.dtype)
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "source-cuda-self")
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "source-cuda-turing",
+        )
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+            "source-cuda-sequential",
+        )
+        monkeypatch.setattr(attention, "_manual_scaled_dot_product_attention", manual)
+        monkeypatch.setattr(attention.mx.fast, "scaled_dot_product_attention", fast)
+        q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
+        self_kv = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
+        cross_kv = mx.ones((1, 1, 16, 4), dtype=mx.bfloat16)
+
+        self_out = attention.scaled_dot_product_attention(q, self_kv, self_kv)
+        cross_out = attention.scaled_dot_product_attention(q, cross_kv, cross_kv)
+        mx.eval(self_out, cross_out)
+
+        assert calls == [("manual", 7697), ("fast", 16)]
+        assert np.array_equal(
+            np.asarray(self_out.astype(mx.float32)),
+            np.full(q.shape, 2.0, dtype=np.float32),
+        )
+        assert np.array_equal(
+            np.asarray(cross_out.astype(mx.float32)),
+            np.full(q.shape, 3.0, dtype=np.float32),
+        )
+
+    def test_source_cuda_self_backend_rejects_incomplete_source_route(
+        self, monkeypatch
+    ):
+        from trellmlx.modules.attention import scaled_dot_product_attention
+
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "source-cuda-self")
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "source-cuda-turing",
+        )
+        monkeypatch.setenv(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+            "mlx-matmul",
+        )
+        q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
+
+        with pytest.raises(
+            ValueError,
+            match="source-cuda-self requires source-cuda-turing softmax and "
+            "source-cuda-sequential value projection",
+        ):
+            scaled_dot_product_attention(q, q, q)
+
     def test_manual_softmax_backend_rejects_unknown_route(self, monkeypatch):
         from trellmlx.modules.attention import scaled_dot_product_attention
 

@@ -89,10 +89,7 @@ def compare_stage(stage: str, reference_path: Path, candidate_path: Path) -> dic
             }
             return report
         if stage in {"sparse_flow_block_trace", "shape_flow_block_trace"}:
-            report["arrays"] = {
-                name: _array_delta(ref[name], cand[name])
-                for name in sorted(set(ref.files) & set(cand.files))
-            }
+            report.update(_block_trace_delta(ref, cand))
             return report
         if stage == "shape_flow_step":
             coords_report, _ref_order, _cand_order = _coord_overlap(ref["coords"], cand["coords"])
@@ -140,6 +137,63 @@ def _array_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]
     diff = np.abs(reference.astype(np.float64) - candidate.astype(np.float64))
     summary.update(_diff_summary(diff))
     return summary
+
+
+def _block_trace_delta(reference: Any, candidate: Any) -> dict[str, Any]:
+    reference_keys = set(reference.files)
+    candidate_keys = set(candidate.files)
+    common_keys = sorted(reference_keys & candidate_keys)
+    arrays: dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
+    for name in common_keys:
+        ref_array = np.asarray(reference[name])
+        cand_array = np.asarray(candidate[name])
+        if _is_numeric_delta_dtype(ref_array.dtype) and _is_numeric_delta_dtype(
+            cand_array.dtype
+        ):
+            arrays[name] = _array_delta(ref_array, cand_array)
+        else:
+            metadata[name] = _metadata_delta(ref_array, cand_array)
+    return {
+        "keys": {
+            "common": common_keys,
+            "reference_only": sorted(reference_keys - candidate_keys),
+            "candidate_only": sorted(candidate_keys - reference_keys),
+        },
+        "arrays": arrays,
+        "metadata": metadata,
+    }
+
+
+def _metadata_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:
+    shape_match = reference.shape == candidate.shape
+    summary: dict[str, Any] = {
+        "reference_shape": list(reference.shape),
+        "candidate_shape": list(candidate.shape),
+        "shape_match": shape_match,
+        "reference_dtype": str(reference.dtype),
+        "candidate_dtype": str(candidate.dtype),
+        "dtype_match": str(reference.dtype) == str(candidate.dtype),
+    }
+    if reference.size == 1 and candidate.size == 1:
+        summary["reference"] = _json_scalar(reference.reshape(-1)[0])
+        summary["candidate"] = _json_scalar(candidate.reshape(-1)[0])
+    summary["exact_match"] = bool(shape_match and np.array_equal(reference, candidate))
+    return summary
+
+
+def _is_numeric_delta_dtype(dtype: np.dtype[Any]) -> bool:
+    return np.dtype(dtype).kind in "biufc"
+
+
+def _json_scalar(value: Any) -> Any:
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _coord_overlap(
