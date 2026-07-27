@@ -2,6 +2,85 @@ import mlx.core as mx
 import numpy as np
 
 
+def _source_sparse_std_reference(values: np.ndarray) -> np.float32:
+    values = np.asarray(values, dtype=np.float32)
+    rows, channels = values.shape
+    assert channels > 0 and channels & (channels - 1) == 0
+
+    def source_mean(matrix: np.ndarray) -> np.float32:
+        work = np.asarray(matrix, dtype=np.float32).copy()
+        width = channels
+        while width > 1:
+            half = width // 2
+            work[:, :half] = np.asarray(
+                work[:, :half] + work[:, half:width],
+                dtype=np.float32,
+            )
+            width = half
+        row_means = np.asarray(
+            work[:, 0] * np.float32(1.0 / channels),
+            dtype=np.float32,
+        )
+        total = np.float32(0.0)
+        for value in row_means:
+            total = np.float32(total + value)
+        return np.float32(total / np.int64(rows))
+
+    mean = source_mean(values)
+    mean2 = source_mean(np.asarray(values * values, dtype=np.float32))
+    variance = np.float32(mean2 - np.float32(mean * mean))
+    return np.sqrt(variance, dtype=np.float32)
+
+
+def test_sparse_cfg_rescale_std_matches_source_reduction_topology():
+    from trellmlx.samplers import _cfg_rescale_std
+
+    rng = np.random.default_rng(20260727)
+    for channels in (8, 32):
+        values = rng.normal(size=(257, channels)).astype(np.float32)
+        expected = _source_sparse_std_reference(values)
+
+        actual = np.asarray(
+            _cfg_rescale_std(mx.array(values), sparse_tokens=True),
+            dtype=np.float32,
+        ).reshape(())
+
+        assert actual.view(np.uint32) == expected.view(np.uint32)
+
+
+def test_sparse_cfg_rescale_rejects_multiple_conditioning_batches():
+    from trellmlx.samplers import flow_euler_sample
+
+    noise = mx.zeros((2, 8), dtype=mx.float32)
+    cond = mx.ones((2, 1, 1), dtype=mx.float32)
+    neg_cond = mx.zeros((2, 1, 1), dtype=mx.float32)
+    coords = mx.array([[0, 0, 0], [1, 0, 0]], dtype=mx.int32)
+
+    class ZeroModel:
+        def __call__(self, sample, t, conditioning, **kwargs):
+            return mx.zeros_like(sample)
+
+    try:
+        flow_euler_sample(
+            ZeroModel(),
+            noise,
+            cond,
+            neg_cond,
+            steps=1,
+            guidance_strength=1.0,
+            guidance_rescale=0.0,
+            verbose=False,
+            coords=coords,
+        )
+    except ValueError as exc:
+        assert str(exc) == (
+            "sparse-token sampling currently requires one conditioning batch; "
+            "got cond=2, neg_cond=2"
+        )
+    else:
+        raise AssertionError("multi-batch sparse-token sampling must fail before model execution")
+
+
 def test_cfg_rescale_matches_reference_without_ratio_clamp():
     from trellmlx.samplers import flow_euler_sample, _pred_to_xstart, _xstart_to_pred
 

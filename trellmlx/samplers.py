@@ -10,6 +10,9 @@ import mlx.core as mx
 import numpy as np
 
 
+_source_sparse_cfg_std_kernel = None
+
+
 def flow_euler_sample(
     model,
     noise: mx.array,
@@ -54,6 +57,20 @@ def flow_euler_sample(
     if concat_cond is not None:
         model_kwargs['concat_cond'] = concat_cond
     sparse_token_rescale = "coords" in model_kwargs and len(noise.shape) == 2
+    if sparse_token_rescale:
+        coords = model_kwargs["coords"]
+        if coords.ndim != 2 or coords.shape != (noise.shape[0], 3):
+            raise ValueError(
+                "sparse-token sampling requires spatial coords with shape "
+                f"[tokens,3], got noise={noise.shape}, coords={coords.shape}"
+            )
+        cond_batches = int(cond.shape[0])
+        neg_cond_batches = int(neg_cond.shape[0])
+        if cond_batches != 1 or neg_cond_batches != 1:
+            raise ValueError(
+                "sparse-token sampling currently requires one conditioning batch; "
+                f"got cond={cond_batches}, neg_cond={neg_cond_batches}"
+            )
 
     # Build cross-attention KV caches if the model supports it.
     # The image conditioning doesn't change between steps, so KV projections
@@ -270,7 +287,7 @@ def _xstart_to_pred(x_t, t, x_0, sigma_min):
 def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:
     """Match source CFG-rescale std axes for dense grids versus SparseTensor tokens."""
     if sparse_tokens:
-        return mx.sqrt(mx.var(x_0))
+        return _source_sparse_cfg_rescale_std(x_0)
 
     reduce_dims = list(range(1, x_0.ndim))
     n = 1
@@ -279,3 +296,75 @@ def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:
     # Match PyTorch torch.std() Bessel correction (correction=1) for dense tensors.
     bessel = n / (n - 1)
     return mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True) * bessel)
+
+
+def _source_sparse_cfg_rescale_std(x_0: mx.array) -> mx.array:
+    """Reproduce SparseTensor.std's CUDA row-tree and segment reduction order."""
+    global _source_sparse_cfg_std_kernel
+
+    if x_0.ndim != 2:
+        raise ValueError(f"sparse CFG rescale expects [tokens, channels], got {x_0.shape}")
+    rows, channels = (int(value) for value in x_0.shape)
+    if rows <= 0 or channels <= 0:
+        raise ValueError(f"sparse CFG rescale requires non-empty input, got {x_0.shape}")
+    if channels > 32 or channels & (channels - 1):
+        return mx.sqrt(mx.var(x_0))
+
+    if _source_sparse_cfg_std_kernel is None:
+        source = r"""
+            uint row_count = rows[0];
+            uint channel_count = channels[0];
+            float mean_sum = 0.0f;
+            float mean2_sum = 0.0f;
+
+            for (uint row = 0; row < row_count; ++row) {
+                float values[32];
+                float squares[32];
+                uint row_offset = row * channel_count;
+                for (uint channel = 0; channel < 32; ++channel) {
+                    float value = channel < channel_count
+                        ? static_cast<float>(inp[row_offset + channel])
+                        : 0.0f;
+                    values[channel] = value;
+                    squares[channel] = value * value;
+                }
+                for (uint offset = 16; offset > 0; offset >>= 1) {
+                    for (uint channel = 0; channel < offset; ++channel) {
+                        values[channel] =
+                            values[channel] + values[channel + offset];
+                        squares[channel] =
+                            squares[channel] + squares[channel + offset];
+                    }
+                }
+                float inverse_channels = 1.0f / static_cast<float>(channel_count);
+                float row_mean = values[0] * inverse_channels;
+                float row_mean2 = squares[0] * inverse_channels;
+                mean_sum = mean_sum + row_mean;
+                mean2_sum = mean2_sum + row_mean2;
+            }
+
+            float mean = mean_sum / static_cast<float>(row_count);
+            float mean2 = mean2_sum / static_cast<float>(row_count);
+            float variance = mean2 - mean * mean;
+            out[0] = metal::precise::sqrt(variance);
+        """
+        _source_sparse_cfg_std_kernel = mx.fast.metal_kernel(
+            name="cfg_rescale_source_sparse_row_tree_segment_fp32",
+            input_names=["inp", "rows", "channels"],
+            output_names=["out"],
+            source=source,
+        )
+
+    out = _source_sparse_cfg_std_kernel(
+        inputs=[
+            x_0,
+            mx.array([rows], dtype=mx.uint32),
+            mx.array([channels], dtype=mx.uint32),
+        ],
+        template=[("T", x_0.dtype)],
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return out.reshape(())
