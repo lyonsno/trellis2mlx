@@ -324,7 +324,11 @@ def _run_suffix(
     switch_step: int,
     capture_steps: list[dict[str, np.ndarray]] | None = None,
 ) -> tuple[Any, list[float]]:
-    from source_cuda_shape_block29_basin_map import _flow_forward, _guided_prediction
+    from source_cuda_shape_block29_basin_map import (
+        _flow_forward,
+        _guidance_capture_to_numpy,
+        _guided_prediction,
+    )
     from trellis2.modules.sparse import SparseTensor
 
     sample = SparseTensor(feats=start_feats.clone(), coords=coords)
@@ -344,6 +348,9 @@ def _run_suffix(
         pred_neg = _flow_forward(
             torch, flow_model, sample, t_model, neg_cond, branch="neg", targets=None
         )
+        guidance_capture: dict[str, Any] | None = (
+            {} if capture_steps is not None else None
+        )
         pred = _guided_prediction(
             sampler=sampler,
             sample=sample,
@@ -353,32 +360,35 @@ def _run_suffix(
             guidance_strength=float(params["guidance_strength"]),
             guidance_rescale=float(params["guidance_rescale"]),
             guidance_interval=guidance_interval,
+            capture=guidance_capture,
         )
         sample_next = sample - (t - t_prev) * pred
         if capture_steps is not None:
-            capture_steps.append(
-                {
-                    "sample_in": sample_in.feats.detach().float().cpu().numpy().astype(
-                        np.float32
-                    ),
-                    "pred_pos": pred_pos.feats.detach().float().cpu().numpy().astype(
-                        np.float32
-                    ),
-                    "pred_neg": pred_neg.feats.detach().float().cpu().numpy().astype(
-                        np.float32
-                    ),
-                    "pred_final": pred.feats.detach().float().cpu().numpy().astype(
-                        np.float32
-                    ),
-                    "sample_next": sample_next.feats.detach()
-                    .float()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32),
-                    "t": np.asarray(t, dtype=np.float32),
-                    "t_prev": np.asarray(t_prev, dtype=np.float32),
-                }
-            )
+            captured_step = {
+                "sample_in": sample_in.feats.detach().float().cpu().numpy().astype(
+                    np.float32
+                ),
+                "pred_pos": pred_pos.feats.detach().float().cpu().numpy().astype(
+                    np.float32
+                ),
+                "pred_neg": pred_neg.feats.detach().float().cpu().numpy().astype(
+                    np.float32
+                ),
+                "pred_final": pred.feats.detach().float().cpu().numpy().astype(
+                    np.float32
+                ),
+                "sample_next": sample_next.feats.detach()
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+                "t": np.asarray(t, dtype=np.float32),
+                "t_prev": np.asarray(t_prev, dtype=np.float32),
+            }
+            if guidance_capture is None:
+                raise AssertionError("guidance capture was not initialized")
+            captured_step.update(_guidance_capture_to_numpy(guidance_capture))
+            capture_steps.append(captured_step)
         sample = sample_next
         torch.cuda.synchronize()
         step_timings.append(time.perf_counter() - step_started)

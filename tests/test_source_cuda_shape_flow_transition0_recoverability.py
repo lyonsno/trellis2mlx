@@ -70,20 +70,86 @@ def _source_recurrence_fixture():
     shape = (coords.shape[0], 32)
     schedule = _schedule_pairs(8, 3.0)
     noise = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 100.0
-    pred_pos = np.full(shape, 0.25, dtype=np.float32)
-    pred_neg = np.full(shape, -0.25, dtype=np.float32)
-    pred_final = np.full(shape, 0.125, dtype=np.float32)
-    sample_next = noise - np.float32(schedule[0][0] - schedule[0][1]) * pred_final
+    pred_pos = (
+        np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 250.0 + 0.1
+    )
+    pred_neg = (
+        np.flip(pred_pos, axis=1).copy() * np.float32(-0.35)
+    )
+
+    def source_step(sample_in, t, t_prev):
+        active = 0.6 <= t <= 1.0
+        pred_cfg = (
+            np.float32(7.5) * pred_pos
+            + np.float32(1.0 - 7.5) * pred_neg
+            if active
+            else pred_pos
+        )
+        captured = {
+            "guidance_active": np.asarray(active, dtype=np.bool_),
+            "pred_cfg": pred_cfg,
+        }
+        if active:
+            sigma_min = np.float32(1e-5)
+            one_minus_sigma = np.float32(1.0 - sigma_min)
+            coefficient = np.float32(
+                sigma_min
+                + np.float32(1.0 - sigma_min) * np.float32(t)
+            )
+            x0_pos = one_minus_sigma * sample_in - coefficient * pred_pos
+            x0_cfg = one_minus_sigma * sample_in - coefficient * pred_cfg
+
+            def sparse_std(value):
+                row_mean = value.mean(axis=1, keepdims=True, dtype=np.float32)
+                row_mean2 = np.square(value).mean(
+                    axis=1, keepdims=True, dtype=np.float32
+                )
+                mean = row_mean.mean(axis=0, keepdims=True, dtype=np.float32)
+                mean2 = row_mean2.mean(axis=0, keepdims=True, dtype=np.float32)
+                return np.sqrt(mean2 - np.square(mean), dtype=np.float32)
+
+            std_pos = sparse_std(x0_pos)
+            std_cfg = sparse_std(x0_cfg)
+            std_ratio = std_pos / std_cfg
+            x0_rescaled = x0_cfg * std_ratio
+            x0_after_rescale = (
+                np.float32(0.5) * x0_rescaled + np.float32(0.5) * x0_cfg
+            )
+            pred_final = (
+                one_minus_sigma * sample_in - x0_after_rescale
+            ) / coefficient
+            captured.update(
+                {
+                    "x0_pos": x0_pos,
+                    "x0_cfg": x0_cfg,
+                    "std_pos": std_pos,
+                    "std_cfg": std_cfg,
+                    "std_ratio": std_ratio,
+                    "x0_rescaled": x0_rescaled,
+                    "x0_after_rescale": x0_after_rescale,
+                }
+            )
+        else:
+            pred_final = pred_cfg
+        sample_next = (
+            sample_in - np.float32(t - t_prev) * pred_final
+        ).astype(np.float32)
+        return captured, pred_final.astype(np.float32), sample_next
+
+    guidance, pred_final, sample_next = source_step(noise, *schedule[0])
     suffix_steps = []
     sample_in = sample_next
     for t, t_prev in schedule[1:]:
-        next_sample = sample_in - np.float32(t - t_prev) * pred_final
+        step_guidance, step_pred_final, next_sample = source_step(
+            sample_in, t, t_prev
+        )
         suffix_steps.append(
             {
                 "sample_in": sample_in,
                 "pred_pos": pred_pos,
                 "pred_neg": pred_neg,
-                "pred_final": pred_final,
+                **step_guidance,
+                "pred_final": step_pred_final,
                 "sample_next": next_sample,
                 "t": np.asarray(t, dtype=np.float32),
                 "t_prev": np.asarray(t_prev, dtype=np.float32),
@@ -97,6 +163,7 @@ def _source_recurrence_fixture():
         transition0_t_prev=np.asarray(schedule[0][1], dtype=np.float32),
         source_transition0_pred_pos=pred_pos,
         source_transition0_pred_neg=pred_neg,
+        source_transition0_guidance=guidance,
         source_transition0_pred_final=pred_final,
         source_transition0_sample_next=sample_next,
         suffix_steps=suffix_steps,
@@ -109,18 +176,51 @@ def _source_recurrence_fixture():
     report = {
         "effective_route": {
             "device_type": "cuda",
+            "attention_backend": "sdpa",
+            "conv_backend": "none",
+            "one_model_load": True,
             "steps": 8,
             "rescale_t": 3.0,
-            "candidate_names": ["source-native-control", "external-candidate"],
+            "route": "official-source-cuda-external-transition0-recoverability",
+            "comparison_class": "external-transition0-plus-source-cuda-suffix",
+            "model_ref": (
+                "microsoft/TRELLIS.2-4B/ckpts/"
+                "slat_flow_img2shape_dit_1_3B_512_bf16"
+            ),
+            "cuda_device": "Tesla T4",
+            "candidate_names": [
+                "source-native-control",
+                "external-cuda-welford-metal",
+            ],
         },
         "pipeline_config": {
+            "sampler_name": "FlowEulerGuidanceIntervalSampler",
+            "sampler_args": {"sigma_min": 1e-5},
             "sampler_params": {
                 "steps": 8,
                 "rescale_t": 3.0,
                 "guidance_strength": 7.5,
+                "guidance_rescale": 0.5,
+                "guidance_interval": [0.6, 1.0],
             }
         },
-        "inputs": {"expected_digests": {"source tar": "1" * 64}},
+        "inputs": {
+            "expected_digests": {
+                name: "1" * 64
+                for name in (
+                    "MLX run report",
+                    "MLX shape-flow steps",
+                    "accepted source baseline",
+                    "accepted source report",
+                    "accepted suffix report",
+                    "accepted suffix result",
+                    "conditioning",
+                    "external transition report",
+                    "external transition step",
+                    "source tar",
+                )
+            }
+        },
         "candidates": [source_candidate],
     }
     return arrays, report
@@ -139,7 +239,107 @@ def test_source_recurrence_artifact_binds_route_arrays_and_exact_linkage(tmp_pat
     assert receipt["validation"]["step_count"] == 8
     assert receipt["validation"]["recurrence_exact"] is True
     assert receipt["sha256"] == _sha256(output)
+    expected_active = int(arrays["guidance_active"].sum())
+    with np.load(output, allow_pickle=False) as archive:
+        assert archive["pred_cfg"].shape[0] == 8
+        for name in (
+            "x0_pos",
+            "x0_cfg",
+            "std_pos",
+            "std_cfg",
+            "std_ratio",
+            "x0_rescaled",
+            "x0_after_rescale",
+        ):
+            assert archive[name].shape[0] == expected_active
     assert validate_source_recurrence_artifact(output)["all_arrays_bound"] is True
+
+
+def test_guided_prediction_captures_the_exact_source_postprocessing_chain():
+    from scripts.source_cuda_shape_block29_basin_map import _guided_prediction
+
+    class FakeSparse:
+        def __init__(self, feats):
+            self.feats = np.asarray(feats, dtype=np.float32)
+
+        @property
+        def ndim(self):
+            return 2
+
+        def std(self, dim=None, keepdim=False):
+            assert dim == [1]
+            assert keepdim is True
+            return np.asarray([[self.feats.std(dtype=np.float32)]], dtype=np.float32)
+
+        def _binary(self, other, op):
+            rhs = other.feats if isinstance(other, FakeSparse) else other
+            return FakeSparse(op(self.feats, rhs))
+
+        def __add__(self, other):
+            return self._binary(other, np.add)
+
+        def __radd__(self, other):
+            return self._binary(other, np.add)
+
+        def __sub__(self, other):
+            return self._binary(other, np.subtract)
+
+        def __rsub__(self, other):
+            return FakeSparse(np.subtract(other, self.feats))
+
+        def __mul__(self, other):
+            return self._binary(other, np.multiply)
+
+        def __rmul__(self, other):
+            return self._binary(other, np.multiply)
+
+        def __truediv__(self, other):
+            return self._binary(other, np.divide)
+
+    class FakeSampler:
+        @staticmethod
+        def _pred_to_xstart(sample, t, pred):
+            return np.float32(0.75) * sample - np.float32(0.25) * pred
+
+        @staticmethod
+        def _xstart_to_pred(sample, t, x0):
+            return (np.float32(0.75) * sample - x0) / np.float32(0.25)
+
+    sample = FakeSparse([[0.5, -0.25, 1.0], [0.75, -0.5, 0.25]])
+    pred_pos = FakeSparse([[0.2, -0.1, 0.4], [0.3, -0.2, 0.1]])
+    pred_neg = FakeSparse([[-0.1, 0.05, -0.2], [-0.15, 0.1, -0.05]])
+    captured = {}
+
+    pred = _guided_prediction(
+        sampler=FakeSampler(),
+        sample=sample,
+        pred_pos=pred_pos,
+        pred_neg=pred_neg,
+        t=0.75,
+        guidance_strength=2.0,
+        guidance_rescale=0.5,
+        guidance_interval=(0.6, 1.0),
+        capture=captured,
+    )
+
+    assert set(captured) == {
+        "guidance_active",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "std_ratio",
+        "x0_rescaled",
+        "x0_after_rescale",
+    }
+    assert captured["x0_after_rescale"] is not pred
+    assert np.array_equal(
+        pred.feats,
+        FakeSampler._xstart_to_pred(
+            sample, 0.75, captured["x0_after_rescale"]
+        ).feats,
+    )
 
 
 def test_source_recurrence_artifact_rejects_corruption_and_route_substitution(tmp_path):
@@ -178,7 +378,61 @@ def test_source_recurrence_artifact_rejects_corruption_and_route_substitution(tm
         **arrays,
         metadata_json=np.asarray(json.dumps(substituted_metadata, sort_keys=True)),
     )
-    with pytest.raises(ValueError, match="effective route"):
+    with pytest.raises(ValueError, match="route"):
+        validate_source_recurrence_artifact(output)
+
+
+def test_source_recurrence_rejects_self_consistent_route_and_sampler_substitution(
+    tmp_path,
+):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    substituted = json.loads(json.dumps(report))
+    substituted["effective_route"].update(
+        {
+            "attention_backend": "route-substituted",
+            "conv_backend": "spconv",
+            "one_model_load": False,
+        }
+    )
+    substituted["pipeline_config"]["sampler_params"]["guidance_strength"] = 999.0
+    metadata = build_source_recurrence_metadata(substituted, arrays)
+    output = tmp_path / "source-recurrence.npz"
+    np.savez(
+        output,
+        **arrays,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="route|sampler"):
+        validate_source_recurrence_artifact(output)
+
+
+def test_source_recurrence_rejects_rehashed_semantically_unbound_guidance(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    fabricated = dict(arrays)
+    fabricated["pred_cfg"] = np.full_like(arrays["pred_cfg"], -123.0)
+    fabricated["x0_after_rescale"] = np.full_like(
+        arrays["x0_after_rescale"], 456.0
+    )
+    metadata = build_source_recurrence_metadata(report, fabricated)
+    output = tmp_path / "source-recurrence.npz"
+    np.savez(
+        output,
+        **fabricated,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="guidance"):
         validate_source_recurrence_artifact(output)
 
 
@@ -204,6 +458,43 @@ def test_source_recurrence_artifact_rejects_self_consistent_broken_linkage(tmp_p
         validate_source_recurrence_artifact(output)
 
 
+def test_source_recurrence_rejects_rehashed_guidance_activity_outside_schedule(
+    tmp_path,
+):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    broken = dict(arrays)
+    broken["guidance_active"] = arrays["guidance_active"].copy()
+    broken["guidance_active"][-1] = True
+    broken["guidance_step_indices"] = np.flatnonzero(
+        broken["guidance_active"]
+    ).astype(np.int32)
+    for name in (
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "std_ratio",
+        "x0_rescaled",
+        "x0_after_rescale",
+    ):
+        broken[name] = np.concatenate([arrays[name], arrays[name][-1:]], axis=0)
+    metadata = build_source_recurrence_metadata(report, broken)
+    output = tmp_path / "source-recurrence.npz"
+    np.savez(
+        output,
+        **broken,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="guidance activity"):
+        validate_source_recurrence_artifact(output)
+
+
 def test_source_recurrence_artifact_rejects_rehashed_prediction_without_euler_change(
     tmp_path,
 ):
@@ -224,7 +515,7 @@ def test_source_recurrence_artifact_rejects_rehashed_prediction_without_euler_ch
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
 
-    with pytest.raises(ValueError, match="Euler transition"):
+    with pytest.raises(ValueError, match="guidance|Euler transition"):
         validate_source_recurrence_artifact(output)
 
 

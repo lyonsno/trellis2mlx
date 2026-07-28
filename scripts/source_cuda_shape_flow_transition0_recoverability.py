@@ -47,7 +47,39 @@ except ImportError:
 
 SCHEMA = "trellis2mlx.source_cuda_shape_flow_transition0_recoverability.v1"
 ARTIFACT_SCHEMA = f"{SCHEMA}.artifact"
-SOURCE_RECURRENCE_SCHEMA = f"{SCHEMA}.source_recurrence"
+SOURCE_RECURRENCE_SCHEMA = f"{SCHEMA}.source_recurrence.v2"
+SOURCE_MODEL_REF = (
+    "microsoft/TRELLIS.2-4B/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16"
+)
+SOURCE_SAMPLER_NAME = "FlowEulerGuidanceIntervalSampler"
+SOURCE_SAMPLER_PARAMS = {
+    "steps": 8,
+    "rescale_t": 3.0,
+    "guidance_strength": 7.5,
+    "guidance_rescale": 0.5,
+    "guidance_interval": [0.6, 1.0],
+}
+SOURCE_SAMPLER_ARGS = {"sigma_min": 1e-5}
+SOURCE_MATRIX_ROUTE = "official-source-cuda-transition0-recoverability-matrix"
+SOURCE_MATRIX_COMPARISON_CLASS = (
+    "transition0-component-substitution-plus-source-cuda-suffix"
+)
+SOURCE_EXTERNAL_ROUTE = "official-source-cuda-external-transition0-recoverability"
+SOURCE_EXTERNAL_COMPARISON_CLASS = "external-transition0-plus-source-cuda-suffix"
+SOURCE_EXTERNAL_CANDIDATE_NAMES = {
+    "external-cuda-welford-metal",
+    "external-cuda-welford-turing-t4",
+}
+SOURCE_REQUIRED_INPUT_DIGESTS = {
+    "MLX run report",
+    "MLX shape-flow steps",
+    "accepted source baseline",
+    "accepted source report",
+    "accepted suffix report",
+    "accepted suffix result",
+    "conditioning",
+    "source tar",
+}
 EXPECTED_CANDIDATE_NAMES = (
     "source-native-control",
     "mlx-pos-source-neg",
@@ -928,6 +960,7 @@ def build_source_recurrence_arrays(
     transition0_t_prev: np.ndarray,
     source_transition0_pred_pos: np.ndarray,
     source_transition0_pred_neg: np.ndarray,
+    source_transition0_guidance: dict[str, np.ndarray],
     source_transition0_pred_final: np.ndarray,
     source_transition0_sample_next: np.ndarray,
     suffix_steps: list[dict[str, np.ndarray]],
@@ -949,16 +982,49 @@ def build_source_recurrence_arrays(
             axis=0,
         )
 
-    return {
+    all_steps = [source_transition0_guidance, *suffix_steps]
+    guidance_active = np.asarray(
+        [
+            bool(np.asarray(step["guidance_active"]).item())
+            for step in all_steps
+        ],
+        dtype=np.bool_,
+    )
+    guidance_step_indices = np.flatnonzero(guidance_active).astype(np.int32)
+    active_steps = [all_steps[index] for index in guidance_step_indices]
+    if not active_steps:
+        raise ValueError("source recurrence did not execute guidance rescale")
+
+    arrays = {
         "coords": np.asarray(coords, dtype=np.int32),
         "sample_in": stack("sample_in", noise),
         "pred_pos": stack("pred_pos", source_transition0_pred_pos),
         "pred_neg": stack("pred_neg", source_transition0_pred_neg),
+        "pred_cfg": stack("pred_cfg", source_transition0_guidance["pred_cfg"]),
         "pred_final": stack("pred_final", source_transition0_pred_final),
         "sample_next": stack("sample_next", source_transition0_sample_next),
         "t": stack("t", transition0_t),
         "t_prev": stack("t_prev", transition0_t_prev),
+        "guidance_active": guidance_active,
+        "guidance_step_indices": guidance_step_indices,
     }
+    for name in (
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "std_ratio",
+        "x0_rescaled",
+        "x0_after_rescale",
+    ):
+        arrays[name] = np.stack(
+            [
+                np.asarray(step[name], dtype=np.float32)
+                for step in active_steps
+            ],
+            axis=0,
+        )
+    return arrays
 
 
 def build_source_recurrence_metadata(
@@ -969,6 +1035,8 @@ def build_source_recurrence_metadata(
         "artifact_status": "computed_pending_external_report",
         "external_report_required": True,
         "effective_route": report["effective_route"],
+        "sampler_name": report["pipeline_config"]["sampler_name"],
+        "sampler_args": report["pipeline_config"]["sampler_args"],
         "sampler_params": report["pipeline_config"]["sampler_params"],
         "inputs": report["inputs"],
         "source_candidate": report["candidates"][0],
@@ -989,10 +1057,20 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
         "sample_in",
         "pred_pos",
         "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "std_ratio",
+        "x0_rescaled",
+        "x0_after_rescale",
         "pred_final",
         "sample_next",
         "t",
         "t_prev",
+        "guidance_active",
+        "guidance_step_indices",
         "metadata_json",
     }
     with np.load(path, allow_pickle=False) as archive:
@@ -1011,24 +1089,72 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
             raise ValueError("source recurrence metadata must require the external report")
         route = metadata.get("effective_route", {})
         candidate_names = route.get("candidate_names")
-        if (
-            route.get("device_type") != "cuda"
-            or route.get("steps") != STEPS
-            or not isinstance(candidate_names, list)
-            or not candidate_names
-            or candidate_names[0] != "source-native-control"
-        ):
-            raise ValueError("source recurrence effective route is not source CUDA")
+        route_name = route.get("route")
+        route_common = {
+            "device_type": "cuda",
+            "attention_backend": "sdpa",
+            "conv_backend": "none",
+            "steps": STEPS,
+            "rescale_t": 3.0,
+            "one_model_load": True,
+            "model_ref": SOURCE_MODEL_REF,
+        }
+        for name, expected in route_common.items():
+            if route.get(name) != expected:
+                raise ValueError(
+                    f"source recurrence route {name} must be {expected!r}"
+                )
+        if not isinstance(route.get("cuda_device"), str) or not route["cuda_device"]:
+            raise ValueError("source recurrence route lacks a CUDA device")
+        if route_name == SOURCE_MATRIX_ROUTE:
+            if (
+                route.get("comparison_class") != SOURCE_MATRIX_COMPARISON_CLASS
+                or candidate_names != list(EXPECTED_CANDIDATE_NAMES)
+            ):
+                raise ValueError("source recurrence matrix route identity is invalid")
+        elif route_name == SOURCE_EXTERNAL_ROUTE:
+            if (
+                route.get("comparison_class") != SOURCE_EXTERNAL_COMPARISON_CLASS
+                or not isinstance(candidate_names, list)
+                or len(candidate_names) != 2
+                or candidate_names[0] != "source-native-control"
+                or candidate_names[1] not in SOURCE_EXTERNAL_CANDIDATE_NAMES
+            ):
+                raise ValueError("source recurrence external route identity is invalid")
+        else:
+            raise ValueError("source recurrence route identity is invalid")
+        if metadata.get("sampler_name") != SOURCE_SAMPLER_NAME:
+            raise ValueError("source recurrence sampler name is invalid")
+        if metadata.get("sampler_args") != SOURCE_SAMPLER_ARGS:
+            raise ValueError("source recurrence sampler arguments are invalid")
         sampler_params = metadata.get("sampler_params", {})
         rescale_t = sampler_params.get("rescale_t")
         if (
-            sampler_params.get("steps") != STEPS
+            sampler_params != SOURCE_SAMPLER_PARAMS
             or not isinstance(rescale_t, (int, float))
             or not np.isfinite(rescale_t)
-            or float(rescale_t) <= 0.0
+            or float(rescale_t) != 3.0
             or route.get("rescale_t") != float(rescale_t)
         ):
             raise ValueError("source recurrence sampler parameters are invalid")
+        expected_digests = metadata.get("inputs", {}).get("expected_digests")
+        required_input_digests = set(SOURCE_REQUIRED_INPUT_DIGESTS)
+        if route_name == SOURCE_EXTERNAL_ROUTE:
+            required_input_digests.update(
+                {"external transition report", "external transition step"}
+            )
+        if not isinstance(expected_digests, dict):
+            raise ValueError("source recurrence input digest identity is missing")
+        for name in required_input_digests:
+            digest = expected_digests.get(name)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(
+                    f"source recurrence input digest {name!r} is invalid"
+                )
         source_candidate = metadata.get("source_candidate", {})
         if (
             source_candidate.get("name") != "source-native-control"
@@ -1058,11 +1184,52 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
         if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
             raise ValueError("source recurrence coords must be int32 [N,4]")
         sample_shape = (STEPS, coords.shape[0], 32)
-        for name in ("sample_in", "pred_pos", "pred_neg", "pred_final", "sample_next"):
+        for name in (
+            "sample_in",
+            "pred_pos",
+            "pred_neg",
+            "pred_cfg",
+            "pred_final",
+            "sample_next",
+        ):
             array = np.asarray(archive[name])
             if array.dtype != np.float32 or array.shape != sample_shape:
                 raise ValueError(
                     f"source recurrence {name} must be float32 {sample_shape}"
+                )
+        guidance_active = np.asarray(archive["guidance_active"])
+        guidance_step_indices = np.asarray(archive["guidance_step_indices"])
+        if guidance_active.dtype != np.bool_ or guidance_active.shape != (STEPS,):
+            raise ValueError("source recurrence guidance_active must be bool [steps]")
+        if (
+            guidance_step_indices.dtype != np.int32
+            or guidance_step_indices.ndim != 1
+            or not np.array_equal(
+                guidance_step_indices,
+                np.flatnonzero(guidance_active).astype(np.int32),
+            )
+        ):
+            raise ValueError(
+                "source recurrence guidance step indices do not match active steps"
+            )
+        active_shape = (guidance_step_indices.size, coords.shape[0], 32)
+        for name in (
+            "x0_pos",
+            "x0_cfg",
+            "x0_rescaled",
+            "x0_after_rescale",
+        ):
+            array = np.asarray(archive[name])
+            if array.dtype != np.float32 or array.shape != active_shape:
+                raise ValueError(
+                    f"source recurrence {name} must be float32 {active_shape}"
+                )
+        scalar_shape = (guidance_step_indices.size, 1, 1)
+        for name in ("std_pos", "std_cfg", "std_ratio"):
+            array = np.asarray(archive[name])
+            if array.dtype != np.float32 or array.shape != scalar_shape:
+                raise ValueError(
+                    f"source recurrence {name} must be float32 {scalar_shape}"
                 )
         sample_in = np.asarray(archive["sample_in"])
         sample_next = np.asarray(archive["sample_next"])
@@ -1084,7 +1251,142 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
             or not np.array_equal(t_prev, expected_t_prev)
         ):
             raise ValueError("source recurrence schedule does not match the source route")
+        guidance_interval = sampler_params.get("guidance_interval")
+        guidance_rescale = sampler_params.get("guidance_rescale")
+        if (
+            not isinstance(guidance_interval, list)
+            or len(guidance_interval) != 2
+            or not all(
+                isinstance(value, (int, float)) and np.isfinite(value)
+                for value in guidance_interval
+            )
+            or not isinstance(guidance_rescale, (int, float))
+            or not np.isfinite(guidance_rescale)
+        ):
+            raise ValueError("source recurrence guidance parameters are invalid")
+        expected_guidance_active = np.asarray(
+            [
+                bool(
+                    float(guidance_interval[0]) <= float(t_value)
+                    <= float(guidance_interval[1])
+                    and float(guidance_rescale) > 0.0
+                )
+                for t_value, _ in expected_schedule
+            ],
+            dtype=np.bool_,
+        )
+        if not np.array_equal(guidance_active, expected_guidance_active):
+            raise ValueError(
+                "source recurrence guidance activity does not match the source schedule"
+            )
+        guidance_strength = np.float32(sampler_params["guidance_strength"])
+        expected_pred_cfg = np.asarray(archive["pred_pos"]).copy()
+        active = guidance_active[:, None, None]
+        cfg_active = (
+            guidance_strength * np.asarray(archive["pred_pos"])
+            + np.float32(1.0 - guidance_strength)
+            * np.asarray(archive["pred_neg"])
+        )
+        expected_pred_cfg = np.where(active, cfg_active, expected_pred_cfg)
+
+        def require_guidance_close(
+            name: str,
+            actual: np.ndarray,
+            expected: np.ndarray,
+            *,
+            atol: float,
+        ) -> None:
+            if not np.allclose(actual, expected, rtol=0.0, atol=atol):
+                max_abs = float(
+                    np.max(
+                        np.abs(
+                            actual.astype(np.float64)
+                            - expected.astype(np.float64)
+                        )
+                    )
+                )
+                raise ValueError(
+                    f"source recurrence guidance {name} is semantically unbound "
+                    f"(max_abs={max_abs})"
+                )
+
+        pred_cfg = np.asarray(archive["pred_cfg"])
+        require_guidance_close(
+            "pred_cfg", pred_cfg, expected_pred_cfg, atol=8e-6
+        )
+        active_indices = guidance_step_indices.astype(np.int64)
+        sample_active = sample_in[active_indices]
+        pos_active = np.asarray(archive["pred_pos"])[active_indices]
+        cfg_active = pred_cfg[active_indices]
+        sigma_min = np.float32(metadata["sampler_args"]["sigma_min"])
+        one_minus_sigma = np.float32(1.0 - sigma_min)
+        coefficient = np.asarray(
+            [
+                np.float32(
+                    sigma_min
+                    + np.float32(1.0 - sigma_min)
+                    * np.float32(expected_schedule[index][0])
+                )
+                for index in active_indices
+            ],
+            dtype=np.float32,
+        )[:, None, None]
+        expected_x0_pos = one_minus_sigma * sample_active - coefficient * pos_active
+        expected_x0_cfg = one_minus_sigma * sample_active - coefficient * cfg_active
+        x0_pos = np.asarray(archive["x0_pos"])
+        x0_cfg = np.asarray(archive["x0_cfg"])
+        require_guidance_close("x0_pos", x0_pos, expected_x0_pos, atol=8e-6)
+        require_guidance_close("x0_cfg", x0_cfg, expected_x0_cfg, atol=8e-6)
+
+        def sparse_std(value: np.ndarray) -> np.ndarray:
+            row_mean = value.mean(axis=2, keepdims=True, dtype=np.float32)
+            row_mean2 = np.square(value).mean(
+                axis=2, keepdims=True, dtype=np.float32
+            )
+            mean = row_mean.mean(axis=1, keepdims=True, dtype=np.float32)
+            mean2 = row_mean2.mean(axis=1, keepdims=True, dtype=np.float32)
+            return np.sqrt(mean2 - np.square(mean), dtype=np.float32)
+
+        std_pos = np.asarray(archive["std_pos"])
+        std_cfg = np.asarray(archive["std_cfg"])
+        require_guidance_close("std_pos", std_pos, sparse_std(x0_pos), atol=1e-5)
+        require_guidance_close("std_cfg", std_cfg, sparse_std(x0_cfg), atol=1e-5)
+        expected_ratio = std_pos / std_cfg
+        std_ratio = np.asarray(archive["std_ratio"])
+        require_guidance_close(
+            "std_ratio", std_ratio, expected_ratio, atol=2e-7
+        )
+        expected_x0_rescaled = x0_cfg * std_ratio
+        x0_rescaled = np.asarray(archive["x0_rescaled"])
+        require_guidance_close(
+            "x0_rescaled", x0_rescaled, expected_x0_rescaled, atol=1e-5
+        )
+        guidance_rescale = np.float32(sampler_params["guidance_rescale"])
+        expected_x0_after = (
+            guidance_rescale * x0_rescaled
+            + np.float32(1.0 - guidance_rescale) * x0_cfg
+        )
+        x0_after = np.asarray(archive["x0_after_rescale"])
+        require_guidance_close(
+            "x0_after_rescale", x0_after, expected_x0_after, atol=1e-5
+        )
         pred_final = np.asarray(archive["pred_final"])
+        expected_pred_final_active = (
+            one_minus_sigma * sample_active - x0_after
+        ) / coefficient
+        require_guidance_close(
+            "pred_final",
+            pred_final[active_indices],
+            expected_pred_final_active,
+            atol=2e-5,
+        )
+        inactive_indices = np.flatnonzero(~guidance_active)
+        if not np.array_equal(
+            pred_final[inactive_indices], pred_cfg[inactive_indices]
+        ):
+            raise ValueError(
+                "source recurrence guidance inactive pred_final differs from pred_cfg"
+            )
         euler_dt = np.asarray(
             [
                 np.float32(t_value - t_prev_value)
@@ -1101,6 +1403,8 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
             )
     return {
         "schema": f"{SOURCE_RECURRENCE_SCHEMA}.saved_artifact",
+        "admission_status": "pending_external_report",
+        "external_report_verified": False,
         "step_count": STEPS,
         "token_count": int(coords.shape[0]),
         "channel_count": 32,
@@ -1339,7 +1643,10 @@ def _candidate_start_states(
     t_prev: float,
     candidate_names: tuple[str, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    from source_cuda_shape_block29_basin_map import _guided_prediction
+    from source_cuda_shape_block29_basin_map import (
+        _guidance_capture_to_numpy,
+        _guided_prediction,
+    )
 
     unknown = sorted(set(candidate_names) - set(EXPECTED_CANDIDATE_NAMES))
     if unknown:
@@ -1380,6 +1687,7 @@ def _candidate_start_states(
         if name not in pairs:
             continue
         pred_pos, pred_neg = pairs[name]
+        guidance_capture: dict[str, Any] = {}
         pred = _guided_prediction(
             sampler=sampler,
             sample=sample,
@@ -1389,10 +1697,12 @@ def _candidate_start_states(
             guidance_strength=guidance_strength,
             guidance_rescale=guidance_rescale,
             guidance_interval=guidance_interval,
+            capture=guidance_capture,
         )
         start = sample - (t - t_prev) * pred
         starts[name] = start
         first_step[name] = {
+            **_guidance_capture_to_numpy(guidance_capture),
             "pred_final": pred.feats.detach().float().cpu().numpy().astype(np.float32),
             "sample_next": start.feats.detach().float().cpu().numpy().astype(np.float32),
         }
@@ -1780,6 +2090,7 @@ def main(argv: list[str] | None = None) -> int:
         report["pipeline_config"] = {
             "path": str(config_path),
             "sampler_name": pipeline_args["shape_slat_sampler"]["name"],
+            "sampler_args": pipeline_args["shape_slat_sampler"]["args"],
             "sampler_params": sampler_params,
             "shape_slat_normalization": pipeline_args["shape_slat_normalization"],
         }
@@ -2048,6 +2359,7 @@ def main(argv: list[str] | None = None) -> int:
                 transition0_t_prev=np.asarray(t_prev, dtype=np.float32),
                 source_transition0_pred_pos=source_pos_np,
                 source_transition0_pred_neg=source_neg_np,
+                source_transition0_guidance=source_first_step,
                 source_transition0_pred_final=source_first_step["pred_final"],
                 source_transition0_sample_next=source_first_step["sample_next"],
                 suffix_steps=source_suffix_steps,

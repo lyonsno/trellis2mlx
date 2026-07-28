@@ -438,6 +438,7 @@ def _guided_prediction(
     guidance_strength: float,
     guidance_rescale: float,
     guidance_interval: tuple[float, float],
+    capture: dict[str, Any] | None = None,
 ) -> Any:
     guidance_active = guidance_interval[0] <= t <= guidance_interval[1]
     pred_cfg = (
@@ -445,15 +446,47 @@ def _guided_prediction(
         if guidance_active
         else pred_pos
     )
+    if capture is not None:
+        capture["guidance_active"] = guidance_active and guidance_rescale > 0
+        capture["pred_cfg"] = pred_cfg
     if not guidance_active or guidance_rescale <= 0:
         return pred_cfg
     x0_pos = sampler._pred_to_xstart(sample, t, pred_pos)
     x0_cfg = sampler._pred_to_xstart(sample, t, pred_cfg)
     std_pos = x0_pos.std(dim=list(range(1, x0_pos.ndim)), keepdim=True)
     std_cfg = x0_cfg.std(dim=list(range(1, x0_cfg.ndim)), keepdim=True)
-    x0_rescaled = x0_cfg * (std_pos / std_cfg)
+    std_ratio = std_pos / std_cfg
+    x0_rescaled = x0_cfg * std_ratio
     x0 = guidance_rescale * x0_rescaled + (1 - guidance_rescale) * x0_cfg
+    if capture is not None:
+        capture.update(
+            {
+                "x0_pos": x0_pos,
+                "x0_cfg": x0_cfg,
+                "std_pos": std_pos,
+                "std_cfg": std_cfg,
+                "std_ratio": std_ratio,
+                "x0_rescaled": x0_rescaled,
+                "x0_after_rescale": x0,
+            }
+        )
     return sampler._xstart_to_pred(sample, t, x0)
+
+
+def _guidance_capture_to_numpy(capture: dict[str, Any]) -> dict[str, np.ndarray]:
+    converted: dict[str, np.ndarray] = {
+        "guidance_active": np.asarray(
+            bool(capture.get("guidance_active", False)), dtype=np.bool_
+        )
+    }
+    for name, value in capture.items():
+        if name == "guidance_active":
+            continue
+        tensor = value.feats if hasattr(value, "feats") else value
+        converted[name] = (
+            tensor.detach().float().cpu().numpy().astype(np.float32, copy=False)
+        )
+    return converted
 
 
 def _run_shape_flow(
