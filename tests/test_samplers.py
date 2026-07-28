@@ -81,6 +81,38 @@ def test_sparse_cfg_rescale_rejects_multiple_conditioning_batches():
         raise AssertionError("multi-batch sparse-token sampling must fail before model execution")
 
 
+def test_flow_euler_rounds_product_before_source_subtraction():
+    from trellmlx.samplers import flow_euler_sample
+
+    sample_value = np.array(0xBCC9E61B, dtype=np.uint32).view(np.float32).item()
+    pred_value = np.array(0xBE2E82DF, dtype=np.uint32).view(np.float32).item()
+    expected_bits = np.uint32(0xBC8A70B2)
+    noise = mx.array([[sample_value]], dtype=mx.float32)
+    prediction = mx.array([[pred_value]], dtype=mx.float32)
+    cond = mx.ones((1, 1), dtype=mx.float32)
+    neg_cond = mx.zeros((1, 1), dtype=mx.float32)
+
+    class FixedModel:
+        def __call__(self, sample, t, conditioning, **kwargs):
+            return prediction
+
+    actual = flow_euler_sample(
+        FixedModel(),
+        noise,
+        cond,
+        neg_cond,
+        steps=8,
+        guidance_strength=1.0,
+        guidance_rescale=0.0,
+        rescale_t=3.0,
+        verbose=False,
+        stop_after_first_step=True,
+    )
+
+    actual_bits = np.asarray(actual, dtype=np.float32).reshape(()).view(np.uint32)
+    assert actual_bits == expected_bits
+
+
 def test_cfg_rescale_matches_reference_without_ratio_clamp():
     from trellmlx.samplers import flow_euler_sample, _pred_to_xstart, _xstart_to_pred
 

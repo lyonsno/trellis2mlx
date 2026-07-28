@@ -196,7 +196,10 @@ def flow_euler_sample(
                 x_0_rescaled = x_0
 
         # Euler step
-        sample_next = sample - (t - t_prev) * pred
+        euler_dt = np.float32(t - t_prev).item()
+        euler_delta = euler_dt * pred
+        mx.eval(euler_delta)
+        sample_next = sample - euler_delta
         if capture_this_step:
             step_payload = {
                 "sample_in": sample,
