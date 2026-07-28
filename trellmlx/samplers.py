@@ -279,12 +279,22 @@ def _branch_model_kwargs(
 
 def _pred_to_xstart(x_t, t, pred, sigma_min):
     """Convert velocity prediction to x_0 estimate."""
-    return (1 - sigma_min) * x_t - (sigma_min + (1 - sigma_min) * t) * pred
+    one_minus_sigma = mx.array(1 - sigma_min, dtype=x_t.dtype)
+    coefficient = mx.array(
+        sigma_min + (1 - sigma_min) * t,
+        dtype=x_t.dtype,
+    )
+    return one_minus_sigma * x_t - coefficient * pred
 
 
 def _xstart_to_pred(x_t, t, x_0, sigma_min):
     """Convert x_0 estimate back to velocity prediction."""
-    return ((1 - sigma_min) * x_t - x_0) / (sigma_min + (1 - sigma_min) * t)
+    one_minus_sigma = mx.array(1 - sigma_min, dtype=x_t.dtype)
+    coefficient = mx.array(
+        sigma_min + (1 - sigma_min) * t,
+        dtype=x_t.dtype,
+    )
+    return (one_minus_sigma * x_t - x_0) / coefficient
 
 
 def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:

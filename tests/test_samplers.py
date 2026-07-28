@@ -286,6 +286,75 @@ def test_flow_euler_uses_sequence_level_cfg_rescale_for_sparse_tokens():
     np.testing.assert_allclose(np.array(out), np.array(expected), rtol=1e-6, atol=1e-6)
 
 
+def test_flow_euler_casts_prediction_to_x0_coefficients_before_graph_fusion():
+    from trellmlx.samplers import flow_euler_sample
+
+    rng = np.random.default_rng(1234)
+    sample_values = rng.normal(size=(8, 32)).astype(np.float32) * np.float32(3.0)
+    pred_pos_values = rng.normal(size=(8, 32)).astype(np.float32) * np.float32(2.0)
+    pred_neg_values = rng.normal(size=(8, 32)).astype(np.float32) * np.float32(2.0)
+    sample = mx.array(sample_values)
+    pred_pos = mx.array(pred_pos_values)
+    pred_neg = mx.array(pred_neg_values)
+    cond = mx.zeros((1, 1, 1), dtype=mx.float32)
+    neg_cond = mx.ones((1, 1, 1), dtype=mx.float32)
+    coords = mx.zeros((8, 3), dtype=mx.int32)
+    captures = []
+
+    class TwoPassModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, sample, t, conditioning, **kwargs):
+            self.calls += 1
+            return pred_pos if self.calls == 1 else pred_neg
+
+    flow_euler_sample(
+        TwoPassModel(),
+        sample,
+        cond,
+        neg_cond,
+        steps=8,
+        guidance_strength=7.5,
+        guidance_rescale=0.5,
+        guidance_interval=(0.6, 1.0),
+        rescale_t=3.0,
+        sigma_min=1e-5,
+        verbose=False,
+        capture_steps=captures,
+        stop_after_first_step=True,
+        start_step_index=1,
+        coords=coords,
+    )
+
+    t_seq = np.linspace(1, 0, 9)
+    t_seq = 3.0 * t_seq / (1 + 2.0 * t_seq)
+    t = float(t_seq[1])
+    one_minus_sigma = np.float32(1.0 - 1e-5)
+    coefficient = np.float32(1e-5 + (1.0 - 1e-5) * t)
+    expected_x0_pos = np.asarray(
+        one_minus_sigma * sample_values - coefficient * pred_pos_values,
+        dtype=np.float32,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(captures[0]["x0_pos"], dtype=np.float32),
+        expected_x0_pos,
+    )
+    x0_after_rescale = np.asarray(
+        captures[0]["x0_after_rescale"],
+        dtype=np.float32,
+    )
+    expected_pred_final = np.asarray(
+        (one_minus_sigma * sample_values - x0_after_rescale) / coefficient,
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(captures[0]["pred_final"], dtype=np.float32),
+        expected_pred_final,
+    )
+
+
 def test_flow_euler_can_capture_every_step():
     from trellmlx.samplers import flow_euler_sample
 
