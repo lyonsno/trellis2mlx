@@ -47,6 +47,7 @@ except ImportError:
 
 SCHEMA = "trellis2mlx.source_cuda_shape_flow_transition0_recoverability.v1"
 ARTIFACT_SCHEMA = f"{SCHEMA}.artifact"
+SOURCE_RECURRENCE_SCHEMA = f"{SCHEMA}.source_recurrence"
 EXPECTED_CANDIDATE_NAMES = (
     "source-native-control",
     "mlx-pos-source-neg",
@@ -634,8 +635,13 @@ def _report_path_guard(
     requested_report: Path,
     primary_output: Path,
     input_paths: dict[str, Path],
+    additional_outputs: dict[str, Path] | None = None,
 ) -> tuple[Path, list[str]]:
-    protected = {"primary output": primary_output, **input_paths}
+    protected = {
+        "primary output": primary_output,
+        **(additional_outputs or {}),
+        **input_paths,
+    }
     collisions = [
         label
         for label, path in protected.items()
@@ -653,7 +659,7 @@ def _report_path_guard(
         )
         if not any(
             _paths_alias(candidate, path)
-            for path in [requested_report, primary_output, *input_paths.values()]
+            for path in [requested_report, *protected.values()]
         ):
             return candidate, collisions
         index += 1
@@ -911,6 +917,225 @@ def build_artifact_metadata(
         "candidates": report["candidates"],
         "anchors": report["anchors"],
         "arrays": array_manifest,
+    }
+
+
+def build_source_recurrence_arrays(
+    *,
+    coords: np.ndarray,
+    noise: np.ndarray,
+    transition0_t: np.ndarray,
+    transition0_t_prev: np.ndarray,
+    source_transition0_pred_pos: np.ndarray,
+    source_transition0_pred_neg: np.ndarray,
+    source_transition0_pred_final: np.ndarray,
+    source_transition0_sample_next: np.ndarray,
+    suffix_steps: list[dict[str, np.ndarray]],
+) -> dict[str, np.ndarray]:
+    if len(suffix_steps) != STEPS - 1:
+        raise ValueError(
+            f"source recurrence requires {STEPS - 1} suffix steps, got {len(suffix_steps)}"
+        )
+
+    def stack(name: str, first: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [
+                np.asarray(first, dtype=np.float32),
+                *[
+                    np.asarray(step[name], dtype=np.float32)
+                    for step in suffix_steps
+                ],
+            ],
+            axis=0,
+        )
+
+    return {
+        "coords": np.asarray(coords, dtype=np.int32),
+        "sample_in": stack("sample_in", noise),
+        "pred_pos": stack("pred_pos", source_transition0_pred_pos),
+        "pred_neg": stack("pred_neg", source_transition0_pred_neg),
+        "pred_final": stack("pred_final", source_transition0_pred_final),
+        "sample_next": stack("sample_next", source_transition0_sample_next),
+        "t": stack("t", transition0_t),
+        "t_prev": stack("t_prev", transition0_t_prev),
+    }
+
+
+def build_source_recurrence_metadata(
+    report: dict[str, Any], arrays: dict[str, np.ndarray]
+) -> dict[str, Any]:
+    return {
+        "schema": SOURCE_RECURRENCE_SCHEMA,
+        "artifact_status": "computed_pending_external_report",
+        "external_report_required": True,
+        "effective_route": report["effective_route"],
+        "sampler_params": report["pipeline_config"]["sampler_params"],
+        "inputs": report["inputs"],
+        "source_candidate": report["candidates"][0],
+        "arrays": {
+            name: {
+                "dtype": str(np.asarray(value).dtype),
+                "shape": [int(dimension) for dimension in np.asarray(value).shape],
+                "sha256": _array_sha256(np.asarray(value)),
+            }
+            for name, value in sorted(arrays.items())
+        },
+    }
+
+
+def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
+    required = {
+        "coords",
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_final",
+        "sample_next",
+        "t",
+        "t_prev",
+        "metadata_json",
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(f"source recurrence artifact is missing arrays: {missing}")
+        raw_metadata = np.asarray(archive["metadata_json"])
+        if raw_metadata.shape != () or raw_metadata.dtype.kind not in {"U", "S"}:
+            raise ValueError("source recurrence metadata_json must be a string scalar")
+        metadata = json.loads(str(raw_metadata.item()))
+        if metadata.get("schema") != SOURCE_RECURRENCE_SCHEMA:
+            raise ValueError("source recurrence metadata schema is invalid")
+        if metadata.get("artifact_status") != "computed_pending_external_report":
+            raise ValueError("source recurrence metadata status is invalid")
+        if metadata.get("external_report_required") is not True:
+            raise ValueError("source recurrence metadata must require the external report")
+        route = metadata.get("effective_route", {})
+        candidate_names = route.get("candidate_names")
+        if (
+            route.get("device_type") != "cuda"
+            or route.get("steps") != STEPS
+            or not isinstance(candidate_names, list)
+            or not candidate_names
+            or candidate_names[0] != "source-native-control"
+        ):
+            raise ValueError("source recurrence effective route is not source CUDA")
+        sampler_params = metadata.get("sampler_params", {})
+        rescale_t = sampler_params.get("rescale_t")
+        if (
+            sampler_params.get("steps") != STEPS
+            or not isinstance(rescale_t, (int, float))
+            or not np.isfinite(rescale_t)
+            or float(rescale_t) <= 0.0
+            or route.get("rescale_t") != float(rescale_t)
+        ):
+            raise ValueError("source recurrence sampler parameters are invalid")
+        source_candidate = metadata.get("source_candidate", {})
+        if (
+            source_candidate.get("name") != "source-native-control"
+            or source_candidate.get("source_step_indices") != list(range(1, STEPS))
+            or source_candidate.get("source_step_count") != STEPS - 1
+        ):
+            raise ValueError("source recurrence candidate identity is incomplete")
+
+        manifest = metadata.get("arrays")
+        if not isinstance(manifest, dict):
+            raise ValueError("source recurrence artifact lacks an array manifest")
+        archive_keys = set(archive.files) - {"metadata_json"}
+        if set(manifest) != archive_keys:
+            raise ValueError("source recurrence artifact array manifest mismatch")
+        for name, expected in manifest.items():
+            array = np.asarray(archive[name])
+            if str(array.dtype) != expected.get("dtype"):
+                raise ValueError(f"source recurrence {name} dtype differs from manifest")
+            if list(array.shape) != expected.get("shape"):
+                raise ValueError(f"source recurrence {name} shape differs from manifest")
+            if _array_sha256(array) != expected.get("sha256"):
+                raise ValueError(f"source recurrence {name} digest differs from manifest")
+            if np.issubdtype(array.dtype, np.floating) and not np.isfinite(array).all():
+                raise ValueError(f"source recurrence {name} contains non-finite values")
+
+        coords = np.asarray(archive["coords"])
+        if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+            raise ValueError("source recurrence coords must be int32 [N,4]")
+        sample_shape = (STEPS, coords.shape[0], 32)
+        for name in ("sample_in", "pred_pos", "pred_neg", "pred_final", "sample_next"):
+            array = np.asarray(archive[name])
+            if array.dtype != np.float32 or array.shape != sample_shape:
+                raise ValueError(
+                    f"source recurrence {name} must be float32 {sample_shape}"
+                )
+        sample_in = np.asarray(archive["sample_in"])
+        sample_next = np.asarray(archive["sample_next"])
+        if not np.array_equal(sample_in[1:], sample_next[:-1]):
+            raise ValueError("source recurrence step linkage is not exact")
+        expected_schedule = _schedule_pairs(
+            STEPS, float(rescale_t)
+        )
+        expected_t = np.asarray([pair[0] for pair in expected_schedule], dtype=np.float32)
+        expected_t_prev = np.asarray(
+            [pair[1] for pair in expected_schedule], dtype=np.float32
+        )
+        t = np.asarray(archive["t"])
+        t_prev = np.asarray(archive["t_prev"])
+        if (
+            t.dtype != np.float32
+            or t_prev.dtype != np.float32
+            or not np.array_equal(t, expected_t)
+            or not np.array_equal(t_prev, expected_t_prev)
+        ):
+            raise ValueError("source recurrence schedule does not match the source route")
+        pred_final = np.asarray(archive["pred_final"])
+        euler_dt = np.asarray(
+            [
+                np.float32(t_value - t_prev_value)
+                for t_value, t_prev_value in expected_schedule
+            ],
+            dtype=np.float32,
+        )
+        euler_delta = euler_dt[:, None, None] * pred_final
+        expected_sample_next = sample_in - euler_delta
+        if not np.array_equal(sample_next, expected_sample_next):
+            raise ValueError(
+                "source recurrence Euler transition does not match "
+                "sample_in, pred_final, and the source schedule"
+            )
+    return {
+        "schema": f"{SOURCE_RECURRENCE_SCHEMA}.saved_artifact",
+        "step_count": STEPS,
+        "token_count": int(coords.shape[0]),
+        "channel_count": 32,
+        "recurrence_exact": True,
+        "all_arrays_bound": True,
+    }
+
+
+def write_source_recurrence_artifact(
+    path: Path,
+    *,
+    arrays: dict[str, np.ndarray],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(arrays)
+    payload["metadata_json"] = np.asarray(
+        json.dumps(
+            build_source_recurrence_metadata(report, arrays),
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(path, **payload)
+        validation = validate_source_recurrence_artifact(path)
+    except Exception:
+        if path.is_file():
+            path.unlink()
+        raise
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "size_bytes": path.stat().st_size,
+        "validation": validation,
     }
 
 
@@ -1252,6 +1477,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
+    parser.add_argument("--source-recurrence-output", type=Path)
     parser.add_argument("--mlx-shape-flow-steps", required=True, type=Path)
     parser.add_argument("--mlx-shape-flow-steps-sha256", required=True)
     parser.add_argument("--mlx-run-report", required=True, type=Path)
@@ -1313,6 +1539,7 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_specs": candidate_specs,
         "attention_backend": args.sparse_attn_backend,
         "conv_backend": args.sparse_conv_backend,
+        "source_recurrence_requested": args.source_recurrence_output is not None,
     }
     input_paths = {
         "MLX shape-flow steps": args.mlx_shape_flow_steps,
@@ -1329,7 +1556,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.external_transition0_report is not None:
         input_paths["external transition report"] = args.external_transition0_report
     failure_report_path, report_collisions = _report_path_guard(
-        args.output_json, args.output_npz, input_paths
+        args.output_json,
+        args.output_npz,
+        input_paths,
+        (
+            {"source recurrence output": args.source_recurrence_output}
+            if args.source_recurrence_output is not None
+            else None
+        ),
     )
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -1342,12 +1576,22 @@ def main(argv: list[str] | None = None) -> int:
         "phase_timings": {},
         "requested_output_json": str(args.output_json),
         "effective_failure_report": str(failure_report_path),
+        "source_recurrence_output_status": (
+            "missing" if args.source_recurrence_output is not None else "not_requested"
+        ),
     }
     try:
         phase = "request_validation"
         phase_started = time.perf_counter()
         if args.output_npz.exists():
             report["primary_output_status"] = "preexisting_untrusted_preserved"
+        if (
+            args.source_recurrence_output is not None
+            and args.source_recurrence_output.exists()
+        ):
+            report["source_recurrence_output_status"] = (
+                "preexisting_untrusted_preserved"
+            )
         if report_collisions:
             raise ValueError(
                 "output JSON collides with protected paths: "
@@ -1391,9 +1635,27 @@ def main(argv: list[str] | None = None) -> int:
             }
         _invalidate_primary_output(
             args.output_npz,
-            protected={"output report": args.output_json, **input_paths},
+            protected={
+                "output report": args.output_json,
+                **(
+                    {"source recurrence output": args.source_recurrence_output}
+                    if args.source_recurrence_output is not None
+                    else {}
+                ),
+                **input_paths,
+            },
         )
         report["primary_output_status"] = "missing"
+        if args.source_recurrence_output is not None:
+            _invalidate_primary_output(
+                args.source_recurrence_output,
+                protected={
+                    "output report": args.output_json,
+                    "primary output": args.output_npz,
+                    **input_paths,
+                },
+            )
+            report["source_recurrence_output_status"] = "missing"
         report["physical_inputs"] = physical_inputs
         report["phase_timings"][phase] = time.perf_counter() - phase_started
         last_trustworthy_phase = phase
@@ -1599,6 +1861,10 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             }
         continuation_seconds = 0.0
+        source_suffix_steps: list[dict[str, np.ndarray]] | None = (
+            [] if args.source_recurrence_output is not None else None
+        )
+        source_first_step: dict[str, np.ndarray] | None = None
 
         def build_starts(
             candidate_names: tuple[str, ...],
@@ -1626,10 +1892,12 @@ def main(argv: list[str] | None = None) -> int:
             start: Any,
             candidate_first_step: dict[str, np.ndarray],
         ) -> dict[str, Any]:
-            nonlocal continuation_seconds
+            nonlocal continuation_seconds, source_first_step
             candidate_started = time.perf_counter()
             start_np = candidate_first_step["sample_next"]
             arrays[f"candidate_{index}_transition0_sample_next"] = start_np
+            if index == 0:
+                source_first_step = candidate_first_step
             result_raw, step_timings = _run_suffix(
                 torch=torch,
                 flow_model=flow_model,
@@ -1640,6 +1908,7 @@ def main(argv: list[str] | None = None) -> int:
                 neg_cond=neg_cond,
                 params=sampler_params,
                 switch_step=1,
+                capture_steps=source_suffix_steps if index == 0 else None,
             )
             result_raw_np = (
                 result_raw.feats.detach().float().cpu().numpy().astype(np.float32)
@@ -1725,6 +1994,7 @@ def main(argv: list[str] | None = None) -> int:
             "attention_backend": getattr(sparse_config, "ATTN", None),
             "conv_backend": getattr(sparse_config, "CONV", None),
             "steps": STEPS,
+            "rescale_t": float(sampler_params["rescale_t"]),
             "one_model_load": True,
             "model_ref": model_ref,
             "candidate_names": list(expected_candidate_names),
@@ -1767,6 +2037,27 @@ def main(argv: list[str] | None = None) -> int:
             validate_result_manifest(report)
         else:
             validate_external_result_manifest(report)
+        source_recurrence_arrays: dict[str, np.ndarray] | None = None
+        if args.source_recurrence_output is not None:
+            if source_first_step is None or source_suffix_steps is None:
+                raise ValueError("source recurrence capture did not execute")
+            source_recurrence_arrays = build_source_recurrence_arrays(
+                coords=np.asarray(trajectory["coords"], dtype=np.int32),
+                noise=np.asarray(mlx_components["noise"], dtype=np.float32),
+                transition0_t=np.asarray(t, dtype=np.float32),
+                transition0_t_prev=np.asarray(t_prev, dtype=np.float32),
+                source_transition0_pred_pos=source_pos_np,
+                source_transition0_pred_neg=source_neg_np,
+                source_transition0_pred_final=source_first_step["pred_final"],
+                source_transition0_sample_next=source_first_step["sample_next"],
+                suffix_steps=source_suffix_steps,
+            )
+            report["source_recurrence_output"] = write_source_recurrence_artifact(
+                args.source_recurrence_output,
+                arrays=source_recurrence_arrays,
+                report=report,
+            )
+            report["source_recurrence_output_status"] = "written"
         arrays["metadata_json"] = np.asarray(
             json.dumps(
                 build_artifact_metadata(report, arrays),

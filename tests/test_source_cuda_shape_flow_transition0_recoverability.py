@@ -10,6 +10,243 @@ def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_parser_accepts_separate_source_recurrence_output(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import build_parser
+
+    trace_path = tmp_path / "source-recurrence.npz"
+    args = build_parser().parse_args(
+        [
+            "--output-json",
+            str(tmp_path / "report.json"),
+            "--output-npz",
+            str(tmp_path / "matrix.npz"),
+            "--mlx-shape-flow-steps",
+            str(tmp_path / "mlx-steps.npz"),
+            "--mlx-shape-flow-steps-sha256",
+            "1" * 64,
+            "--mlx-run-report",
+            str(tmp_path / "mlx-report.json"),
+            "--mlx-run-report-sha256",
+            "2" * 64,
+            "--conditioning",
+            str(tmp_path / "conditioning.npz"),
+            "--conditioning-sha256",
+            "3" * 64,
+            "--accepted-source-baseline",
+            str(tmp_path / "source.npz"),
+            "--accepted-source-baseline-sha256",
+            "4" * 64,
+            "--accepted-source-report",
+            str(tmp_path / "source.json"),
+            "--accepted-source-report-sha256",
+            "5" * 64,
+            "--accepted-suffix-result",
+            str(tmp_path / "suffix.npz"),
+            "--accepted-suffix-result-sha256",
+            "6" * 64,
+            "--accepted-suffix-report",
+            str(tmp_path / "suffix.json"),
+            "--accepted-suffix-report-sha256",
+            "7" * 64,
+            "--source-tar",
+            str(tmp_path / "source.tar"),
+            "--source-tar-sha256",
+            "8" * 64,
+            "--source-recurrence-output",
+            str(trace_path),
+        ]
+    )
+
+    assert args.source_recurrence_output == trace_path
+
+
+def _source_recurrence_fixture():
+    from scripts.source_cuda_shape_flow_suffix_ladder import _schedule_pairs
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_arrays,
+    )
+
+    coords = np.asarray([[0, 0, 0, 0], [0, 1, 1, 1]], dtype=np.int32)
+    shape = (coords.shape[0], 32)
+    schedule = _schedule_pairs(8, 3.0)
+    noise = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 100.0
+    pred_pos = np.full(shape, 0.25, dtype=np.float32)
+    pred_neg = np.full(shape, -0.25, dtype=np.float32)
+    pred_final = np.full(shape, 0.125, dtype=np.float32)
+    sample_next = noise - np.float32(schedule[0][0] - schedule[0][1]) * pred_final
+    suffix_steps = []
+    sample_in = sample_next
+    for t, t_prev in schedule[1:]:
+        next_sample = sample_in - np.float32(t - t_prev) * pred_final
+        suffix_steps.append(
+            {
+                "sample_in": sample_in,
+                "pred_pos": pred_pos,
+                "pred_neg": pred_neg,
+                "pred_final": pred_final,
+                "sample_next": next_sample,
+                "t": np.asarray(t, dtype=np.float32),
+                "t_prev": np.asarray(t_prev, dtype=np.float32),
+            }
+        )
+        sample_in = next_sample
+    arrays = build_source_recurrence_arrays(
+        coords=coords,
+        noise=noise,
+        transition0_t=np.asarray(schedule[0][0], dtype=np.float32),
+        transition0_t_prev=np.asarray(schedule[0][1], dtype=np.float32),
+        source_transition0_pred_pos=pred_pos,
+        source_transition0_pred_neg=pred_neg,
+        source_transition0_pred_final=pred_final,
+        source_transition0_sample_next=sample_next,
+        suffix_steps=suffix_steps,
+    )
+    source_candidate = {
+        "name": "source-native-control",
+        "source_step_indices": list(range(1, 8)),
+        "source_step_count": 7,
+    }
+    report = {
+        "effective_route": {
+            "device_type": "cuda",
+            "steps": 8,
+            "rescale_t": 3.0,
+            "candidate_names": ["source-native-control", "external-candidate"],
+        },
+        "pipeline_config": {
+            "sampler_params": {
+                "steps": 8,
+                "rescale_t": 3.0,
+                "guidance_strength": 7.5,
+            }
+        },
+        "inputs": {"expected_digests": {"source tar": "1" * 64}},
+        "candidates": [source_candidate],
+    }
+    return arrays, report
+
+
+def test_source_recurrence_artifact_binds_route_arrays_and_exact_linkage(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        validate_source_recurrence_artifact,
+        write_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    output = tmp_path / "source-recurrence.npz"
+    receipt = write_source_recurrence_artifact(output, arrays=arrays, report=report)
+
+    assert receipt["validation"]["step_count"] == 8
+    assert receipt["validation"]["recurrence_exact"] is True
+    assert receipt["sha256"] == _sha256(output)
+    assert validate_source_recurrence_artifact(output)["all_arrays_bound"] is True
+
+
+def test_source_recurrence_artifact_rejects_corruption_and_route_substitution(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    output = tmp_path / "source-recurrence.npz"
+    metadata = build_source_recurrence_metadata(report, arrays)
+    np.savez(
+        output,
+        **arrays,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    corrupted = dict(arrays)
+    corrupted["pred_neg"] = arrays["pred_neg"].copy()
+    corrupted["pred_neg"][3, 0, 0] += np.float32(1.0)
+    np.savez(
+        output,
+        **corrupted,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+    with pytest.raises(ValueError, match="pred_neg digest"):
+        validate_source_recurrence_artifact(output)
+
+    substituted_report = json.loads(json.dumps(report))
+    substituted_report["effective_route"]["device_type"] = "cpu"
+    substituted_metadata = build_source_recurrence_metadata(
+        substituted_report, arrays
+    )
+    np.savez(
+        output,
+        **arrays,
+        metadata_json=np.asarray(json.dumps(substituted_metadata, sort_keys=True)),
+    )
+    with pytest.raises(ValueError, match="effective route"):
+        validate_source_recurrence_artifact(output)
+
+
+def test_source_recurrence_artifact_rejects_self_consistent_broken_linkage(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    broken = dict(arrays)
+    broken["sample_in"] = arrays["sample_in"].copy()
+    broken["sample_in"][4, 0, 0] += np.float32(1.0)
+    metadata = build_source_recurrence_metadata(report, broken)
+    output = tmp_path / "source-recurrence.npz"
+    np.savez(
+        output,
+        **broken,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="step linkage"):
+        validate_source_recurrence_artifact(output)
+
+
+def test_source_recurrence_artifact_rejects_rehashed_prediction_without_euler_change(
+    tmp_path,
+):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        build_source_recurrence_metadata,
+        validate_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    broken = dict(arrays)
+    broken["pred_final"] = arrays["pred_final"].copy()
+    broken["pred_final"][4, 0, 0] += np.float32(1.0)
+    metadata = build_source_recurrence_metadata(report, broken)
+    output = tmp_path / "source-recurrence.npz"
+    np.savez(
+        output,
+        **broken,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="Euler transition"):
+        validate_source_recurrence_artifact(output)
+
+
+def test_source_recurrence_artifact_removes_partial_write(tmp_path, monkeypatch):
+    from scripts import source_cuda_shape_flow_transition0_recoverability as witness
+
+    arrays, report = _source_recurrence_fixture()
+    output = tmp_path / "source-recurrence.npz"
+
+    def partial_save(path, **payload):
+        path.write_bytes(b"partial archive")
+        raise OSError("disk full during recurrence write")
+
+    monkeypatch.setattr(witness.np, "savez", partial_save)
+    with pytest.raises(OSError, match="disk full"):
+        witness.write_source_recurrence_artifact(
+            output, arrays=arrays, report=report
+        )
+
+    assert not output.exists()
+
+
 def _write_transition_capture(tmp_path, *, omit=None):
     shape = (8, 2, 3)
     sample_in = np.zeros(shape, dtype=np.float32)

@@ -322,6 +322,7 @@ def _run_suffix(
     neg_cond: Any,
     params: dict[str, Any],
     switch_step: int,
+    capture_steps: list[dict[str, np.ndarray]] | None = None,
 ) -> tuple[Any, list[float]]:
     from source_cuda_shape_block29_basin_map import _flow_forward, _guided_prediction
     from trellis2.modules.sparse import SparseTensor
@@ -333,6 +334,7 @@ def _run_suffix(
     for step_index in suffix_step_indices(switch_step, steps=len(schedule)):
         step_started = time.perf_counter()
         t, t_prev = schedule[step_index]
+        sample_in = sample
         t_model = torch.tensor(
             [1000.0 * t] * sample.shape[0], device=sample.device, dtype=torch.float32
         )
@@ -352,7 +354,32 @@ def _run_suffix(
             guidance_rescale=float(params["guidance_rescale"]),
             guidance_interval=guidance_interval,
         )
-        sample = sample - (t - t_prev) * pred
+        sample_next = sample - (t - t_prev) * pred
+        if capture_steps is not None:
+            capture_steps.append(
+                {
+                    "sample_in": sample_in.feats.detach().float().cpu().numpy().astype(
+                        np.float32
+                    ),
+                    "pred_pos": pred_pos.feats.detach().float().cpu().numpy().astype(
+                        np.float32
+                    ),
+                    "pred_neg": pred_neg.feats.detach().float().cpu().numpy().astype(
+                        np.float32
+                    ),
+                    "pred_final": pred.feats.detach().float().cpu().numpy().astype(
+                        np.float32
+                    ),
+                    "sample_next": sample_next.feats.detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32),
+                    "t": np.asarray(t, dtype=np.float32),
+                    "t_prev": np.asarray(t_prev, dtype=np.float32),
+                }
+            )
+        sample = sample_next
         torch.cuda.synchronize()
         step_timings.append(time.perf_counter() - step_started)
     return sample, step_timings
