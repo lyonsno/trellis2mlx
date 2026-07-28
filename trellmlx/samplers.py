@@ -289,12 +289,14 @@ def _pred_to_xstart(x_t, t, pred, sigma_min):
 
 def _xstart_to_pred(x_t, t, x_0, sigma_min):
     """Convert x_0 estimate back to velocity prediction."""
-    one_minus_sigma = mx.array(1 - sigma_min, dtype=x_t.dtype)
-    coefficient = mx.array(
-        sigma_min + (1 - sigma_min) * t,
+    one_minus_sigma_value = 1 - sigma_min
+    coefficient_value = sigma_min + one_minus_sigma_value * t
+    one_minus_sigma = mx.array(one_minus_sigma_value, dtype=x_t.dtype)
+    inverse_coefficient = mx.array(
+        1.0 / coefficient_value,
         dtype=x_t.dtype,
     )
-    return (one_minus_sigma * x_t - x_0) / coefficient
+    return (one_minus_sigma * x_t - x_0) * inverse_coefficient
 
 
 def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:

@@ -286,6 +286,101 @@ def test_flow_euler_uses_sequence_level_cfg_rescale_for_sparse_tokens():
     np.testing.assert_allclose(np.array(out), np.array(expected), rtol=1e-6, atol=1e-6)
 
 
+def test_xstart_to_pred_matches_source_cuda_scalar_reciprocal_multiply():
+    from trellmlx.samplers import _xstart_to_pred
+
+    numerator_bits = np.asarray(
+        [
+            0x3F71096F,
+            0x3F90FCF7,
+            0x3ED52D65,
+            0xBF4334B6,
+            0x3FB66B7B,
+            0xC016A567,
+            0xBF34CE47,
+            0xBEC0501F,
+            0xBFA14CB8,
+            0x3ECBDCBA,
+            0xBE2CD2B2,
+            0x3F875486,
+            0xBF3CA618,
+            0x3F8FEF13,
+            0x3F86CE39,
+            0xBF173A0F,
+        ],
+        dtype=np.uint32,
+    )
+    expected_bits = np.asarray(
+        [
+            0x3F7C83C1,
+            0x3F97E46B,
+            0x3EDF5419,
+            0xBF4C8056,
+            0x3FBF1B3D,
+            0xC01DD1D4,
+            0xBF3D6A5C,
+            0xBEC9787B,
+            0xBFA8FB04,
+            0x3ED591E0,
+            0xBE350D77,
+            0x3F8DC63E,
+            0xBF45A1C9,
+            0x3F96C9AD,
+            0x3F8D398C,
+            0xBF1E6D90,
+        ],
+        dtype=np.uint32,
+    )
+    numerator = numerator_bits.view(np.float32)
+    t_seq = np.linspace(1, 0, 9)
+    t_seq = 3.0 * t_seq / (1 + 2.0 * t_seq)
+
+    result = _xstart_to_pred(
+        mx.zeros(numerator.shape, dtype=mx.float32),
+        float(t_seq[1]),
+        mx.array(-numerator),
+        1e-5,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(result, dtype=np.float32).view(np.uint32),
+        expected_bits,
+    )
+
+
+def test_xstart_to_pred_matches_source_cuda_reciprocals_across_schedule():
+    from trellmlx.samplers import _xstart_to_pred
+
+    t_seq = np.linspace(1, 0, 9)
+    t_seq = 3.0 * t_seq / (1 + 2.0 * t_seq)
+    expected_bits = np.asarray(
+        [
+            0x3F800000,
+            0x3F86185D,
+            0x3F8E38D9,
+            0x3F999985,
+            0x3FAAAA85,
+            0x3FC71C29,
+        ],
+        dtype=np.uint32,
+    )
+    actual = []
+
+    for t in t_seq[:6]:
+        result = _xstart_to_pred(
+            mx.zeros((1,), dtype=mx.float32),
+            float(t),
+            mx.array([-1.0], dtype=mx.float32),
+            1e-5,
+        )
+        actual.append(np.asarray(result, dtype=np.float32)[0])
+
+    np.testing.assert_array_equal(
+        np.asarray(actual, dtype=np.float32).view(np.uint32),
+        expected_bits,
+    )
+
+
 def test_flow_euler_casts_prediction_to_x0_coefficients_before_graph_fusion():
     from trellmlx.samplers import flow_euler_sample
 
@@ -331,7 +426,8 @@ def test_flow_euler_casts_prediction_to_x0_coefficients_before_graph_fusion():
     t_seq = 3.0 * t_seq / (1 + 2.0 * t_seq)
     t = float(t_seq[1])
     one_minus_sigma = np.float32(1.0 - 1e-5)
-    coefficient = np.float32(1e-5 + (1.0 - 1e-5) * t)
+    coefficient_value = 1e-5 + (1.0 - 1e-5) * t
+    coefficient = np.float32(coefficient_value)
     expected_x0_pos = np.asarray(
         one_minus_sigma * sample_values - coefficient * pred_pos_values,
         dtype=np.float32,
@@ -345,8 +441,10 @@ def test_flow_euler_casts_prediction_to_x0_coefficients_before_graph_fusion():
         captures[0]["x0_after_rescale"],
         dtype=np.float32,
     )
+    inverse_coefficient = np.float32(1.0 / coefficient_value)
     expected_pred_final = np.asarray(
-        (one_minus_sigma * sample_values - x0_after_rescale) / coefficient,
+        (one_minus_sigma * sample_values - x0_after_rescale)
+        * inverse_coefficient,
         dtype=np.float32,
     )
     np.testing.assert_array_equal(

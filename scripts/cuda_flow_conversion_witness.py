@@ -15,14 +15,12 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA = "trellis2mlx.cuda_flow_conversion_witness.v2"
+SCHEMA = "trellis2mlx.cuda_flow_conversion_witness.v3"
 EXPECTED_TORCH = "2.10.0+cu128"
 EXPECTED_DEVICE = "Tesla T4"
 STEP_INDEX = 1
 STEPS = 8
 RESCALE_T = 3.0
-NORMALIZED_RECIPROCAL_COUNT = 1 << 23
-SWEEP_EXPONENT_BIT_VALUES = (0x3F000000, 0x3F800000)
 
 
 def sha256_file(path: Path) -> str:
@@ -125,42 +123,22 @@ def analyze_conversion(
     }
 
 
-def reciprocal_coordinates(
-    values: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    values = np.asarray(values)
-    if values.dtype != np.float32:
-        raise ValueError("reciprocal coordinates must be float32")
-    if (
-        not np.isfinite(values).all()
-        or np.any(values <= 0)
-        or np.any(np.abs(values) < np.finfo(np.float32).tiny)
-    ):
-        raise ValueError(
-            "reciprocal coordinates require positive normal float32 values"
-        )
-    bits = values.view(np.uint32)
-    exponent_bits = np.bitwise_and(bits, np.uint32(0x7F800000))
-    mantissa_coordinates = np.bitwise_and(
-        bits, np.uint32(0x007FFFFF)
-    ).astype(np.int64)
-    return exponent_bits, mantissa_coordinates
-
-
 def analyze_reciprocal_schedule(
     *,
     step_indices: np.ndarray,
-    coefficients: np.ndarray,
+    coefficient_float64: np.ndarray,
+    coefficient_float32: np.ndarray,
     native_reciprocals: np.ndarray,
-    correctly_rounded_reciprocals: np.ndarray,
+    host_float64_reciprocals: np.ndarray,
     pred_recomputed: np.ndarray,
     source_pred_final: np.ndarray,
 ) -> dict[str, Any]:
     step_indices = np.asarray(step_indices)
-    coefficients = np.asarray(coefficients)
+    coefficient_float64 = np.asarray(coefficient_float64)
+    coefficient_float32 = np.asarray(coefficient_float32)
     native_reciprocals = np.asarray(native_reciprocals)
-    correctly_rounded_reciprocals = np.asarray(
-        correctly_rounded_reciprocals
+    host_float64_reciprocals = np.asarray(
+        host_float64_reciprocals
     )
     pred_recomputed = np.asarray(pred_recomputed)
     source_pred_final = np.asarray(source_pred_final)
@@ -173,10 +151,20 @@ def analyze_reciprocal_schedule(
         raise ValueError(
             "schedule step indices must be unique sorted int32 values"
         )
+    if (
+        coefficient_float64.dtype != np.float64
+        or coefficient_float64.shape != (active_count,)
+        or not np.isfinite(coefficient_float64).all()
+        or np.any(coefficient_float64 <= 0)
+    ):
+        raise ValueError(
+            "coefficient_float64 must be positive finite float64 "
+            "with one value per active step"
+        )
     for name, array in (
-        ("coefficients", coefficients),
+        ("coefficient_float32", coefficient_float32),
         ("native_reciprocals", native_reciprocals),
-        ("correctly_rounded_reciprocals", correctly_rounded_reciprocals),
+        ("host_float64_reciprocals", host_float64_reciprocals),
     ):
         if array.dtype != np.float32 or array.shape != (active_count,):
             raise ValueError(
@@ -184,8 +172,28 @@ def analyze_reciprocal_schedule(
             )
         if not np.isfinite(array).all():
             raise ValueError(f"{name} contains non-finite values")
-    if np.any(coefficients <= 0):
-        raise ValueError("schedule coefficients must be positive")
+    expected_coefficient_float32 = coefficient_float64.astype(np.float32)
+    if not np.array_equal(
+        coefficient_float32, expected_coefficient_float32
+    ):
+        raise ValueError("float32 coefficient reference is stale")
+    expected_host_reciprocals = (1.0 / coefficient_float64).astype(
+        np.float32
+    )
+    if not np.array_equal(
+        host_float64_reciprocals, expected_host_reciprocals
+    ):
+        raise ValueError("host float64 reciprocal reference is stale")
+    if not np.array_equal(native_reciprocals, host_float64_reciprocals):
+        mismatch_count = int(
+            np.count_nonzero(
+                native_reciprocals != host_float64_reciprocals
+            )
+        )
+        raise ValueError(
+            "native scalar reciprocal differs from host float64 reference "
+            f"(nonzero={mismatch_count})"
+        )
     if (
         pred_recomputed.dtype != np.float32
         or source_pred_final.dtype != np.float32
@@ -202,11 +210,12 @@ def analyze_reciprocal_schedule(
     ):
         raise ValueError("schedule predictions contain non-finite values")
 
-    coefficient_bits = coefficients.view(np.uint32)
+    coefficient_float64_bits = coefficient_float64.view(np.uint64)
+    coefficient_float32_bits = coefficient_float32.view(np.uint32)
     native_bits = native_reciprocals.view(np.uint32)
-    rounded_bits = correctly_rounded_reciprocals.view(np.uint32)
+    host_bits = host_float64_reciprocals.view(np.uint32)
     signed_delta = (
-        native_bits.astype(np.int64) - rounded_bits.astype(np.int64)
+        native_bits.astype(np.int64) - host_bits.astype(np.int64)
     )
     rows = []
     for active_row, step_index in enumerate(step_indices.tolist()):
@@ -224,14 +233,19 @@ def analyze_reciprocal_schedule(
             {
                 "active_row": active_row,
                 "step_index": step_index,
-                "coefficient_bits": f"0x{int(coefficient_bits[active_row]):08x}",
+                "coefficient_float64_bits": (
+                    f"0x{int(coefficient_float64_bits[active_row]):016x}"
+                ),
+                "coefficient_float32_bits": (
+                    f"0x{int(coefficient_float32_bits[active_row]):08x}"
+                ),
                 "native_reciprocal_bits": (
                     f"0x{int(native_bits[active_row]):08x}"
                 ),
-                "correctly_rounded_reciprocal_bits": (
-                    f"0x{int(rounded_bits[active_row]):08x}"
+                "host_float64_reciprocal_bits": (
+                    f"0x{int(host_bits[active_row]):08x}"
                 ),
-                "native_minus_correctly_rounded_ulp": int(
+                "native_minus_host_float64_ulp": int(
                     signed_delta[active_row]
                 ),
                 "prediction_exact": True,
@@ -239,162 +253,9 @@ def analyze_reciprocal_schedule(
         )
     return {
         "all_active_predictions_exact": True,
+        "all_native_reciprocals_match_host_float64": True,
         "active_step_count": active_count,
         "rows": rows,
-    }
-
-
-def analyze_normalized_reciprocal_sweep(
-    *,
-    reciprocal_ulp_delta: np.ndarray,
-    sweep_exponent_bits: np.ndarray,
-    schedule_coefficients: np.ndarray,
-    schedule_native_reciprocals: np.ndarray,
-    schedule_correctly_rounded_reciprocals: np.ndarray,
-    expected_count: int = NORMALIZED_RECIPROCAL_COUNT,
-) -> dict[str, Any]:
-    reciprocal_ulp_delta = np.asarray(reciprocal_ulp_delta)
-    sweep_exponent_bits = np.asarray(sweep_exponent_bits)
-    if (
-        reciprocal_ulp_delta.dtype != np.int8
-        or reciprocal_ulp_delta.ndim != 2
-        or reciprocal_ulp_delta.shape[1] != expected_count
-    ):
-        raise ValueError(
-            "normalized reciprocal sweep must cover exactly "
-            f"{expected_count} coordinates per exponent as int8"
-        )
-    exponent_count = reciprocal_ulp_delta.shape[0]
-    if (
-        sweep_exponent_bits.dtype != np.uint32
-        or sweep_exponent_bits.shape != (exponent_count,)
-        or not np.array_equal(
-            sweep_exponent_bits, np.unique(sweep_exponent_bits)
-        )
-        or np.any(
-            np.bitwise_and(
-                sweep_exponent_bits, np.uint32(0x807FFFFF)
-            )
-            != 0
-        )
-        or np.any(sweep_exponent_bits == 0)
-        or np.any(sweep_exponent_bits == np.uint32(0x7F800000))
-    ):
-        raise ValueError(
-            "sweep exponent bits must be unique sorted positive normal "
-            "float32 exponent fields"
-        )
-    schedule_coefficients = np.asarray(schedule_coefficients)
-    schedule_native_reciprocals = np.asarray(
-        schedule_native_reciprocals
-    )
-    schedule_correctly_rounded_reciprocals = np.asarray(
-        schedule_correctly_rounded_reciprocals
-    )
-    schedule_count = schedule_coefficients.size
-    for name, array in (
-        ("schedule_coefficients", schedule_coefficients),
-        ("schedule_native_reciprocals", schedule_native_reciprocals),
-        (
-            "schedule_correctly_rounded_reciprocals",
-            schedule_correctly_rounded_reciprocals,
-        ),
-    ):
-        if array.dtype != np.float32 or array.shape != (schedule_count,):
-            raise ValueError(
-                f"{name} must be float32 with one value per schedule coordinate"
-            )
-        if not np.isfinite(array).all():
-            raise ValueError(f"{name} contains non-finite values")
-
-    schedule_exponent_bits, mantissa_coordinates = reciprocal_coordinates(
-        schedule_coefficients
-    )
-    if np.any(mantissa_coordinates >= expected_count):
-        raise ValueError("schedule coordinate lies outside the sweep domain")
-    exponent_rows = {
-        int(exponent_bits): row
-        for row, exponent_bits in enumerate(sweep_exponent_bits.tolist())
-    }
-    try:
-        schedule_exponent_rows = np.asarray(
-            [
-                exponent_rows[int(exponent_bits)]
-                for exponent_bits in schedule_exponent_bits.tolist()
-            ],
-            dtype=np.int64,
-        )
-    except KeyError as exc:
-        raise ValueError(
-            "schedule exponent lies outside the sweep domain"
-        ) from exc
-    rounded_bits = schedule_correctly_rounded_reciprocals.view(np.uint32)
-    reconstructed_bits = (
-        rounded_bits.astype(np.int64)
-        + reciprocal_ulp_delta[
-            schedule_exponent_rows, mantissa_coordinates
-        ].astype(np.int64)
-    )
-    native_bits = schedule_native_reciprocals.view(np.uint32).astype(np.int64)
-    if not np.array_equal(reconstructed_bits, native_bits):
-        raise ValueError(
-            "normalized reciprocal sweep does not reproduce schedule "
-            "native reciprocal"
-        )
-
-    exponent_reports = []
-    for exponent_bits, delta_row in zip(
-        sweep_exponent_bits.tolist(), reciprocal_ulp_delta
-    ):
-        values, counts = np.unique(delta_row, return_counts=True)
-        run_count = (
-            0
-            if delta_row.size == 0
-            else 1
-            + int(np.count_nonzero(delta_row[1:] != delta_row[:-1]))
-        )
-        exponent_reports.append(
-            {
-                "exponent_bits": f"0x{int(exponent_bits):08x}",
-                "delta_histogram": {
-                    str(int(value)): int(count)
-                    for value, count in zip(
-                        values.tolist(), counts.tolist()
-                    )
-                },
-                "nonzero_count": int(np.count_nonzero(delta_row)),
-                "run_count": run_count,
-            }
-        )
-    return {
-        "domain": {
-            "input": "positive_normal_float32_values_at_listed_exponents",
-            "exponent_bits": [
-                f"0x{int(value):08x}"
-                for value in sweep_exponent_bits.tolist()
-            ],
-            "mantissa_coordinate_count_per_exponent": int(expected_count),
-            "total_coordinate_count": int(
-                exponent_count * expected_count
-            ),
-            "complete_per_exponent": True,
-        },
-        "schedule_cross_authentication": {
-            "exact": True,
-            "coordinate_count": schedule_count,
-            "coordinates": [
-                {
-                    "exponent_bits": f"0x{int(exponent_bits):08x}",
-                    "mantissa_coordinate": int(mantissa_coordinate),
-                }
-                for exponent_bits, mantissa_coordinate in zip(
-                    schedule_exponent_bits.tolist(),
-                    mantissa_coordinates.tolist(),
-                )
-            ],
-        },
-        "exponents": exponent_reports,
-        "array_sha256": sha256_array(reciprocal_ulp_delta),
     }
 
 
@@ -402,13 +263,12 @@ def analyze_output_contract(
     *,
     source_pred_final: np.ndarray,
     step_indices: np.ndarray,
-    coefficients: np.ndarray,
+    coefficient_float64: np.ndarray,
+    coefficient_float32: np.ndarray,
     pred_direct: np.ndarray,
     pred_recomputed: np.ndarray,
     native_reciprocals: np.ndarray,
-    correctly_rounded_reciprocals: np.ndarray,
-    reciprocal_ulp_delta: np.ndarray,
-    sweep_exponent_bits: np.ndarray,
+    host_float64_reciprocals: np.ndarray,
 ) -> dict[str, Any]:
     source_pred_final = np.asarray(source_pred_final)
     pred_direct = np.asarray(pred_direct)
@@ -432,25 +292,16 @@ def analyze_output_contract(
         )
     schedule = analyze_reciprocal_schedule(
         step_indices=step_indices,
-        coefficients=coefficients,
+        coefficient_float64=coefficient_float64,
+        coefficient_float32=coefficient_float32,
         native_reciprocals=native_reciprocals,
-        correctly_rounded_reciprocals=correctly_rounded_reciprocals,
+        host_float64_reciprocals=host_float64_reciprocals,
         pred_recomputed=pred_recomputed,
         source_pred_final=source_pred_final,
-    )
-    sweep = analyze_normalized_reciprocal_sweep(
-        reciprocal_ulp_delta=reciprocal_ulp_delta,
-        sweep_exponent_bits=sweep_exponent_bits,
-        schedule_coefficients=coefficients,
-        schedule_native_reciprocals=native_reciprocals,
-        schedule_correctly_rounded_reciprocals=(
-            correctly_rounded_reciprocals
-        ),
     )
     return {
         "pred_direct_vs_source": direct_metric,
         "reciprocal_schedule": schedule,
-        "normalized_reciprocal_sweep": sweep,
     }
 
 
@@ -706,15 +557,6 @@ def main() -> int:
                 )
             ],
         }
-        report["normalized_reciprocal_sweep_requested"] = {
-            "input_exponent_bits": [
-                f"0x{value:08x}" for value in SWEEP_EXPONENT_BIT_VALUES
-            ],
-            "mantissa_coordinate_count_per_exponent": (
-                NORMALIZED_RECIPROCAL_COUNT
-            ),
-            "complete_per_exponent": True,
-        }
         report["last_trustworthy_phase"] = "input_validated"
         report["failure_phase"] = "cuda_route_validation"
 
@@ -783,72 +625,15 @@ def main() -> int:
                 .astype(np.float32, copy=False)
             )
 
-        report["failure_phase"] = "normalized_reciprocal_sweep"
-        sweep_started = time.time()
-        normalized_native_rows = []
-        for exponent_bits in SWEEP_EXPONENT_BIT_VALUES:
-            normalized_input_bits = (
-                torch.arange(
-                    NORMALIZED_RECIPROCAL_COUNT,
-                    device="cuda",
-                    dtype=torch.int32,
-                )
-                + exponent_bits
-            )
-            normalized_inputs = normalized_input_bits.view(torch.float32)
-            normalized_native_rows.append(
-                as_float32(
-                    torch.ones_like(normalized_inputs) / normalized_inputs
-                )
-            )
-        torch.cuda.synchronize()
-        report["cuda_sweep_execution_seconds"] = time.time() - sweep_started
-        reciprocal_ulp_delta_rows = []
-        for exponent_bits, normalized_native in zip(
-            SWEEP_EXPONENT_BIT_VALUES, normalized_native_rows
-        ):
-            normalized_input_bits_cpu = (
-                np.arange(NORMALIZED_RECIPROCAL_COUNT, dtype=np.uint32)
-                + np.uint32(exponent_bits)
-            )
-            normalized_inputs_cpu = normalized_input_bits_cpu.view(
-                np.float32
-            )
-            normalized_correctly_rounded = np.divide(
-                np.ones_like(normalized_inputs_cpu),
-                normalized_inputs_cpu,
-                dtype=np.float32,
-            )
-            reciprocal_ulp_delta_rows.append(
-                normalized_native.view(np.uint32).astype(np.int64)
-                - normalized_correctly_rounded.view(np.uint32).astype(
-                    np.int64
-                )
-            )
-        reciprocal_ulp_delta_int64 = np.stack(
-            reciprocal_ulp_delta_rows
+        coefficient_float64 = np.asarray(
+            scalars["coefficient"], dtype=np.float64
         )
-        if (
-            reciprocal_ulp_delta_int64.min(initial=0) < np.iinfo(np.int8).min
-            or reciprocal_ulp_delta_int64.max(initial=0)
-            > np.iinfo(np.int8).max
-        ):
-            raise ValueError(
-                "normalized reciprocal ULP delta does not fit in int8"
-            )
-        reciprocal_ulp_delta = reciprocal_ulp_delta_int64.astype(np.int8)
-        sweep_exponent_bits = np.asarray(
-            SWEEP_EXPONENT_BIT_VALUES, dtype=np.uint32
-        )
-
-        coefficients_float32 = np.asarray(
+        coefficient_float32 = np.asarray(
             scalars["coefficient"], dtype=np.float32
         )
-        correctly_rounded_reciprocals = np.divide(
-            np.ones_like(coefficients_float32),
-            coefficients_float32,
-            dtype=np.float32,
-        )
+        host_float64_reciprocals = (
+            1.0 / coefficient_float64
+        ).astype(np.float32)
         step_indices = np.asarray(
             source_identity["guidance_step_indices"], dtype=np.int32
         )
@@ -858,28 +643,22 @@ def main() -> int:
             "pred_direct": as_float32(pred_direct),
             "pred_recomputed": as_float32(pred_recomputed),
             "native_reciprocals": as_float32(native_reciprocals),
-            "correctly_rounded_reciprocals": (
-                correctly_rounded_reciprocals
-            ),
-            "reciprocal_ulp_delta": reciprocal_ulp_delta,
-            "sweep_exponent_bits": sweep_exponent_bits,
+            "host_float64_reciprocals": host_float64_reciprocals,
             "step_indices": step_indices,
-            "coefficient_float32": coefficients_float32,
+            "coefficient_float64": coefficient_float64,
+            "coefficient_float32": coefficient_float32,
         }
         report["last_trustworthy_phase"] = "oracle_executed"
         report["failure_phase"] = "self_authentication"
         output_contract = analyze_output_contract(
             source_pred_final=source_arrays["source_pred_final"],
             step_indices=step_indices,
-            coefficients=coefficients_float32,
+            coefficient_float64=coefficient_float64,
+            coefficient_float32=coefficient_float32,
             pred_direct=output_arrays["pred_direct"],
             pred_recomputed=output_arrays["pred_recomputed"],
             native_reciprocals=output_arrays["native_reciprocals"],
-            correctly_rounded_reciprocals=(
-                correctly_rounded_reciprocals
-            ),
-            reciprocal_ulp_delta=reciprocal_ulp_delta,
-            sweep_exponent_bits=sweep_exponent_bits,
+            host_float64_reciprocals=host_float64_reciprocals,
         )
         report.update(output_contract)
         step_one_active_row = source_identity["step_one_active_row"]
@@ -912,7 +691,6 @@ def main() -> int:
             one_minus_sigma=np.asarray(
                 scalars["one_minus_sigma"], dtype=np.float64
             ),
-            coefficient=np.asarray(scalars["coefficient"], dtype=np.float64),
         )
         with np.load(output_npz, allow_pickle=False) as archive:
             for name, expected in {**source_arrays, **output_arrays}.items():
@@ -931,7 +709,10 @@ def main() -> int:
                     archive["source_pred_final"]
                 ),
                 step_indices=np.asarray(archive["step_indices"]),
-                coefficients=np.asarray(
+                coefficient_float64=np.asarray(
+                    archive["coefficient_float64"]
+                ),
+                coefficient_float32=np.asarray(
                     archive["coefficient_float32"]
                 ),
                 pred_direct=np.asarray(archive["pred_direct"]),
@@ -939,14 +720,8 @@ def main() -> int:
                 native_reciprocals=np.asarray(
                     archive["native_reciprocals"]
                 ),
-                correctly_rounded_reciprocals=np.asarray(
-                    archive["correctly_rounded_reciprocals"]
-                ),
-                reciprocal_ulp_delta=np.asarray(
-                    archive["reciprocal_ulp_delta"]
-                ),
-                sweep_exponent_bits=np.asarray(
-                    archive["sweep_exponent_bits"]
+                host_float64_reciprocals=np.asarray(
+                    archive["host_float64_reciprocals"]
                 ),
             )
             if reloaded_contract != output_contract:
