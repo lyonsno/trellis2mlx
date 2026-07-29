@@ -40,6 +40,23 @@ from ..modules.attention import MultiHeadRMSNorm
 from ..modules.rope import build_sparse_rope_phases
 
 
+def _shape_shared_modulation(
+    t: mx.array,
+    t_embedder: TimestepEmbedder,
+    adaLN_modulation: nn.Sequential,
+    compute_dtype: mx.Dtype,
+    shape_timestep_modulation_lut=None,
+) -> mx.array:
+    if shape_timestep_modulation_lut is not None:
+        return shape_timestep_modulation_lut.lookup_mlx(t, compute_dtype)
+    return _source_shared_modulation(
+        t,
+        t_embedder,
+        adaLN_modulation,
+        compute_dtype,
+    )
+
+
 def _source_cuda_terminal_linear(
     x: mx.array,
     linear: nn.Linear,
@@ -159,6 +176,7 @@ class SLatFlowModel(nn.Module):
         cross_kv_cache: list = None,  # precomputed cross-attention KV per block
         shape_block_injection=None,
         shape_block_injection_branch: str | None = None,
+        shape_timestep_modulation_lut=None,
     ) -> mx.array:
         input_dtype = x.dtype
         N = x.shape[0]
@@ -175,7 +193,17 @@ class SLatFlowModel(nn.Module):
         # Project to model channels
         x = self.input_layer(x)  # [N, C]
         compute_dtype = _infer_compute_dtype(self)
-        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
+        if shape_timestep_modulation_lut is not None and not self.shape_flow_layernorm:
+            raise ValueError(
+                "source-CUDA timestep modulation LUT is only valid for shape flow"
+            )
+        mod = _shape_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            shape_timestep_modulation_lut,
+        )
         x = x.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
@@ -276,6 +304,7 @@ class SLatFlowModel(nn.Module):
         cross_kv_cache: list = None,
         shape_block_injection=None,
         shape_block_injection_branch: str | None = None,
+        shape_timestep_modulation_lut=None,
     ) -> dict[str, mx.array]:
         if block_index < 0 or block_index >= len(self.blocks):
             raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
@@ -290,7 +319,17 @@ class SLatFlowModel(nn.Module):
 
         x = self.input_layer(x)
         compute_dtype = _infer_compute_dtype(self)
-        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
+        if shape_timestep_modulation_lut is not None and not self.shape_flow_layernorm:
+            raise ValueError(
+                "source-CUDA timestep modulation LUT is only valid for shape flow"
+            )
+        mod = _shape_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            shape_timestep_modulation_lut,
+        )
         x = x.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 

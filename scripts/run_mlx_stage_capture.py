@@ -77,6 +77,8 @@ INPUT_PATH_FIELDS = (
     "turing_rope_phase_lut",
     "shape_flow_block_injection_trace",
     "shape_flow_block_injection_manifest",
+    "shape_timestep_modulation_lut",
+    "shape_timestep_modulation_report",
 )
 
 
@@ -221,6 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turing-rsqrt-lut")
     parser.add_argument("--expected-turing-rsqrt-lut-sha256")
     parser.add_argument("--shape-flow-noise-sample")
+    parser.add_argument("--shape-timestep-modulation-lut")
+    parser.add_argument("--shape-timestep-modulation-report")
+    parser.add_argument("--expected-shape-timestep-modulation-lut-sha256")
+    parser.add_argument("--expected-shape-timestep-modulation-report-sha256")
+    parser.add_argument(
+        "--expected-shape-timestep-modulation-source-checkpoint-sha256"
+    )
     parser.add_argument("--shape-flow-block-injection-trace")
     parser.add_argument("--shape-flow-block-injection-manifest")
     parser.add_argument("--shape-flow-block-injection-step-index", type=int, default=0)
@@ -293,6 +302,9 @@ def build_route_identity(
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
     turing_lut_identity = _validate_turing_rsqrt_route_args(args)
     turing_rope_lut_identity = _validate_turing_rope_route_args(args)
+    timestep_modulation_identity = (
+        _validate_shape_timestep_modulation_route_args(args)
+    )
     if repo_identity is None:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
     attention_backend_requested = os.environ.get(
@@ -539,6 +551,30 @@ def build_route_identity(
                 _sha256_file(args.shape_flow_noise_sample)
                 if args.shape_flow_noise_sample else None
             ),
+            "shape_timestep_modulation_lut_path": (
+                timestep_modulation_identity["npz_path"]
+            ),
+            "shape_timestep_modulation_lut_sha256_requested": (
+                timestep_modulation_identity["npz_sha256_requested"]
+            ),
+            "shape_timestep_modulation_lut_sha256_effective": (
+                timestep_modulation_identity["npz_sha256_effective"]
+            ),
+            "shape_timestep_modulation_report_path": (
+                timestep_modulation_identity["report_path"]
+            ),
+            "shape_timestep_modulation_report_sha256_requested": (
+                timestep_modulation_identity["report_sha256_requested"]
+            ),
+            "shape_timestep_modulation_report_sha256_effective": (
+                timestep_modulation_identity["report_sha256_effective"]
+            ),
+            "shape_timestep_modulation_source_checkpoint_sha256": (
+                timestep_modulation_identity["source_checkpoint_sha256"]
+            ),
+            "shape_timestep_modulation_identity": (
+                timestep_modulation_identity["identity"]
+            ),
         },
         "source": {
             "image_path": image_path,
@@ -700,6 +736,25 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         return 2
+    try:
+        _validate_shape_timestep_modulation_route_args(args)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_shape_timestep_modulation_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     if invalid_inputs:
         _write_json(
             output_dir / "run_report.json",
@@ -850,6 +905,27 @@ def main(argv: list[str] | None = None) -> int:
                     route_identity,
                     checkpoint_npz,
                 )
+            modulation_binding = (
+                _bind_effective_shape_timestep_modulation_identity(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            if args.stop_after_stage == "shape_flow_steps":
+                if (
+                    primary_output_validation["sampler"][
+                        "shape_timestep_modulation_route"
+                    ]
+                    != modulation_binding[
+                        "shape_timestep_modulation_route"
+                    ]
+                ):
+                    raise ValueError(
+                        "shape_flow_steps modulation validation differs from "
+                        "the shared effective binding"
+                    )
+            else:
+                primary_output_validation = modulation_binding
             if args.stop_after_stage == "shape_flow_block_trace":
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
                 _bind_effective_shape_flow_attention_route(
@@ -888,7 +964,13 @@ def main(argv: list[str] | None = None) -> int:
             "route_identity": route_identity,
             "last_trustworthy_phase": (
                 f"{args.stop_after_stage}_validated"
-                if status == "done" and args.stop_after_stage == "shape_flow_steps"
+                if status == "done"
+                and args.stop_after_stage
+                in {
+                    "shape_flow_step",
+                    "shape_flow_steps",
+                    "shape_flow_block_trace",
+                }
                 else f"{args.stop_after_stage}_saved"
                 if status == "done" and output_written
                 else "route_identity_written"
@@ -1035,6 +1117,55 @@ def _bind_effective_shape_flow_layernorm_backend(
             effective_turing_lut_content_sha256
         )
     return effective
+
+
+def _bind_effective_shape_timestep_modulation_identity(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    checkpoint_path = Path(checkpoint_path)
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        identity = None
+        identity_json = ""
+        if "shape_timestep_modulation_lut_json" in checkpoint:
+            value = np.asarray(
+                checkpoint["shape_timestep_modulation_lut_json"]
+            )
+            if value.shape != () or value.dtype.kind not in {"U", "S"}:
+                raise ValueError(
+                    "shape-flow checkpoint timestep modulation identity "
+                    "must be a string scalar"
+                )
+            identity_json = str(value.item())
+            if identity_json:
+                try:
+                    identity = json.loads(identity_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "shape-flow checkpoint timestep modulation identity "
+                        "is invalid JSON"
+                    ) from exc
+                if not isinstance(identity, dict):
+                    raise ValueError(
+                        "shape-flow checkpoint timestep modulation identity "
+                        "must decode to an object"
+                    )
+    effective = _validate_shape_timestep_modulation_identity(
+        identity,
+        expected_route=route,
+    )
+    route["shape_timestep_modulation_identity_effective"] = effective
+    return {
+        "schema": "trellis2mlx.shape_timestep_modulation_binding.v1",
+        "path": str(checkpoint_path),
+        "sha256": _sha256_file(checkpoint_path),
+        "size_bytes": checkpoint_path.stat().st_size,
+        "shape_timestep_modulation_lut_json": identity_json,
+        "shape_timestep_modulation_route": effective,
+    }
 
 
 def _bind_effective_shape_flow_attention_route(
@@ -1560,6 +1691,38 @@ def _validate_shape_flow_steps_checkpoint(
             injection_identity,
             expected_route=expected_route or {},
         )
+        modulation_json = ""
+        if "shape_timestep_modulation_lut_json" in checkpoint:
+            modulation_array = np.asarray(
+                checkpoint["shape_timestep_modulation_lut_json"]
+            )
+            if (
+                modulation_array.shape != ()
+                or modulation_array.dtype.kind not in {"U", "S"}
+            ):
+                raise ValueError(
+                    "shape_flow_steps shape_timestep_modulation_lut_json "
+                    "must be a string scalar"
+                )
+            modulation_json = str(modulation_array.item())
+        modulation_identity = None
+        if modulation_json:
+            try:
+                modulation_identity = json.loads(modulation_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "shape_flow_steps shape_timestep_modulation_lut_json "
+                    "is invalid JSON"
+                ) from exc
+            if not isinstance(modulation_identity, dict):
+                raise ValueError(
+                    "shape_flow_steps shape_timestep_modulation_lut_json "
+                    "must decode to an object"
+                )
+        modulation_route = _validate_shape_timestep_modulation_identity(
+            modulation_identity,
+            expected_route=expected_route or {},
+        )
         backend_array = np.asarray(checkpoint["shape_flow_layernorm_backend"])
         if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
             raise ValueError(
@@ -1668,6 +1831,8 @@ def _validate_shape_flow_steps_checkpoint(
             "guidance_interval": [float(value) for value in guidance_interval],
             "shape_flow_block_injection_json": injection_json,
             "shape_flow_block_injection_route": injection_route,
+            "shape_timestep_modulation_lut_json": modulation_json,
+            "shape_timestep_modulation_route": modulation_route,
             "shape_flow_layernorm_backend": effective_backend,
             "qk_norm_backend": effective_qk_backend,
             "rope_backend": effective_rope_backend,
@@ -1683,6 +1848,38 @@ def _validate_shape_flow_steps_checkpoint(
         },
         "finite": True,
     }
+
+
+def _validate_shape_timestep_modulation_identity(
+    identity: dict[str, Any] | None,
+    *,
+    expected_route: dict[str, Any],
+) -> dict[str, Any] | None:
+    expected_identity = expected_route.get(
+        "shape_timestep_modulation_identity"
+    )
+    if expected_identity is None:
+        if identity is not None:
+            raise ValueError(
+                "shape-flow checkpoint carries timestep modulation identity but "
+                "the requested route carries none"
+            )
+        return None
+    if identity is None:
+        raise ValueError(
+            "shape-flow checkpoint omits requested timestep modulation identity"
+        )
+    if identity.get("route_identity_evidence") is not True:
+        raise ValueError(
+            "shape-flow checkpoint timestep modulation identity omits "
+            "route_identity_evidence=true"
+        )
+    if identity != expected_identity:
+        raise ValueError(
+            "shape-flow checkpoint effective timestep modulation identity does "
+            "not match the authenticated requested route"
+        )
+    return identity
 
 
 def _validate_shape_flow_injection_identity(
@@ -1973,6 +2170,23 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             "--shape-flow-noise-sample",
             str(Path(args.shape_flow_noise_sample)),
         ])
+    if args.shape_timestep_modulation_lut:
+        command.extend(
+            [
+                "--shape-timestep-modulation-lut",
+                str(Path(args.shape_timestep_modulation_lut)),
+                "--shape-timestep-modulation-report",
+                str(Path(args.shape_timestep_modulation_report)),
+                "--expected-shape-timestep-modulation-lut-sha256",
+                args.expected_shape_timestep_modulation_lut_sha256,
+                "--expected-shape-timestep-modulation-report-sha256",
+                args.expected_shape_timestep_modulation_report_sha256,
+                "--expected-shape-timestep-modulation-source-checkpoint-sha256",
+                (
+                    args.expected_shape_timestep_modulation_source_checkpoint_sha256
+                ),
+            ]
+        )
     if args.shape_flow_block_injection_trace:
         command.extend([
             "--shape-flow-block-injection-trace",
@@ -1999,6 +2213,83 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             str(Path(args.shape_flow_block_injection_manifest)),
         ])
     return command
+
+
+def _validate_shape_timestep_modulation_route_args(
+    args: argparse.Namespace,
+) -> dict[str, object | None]:
+    values = (
+        args.shape_timestep_modulation_lut,
+        args.shape_timestep_modulation_report,
+        args.expected_shape_timestep_modulation_lut_sha256,
+        args.expected_shape_timestep_modulation_report_sha256,
+        args.expected_shape_timestep_modulation_source_checkpoint_sha256,
+    )
+    if not any(values):
+        return {
+            "npz_path": None,
+            "npz_sha256_requested": None,
+            "npz_sha256_effective": None,
+            "report_path": None,
+            "report_sha256_requested": None,
+            "report_sha256_effective": None,
+            "source_checkpoint_sha256": None,
+            "identity": None,
+        }
+    if not all(values):
+        raise ValueError(
+            "source-CUDA shape timestep modulation replay requires the LUT, "
+            "witness report, both expected artifact SHA256 values, and the "
+            "expected source checkpoint SHA256"
+        )
+    if not args.no_cascade:
+        raise ValueError(
+            "source-CUDA shape timestep modulation replay requires --no-cascade"
+        )
+    if args.stop_after_stage not in {
+        "shape_flow_step",
+        "shape_flow_steps",
+        "shape_flow_block_trace",
+    }:
+        raise ValueError(
+            "source-CUDA shape timestep modulation replay is only valid for "
+            "shape-flow diagnostic stops"
+        )
+
+    from trellmlx.timestep_modulation_lut import (
+        load_source_cuda_timestep_modulation_lut,
+    )
+
+    lut = load_source_cuda_timestep_modulation_lut(
+        npz_path=args.shape_timestep_modulation_lut,
+        report_path=args.shape_timestep_modulation_report,
+        expected_npz_sha256=(
+            args.expected_shape_timestep_modulation_lut_sha256
+        ),
+        expected_report_sha256=(
+            args.expected_shape_timestep_modulation_report_sha256
+        ),
+        expected_source_checkpoint_sha256=(
+            args.expected_shape_timestep_modulation_source_checkpoint_sha256
+        ),
+    )
+    identity = lut.report_identity()
+    return {
+        "npz_path": str(Path(args.shape_timestep_modulation_lut)),
+        "npz_sha256_requested": (
+            args.expected_shape_timestep_modulation_lut_sha256
+        ),
+        "npz_sha256_effective": identity["npz_sha256_effective"],
+        "report_path": str(Path(args.shape_timestep_modulation_report)),
+        "report_sha256_requested": (
+            args.expected_shape_timestep_modulation_report_sha256
+        ),
+        "report_sha256_effective": identity["report_sha256_effective"],
+        "source_checkpoint_sha256": (
+            identity["source_checkpoint_sha256_effective"]
+        ),
+        "identity": identity,
+    }
 
 
 def _validate_turing_rsqrt_route_args(

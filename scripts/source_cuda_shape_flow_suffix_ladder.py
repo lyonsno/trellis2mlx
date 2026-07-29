@@ -103,12 +103,67 @@ def _required_scalar(archive: Any, name: str, *, dtype: np.dtype) -> Any:
     return value.item()
 
 
+def _validate_expected_modulation_identity(
+    identity: dict[str, str] | None,
+) -> None:
+    if identity is None:
+        return
+    required = {
+        "npz_sha256_effective",
+        "report_sha256_effective",
+        "source_checkpoint_sha256_effective",
+    }
+    if set(identity) != required:
+        raise ValueError(
+            "expected timestep modulation identity must contain exactly "
+            f"{sorted(required)}"
+        )
+    for key in sorted(required):
+        value = identity[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(
+                f"expected timestep modulation identity {key} must be a "
+                "lowercase 64-character SHA256"
+            )
+
+
+def _decode_modulation_checkpoint_identity(value: np.ndarray) -> dict[str, Any] | None:
+    if value.shape != () or value.dtype.kind not in {"U", "S"}:
+        raise ValueError(
+            "MLX trajectory shape_timestep_modulation_lut_json must be a "
+            "string scalar"
+        )
+    text = str(value.item())
+    if not text:
+        return None
+    try:
+        identity = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "MLX trajectory checkpoint timestep modulation identity is invalid JSON"
+        ) from exc
+    if not isinstance(identity, dict):
+        raise ValueError(
+            "MLX trajectory checkpoint timestep modulation identity must be an object"
+        )
+    return identity
+
+
 def load_mlx_trajectory(
-    capture_path: Path, run_report_path: Path, conditioning_path: Path
+    capture_path: Path,
+    run_report_path: Path,
+    conditioning_path: Path,
+    *,
+    expected_modulation_identity: dict[str, str] | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     capture_path = Path(capture_path)
     run_report_path = Path(run_report_path)
     conditioning_path = Path(conditioning_path)
+    _validate_expected_modulation_identity(expected_modulation_identity)
     report = json.loads(run_report_path.read_text())
     if report.get("status") != "done":
         raise ValueError("MLX run report is not done")
@@ -134,11 +189,85 @@ def load_mlx_trajectory(
         raise ValueError("MLX trajectory unexpectedly requests direct trace injection")
     if route.get("shape_flow_block_injection_manifest_path") is not None:
         raise ValueError("MLX trajectory unexpectedly requests manifest injection")
+    route_modulation_identity = route.get("shape_timestep_modulation_identity")
+    validation = report.get("primary_output_validation", {})
+    validation_sampler = validation.get("sampler", {})
+    validated_modulation_identity = validation_sampler.get(
+        "shape_timestep_modulation_route"
+    )
+    if expected_modulation_identity is None:
+        if (
+            route_modulation_identity is not None
+            or validated_modulation_identity is not None
+        ):
+            raise ValueError(
+                "MLX trajectory carries timestep modulation identity under "
+                "explicit default mode"
+            )
+    else:
+        if not isinstance(route_modulation_identity, dict):
+            raise ValueError(
+                "MLX route omits requested timestep modulation identity"
+            )
+        if route_modulation_identity.get("route_identity_evidence") is not True:
+            raise ValueError(
+                "MLX route timestep modulation identity omits "
+                "route_identity_evidence=true"
+            )
+        canonical_identity = {
+            "schema": "trellis2mlx.source_cuda_timestep_modulation_lut.v1",
+            "route": "source-cuda-t4-canonical-shared-adaln-lut",
+            "step_indices": list(range(STEPS)),
+            "timestep_float32_bits": [
+                "0x447a0000",
+                "0x446ea2e9",
+                "0x44610000",
+                "0x44505555",
+                "0x443b8000",
+                "0x4420b6db",
+                "0x43fa0000",
+                "0x43960000",
+            ],
+            "modulation_shape": [STEPS, 9216],
+        }
+        for key, expected in canonical_identity.items():
+            if route_modulation_identity.get(key) != expected:
+                raise ValueError(
+                    f"MLX route timestep modulation identity {key} is not "
+                    "canonical"
+                )
+        for key, expected in expected_modulation_identity.items():
+            if route_modulation_identity.get(key) != expected:
+                raise ValueError(
+                    f"MLX route timestep modulation identity {key} does not "
+                    "match the admitted value"
+                )
+        route_fields = {
+            "npz_sha256_effective": (
+                "shape_timestep_modulation_lut_sha256_effective"
+            ),
+            "report_sha256_effective": (
+                "shape_timestep_modulation_report_sha256_effective"
+            ),
+            "source_checkpoint_sha256_effective": (
+                "shape_timestep_modulation_source_checkpoint_sha256"
+            ),
+        }
+        for identity_key, route_key in route_fields.items():
+            if route.get(route_key) != expected_modulation_identity[identity_key]:
+                raise ValueError(
+                    f"MLX route {route_key} does not match the admitted "
+                    "timestep modulation identity"
+                )
+        if validated_modulation_identity != route_modulation_identity:
+            raise ValueError(
+                "MLX primary validation timestep modulation identity does not "
+                "match the requested route"
+            )
     conditioning_sha = _sha256(conditioning_path)
     if route.get("conditioning_sample_sha256") != conditioning_sha:
         raise ValueError("conditioning digest does not match admitted MLX route")
     capture_sha = _sha256(capture_path)
-    validation = report.get("primary_output_validation", {})
     if validation.get("sha256") != capture_sha:
         raise ValueError("MLX trajectory digest does not match run report")
     if validation.get("step_count") != STEPS:
@@ -165,6 +294,10 @@ def load_mlx_trajectory(
             raise ValueError(f"MLX trajectory is missing arrays: {missing}")
         for name in required_arrays:
             arrays[name] = np.asarray(archive[name])
+        if "shape_timestep_modulation_lut_json" in archive.files:
+            arrays["shape_timestep_modulation_lut_json"] = np.asarray(
+                archive["shape_timestep_modulation_lut_json"]
+            )
         scalar_values = {
             "steps": _required_scalar(archive, "steps", dtype=np.dtype(np.int32)),
             "guidance_strength": _required_scalar(
@@ -196,6 +329,18 @@ def load_mlx_trajectory(
     injection = arrays["shape_flow_block_injection_json"]
     if injection.shape != () or injection.dtype.kind not in {"U", "S"} or str(injection.item()):
         raise ValueError("MLX trajectory carries unexpected injection identity")
+    checkpoint_modulation_identity = (
+        _decode_modulation_checkpoint_identity(
+            arrays["shape_timestep_modulation_lut_json"]
+        )
+        if "shape_timestep_modulation_lut_json" in arrays
+        else None
+    )
+    if checkpoint_modulation_identity != route_modulation_identity:
+        raise ValueError(
+            "MLX trajectory checkpoint timestep modulation identity does not "
+            "match the requested route"
+        )
 
     sample_in = arrays["sample_in"]
     pred_final = arrays["pred_final"]
@@ -243,6 +388,7 @@ def load_mlx_trajectory(
         "conditioning_sha256": conditioning_sha,
         "shape_flow_noise_sample_sha256": route.get("shape_flow_noise_sample_sha256"),
         "shape_slat_support_sample_sha256": route.get("shape_slat_support_sample_sha256"),
+        "shape_timestep_modulation_identity": route_modulation_identity,
         "euler_transition_max_abs_residual": euler_residual,
     }
     return arrays, identity
@@ -563,6 +709,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-npz", required=True, type=Path)
     parser.add_argument("--mlx-shape-flow-steps", required=True, type=Path)
     parser.add_argument("--mlx-run-report", required=True, type=Path)
+    parser.add_argument(
+        "--mlx-timestep-modulation-route",
+        choices=("default", "source-cuda-lut"),
+    )
+    parser.add_argument("--expected-modulation-lut-sha256")
+    parser.add_argument("--expected-modulation-report-sha256")
+    parser.add_argument("--expected-modulation-source-checkpoint-sha256")
     parser.add_argument("--conditioning", required=True, type=Path)
     parser.add_argument("--accepted-source-baseline", required=True, type=Path)
     parser.add_argument("--accepted-source-report", required=True, type=Path)
@@ -580,12 +733,27 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     phase = "arguments_parsed"
     last_trustworthy_phase: str | None = phase
+    expected_modulation_identity = (
+        {
+            "npz_sha256_effective": args.expected_modulation_lut_sha256,
+            "report_sha256_effective": args.expected_modulation_report_sha256,
+            "source_checkpoint_sha256_effective": (
+                args.expected_modulation_source_checkpoint_sha256
+            ),
+        }
+        if args.mlx_timestep_modulation_route == "source-cuda-lut"
+        else None
+    )
     requested_route = {
         "route": "official-source-cuda-shape-flow-suffix-ladder-from-exact-mlx-prefixes",
         "steps": STEPS,
         "switch_steps": list(SWITCH_STEPS),
         "attention_backend": args.sparse_attn_backend,
         "conv_backend": args.sparse_conv_backend,
+        "mlx_timestep_modulation_route": (
+            args.mlx_timestep_modulation_route
+        ),
+        "expected_modulation_identity": expected_modulation_identity,
     }
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -601,6 +769,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         phase = "request_validation"
         phase_started = time.perf_counter()
+        if args.mlx_timestep_modulation_route not in {
+            "default",
+            "source-cuda-lut",
+        }:
+            raise ValueError(
+                "--mlx-timestep-modulation-route must explicitly select "
+                "default or source-cuda-lut"
+            )
+        if (
+            args.mlx_timestep_modulation_route == "default"
+            and any(
+                value is not None
+                for value in (
+                    args.expected_modulation_lut_sha256,
+                    args.expected_modulation_report_sha256,
+                    args.expected_modulation_source_checkpoint_sha256,
+                )
+            )
+        ):
+            raise ValueError(
+                "expected modulation SHA256 values require source-cuda-lut mode"
+            )
+        _validate_expected_modulation_identity(expected_modulation_identity)
         try:
             _invalidate_primary_output(
                 args.output_npz,
@@ -633,7 +824,10 @@ def main(argv: list[str] | None = None) -> int:
         ):
             _validate_file(path, label=label)
         trajectory, mlx_identity = load_mlx_trajectory(
-            args.mlx_shape_flow_steps, args.mlx_run_report, args.conditioning
+            args.mlx_shape_flow_steps,
+            args.mlx_run_report,
+            args.conditioning,
+            expected_modulation_identity=expected_modulation_identity,
         )
         source_tar_sha = _sha256(args.source_tar)
         source_anchor, source_identity = _load_source_anchor(

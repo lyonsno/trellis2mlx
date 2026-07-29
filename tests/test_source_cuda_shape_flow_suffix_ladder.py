@@ -5,12 +5,63 @@ import numpy as np
 import pytest
 
 
+MODULATION_NPZ_SHA256 = "c" * 64
+MODULATION_REPORT_SHA256 = "d" * 64
+MODULATION_SOURCE_CHECKPOINT_SHA256 = "e" * 64
+
+
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_capture(tmp_path, *, recurrence_delta=0.0, backend="mlx-metal"):
+def _modulation_identity():
+    return {
+        "schema": "trellis2mlx.source_cuda_timestep_modulation_lut.v1",
+        "route_identity_evidence": True,
+        "route": "source-cuda-t4-canonical-shared-adaln-lut",
+        "npz_path": "/authenticated/cuda_result.npz",
+        "npz_sha256_effective": MODULATION_NPZ_SHA256,
+        "report_path": "/authenticated/cuda_result.json",
+        "report_sha256_effective": MODULATION_REPORT_SHA256,
+        "source_checkpoint_sha256_effective": (
+            MODULATION_SOURCE_CHECKPOINT_SHA256
+        ),
+        "step_indices": list(range(8)),
+        "timestep_float32_bits": [
+            "0x447a0000",
+            "0x446ea2e9",
+            "0x44610000",
+            "0x44505555",
+            "0x443b8000",
+            "0x4420b6db",
+            "0x43fa0000",
+            "0x43960000",
+        ],
+        "modulation_shape": [8, 9216],
+    }
+
+
+def _expected_modulation_identity():
+    return {
+        "npz_sha256_effective": MODULATION_NPZ_SHA256,
+        "report_sha256_effective": MODULATION_REPORT_SHA256,
+        "source_checkpoint_sha256_effective": (
+            MODULATION_SOURCE_CHECKPOINT_SHA256
+        ),
+    }
+
+
+def _write_capture(
+    tmp_path,
+    *,
+    recurrence_delta=0.0,
+    backend="mlx-metal",
+    checkpoint_modulation_identity=None,
+):
     steps = 8
+    modulation_identity = _modulation_identity()
+    if checkpoint_modulation_identity is None:
+        checkpoint_modulation_identity = modulation_identity
     sample_in = np.zeros((steps, 2, 3), dtype=np.float32)
     pred_final = np.ones_like(sample_in)
     schedule = np.linspace(1, 0, steps + 1)
@@ -42,6 +93,9 @@ def _write_capture(tmp_path, *, recurrence_delta=0.0, backend="mlx-metal"):
         rescale_t=np.asarray(3.0, dtype=np.float32),
         sigma_min=np.asarray(1e-5, dtype=np.float32),
         shape_flow_block_injection_json=np.asarray(""),
+        shape_timestep_modulation_lut_json=np.asarray(
+            json.dumps(checkpoint_modulation_identity, sort_keys=True)
+        ),
     )
     conditioning = tmp_path / "conditioning.npz"
     np.savez(
@@ -62,6 +116,11 @@ def _write_capture(tmp_path, *, recurrence_delta=0.0, backend="mlx-metal"):
                     "token_count": 2,
                     "channel_count": 3,
                     "recurrence_exact": recurrence_delta == 0.0,
+                    "sampler": {
+                        "shape_timestep_modulation_route": (
+                            modulation_identity
+                        ),
+                    },
                 },
                 "route_identity": {
                     "requested_stop": "shape_flow_steps",
@@ -76,6 +135,18 @@ def _write_capture(tmp_path, *, recurrence_delta=0.0, backend="mlx-metal"):
                         "shape_slat_support_sample_sha256": "b" * 64,
                         "shape_flow_block_injection_trace_path": None,
                         "shape_flow_block_injection_manifest_path": None,
+                        "shape_timestep_modulation_lut_sha256_effective": (
+                            MODULATION_NPZ_SHA256
+                        ),
+                        "shape_timestep_modulation_report_sha256_effective": (
+                            MODULATION_REPORT_SHA256
+                        ),
+                        "shape_timestep_modulation_source_checkpoint_sha256": (
+                            MODULATION_SOURCE_CHECKPOINT_SHA256
+                        ),
+                        "shape_timestep_modulation_identity": (
+                            modulation_identity
+                        ),
                     },
                 },
             },
@@ -100,12 +171,21 @@ def test_load_mlx_trajectory_binds_admitted_route_and_exact_recurrence(tmp_path)
     from scripts.source_cuda_shape_flow_suffix_ladder import load_mlx_trajectory
 
     capture, report, conditioning = _write_capture(tmp_path)
-    arrays, identity = load_mlx_trajectory(capture, report, conditioning)
+    arrays, identity = load_mlx_trajectory(
+        capture,
+        report,
+        conditioning,
+        expected_modulation_identity=_expected_modulation_identity(),
+    )
 
     assert arrays["sample_in"].shape == (8, 2, 3)
     assert np.array_equal(arrays["sample_in"][0], arrays["noise"])
     assert identity["backend"] == "mlx-metal"
     assert identity["capture_sha256"] == _sha256(capture)
+    assert (
+        identity["shape_timestep_modulation_identity"]
+        == _modulation_identity()
+    )
 
 
 def test_load_mlx_trajectory_rejects_false_closure_routes_and_recurrence(tmp_path):
@@ -113,11 +193,45 @@ def test_load_mlx_trajectory_rejects_false_closure_routes_and_recurrence(tmp_pat
 
     capture, report, conditioning = _write_capture(tmp_path, backend="cpu")
     with pytest.raises(ValueError, match="backend"):
-        load_mlx_trajectory(capture, report, conditioning)
+        load_mlx_trajectory(
+            capture,
+            report,
+            conditioning,
+            expected_modulation_identity=_expected_modulation_identity(),
+        )
 
     capture, report, conditioning = _write_capture(tmp_path, recurrence_delta=0.25)
     with pytest.raises(ValueError, match="recurrence"):
-        load_mlx_trajectory(capture, report, conditioning)
+        load_mlx_trajectory(
+            capture,
+            report,
+            conditioning,
+            expected_modulation_identity=_expected_modulation_identity(),
+        )
+
+
+def test_load_mlx_trajectory_rejects_substituted_modulation_checkpoint_identity(
+    tmp_path,
+):
+    from scripts.source_cuda_shape_flow_suffix_ladder import load_mlx_trajectory
+
+    substituted = _modulation_identity()
+    substituted["npz_sha256_effective"] = "f" * 64
+    capture, report, conditioning = _write_capture(
+        tmp_path,
+        checkpoint_modulation_identity=substituted,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="checkpoint.*timestep modulation identity",
+    ):
+        load_mlx_trajectory(
+            capture,
+            report,
+            conditioning,
+            expected_modulation_identity=_expected_modulation_identity(),
+        )
 
 
 def test_anchor_classification_is_explicit_at_both_anchors_and_ties():
@@ -233,6 +347,7 @@ def test_cli_missing_inputs_remove_stale_primary_and_write_durable_report(tmp_pa
             "--output-npz", str(output),
             "--mlx-shape-flow-steps", str(tmp_path / "missing-steps.npz"),
             "--mlx-run-report", str(tmp_path / "missing-run.json"),
+            "--mlx-timestep-modulation-route", "default",
             "--conditioning", str(tmp_path / "missing-conditioning.npz"),
             "--accepted-source-baseline", str(tmp_path / "missing-baseline.npz"),
             "--accepted-source-report", str(tmp_path / "missing-source.json"),
@@ -261,6 +376,7 @@ def test_cli_refuses_to_delete_an_input_collision(tmp_path):
             "--output-npz", str(capture),
             "--mlx-shape-flow-steps", str(capture),
             "--mlx-run-report", str(report_input),
+            "--mlx-timestep-modulation-route", "default",
             "--conditioning", str(conditioning),
             "--accepted-source-baseline", str(tmp_path / "baseline.npz"),
             "--accepted-source-report", str(tmp_path / "source.json"),

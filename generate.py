@@ -952,6 +952,18 @@ def main():
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
+    parser.add_argument("--shape-timestep-modulation-lut", metavar="NPZ",
+                        help="Diagnostic: replay authenticated source-CUDA shared AdaLN modulation.")
+    parser.add_argument("--shape-timestep-modulation-report", metavar="JSON",
+                        help="Witness report authenticating --shape-timestep-modulation-lut.")
+    parser.add_argument("--expected-shape-timestep-modulation-lut-sha256",
+                        help="Require the source-CUDA modulation NPZ to match this SHA256.")
+    parser.add_argument("--expected-shape-timestep-modulation-report-sha256",
+                        help="Require the source-CUDA modulation report to match this SHA256.")
+    parser.add_argument(
+        "--expected-shape-timestep-modulation-source-checkpoint-sha256",
+        help="Require the modulation witness to bind this source checkpoint SHA256.",
+    )
     parser.add_argument("--shape-flow-block-injection-trace", metavar="NPZ",
                         help="Diagnostic: inject a named shape-flow block tensor from an NPZ trace.")
     parser.add_argument("--shape-flow-block-injection-manifest", metavar="JSON",
@@ -1039,6 +1051,32 @@ def main():
         )
     if (args.shape_flow_block_injection_trace or args.shape_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with shape-flow block injection")
+    modulation_lut_args = (
+        args.shape_timestep_modulation_lut,
+        args.shape_timestep_modulation_report,
+        args.expected_shape_timestep_modulation_lut_sha256,
+        args.expected_shape_timestep_modulation_report_sha256,
+        args.expected_shape_timestep_modulation_source_checkpoint_sha256,
+    )
+    if any(modulation_lut_args) and not all(modulation_lut_args):
+        parser.error(
+            "source-CUDA shape timestep modulation replay requires the LUT, "
+            "witness report, both expected artifact SHA256 values, and the "
+            "expected source checkpoint SHA256"
+        )
+    if all(modulation_lut_args) and not args.no_cascade:
+        parser.error(
+            "source-CUDA shape timestep modulation replay requires --no-cascade"
+        )
+    if all(modulation_lut_args) and args.stop_after_stage not in {
+        "shape_flow_step",
+        "shape_flow_steps",
+        "shape_flow_block_trace",
+    }:
+        parser.error(
+            "source-CUDA shape timestep modulation replay is only valid for "
+            "shape-flow diagnostic stops"
+        )
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
     if (
@@ -2021,6 +2059,33 @@ def main():
             sort_keys=True,
         )
 
+    shape_timestep_modulation_lut = None
+    shape_timestep_modulation_lut_json = ""
+    if args.shape_timestep_modulation_lut:
+        from trellmlx.timestep_modulation_lut import (
+            load_source_cuda_timestep_modulation_lut,
+        )
+
+        shape_timestep_modulation_lut = (
+            load_source_cuda_timestep_modulation_lut(
+                npz_path=args.shape_timestep_modulation_lut,
+                report_path=args.shape_timestep_modulation_report,
+                expected_npz_sha256=(
+                    args.expected_shape_timestep_modulation_lut_sha256
+                ),
+                expected_report_sha256=(
+                    args.expected_shape_timestep_modulation_report_sha256
+                ),
+                expected_source_checkpoint_sha256=(
+                    args.expected_shape_timestep_modulation_source_checkpoint_sha256
+                ),
+            )
+        )
+        shape_timestep_modulation_lut_json = json.dumps(
+            shape_timestep_modulation_lut.report_identity(),
+            sort_keys=True,
+        )
+
     N_lr = len(lr_coords)
     if args.shape_flow_noise_sample:
         shape_flow_noise_sample_npz = np.load(args.shape_flow_noise_sample)
@@ -2100,6 +2165,7 @@ def main():
                 verbose=False,
                 coords=mx.array(lr_coords),
                 capture_steps=shape_trace_steps,
+                shape_timestep_modulation_lut=shape_timestep_modulation_lut,
                 **SHAPE_SAMPLER,
             )
             if shape_trace_step_index >= len(shape_trace_steps):
@@ -2126,6 +2192,7 @@ def main():
                 else None
             ),
             shape_block_injection_branch="pos",
+            shape_timestep_modulation_lut=shape_timestep_modulation_lut,
         )
         neg_trace = lr_slat_flow.trace_block(
             shape_trace_sample,
@@ -2141,6 +2208,7 @@ def main():
                 else None
             ),
             shape_block_injection_branch="neg",
+            shape_timestep_modulation_lut=shape_timestep_modulation_lut,
         )
 
         def trace_np(value):
@@ -2184,6 +2252,9 @@ def main():
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_timestep_modulation_lut_json=np.array(
+                shape_timestep_modulation_lut_json
+            ),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
@@ -2212,6 +2283,7 @@ def main():
         capture_steps=shape_step_captures,
         stop_after_first_step=args.stop_after_stage == "shape_flow_step",
         shape_block_injection=shape_block_injection,
+        shape_timestep_modulation_lut=shape_timestep_modulation_lut,
         **SHAPE_SAMPLER,
     )
     mx.eval(lr_slat)
@@ -2250,6 +2322,9 @@ def main():
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_timestep_modulation_lut_json=np.array(
+                shape_timestep_modulation_lut_json
+            ),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
@@ -2313,6 +2388,9 @@ def main():
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
             sigma_min=np.array(1e-5, dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
+            shape_timestep_modulation_lut_json=np.array(
+                shape_timestep_modulation_lut_json
+            ),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
