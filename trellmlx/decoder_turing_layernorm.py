@@ -26,6 +26,8 @@ _turing_rsqrt_lut_artifact_sha256_attested = None
 _turing_rsqrt_lut_content_sha256 = None
 _affine_kernel = None
 _affine_stats_kernel = None
+_noaffine_kernel = None
+_noaffine_stats_kernel = None
 
 
 def configure_decoder_layernorm_backend(
@@ -123,6 +125,33 @@ def decoder_layernorm_backend_identity(
             "hidden_width": 1024,
             "affine": True,
         },
+        "authenticated_contracts": [
+            {
+                "input_dtype": "float16",
+                "parameter_dtype": "float16",
+                "hidden_width": 1024,
+                "affine": True,
+                "reduction": {
+                    "threads": 128,
+                    "warps": 4,
+                    "vector_width": 4,
+                    "values_per_thread": 8,
+                    "accumulator_dtype": "float32",
+                },
+            },
+            {
+                "input_dtype": "float16",
+                "hidden_width": 512,
+                "affine": False,
+                "reduction": {
+                    "threads": 128,
+                    "warps": 4,
+                    "vector_width": 4,
+                    "values_per_thread": 4,
+                    "accumulator_dtype": "float32",
+                },
+            },
+        ],
         "reduction": {
             "threads": 128,
             "warps": 4,
@@ -164,6 +193,28 @@ def layernorm_affine(
     )
 
 
+def layernorm_noaffine(
+    x: mx.array,
+    eps: float = 1e-6,
+) -> mx.array:
+    """Dispatch an authenticated non-affine decoder LayerNorm."""
+    if _backend == DEFAULT_BACKEND:
+        return mx.fast.layer_norm(x, None, None, eps).astype(x.dtype)
+    if x.ndim != 2 or x.shape[1] != 512:
+        shape = x.shape if x.ndim == 2 else None
+        raise ValueError(
+            f"{_backend} non-affine route is authenticated only for "
+            f"2D width-512 rows, got {shape}"
+        )
+    if _turing_rsqrt_delta_lut is None:
+        raise RuntimeError(f"{_backend} correction LUT is not configured")
+    return turing_layernorm_noaffine_fp16(
+        x,
+        _turing_rsqrt_delta_lut,
+        eps,
+    )
+
+
 def _validate_turing_rsqrt_lut(rsqrt_delta_lut: mx.array) -> None:
     if rsqrt_delta_lut.dtype != mx.int8:
         raise ValueError(
@@ -180,10 +231,8 @@ def _validate_turing_rsqrt_lut(rsqrt_delta_lut: mx.array) -> None:
         )
 
 
-def _validate_contract(
+def _validate_input_contract(
     x: mx.array,
-    weight: mx.array,
-    bias: mx.array,
     rsqrt_delta_lut: mx.array,
 ) -> int:
     if x.dtype != mx.float16:
@@ -197,6 +246,17 @@ def _validate_contract(
         raise ValueError(
             f"Turing decoder LayerNorm width must be a nonzero multiple of 4, got {width}"
         )
+    _validate_turing_rsqrt_lut(rsqrt_delta_lut)
+    return width
+
+
+def _validate_affine_contract(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    rsqrt_delta_lut: mx.array,
+) -> int:
+    width = _validate_input_contract(x, rsqrt_delta_lut)
     for name, parameter in (("weight", weight), ("bias", bias)):
         if parameter.dtype != mx.float16:
             raise ValueError(
@@ -208,7 +268,6 @@ def _validate_contract(
                 f"Turing decoder LayerNorm {name} shape must be ({width},), "
                 f"got {parameter.shape}"
             )
-    _validate_turing_rsqrt_lut(rsqrt_delta_lut)
     return width
 
 
@@ -221,7 +280,7 @@ def turing_layernorm_affine_fp16(
 ) -> mx.array:
     """Apply the PyTorch CUDA FP16 affine LayerNorm arithmetic contract."""
     global _affine_kernel
-    width = _validate_contract(x, weight, bias, rsqrt_delta_lut)
+    width = _validate_affine_contract(x, weight, bias, rsqrt_delta_lut)
     if _affine_kernel is None:
         _affine_kernel = _build_affine_kernel(include_stats=False)
     return _run_affine_kernel(
@@ -245,7 +304,7 @@ def turing_layernorm_affine_fp16_with_stats(
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     """Apply the exact route and expose mean, pre-rsqrt variance, and rstd."""
     global _affine_stats_kernel
-    width = _validate_contract(x, weight, bias, rsqrt_delta_lut)
+    width = _validate_affine_contract(x, weight, bias, rsqrt_delta_lut)
     if _affine_stats_kernel is None:
         _affine_stats_kernel = _build_affine_kernel(include_stats=True)
     return tuple(
@@ -254,6 +313,48 @@ def turing_layernorm_affine_fp16_with_stats(
             x,
             weight,
             bias,
+            rsqrt_delta_lut,
+            width,
+            eps,
+            include_stats=True,
+        )
+    )
+
+
+def turing_layernorm_noaffine_fp16(
+    x: mx.array,
+    rsqrt_delta_lut: mx.array,
+    eps: float = 1e-6,
+) -> mx.array:
+    """Apply the PyTorch CUDA FP16 non-affine LayerNorm arithmetic contract."""
+    global _noaffine_kernel
+    width = _validate_input_contract(x, rsqrt_delta_lut)
+    if _noaffine_kernel is None:
+        _noaffine_kernel = _build_noaffine_kernel(include_stats=False)
+    return _run_noaffine_kernel(
+        _noaffine_kernel,
+        x,
+        rsqrt_delta_lut,
+        width,
+        eps,
+        include_stats=False,
+    )[0]
+
+
+def turing_layernorm_noaffine_fp16_with_stats(
+    x: mx.array,
+    rsqrt_delta_lut: mx.array,
+    eps: float = 1e-6,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Apply the non-affine exact route and expose its reduction statistics."""
+    global _noaffine_stats_kernel
+    width = _validate_input_contract(x, rsqrt_delta_lut)
+    if _noaffine_stats_kernel is None:
+        _noaffine_stats_kernel = _build_noaffine_kernel(include_stats=True)
+    return tuple(
+        _run_noaffine_kernel(
+            _noaffine_stats_kernel,
+            x,
             rsqrt_delta_lut,
             width,
             eps,
@@ -298,7 +399,47 @@ def _run_affine_kernel(
     )
 
 
+def _run_noaffine_kernel(
+    kernel,
+    x: mx.array,
+    rsqrt_delta_lut: mx.array,
+    width: int,
+    eps: float,
+    *,
+    include_stats: bool,
+):
+    rows = x.shape[0]
+    inputs = [
+        x,
+        mx.array([eps], dtype=mx.float32),
+        rsqrt_delta_lut,
+        mx.array([width], dtype=mx.uint32),
+    ]
+    output_shapes = [x.shape]
+    output_dtypes = [mx.float16]
+    if include_stats:
+        stats_shape = (rows, 1)
+        output_shapes.extend((stats_shape, stats_shape, stats_shape))
+        output_dtypes.extend((mx.float32, mx.float32, mx.float32))
+    return kernel(
+        inputs=inputs,
+        template=[("T", mx.float16)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+    )
+
+
 def _build_affine_kernel(*, include_stats: bool):
+    return _build_kernel(affine=True, include_stats=include_stats)
+
+
+def _build_noaffine_kernel(*, include_stats: bool):
+    return _build_kernel(affine=False, include_stats=include_stats)
+
+
+def _build_kernel(*, affine: bool, include_stats: bool):
     header = r"""
         struct WelfordDataDecoder {
             float mean;
@@ -349,6 +490,51 @@ def _build_affine_kernel(*, include_stats: bool):
         }
         """
         output_names.extend(("mean_out", "variance_out", "rstd_out"))
+    if affine:
+        output_write = r"""
+        for (uint vector_index = thread_index;
+             vector_index < width_value / vector_width;
+             vector_index += warp_width * warp_count) {
+            uint channel = vector_index * vector_width;
+            uint offset = row_offset + channel;
+            float normalized0 =
+                rstd * (static_cast<float>(inp[offset]) - mean);
+            float normalized1 =
+                rstd * (static_cast<float>(inp[offset + 1]) - mean);
+            float normalized2 =
+                rstd * (static_cast<float>(inp[offset + 2]) - mean);
+            float normalized3 =
+                rstd * (static_cast<float>(inp[offset + 3]) - mean);
+            out[offset] = static_cast<T>(
+                metal::fma(static_cast<float>(weight[channel]), normalized0,
+                           static_cast<float>(bias[channel])));
+            out[offset + 1] = static_cast<T>(
+                metal::fma(static_cast<float>(weight[channel + 1]), normalized1,
+                           static_cast<float>(bias[channel + 1])));
+            out[offset + 2] = static_cast<T>(
+                metal::fma(static_cast<float>(weight[channel + 2]), normalized2,
+                           static_cast<float>(bias[channel + 2])));
+            out[offset + 3] = static_cast<T>(
+                metal::fma(static_cast<float>(weight[channel + 3]), normalized3,
+                           static_cast<float>(bias[channel + 3])));
+        }
+        """
+    else:
+        output_write = r"""
+        for (uint vector_index = thread_index;
+             vector_index < width_value / vector_width;
+             vector_index += warp_width * warp_count) {
+            uint offset = row_offset + vector_index * vector_width;
+            out[offset] = static_cast<T>(
+                rstd * (static_cast<float>(inp[offset]) - mean));
+            out[offset + 1] = static_cast<T>(
+                rstd * (static_cast<float>(inp[offset + 1]) - mean));
+            out[offset + 2] = static_cast<T>(
+                rstd * (static_cast<float>(inp[offset + 2]) - mean));
+            out[offset + 3] = static_cast<T>(
+                rstd * (static_cast<float>(inp[offset + 3]) - mean));
+        }
+        """
     source = r"""
         constexpr uint vector_width = 4;
         constexpr uint warp_width = 32;
@@ -422,41 +608,23 @@ def _build_affine_kernel(*, include_stats: bool):
         float rstd = as_type<float>(static_cast<uint>(corrected_bits));
 
         __WRITE_STATS__
-
-        for (uint vector_index = thread_index;
-             vector_index < width_value / vector_width;
-             vector_index += warp_width * warp_count) {
-            uint channel = vector_index * vector_width;
-            uint offset = row_offset + channel;
-            float normalized0 =
-                rstd * (static_cast<float>(inp[offset]) - mean);
-            float normalized1 =
-                rstd * (static_cast<float>(inp[offset + 1]) - mean);
-            float normalized2 =
-                rstd * (static_cast<float>(inp[offset + 2]) - mean);
-            float normalized3 =
-                rstd * (static_cast<float>(inp[offset + 3]) - mean);
-            out[offset] = static_cast<T>(
-                metal::fma(static_cast<float>(weight[channel]), normalized0,
-                           static_cast<float>(bias[channel])));
-            out[offset + 1] = static_cast<T>(
-                metal::fma(static_cast<float>(weight[channel + 1]), normalized1,
-                           static_cast<float>(bias[channel + 1])));
-            out[offset + 2] = static_cast<T>(
-                metal::fma(static_cast<float>(weight[channel + 2]), normalized2,
-                           static_cast<float>(bias[channel + 2])));
-            out[offset + 3] = static_cast<T>(
-                metal::fma(static_cast<float>(weight[channel + 3]), normalized3,
-                           static_cast<float>(bias[channel + 3])));
-        }
-    """.replace("__WRITE_STATS__", stats_write)
+        __OUTPUT_WRITE__
+    """.replace("__WRITE_STATS__", stats_write).replace(
+        "__OUTPUT_WRITE__",
+        output_write,
+    )
+    route = "affine" if affine else "noaffine"
+    input_names = ["inp", "eps"]
+    if affine:
+        input_names.extend(("weight", "bias"))
+    input_names.extend(("rsqrt_delta", "width"))
     return mx.fast.metal_kernel(
         name=(
-            "decoder_turing_welford_layernorm_f16_affine_stats"
+            f"decoder_turing_welford_layernorm_f16_{route}_stats"
             if include_stats
-            else "decoder_turing_welford_layernorm_f16_affine"
+            else f"decoder_turing_welford_layernorm_f16_{route}"
         ),
-        input_names=["inp", "eps", "weight", "bias", "rsqrt_delta", "width"],
+        input_names=input_names,
         output_names=output_names,
         header=header,
         source=source,

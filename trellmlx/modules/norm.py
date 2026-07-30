@@ -45,4 +45,8 @@ class LayerNorm32(nn.Module):
             from ..decoder_turing_layernorm import layernorm_affine
 
             return layernorm_affine(x, weight, bias, self.eps).astype(orig_dtype)
+        if self.decoder_layernorm:
+            from ..decoder_turing_layernorm import layernorm_noaffine
+
+            return layernorm_noaffine(x, self.eps).astype(orig_dtype)
         return mx.fast.layer_norm(x, weight, bias, self.eps).astype(orig_dtype)

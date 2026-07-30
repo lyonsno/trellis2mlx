@@ -95,6 +95,33 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
         "hidden_width": 1024,
         "affine": True,
     }
+    assert identity["authenticated_contracts"] == [
+        {
+            "input_dtype": "float16",
+            "parameter_dtype": "float16",
+            "hidden_width": 1024,
+            "affine": True,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "values_per_thread": 8,
+                "accumulator_dtype": "float32",
+            },
+        },
+        {
+            "input_dtype": "float16",
+            "hidden_width": 512,
+            "affine": False,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "values_per_thread": 4,
+                "accumulator_dtype": "float32",
+            },
+        },
+    ]
     assert identity["turing_rsqrt_lut_artifact_sha256_attested"] == artifact_sha256
     assert identity["turing_rsqrt_lut_content_sha256"] == hashlib.sha256(
         np.asarray(correction).tobytes()
@@ -131,6 +158,56 @@ def test_decoder_layernorm_consumer_dispatches_exact_backend():
     mx.eval(actual)
 
     np.testing.assert_array_equal(np.asarray(actual), expected)
+
+
+def test_decoder_noaffine_layernorm_consumer_dispatches_exact_backend(monkeypatch):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+    from trellmlx.modules.norm import LayerNorm32
+
+    called = {}
+
+    def fake_noaffine(x, eps):
+        called["shape"] = x.shape
+        called["eps"] = eps
+        return mx.full(x.shape, 7, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "layernorm_noaffine",
+        fake_noaffine,
+        raising=False,
+    )
+    norm = LayerNorm32(512, affine=False, decoder_layernorm=True)
+    actual = norm(mx.zeros((3, 512), dtype=mx.float16))
+    mx.eval(actual)
+
+    assert called == {"shape": (3, 512), "eps": 1e-6}
+    np.testing.assert_array_equal(np.asarray(actual), np.full((3, 512), 7))
+
+
+def test_turing_decoder_noaffine_layernorm_matches_identity_affine_schedule():
+    import mlx.core as mx
+
+    from trellmlx.decoder_turing_layernorm import (
+        turing_layernorm_affine_fp16,
+        turing_layernorm_noaffine_fp16,
+    )
+
+    values = np.linspace(-9.0, 11.0, 3 * 512, dtype=np.float16).reshape(3, 512)
+    correction = mx.zeros((1 << 24,), dtype=mx.int8)
+    x = mx.array(values)
+    expected = turing_layernorm_affine_fp16(
+        x,
+        mx.ones((512,), dtype=mx.float16),
+        mx.zeros((512,), dtype=mx.float16),
+        correction,
+    )
+    actual = turing_layernorm_noaffine_fp16(x, correction)
+    mx.eval(expected, actual)
+
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def test_shape_decoder_level_zero_norms_are_exact_route_consumers():
@@ -185,6 +262,7 @@ def test_shape_decoder_exact_layernorm_enrollment_stops_at_authenticated_width()
     assert len(level0_upsample) == 1
     assert all(block.norm.decoder_layernorm for block in level0_blocks)
     assert level0_upsample[0].norm1.decoder_layernorm is True
+    assert level0_upsample[0].norm2.decoder_layernorm is True
     assert all(block.norm.decoder_layernorm is False for block in level1_blocks)
 
 
