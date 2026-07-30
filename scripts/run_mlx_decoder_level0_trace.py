@@ -9,11 +9,16 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import traceback
 from typing import Any
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.decoder_level0_trace_contract import (
     decoder_trace_input_sha256,
@@ -22,7 +27,6 @@ from scripts.decoder_level0_trace_contract import (
 
 
 SCHEMA = "trellis2mlx.decoder_level0_trace_run.v1"
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_parser() -> argparse.ArgumentParser:

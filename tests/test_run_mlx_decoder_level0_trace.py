@@ -1,7 +1,28 @@
 import hashlib
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
+
+
+def test_decoder_trace_script_entry_points_resolve_repo_contract_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    for relative_path in (
+        "scripts/run_mlx_decoder_level0_trace.py",
+        "scripts/compare_decoder_level0_traces.py",
+        "scripts/source_cuda_postcond_full_decode_timing.py",
+    ):
+        completed = subprocess.run(
+            [sys.executable, str(repo_root / relative_path), "--help"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, (
+            f"{relative_path} direct entry failed:\n{completed.stderr}"
+        )
 
 
 def test_local_trace_failure_before_primary_writes_durable_phase_report(tmp_path):
