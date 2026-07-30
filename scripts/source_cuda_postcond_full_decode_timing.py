@@ -85,6 +85,41 @@ def load_decoder_level0_trace_contract():
     raise ModuleNotFoundError("decoder_level0_trace_contract")
 
 
+def load_decoder_level1_trace_contract():
+    if not __package__:
+        contract_path = Path(__file__).resolve().with_name(
+            "decoder_level1_trace_contract.py"
+        )
+        if not contract_path.is_file():
+            raise ModuleNotFoundError(
+                "standalone decoder trace runner requires adjacent contract "
+                f"{contract_path}",
+                name="decoder_level1_trace_contract",
+            )
+        spec = importlib.util.spec_from_file_location(
+            "decoder_level1_trace_contract",
+            contract_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"cannot load decoder level-one trace contract from {contract_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    for module_name in (
+        "scripts.decoder_level1_trace_contract",
+        "decoder_level1_trace_contract",
+    ):
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {module_name, module_name.split(".", 1)[0]}:
+                raise
+    raise ModuleNotFoundError("decoder_level1_trace_contract")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", required=True, type=Path)
@@ -158,6 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Capture exact operation boundaries through the official shape "
             "decoder's first level without subdivision or mesh conversion."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-level1-trace",
+        action="store_true",
+        help=(
+            "Capture the official shape decoder's first channel-to-spatial "
+            "upsample and level-one block 0 without mesh conversion."
         ),
     )
     parser.add_argument(
@@ -933,8 +976,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     decoder_state_only = bool(args.decoder_state_only)
     decoder_level0_trace = bool(args.decoder_level0_trace)
+    decoder_level1_trace = bool(args.decoder_level1_trace)
+    decoder_trace_mode = decoder_level0_trace or decoder_level1_trace
     route_name = (
-        "official-source-cuda-shape-decoder-level0-trace"
+        "official-source-cuda-shape-decoder-level1-trace"
+        if decoder_level1_trace
+        else "official-source-cuda-shape-decoder-level0-trace"
         if decoder_level0_trace
         else "official-source-cuda-shape-slat-decoder-raw-state"
         if decoder_state_only
@@ -972,11 +1019,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "resolution": 512,
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
-            "raw_meshes": not decoder_state_only and not decoder_level0_trace,
+            "decoder_level1_trace": decoder_level1_trace,
+            "raw_meshes": not decoder_state_only and not decoder_trace_mode,
             "post_fill_holes_snapshots": (
-                not decoder_state_only and not decoder_level0_trace
+                not decoder_state_only and not decoder_trace_mode
             ),
-            "mesh_conversion": not decoder_state_only and not decoder_level0_trace,
+            "mesh_conversion": not decoder_state_only and not decoder_trace_mode,
             "one_model_load": True,
             "no_download": bool(args.no_download),
         },
@@ -1001,9 +1049,16 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     try:
         if collision:
             raise ValueError("--output-json collides with protected input")
-        if decoder_state_only and decoder_level0_trace:
+        if sum(
+            (
+                decoder_state_only,
+                decoder_level0_trace,
+                decoder_level1_trace,
+            )
+        ) > 1:
             raise ValueError(
-                "--decoder-state-only and --decoder-level0-trace are mutually exclusive"
+                "--decoder-state-only, --decoder-level0-trace, and "
+                "--decoder-level1-trace are mutually exclusive"
             )
         if grid_path is None:
             raise ValueError("--shape-slat-grid is required for selective decode")
@@ -1021,7 +1076,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             raise ValueError("duplicate --shape-slat-point values are not allowed")
 
         output_dir = Path(args.output_dir)
-        if decoder_level0_trace:
+        if decoder_level1_trace:
+            expected_paths = [
+                output_dir / f"{point_name}.decoder-level1-trace.npz"
+                for point_name in point_names
+            ]
+        elif decoder_level0_trace:
             expected_paths = [
                 output_dir / f"{point_name}.decoder-level0-trace.npz"
                 for point_name in point_names
@@ -1102,13 +1162,14 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             path.unlink(missing_ok=True)
         report["selected_point_names"] = point_names
         report["expected_artifact_count"] = len(expected_paths)
-        if decoder_level0_trace:
+        if decoder_trace_mode:
+            trace_level = 1 if decoder_level1_trace else 0
             report["decoder_trace_artifacts"] = [
                 {
                     "coordinate_key": point_name,
                     "path": str(
                         output_dir
-                        / f"{point_name}.decoder-level0-trace.npz"
+                        / f"{point_name}.decoder-level{trace_level}-trace.npz"
                     ),
                     "status": "not_written",
                 }
@@ -1136,7 +1197,9 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             ]
         if expected_output_collision:
             output_kind = (
-                "decoder-level0-trace"
+                "decoder-level1-trace"
+                if decoder_level1_trace
+                else "decoder-level0-trace"
                 if decoder_level0_trace
                 else "decoder-state"
                 if decoder_state_only
@@ -1199,14 +1262,15 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "resolution": 512,
                         "decoder_state_only": decoder_state_only,
                         "decoder_level0_trace": decoder_level0_trace,
+                        "decoder_level1_trace": decoder_level1_trace,
                         "raw_meshes": (
-                            not decoder_state_only and not decoder_level0_trace
+                            not decoder_state_only and not decoder_trace_mode
                         ),
                         "post_fill_holes_snapshots": (
-                            not decoder_state_only and not decoder_level0_trace
+                            not decoder_state_only and not decoder_trace_mode
                         ),
                         "mesh_conversion": (
-                            not decoder_state_only and not decoder_level0_trace
+                            not decoder_state_only and not decoder_trace_mode
                         ),
                         "one_model_load": True,
                     },
@@ -1303,36 +1367,62 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             point_started = time.perf_counter()
             feats_tensor = torch.from_numpy(selected_arrays[point_name].copy()).to(device=device)
             shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
-            if decoder_level0_trace:
+            if decoder_trace_mode:
                 with torch.no_grad():
-                    trace_arrays = capture_source_decoder_level0_trace(
-                        decoder,
-                        shape_slat,
+                    trace_arrays = (
+                        capture_source_decoder_level1_trace(
+                            decoder,
+                            shape_slat,
+                        )
+                        if decoder_level1_trace
+                        else capture_source_decoder_level0_trace(
+                            decoder,
+                            shape_slat,
+                        )
                     )
                 sync_cuda(torch)
+                trace_level = 1 if decoder_level1_trace else 0
                 trace_path = (
                     output_dir
-                    / f"{point_name}.decoder-level0-trace.npz"
+                    / f"{point_name}.decoder-level{trace_level}-trace.npz"
                 )
-                trace_contract = load_decoder_level0_trace_contract()
-
-                validation = trace_contract.write_decoder_level0_trace_npz(
-                    trace_path,
-                    trace_arrays,
-                    latent_channels=32,
-                    channels=1024,
-                    torso_dtype=np.float16,
-                )
+                if decoder_level1_trace:
+                    trace_contract = load_decoder_level1_trace_contract()
+                    validation = trace_contract.write_decoder_level1_trace_npz(
+                        trace_path,
+                        trace_arrays,
+                        parent_channels=1024,
+                        child_channels=512,
+                        torso_dtype=np.float16,
+                    )
+                    input_tensor_sha256 = (
+                        trace_contract.decoder_level1_trace_input_sha256(
+                            trace_arrays["level0_output"],
+                            trace_arrays["parent_coords"],
+                        )
+                    )
+                else:
+                    trace_contract = load_decoder_level0_trace_contract()
+                    validation = trace_contract.write_decoder_level0_trace_npz(
+                        trace_path,
+                        trace_arrays,
+                        latent_channels=32,
+                        channels=1024,
+                        torso_dtype=np.float16,
+                    )
+                    input_tensor_sha256 = (
+                        trace_contract.decoder_trace_input_sha256(
+                            selected_arrays[point_name],
+                            coords,
+                        )
+                    )
                 trace_artifact = decoder_trace_artifact_by_key[point_name]
                 trace_artifact.update(
                     {
                         "status": "written",
                         "sha256": sha256_file(trace_path),
                         "size_bytes": trace_path.stat().st_size,
-                        "input_tensor_sha256": trace_contract.decoder_trace_input_sha256(
-                            selected_arrays[point_name],
-                            coords,
-                        ),
+                        "input_tensor_sha256": input_tensor_sha256,
                         "validation": validation,
                     }
                 )
@@ -1439,14 +1529,15 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "resolution": 512,
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
-            "raw_meshes": not decoder_state_only and not decoder_level0_trace,
+            "decoder_level1_trace": decoder_level1_trace,
+            "raw_meshes": not decoder_state_only and not decoder_trace_mode,
             "post_fill_holes_snapshots": (
-                not decoder_state_only and not decoder_level0_trace
+                not decoder_state_only and not decoder_trace_mode
             ),
-            "mesh_conversion": not decoder_state_only and not decoder_level0_trace,
+            "mesh_conversion": not decoder_state_only and not decoder_trace_mode,
             "one_model_load": True,
         }
-        if not decoder_state_only and not decoder_level0_trace:
+        if not decoder_state_only and not decoder_trace_mode:
             effective_route["fill_holes_effective_change_count"] = sum(
                 bool(point["fill_holes_effective_change"])
                 for point in point_results
@@ -1457,7 +1548,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 "failure_phase": None,
                 "last_trustworthy_phase": (
                     "all_selected_decoder_traces_written"
-                    if decoder_level0_trace
+                    if decoder_trace_mode
                     else
                     "all_selected_decoder_states_written"
                     if decoder_state_only
@@ -1619,6 +1710,133 @@ def capture_source_decoder_level0_trace(
         "torso_input": tensor_to_numpy(torso_input.feats),
         **block_arrays,
         "level0_subdiv_logits": tensor_to_numpy(level0_subdiv.feats),
+    }
+    return {
+        name: np.ascontiguousarray(values)
+        for name, values in arrays.items()
+    }
+
+
+def capture_source_decoder_level1_trace(
+    decoder: Any,
+    shape_slat: Any,
+) -> dict[str, np.ndarray]:
+    import torch.nn.functional as torch_functional
+
+    from trellis2.models.sc_vaes.sparse_unet_vae import (
+        SparseConvNeXtBlock3d,
+        SparseResBlockC2S3d,
+    )
+
+    level0 = decoder.blocks[0]
+    level0_blocks = [
+        block for block in level0 if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    level0_upsample = [
+        block for block in level0 if isinstance(block, SparseResBlockC2S3d)
+    ]
+    level1_blocks = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    if len(level0_blocks) != 4 or len(level0_upsample) != 1:
+        raise ValueError(
+            "source level-one trace requires four level-zero ConvNeXt blocks "
+            f"and one upsample, got {len(level0_blocks)} and "
+            f"{len(level0_upsample)}"
+        )
+    if len(level1_blocks) != 16:
+        raise ValueError(
+            "source level-one trace requires sixteen level-one ConvNeXt "
+            f"blocks, got {len(level1_blocks)}"
+        )
+
+    current = decoder.from_latent(shape_slat).type(decoder.dtype)
+    for block in level0_blocks:
+        current = block(current)
+    level0_output = current
+    upsample = level0_upsample[0]
+
+    subdiv = upsample.to_subdiv(level0_output)
+    norm1 = upsample.norm1(level0_output.feats)
+    silu1 = torch_functional.silu(norm1)
+    conv1 = upsample.conv1(level0_output.replace(silu1))
+    subdiv_binarized = subdiv.replace(subdiv.feats > 0)
+    h_c2s = upsample.updown(conv1, subdiv_binarized)
+    skip_c2s = upsample.updown(level0_output, subdiv_binarized)
+    norm2 = upsample.norm2(h_c2s.feats)
+    silu2 = torch_functional.silu(norm2)
+    conv2 = upsample.conv2(h_c2s.replace(silu2))
+    skip_repeated = upsample.skip_connection(skip_c2s)
+    upsample_output = conv2 + skip_repeated
+
+    natural_output, natural_subdiv = upsample(level0_output)
+    for name, manual, natural in (
+        ("features", upsample_output.feats, natural_output.feats),
+        ("coordinates", upsample_output.coords, natural_output.coords),
+        ("subdivision logits", subdiv.feats, natural_subdiv.feats),
+    ):
+        if not np.array_equal(
+            tensor_to_numpy(manual),
+            tensor_to_numpy(natural),
+        ):
+            raise RuntimeError(
+                "manual source first-upsample trace does not exactly "
+                f"reproduce natural {name}"
+            )
+    if not np.array_equal(
+        tensor_to_numpy(h_c2s.coords),
+        tensor_to_numpy(skip_c2s.coords),
+    ):
+        raise RuntimeError(
+            "source upsample feature and skip coordinates differ"
+        )
+
+    block0 = level1_blocks[0]
+    block0_conv_state = block0.conv(upsample_output)
+    block0_norm = block0.norm(block0_conv_state.feats)
+    block0_fc1 = block0.mlp[0](block0_norm)
+    block0_silu = block0.mlp[1](block0_fc1)
+    block0_fc2 = block0.mlp[2](block0_silu)
+    block0_output = upsample_output.replace(
+        block0_fc2 + upsample_output.feats
+    )
+    natural_block0 = block0(upsample_output)
+    for name, manual, natural in (
+        ("features", block0_output.feats, natural_block0.feats),
+        ("coordinates", block0_output.coords, natural_block0.coords),
+    ):
+        if not np.array_equal(
+            tensor_to_numpy(manual),
+            tensor_to_numpy(natural),
+        ):
+            raise RuntimeError(
+                "manual source level-one block-0 trace does not exactly "
+                f"reproduce natural {name}"
+            )
+
+    arrays = {
+        "parent_coords": tensor_to_numpy(level0_output.coords),
+        "child_coords": tensor_to_numpy(natural_output.coords),
+        "level0_output": tensor_to_numpy(level0_output.feats),
+        "upsample_subdiv_logits": tensor_to_numpy(subdiv.feats),
+        "upsample_norm1": tensor_to_numpy(norm1),
+        "upsample_silu1": tensor_to_numpy(silu1),
+        "upsample_conv1": tensor_to_numpy(conv1.feats),
+        "upsample_h_c2s": tensor_to_numpy(h_c2s.feats),
+        "upsample_skip_c2s": tensor_to_numpy(skip_c2s.feats),
+        "upsample_skip_repeated": tensor_to_numpy(skip_repeated.feats),
+        "upsample_norm2": tensor_to_numpy(norm2),
+        "upsample_silu2": tensor_to_numpy(silu2),
+        "upsample_conv2": tensor_to_numpy(conv2.feats),
+        "upsample_output": tensor_to_numpy(natural_output.feats),
+        "level1_block0_conv": tensor_to_numpy(block0_conv_state.feats),
+        "level1_block0_norm": tensor_to_numpy(block0_norm),
+        "level1_block0_mlp_fc1": tensor_to_numpy(block0_fc1),
+        "level1_block0_silu": tensor_to_numpy(block0_silu),
+        "level1_block0_mlp_fc2": tensor_to_numpy(block0_fc2),
+        "level1_block0_output": tensor_to_numpy(natural_block0.feats),
     }
     return {
         name: np.ascontiguousarray(values)

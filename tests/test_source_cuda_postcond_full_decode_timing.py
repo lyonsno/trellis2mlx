@@ -152,6 +152,87 @@ def test_level0_trace_contract_package_import_keeps_package_identity():
     assert contract.__name__ == "scripts.decoder_level0_trace_contract"
 
 
+def test_level1_trace_contract_loads_from_flat_kaggle_capsule(tmp_path):
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    shutil.copy2(
+        Path(source_runner.__file__),
+        capsule / "source_cuda_postcond_full_decode_timing.py",
+    )
+    shutil.copy2(
+        Path(source_runner.__file__).with_name("decoder_level1_trace_contract.py"),
+        capsule / "decoder_level1_trace_contract.py",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import source_cuda_postcond_full_decode_timing as runner; "
+                "contract = runner.load_decoder_level1_trace_contract(); "
+                "assert contract.__name__ == 'decoder_level1_trace_contract'"
+            ),
+        ],
+        cwd=capsule,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_level1_trace_contract_missing_from_flat_capsule_fails_locally(tmp_path):
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    shutil.copy2(
+        Path(source_runner.__file__),
+        capsule / "source_cuda_postcond_full_decode_timing.py",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import source_cuda_postcond_full_decode_timing as runner; "
+                "\ntry:\n"
+                "    runner.load_decoder_level1_trace_contract()\n"
+                "except ModuleNotFoundError as exc:\n"
+                "    assert exc.name == 'decoder_level1_trace_contract'\n"
+                "    assert 'adjacent contract' in str(exc)\n"
+                "else:\n"
+                "    raise AssertionError('inherited package contract was accepted')\n"
+            ),
+        ],
+        cwd=capsule,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_parser_exposes_decoder_level1_trace_mode():
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    args = source_runner.build_parser().parse_args(
+        [
+            "--output-json",
+            "report.json",
+            "--decoder-level1-trace",
+        ]
+    )
+
+    assert args.decoder_level1_trace is True
+
+
 def _shape_slat_decode_args(
     tmp_path,
     grid,
@@ -251,6 +332,75 @@ def test_shape_slat_level0_trace_and_raw_state_are_mutually_exclusive(tmp_path):
         point_names,
     )
     args.extend(["--decoder-level0-trace", "--decoder-state-only"])
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "mutually exclusive" in report["error"]
+
+
+def test_shape_slat_level1_trace_preflight_records_distinct_effective_route(
+    tmp_path,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.append("--decoder-level1-trace")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    trace_path = tmp_path / "meshes" / "alpha-1_beta-1.decoder-level1-trace.npz"
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["requested_route"]["decoder_level1_trace"] is True
+    assert report["requested_route"]["raw_meshes"] is False
+    assert (
+        report["effective_route"]["route"]
+        == "official-source-cuda-shape-decoder-level1-trace"
+    )
+    assert report["effective_route"]["device_type"] == "not_loaded_no_download"
+    assert report["decoder_trace_artifacts"] == [
+        {
+            "coordinate_key": "alpha-1_beta-1",
+            "path": str(trace_path),
+            "status": "not_written_no_download",
+        }
+    ]
+    assert report["mesh_artifacts"] == []
+    assert report["decoder_state_artifacts"] == []
+    assert not trace_path.exists()
+
+
+def test_shape_slat_level0_and_level1_trace_are_mutually_exclusive(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.extend(["--decoder-level0-trace", "--decoder-level1-trace"])
 
     rc = main(args)
 
