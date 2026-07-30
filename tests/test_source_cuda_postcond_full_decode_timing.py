@@ -113,6 +113,74 @@ def _shape_slat_decode_args(
     return args
 
 
+def test_shape_slat_level0_trace_preflight_records_distinct_effective_route(
+    tmp_path,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.append("--decoder-level0-trace")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    trace_path = tmp_path / "meshes" / "alpha-1_beta-1.decoder-level0-trace.npz"
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["requested_route"]["decoder_level0_trace"] is True
+    assert (
+        report["effective_route"]["route"]
+        == "official-source-cuda-shape-decoder-level0-trace"
+    )
+    assert report["effective_route"]["device_type"] == "not_loaded_no_download"
+    assert report["decoder_trace_artifacts"] == [
+        {
+            "coordinate_key": "alpha-1_beta-1",
+            "path": str(trace_path),
+            "status": "not_written_no_download",
+        }
+    ]
+    assert report["mesh_artifacts"] == []
+    assert report["decoder_state_artifacts"] == []
+    assert not trace_path.exists()
+
+
+def test_shape_slat_level0_trace_and_raw_state_are_mutually_exclusive(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.extend(["--decoder-level0-trace", "--decoder-state-only"])
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "mutually exclusive" in report["error"]
+
+
 def _write_shape_slat_suffix_fixture(tmp_path):
     import hashlib
     import json
