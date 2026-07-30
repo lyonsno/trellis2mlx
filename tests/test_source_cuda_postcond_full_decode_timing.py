@@ -1,3 +1,8 @@
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 
@@ -71,6 +76,38 @@ def _write_shape_slat_grid_fixture(tmp_path, *, points=None):
         + "\n"
     )
     return grid, source_report, [row[0] for row in points]
+
+
+def test_level0_trace_contract_loads_from_flat_kaggle_capsule(tmp_path):
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    runner_path = capsule / "source_cuda_postcond_full_decode_timing.py"
+    contract_path = capsule / "decoder_level0_trace_contract.py"
+    shutil.copy2(Path(source_runner.__file__), runner_path)
+    shutil.copy2(
+        Path(source_runner.__file__).with_name("decoder_level0_trace_contract.py"),
+        contract_path,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import source_cuda_postcond_full_decode_timing as runner; "
+                "contract = runner.load_decoder_level0_trace_contract(); "
+                "assert contract.__name__ == 'decoder_level0_trace_contract'"
+            ),
+        ],
+        cwd=capsule,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _shape_slat_decode_args(

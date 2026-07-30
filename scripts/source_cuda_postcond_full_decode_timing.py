@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,19 @@ MODEL_NAMES_BY_PIPELINE_TYPE = {
         "tex_slat_flow_model_1024",
     ),
 }
+
+
+def load_decoder_level0_trace_contract():
+    for module_name in (
+        "scripts.decoder_level0_trace_contract",
+        "decoder_level0_trace_contract",
+    ):
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {module_name, module_name.split(".", 1)[0]}:
+                raise
+    raise ModuleNotFoundError("decoder_level0_trace_contract")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1278,12 +1292,9 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     output_dir
                     / f"{point_name}.decoder-level0-trace.npz"
                 )
-                from scripts.decoder_level0_trace_contract import (
-                    decoder_trace_input_sha256,
-                    write_decoder_level0_trace_npz,
-                )
+                trace_contract = load_decoder_level0_trace_contract()
 
-                validation = write_decoder_level0_trace_npz(
+                validation = trace_contract.write_decoder_level0_trace_npz(
                     trace_path,
                     trace_arrays,
                     latent_channels=32,
@@ -1296,7 +1307,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "status": "written",
                         "sha256": sha256_file(trace_path),
                         "size_bytes": trace_path.stat().st_size,
-                        "input_tensor_sha256": decoder_trace_input_sha256(
+                        "input_tensor_sha256": trace_contract.decoder_trace_input_sha256(
                             selected_arrays[point_name],
                             coords,
                         ),
