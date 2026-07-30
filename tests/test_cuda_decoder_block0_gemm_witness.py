@@ -240,6 +240,236 @@ def test_cublas_gemm_ex_maps_row_major_product_to_column_major_call():
     assert integer(call[18]) == CUBLAS_GEMM_DEFAULT_TENSOR_OP
 
 
+def test_cublas_gemm_ex_can_publish_fp32_output_without_changing_inputs():
+    from scripts.cuda_decoder_block0_gemm_witness import (
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        CUDA_R_32F,
+        _invoke_cublas_gemm_ex,
+    )
+
+    class PointerTensor:
+        def __init__(self, shape, pointer):
+            self.shape = shape
+            self._pointer = pointer
+
+        def data_ptr(self):
+            return self._pointer
+
+        def is_contiguous(self):
+            return True
+
+    calls = []
+
+    def gemm_ex(*args):
+        calls.append(args)
+        return 0
+
+    status = _invoke_cublas_gemm_ex(
+        gemm_ex,
+        handle=44,
+        x=PointerTensor((7697, 1024), 11),
+        weight=PointerTensor((1024, 1024), 22),
+        output=PointerTensor((7697, 1024), 33),
+        output_cuda_type=CUDA_R_32F,
+        algorithm_id=CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+    )
+
+    assert status == 0
+    assert len(calls) == 1
+    call = calls[0]
+    integer = lambda value: value.value
+    assert (integer(call[8]), integer(call[11])) == (2, 2)
+    assert integer(call[15]) == CUDA_R_32F
+    assert integer(call[17]) == CUDA_R_32F
+
+
+def test_sm75_compiler_evidence_requires_wmma_ptx_and_hmma_1688_sass():
+    from scripts import cuda_decoder_block0_gemm_witness as witness
+
+    classify = getattr(witness, "classify_sm75_compiler_evidence", None)
+    assert callable(classify), "SM75 compiler classifier is not implemented"
+
+    target_symbol = "_Z25sm75_wmma_gemm_kernelPK6__halfS1_Pfiii"
+    evidence = classify(
+        ptx="\n".join(
+            [
+                "Fatbin ptx code:",
+                "arch = sm_75",
+                ".target sm_75",
+                f".visible .entry {target_symbol}(",
+                ")",
+                "{",
+                (
+                    "wmma.mma.sync.aligned.row.row.m16n16k16"
+                    ".f32.f16.f16.f32"
+                ),
+                "}",
+            ]
+        ),
+        sass="\n".join(
+            [
+                "Fatbin elf code:",
+                "arch = sm_75",
+                "code for sm_75",
+                f"Function : {target_symbol}",
+                "/*03d0*/ HMMA.1688.F32 R8, R12, R20, R8;",
+            ]
+        ),
+    )
+    assert evidence["effective_ptx_architecture"] == "sm_75"
+    assert evidence["effective_cubin_architecture"] == "sm_75"
+    assert evidence["ptx_target_symbol"] == target_symbol
+    assert evidence["sass_target_symbol"] == target_symbol
+    assert evidence["ptx_wmma_m16n16k16_count"] == 1
+    assert evidence["sass_hmma_1688_count"] == 1
+
+    unrelated_symbol = "_Z21unrelated_wmma_kernelv"
+    with pytest.raises(ValueError, match="target.*PTX"):
+        classify(
+            ptx="\n".join(
+                [
+                    "arch = sm_75",
+                    ".target sm_75",
+                    f".visible .entry {unrelated_symbol}()",
+                    "{",
+                    (
+                        "wmma.mma.sync.aligned.row.row.m16n16k16"
+                        ".f32.f16.f16.f32"
+                    ),
+                    "}",
+                ]
+            ),
+            sass="\n".join(
+                [
+                    "arch = sm_75",
+                    "code for sm_75",
+                    f"Function : {unrelated_symbol}",
+                    "/*03d0*/ HMMA.1688.F32 R8, R12, R20, R8;",
+                ]
+            ),
+        )
+
+    with pytest.raises(ValueError, match="sm_75.*SASS"):
+        classify(
+            ptx="\n".join(
+                [
+                    "arch = sm_75",
+                    ".target sm_75",
+                    f".visible .entry {target_symbol}()",
+                    "{",
+                    (
+                        "wmma.mma.sync.aligned.row.row.m16n16k16"
+                        ".f32.f16.f16.f32"
+                    ),
+                    "}",
+                ]
+            ),
+            sass="\n".join(
+                [
+                    "arch = sm_80",
+                    "code for sm_80",
+                    f"Function : {target_symbol}",
+                    "/*03d0*/ HMMA.1688.F32 R8, R12, R20, R8;",
+                ]
+            ),
+        )
+
+
+def test_sm75_probe_arrays_require_exact_input_window_bytes():
+    from scripts import cuda_decoder_block0_gemm_witness as witness
+
+    validate = getattr(witness, "validate_sm75_mma_probe_arrays", None)
+    assert callable(validate), "SM75 probe-array validation is not implemented"
+
+    arrays = {
+        "wmma_input_window": np.zeros((16, 32), dtype=np.float16),
+        "cublas_tensor_fp16_unbiased_row": np.zeros(4, dtype=np.float16),
+        "cublas_regular_fp16_unbiased_row": np.zeros(4, dtype=np.float16),
+        "cublas_tensor_fp32_row": np.zeros(4, dtype=np.float32),
+        "cublas_regular_fp32_row": np.zeros(4, dtype=np.float32),
+        "wmma_fp32_row": np.zeros(4, dtype=np.float32),
+    }
+    validated = validate(arrays, reduction=32, channels=4)
+    assert np.array_equal(validated["wmma_input_window"], arrays["wmma_input_window"])
+
+    missing = dict(arrays)
+    del missing["wmma_input_window"]
+    with pytest.raises(ValueError, match="wmma_input_window"):
+        validate(missing, reduction=32, channels=4)
+
+    wrong_dtype = dict(arrays)
+    wrong_dtype["wmma_input_window"] = np.zeros((16, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="wmma_input_window.*float16"):
+        validate(wrong_dtype, reduction=32, channels=4)
+
+
+def test_sm75_analysis_authenticates_tensor_and_regular_prebias_rows():
+    from scripts import cuda_decoder_block0_gemm_witness as witness
+
+    analyze = getattr(witness, "analyze_sm75_mma_outputs", None)
+    assert callable(analyze), "SM75 MMA analysis is not implemented"
+
+    bias = np.asarray([0.5, -0.25], dtype=np.float16)
+    tensor = np.asarray([1.0, 2.0], dtype=np.float16)
+    regular = np.asarray([1.5, 1.0], dtype=np.float16)
+    outputs = {
+        "cublas_tensor_fp16_unbiased_row": tensor,
+        "cublas_regular_fp16_unbiased_row": regular,
+        "cublas_tensor_fp32_row": tensor.astype(np.float32),
+        "cublas_regular_fp32_row": regular.astype(np.float32),
+        "wmma_fp32_row": tensor.astype(np.float32),
+    }
+    report = analyze(
+        outputs=outputs,
+        bias=bias,
+        source_trace_row=(tensor + bias).astype(np.float16),
+        local_trace_row=(regular + bias).astype(np.float16),
+    )
+
+    assert report["self_authentication"] == {
+        "tensor_fp16_plus_bias_exact_source": True,
+        "regular_fp16_plus_bias_exact_local": True,
+    }
+    assert report["localization"] == "sm75_wmma_chain_exact_cublas_tensor"
+    assert report["wmma_fp32_vs_cublas_tensor_fp32"]["nonzero"] == 0
+
+    outputs["cublas_regular_fp16_unbiased_row"] = tensor
+    with pytest.raises(ValueError, match="regular.*local"):
+        analyze(
+            outputs=outputs,
+            bias=bias,
+            source_trace_row=(tensor + bias).astype(np.float16),
+            local_trace_row=(regular + bias).astype(np.float16),
+        )
+
+
+def test_sm75_analysis_preserves_mainloop_or_epilogue_discriminator():
+    from scripts import cuda_decoder_block0_gemm_witness as witness
+
+    analyze = getattr(witness, "analyze_sm75_mma_outputs", None)
+    assert callable(analyze), "SM75 MMA analysis is not implemented"
+
+    tensor = np.asarray([1.0, 2.0], dtype=np.float16)
+    regular = np.asarray([1.0, 2.5], dtype=np.float16)
+    outputs = {
+        "cublas_tensor_fp16_unbiased_row": tensor,
+        "cublas_regular_fp16_unbiased_row": regular,
+        "cublas_tensor_fp32_row": tensor.astype(np.float32),
+        "cublas_regular_fp32_row": regular.astype(np.float32),
+        "wmma_fp32_row": regular.astype(np.float32),
+    }
+    report = analyze(
+        outputs=outputs,
+        bias=np.zeros(2, dtype=np.float16),
+        source_trace_row=tensor,
+        local_trace_row=regular,
+    )
+
+    assert report["localization"] == "cublas_mainloop_or_epilogue_required"
+    assert report["wmma_fp16_vs_cublas_tensor_fp16"]["nonzero"] == 1
+    assert report["wmma_fp16_vs_cublas_regular_fp16"]["nonzero"] == 0
+
+
 def test_cublas_sweep_records_every_status_and_full_matrix_metric():
     from scripts.cuda_decoder_block0_gemm_witness import (
         CUBLAS_STATUS_NOT_SUPPORTED,
@@ -424,6 +654,11 @@ def test_cuda_runtime_records_requested_and_effective_policy_per_variant(
             },
             {"default_tensor_op_exact_pytorch_full": True},
         ),
+    )
+    monkeypatch.setattr(
+        witness,
+        "_run_sm75_mma_probe",
+        lambda **kwargs: ({}, {"route": "test-sm75-wmma"}),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
@@ -682,6 +917,16 @@ def test_gemm_witness_removes_primary_on_postpublication_hard_interrupt(
         name: source_row.copy()
         for name in witness.VARIANT_NAMES
     }
+    outputs.update(
+        {
+            "wmma_input_window": np.zeros((16, 4), dtype=np.float16),
+            "cublas_tensor_fp16_unbiased_row": source_row.copy(),
+            "cublas_regular_fp16_unbiased_row": source_row.copy(),
+            "cublas_tensor_fp32_row": source_row.astype(np.float32),
+            "cublas_regular_fp32_row": source_row.astype(np.float32),
+            "wmma_fp32_row": source_row.astype(np.float32),
+        }
+    )
     monkeypatch.setattr(
         witness,
         "_run_cuda",

@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import time
 import traceback
@@ -18,7 +20,7 @@ import zipfile
 import numpy as np
 
 
-SCHEMA = "trellis2mlx.cuda_decoder_block0_gemm_witness.v2"
+SCHEMA = "trellis2mlx.cuda_decoder_block0_gemm_witness.v3"
 EXPECTED_TORCH = "2.10.0+cu128"
 EXPECTED_DEVICE = "Tesla T4"
 VARIANT_NAMES = (
@@ -34,6 +36,8 @@ CUBLAS_OP_N = 0
 CUDA_R_32F = 0
 CUDA_R_16F = 2
 CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99
+CUBLAS_GEMM_REGULAR_REFERENCE = 2
+CUBLAS_GEMM_TENSOR_REFERENCE = 100
 LEGACY_CUBLAS_EXPLICIT_ALGORITHM_IDS = (
     *range(0, 24),
     *range(100, 116),
@@ -44,12 +48,127 @@ SOURCE_ROUTE = "official-source-cuda-shape-decoder-level0-trace"
 LOCAL_ROUTE = "mlx-shape-decoder-level0-trace-fp16"
 CENTER_KERNEL_INDEX = 13
 
+SM75_WMMA_CPP_SOURCE = """
+torch::Tensor sm75_wmma_gemm_cuda(
+    torch::Tensor input,
+    torch::Tensor weight);
+"""
+
+SM75_WMMA_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+namespace wmma = nvcuda::wmma;
+
+__global__ void sm75_wmma_gemm_kernel(
+    const half* input,
+    const half* weight,
+    float* output,
+    int rows,
+    int channels,
+    int reduction) {
+  const int tile_row = static_cast<int>(blockIdx.y) * 16;
+  const int tile_col = static_cast<int>(blockIdx.x) * 16;
+  if (tile_row >= rows || tile_col >= channels) {
+    return;
+  }
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>
+      input_fragment;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+      weight_fragment;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+      accumulator_fragment;
+  wmma::fill_fragment(accumulator_fragment, 0.0f);
+
+  for (int offset = 0; offset < reduction; offset += 16) {
+    wmma::load_matrix_sync(
+        input_fragment,
+        input + tile_row * reduction + offset,
+        reduction);
+    wmma::load_matrix_sync(
+        weight_fragment,
+        weight + offset * channels + tile_col,
+        channels);
+    wmma::mma_sync(
+        accumulator_fragment,
+        input_fragment,
+        weight_fragment,
+        accumulator_fragment);
+  }
+  wmma::store_matrix_sync(
+      output + tile_row * channels + tile_col,
+      accumulator_fragment,
+      channels,
+      wmma::mem_row_major);
+}
+
+torch::Tensor sm75_wmma_gemm_cuda(
+    torch::Tensor input,
+    torch::Tensor weight) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "inputs must be CUDA");
+  TORCH_CHECK(
+      input.scalar_type() == at::kHalf &&
+          weight.scalar_type() == at::kHalf,
+      "inputs must be float16");
+  TORCH_CHECK(
+      input.is_contiguous() && weight.is_contiguous(),
+      "inputs must be contiguous");
+  TORCH_CHECK(
+      input.dim() == 2 && weight.dim() == 2,
+      "inputs must be matrices");
+  const int rows = static_cast<int>(input.size(0));
+  const int reduction = static_cast<int>(input.size(1));
+  TORCH_CHECK(
+      weight.size(0) == reduction,
+      "weight reduction dimension mismatch");
+  const int channels = static_cast<int>(weight.size(1));
+  TORCH_CHECK(
+      rows % 16 == 0 && channels % 16 == 0 && reduction % 16 == 0,
+      "WMMA dimensions must be multiples of 16");
+
+  auto output = torch::empty(
+      {rows, channels},
+      input.options().dtype(torch::kFloat32));
+  const dim3 grid(channels / 16, rows / 16);
+  sm75_wmma_gemm_kernel<<<
+      grid,
+      32,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+          output.data_ptr<float>(),
+          rows,
+          channels,
+          reduction);
+  const cudaError_t error = cudaGetLastError();
+  TORCH_CHECK(
+      error == cudaSuccess,
+      "SM75 WMMA kernel launch failed: ",
+      cudaGetErrorString(error));
+  return output;
+}
+"""
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_array(array: np.ndarray) -> str:
+    value = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(value.dtype.str.encode("ascii"))
+    digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+    digest.update(value.tobytes())
     return digest.hexdigest()
 
 
@@ -335,6 +454,238 @@ def analyze_outputs(
     }
 
 
+def _ptx_target_function(ptx: str) -> tuple[str, str, list[str]]:
+    lines = ptx.splitlines()
+    architecture: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(".target "):
+            architecture = stripped.removeprefix(".target ").split(",", 1)[0]
+        if (
+            ".entry" not in stripped
+            or "sm75_wmma_gemm_kernel" not in stripped
+            or architecture != "sm_75"
+        ):
+            continue
+        symbol = stripped.split(".entry", 1)[1].strip().split("(", 1)[0]
+        section: list[str] = []
+        brace_depth = 0
+        body_started = False
+        for section_line in lines[index:]:
+            section.append(section_line)
+            brace_depth += section_line.count("{")
+            if "{" in section_line:
+                body_started = True
+            brace_depth -= section_line.count("}")
+            if body_started and brace_depth == 0:
+                return architecture, symbol, section
+        raise ValueError("target SM75 WMMA PTX function body is incomplete")
+    raise ValueError("compiler evidence lacks target SM75 WMMA kernel PTX")
+
+
+def _sass_target_function(sass: str) -> tuple[str, str, list[str]]:
+    lines = sass.splitlines()
+    architecture: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("code for "):
+            architecture = stripped.removeprefix("code for ").split()[0]
+        if (
+            not stripped.startswith("Function :")
+            or "sm75_wmma_gemm_kernel" not in stripped
+            or architecture != "sm_75"
+        ):
+            continue
+        symbol = stripped.split(":", 1)[1].strip()
+        section = [line]
+        for section_line in lines[index + 1 :]:
+            section_stripped = section_line.strip()
+            if (
+                section_stripped.startswith("Function :")
+                or section_stripped.startswith("code for ")
+                or section_stripped.startswith("Fatbin ")
+            ):
+                break
+            section.append(section_line)
+        return architecture, symbol, section
+    raise ValueError("compiler evidence lacks sm_75 target-kernel SASS")
+
+
+def classify_sm75_compiler_evidence(
+    *, ptx: str, sass: str
+) -> dict[str, Any]:
+    ptx_arch, ptx_symbol, ptx_section = _ptx_target_function(ptx)
+    sass_arch, sass_symbol, sass_section = _sass_target_function(sass)
+    if ptx_symbol != sass_symbol:
+        raise ValueError(
+            "PTX and SASS target-kernel symbols differ: "
+            f"{ptx_symbol} versus {sass_symbol}"
+        )
+    ptx_matching_lines = [
+        line.strip()
+        for line in ptx_section
+        if (
+            "wmma.mma.sync.aligned" in line
+            and "m16n16k16" in line
+            and "f32" in line
+        )
+    ]
+    sass_matching_lines = [
+        line.strip() for line in sass_section if "HMMA.1688" in line
+    ]
+    ptx_count = len(ptx_matching_lines)
+    sass_count = len(sass_matching_lines)
+    if not ptx_count:
+        raise ValueError(
+            "target-kernel PTX lacks WMMA m16n16k16 FP32 accumulation"
+        )
+    if not sass_count:
+        raise ValueError(
+            "target-kernel sm_75 SASS lacks HMMA.1688 instructions"
+        )
+    return {
+        "effective_ptx_architecture": ptx_arch,
+        "effective_cubin_architecture": sass_arch,
+        "ptx_target_symbol": ptx_symbol,
+        "sass_target_symbol": sass_symbol,
+        "ptx_wmma_m16n16k16_count": ptx_count,
+        "sass_hmma_1688_count": sass_count,
+        "ptx_matching_lines": ptx_matching_lines,
+        "sass_matching_lines": sass_matching_lines,
+    }
+
+
+def validate_sm75_mma_probe_arrays(
+    arrays: dict[str, np.ndarray],
+    *,
+    reduction: int,
+    channels: int,
+) -> dict[str, np.ndarray]:
+    required = {
+        "wmma_input_window": (np.dtype(np.float16), (16, reduction)),
+        "cublas_tensor_fp16_unbiased_row": (
+            np.dtype(np.float16),
+            (channels,),
+        ),
+        "cublas_regular_fp16_unbiased_row": (
+            np.dtype(np.float16),
+            (channels,),
+        ),
+        "cublas_tensor_fp32_row": (np.dtype(np.float32), (channels,)),
+        "cublas_regular_fp32_row": (np.dtype(np.float32), (channels,)),
+        "wmma_fp32_row": (np.dtype(np.float32), (channels,)),
+    }
+    normalized: dict[str, np.ndarray] = {}
+    for name, (dtype, shape) in required.items():
+        if name not in arrays:
+            raise ValueError(f"SM75 MMA output missing {name}")
+        value = np.asarray(arrays[name])
+        if value.dtype != dtype:
+            raise ValueError(
+                f"{name} must have dtype {dtype}, got {value.dtype}"
+            )
+        if value.shape != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {value.shape}"
+            )
+        if not np.all(np.isfinite(value)):
+            raise ValueError(f"{name} contains non-finite values")
+        normalized[name] = value
+    return normalized
+
+
+def analyze_sm75_mma_outputs(
+    *,
+    outputs: dict[str, np.ndarray],
+    bias: np.ndarray,
+    source_trace_row: np.ndarray,
+    local_trace_row: np.ndarray,
+) -> dict[str, Any]:
+    required = {
+        "cublas_tensor_fp16_unbiased_row": np.dtype(np.float16),
+        "cublas_regular_fp16_unbiased_row": np.dtype(np.float16),
+        "cublas_tensor_fp32_row": np.dtype(np.float32),
+        "cublas_regular_fp32_row": np.dtype(np.float32),
+        "wmma_fp32_row": np.dtype(np.float32),
+    }
+    source = np.asarray(source_trace_row)
+    local = np.asarray(local_trace_row)
+    bias_row = np.asarray(bias)
+    if source.dtype != np.float16 or local.dtype != np.float16:
+        raise ValueError("source and local trace rows must have dtype float16")
+    if bias_row.dtype != np.float16 or bias_row.shape != source.shape:
+        raise ValueError(
+            "SM75 MMA bias must be a float16 row matching the trace"
+        )
+
+    normalized: dict[str, np.ndarray] = {}
+    for name, dtype in required.items():
+        if name not in outputs:
+            raise ValueError(f"SM75 MMA output missing {name}")
+        value = np.asarray(outputs[name])
+        if value.dtype != dtype:
+            raise ValueError(
+                f"{name} must have dtype {dtype}, got {value.dtype}"
+            )
+        if value.shape != source.shape:
+            raise ValueError(
+                f"{name} shape {value.shape} does not match {source.shape}"
+            )
+        if not np.all(np.isfinite(value)):
+            raise ValueError(f"{name} contains non-finite values")
+        normalized[name] = value
+
+    tensor_fp16 = normalized["cublas_tensor_fp16_unbiased_row"]
+    regular_fp16 = normalized["cublas_regular_fp16_unbiased_row"]
+    tensor_biased = np.add(tensor_fp16, bias_row, dtype=np.float16)
+    regular_biased = np.add(regular_fp16, bias_row, dtype=np.float16)
+    if not np.array_equal(tensor_biased, source):
+        raise ValueError(
+            "cuBLAS tensor FP16 pre-bias row does not reproduce source "
+            "after bias"
+        )
+    if not np.array_equal(regular_biased, local):
+        raise ValueError(
+            "cuBLAS regular FP16 pre-bias row does not reproduce local "
+            "MLX after bias"
+        )
+
+    wmma_fp32 = normalized["wmma_fp32_row"]
+    tensor_fp32 = normalized["cublas_tensor_fp32_row"]
+    regular_fp32 = normalized["cublas_regular_fp32_row"]
+    wmma_fp16 = wmma_fp32.astype(np.float16)
+    wmma_tensor_fp16 = _metric(wmma_fp16, tensor_fp16)
+    wmma_regular_fp16 = _metric(wmma_fp16, regular_fp16)
+    wmma_tensor_fp32 = _metric(wmma_fp32, tensor_fp32)
+    localization = (
+        "sm75_wmma_chain_exact_cublas_tensor"
+        if (
+            wmma_tensor_fp16["exact"]
+            and wmma_tensor_fp32["exact"]
+        )
+        else "cublas_mainloop_or_epilogue_required"
+    )
+    return {
+        "self_authentication": {
+            "tensor_fp16_plus_bias_exact_source": True,
+            "regular_fp16_plus_bias_exact_local": True,
+        },
+        "localization": localization,
+        "wmma_fp16_vs_cublas_tensor_fp16": wmma_tensor_fp16,
+        "wmma_fp16_vs_cublas_regular_fp16": wmma_regular_fp16,
+        "wmma_fp32_vs_cublas_tensor_fp32": wmma_tensor_fp32,
+        "wmma_fp32_vs_cublas_regular_fp32": _metric(
+            wmma_fp32, regular_fp32
+        ),
+        "cublas_tensor_fp32_cast_vs_tensor_fp16": _metric(
+            tensor_fp32.astype(np.float16), tensor_fp16
+        ),
+        "cublas_regular_fp32_cast_vs_regular_fp16": _metric(
+            regular_fp32.astype(np.float16), regular_fp16
+        ),
+    }
+
+
 def _load_npz(path: Path) -> dict[str, np.ndarray]:
     with zipfile.ZipFile(path) as archive:
         logical = [
@@ -374,6 +725,7 @@ def _invoke_cublas_gemm_ex(
     weight,
     output,
     algorithm_id: int,
+    output_cuda_type: int = CUDA_R_16F,
 ) -> int:
     if len(x.shape) != 2 or len(weight.shape) != 2 or len(output.shape) != 2:
         raise ValueError("cuBLAS GEMM tensors must all be two-dimensional")
@@ -392,6 +744,10 @@ def _invoke_cublas_gemm_ex(
     for name, value in (("x", x), ("weight", weight), ("output", output)):
         if not value.is_contiguous():
             raise ValueError(f"cuBLAS GEMM {name} tensor must be contiguous")
+    if output_cuda_type not in {CUDA_R_16F, CUDA_R_32F}:
+        raise ValueError(
+            f"unsupported cuBLAS output CUDA type {output_cuda_type}"
+        )
 
     alpha = ctypes.c_float(1.0)
     beta = ctypes.c_float(0.0)
@@ -411,7 +767,7 @@ def _invoke_cublas_gemm_ex(
         ctypes.c_int(reduction),
         ctypes.byref(beta),
         ctypes.c_void_p(output.data_ptr()),
-        ctypes.c_int(CUDA_R_16F),
+        ctypes.c_int(output_cuda_type),
         ctypes.c_int(channels),
         ctypes.c_int(CUDA_R_32F),
         ctypes.c_int(algorithm_id),
@@ -683,6 +1039,246 @@ def _run_cublas_algorithm_sweep(
     return arrays, report
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _build_sm75_wmma_extension():
+    from torch.utils.cpp_extension import load_inline
+
+    previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.5+PTX"
+    try:
+        return load_inline(
+            name="trellis2mlx_sm75_wmma_gemm_v1",
+            cpp_sources=SM75_WMMA_CPP_SOURCE,
+            cuda_sources=SM75_WMMA_CUDA_SOURCE,
+            functions=["sm75_wmma_gemm_cuda"],
+            extra_cuda_cflags=["-O3", "--fmad=true"],
+            with_cuda=True,
+            verbose=True,
+        )
+    finally:
+        if previous_arch_list is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch_list
+
+
+def _collect_sm75_compiler_evidence(module) -> dict[str, Any]:
+    cuobjdump = shutil.which("cuobjdump")
+    if cuobjdump is None:
+        raise RuntimeError("cuobjdump is unavailable")
+    module_path = Path(module.__file__)
+    if not module_path.is_file():
+        raise RuntimeError(
+            f"compiled WMMA extension is missing: {module_path}"
+        )
+
+    outputs: dict[str, str] = {}
+    commands = {
+        "ptx": [cuobjdump, "--dump-ptx", str(module_path)],
+        "sass": [cuobjdump, "--dump-sass", str(module_path)],
+    }
+    for name, command in commands.items():
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"cuobjdump {name} failed: "
+                + (completed.stdout + completed.stderr).strip()
+            )
+        outputs[name] = completed.stdout
+
+    classification = classify_sm75_compiler_evidence(
+        ptx=outputs["ptx"],
+        sass=outputs["sass"],
+    )
+    return {
+        "requested_architecture": "sm_75",
+        "effective_ptx_architecture": classification[
+            "effective_ptx_architecture"
+        ],
+        "effective_cubin_architecture": classification[
+            "effective_cubin_architecture"
+        ],
+        "ptx_target_symbol": classification["ptx_target_symbol"],
+        "sass_target_symbol": classification["sass_target_symbol"],
+        "torch_cuda_arch_list": "7.5+PTX",
+        "classification": {
+            "ptx_wmma_m16n16k16_count": classification[
+                "ptx_wmma_m16n16k16_count"
+            ],
+            "sass_hmma_1688_count": classification[
+                "sass_hmma_1688_count"
+            ],
+        },
+        "extension_sha256": sha256_file(module_path),
+        "ptx_sha256": _sha256_text(outputs["ptx"]),
+        "sass_sha256": _sha256_text(outputs["sass"]),
+        "ptx_matching_lines": classification["ptx_matching_lines"],
+        "sass_matching_lines": classification["sass_matching_lines"],
+        "cuobjdump_commands": {
+            name: ["cuobjdump", *command[1:-1], "<extension>"]
+            for name, command in commands.items()
+        },
+    }
+
+
+def _run_sm75_mma_probe(
+    *,
+    torch,
+    x,
+    weight,
+    default_product,
+    local_product,
+    row_index: int,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    library, gemm_ex = _load_cublas_gemm_ex()
+    handle = int(torch.cuda.current_blas_handle())
+    rows, channels = (int(value) for value in default_product.shape)
+
+    def run_cublas(*, algorithm_id: int, output_dtype, output_cuda_type: int):
+        candidate = torch.empty(
+            (rows, channels),
+            device="cuda",
+            dtype=output_dtype,
+        )
+        status = _invoke_cublas_gemm_ex(
+            gemm_ex,
+            handle=handle,
+            x=x,
+            weight=weight,
+            output=candidate,
+            output_cuda_type=output_cuda_type,
+            algorithm_id=algorithm_id,
+        )
+        torch.cuda.synchronize()
+        if status != CUBLAS_STATUS_SUCCESS:
+            raise RuntimeError(
+                f"cuBLAS algorithm {algorithm_id} with output type "
+                f"{output_cuda_type} failed with status {status}"
+            )
+        return candidate
+
+    regular_fp16 = run_cublas(
+        algorithm_id=CUBLAS_GEMM_REGULAR_REFERENCE,
+        output_dtype=torch.float16,
+        output_cuda_type=CUDA_R_16F,
+    )
+    tensor_fp16 = run_cublas(
+        algorithm_id=CUBLAS_GEMM_TENSOR_REFERENCE,
+        output_dtype=torch.float16,
+        output_cuda_type=CUDA_R_16F,
+    )
+    regular_nonzero = int(
+        torch.count_nonzero(regular_fp16 != local_product).item()
+    )
+    tensor_nonzero = int(
+        torch.count_nonzero(tensor_fp16 != default_product).item()
+    )
+    if regular_nonzero:
+        raise ValueError(
+            "regular cuBLAS reference no longer reproduces complete local "
+            f"product: {regular_nonzero} mismatches"
+        )
+    if tensor_nonzero:
+        raise ValueError(
+            "tensor cuBLAS reference no longer reproduces complete source "
+            f"product: {tensor_nonzero} mismatches"
+        )
+
+    regular_fp32 = run_cublas(
+        algorithm_id=CUBLAS_GEMM_REGULAR_REFERENCE,
+        output_dtype=torch.float32,
+        output_cuda_type=CUDA_R_32F,
+    )
+    tensor_fp32 = run_cublas(
+        algorithm_id=CUBLAS_GEMM_TENSOR_REFERENCE,
+        output_dtype=torch.float32,
+        output_cuda_type=CUDA_R_32F,
+    )
+
+    window_start = (row_index // 16) * 16
+    if window_start + 16 > rows:
+        window_start = rows - 16
+    if window_start < 0 or not (window_start <= row_index < window_start + 16):
+        raise ValueError("unable to construct a 16-row WMMA target window")
+    input_window = x[window_start : window_start + 16].contiguous()
+    if tuple(input_window.shape) != (16, int(x.shape[1])):
+        raise ValueError(
+            f"WMMA input window has invalid shape {tuple(input_window.shape)}"
+        )
+
+    module = _build_sm75_wmma_extension()
+    compiler_evidence = _collect_sm75_compiler_evidence(module)
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    wmma_output = module.sm75_wmma_gemm_cuda(input_window, weight)
+    torch.cuda.synchronize()
+    wmma_seconds = time.perf_counter() - started
+    if wmma_output.dtype != torch.float32:
+        raise ValueError(
+            f"WMMA output must be float32, got {wmma_output.dtype}"
+        )
+    if tuple(wmma_output.shape) != (16, channels):
+        raise ValueError(
+            f"WMMA output must have shape {(16, channels)}, "
+            f"got {tuple(wmma_output.shape)}"
+        )
+    target_offset = row_index - window_start
+
+    arrays = {
+        "wmma_input_window": _to_cpu_numpy_preserve_dtype(input_window),
+        "cublas_tensor_fp16_unbiased_row": _to_cpu_numpy_preserve_dtype(
+            tensor_fp16[row_index]
+        ),
+        "cublas_regular_fp16_unbiased_row": _to_cpu_numpy_preserve_dtype(
+            regular_fp16[row_index]
+        ),
+        "cublas_tensor_fp32_row": _to_cpu_numpy_preserve_dtype(
+            tensor_fp32[row_index]
+        ),
+        "cublas_regular_fp32_row": _to_cpu_numpy_preserve_dtype(
+            regular_fp32[row_index]
+        ),
+        "wmma_fp32_row": _to_cpu_numpy_preserve_dtype(
+            wmma_output[target_offset]
+        ),
+    }
+    arrays = validate_sm75_mma_probe_arrays(
+        arrays,
+        reduction=int(x.shape[1]),
+        channels=channels,
+    )
+    report = {
+        "route": "direct-sm75-wmma-versus-legacy-cublas",
+        "regular_algorithm_id": CUBLAS_GEMM_REGULAR_REFERENCE,
+        "tensor_algorithm_id": CUBLAS_GEMM_TENSOR_REFERENCE,
+        "regular_fp16_exact_complete_local_product": True,
+        "tensor_fp16_exact_complete_pytorch_product": True,
+        "wmma_input_window": {
+            "start": window_start,
+            "stop": window_start + 16,
+            "target_offset": target_offset,
+            "shape": [16, int(x.shape[1])],
+            "dtype": "float16",
+            "sha256": sha256_array(arrays["wmma_input_window"]),
+        },
+        "wmma_weight_matrix_sha256": sha256_array(
+            _to_cpu_numpy_preserve_dtype(weight)
+        ),
+        "wmma_seconds": wmma_seconds,
+        "compiler_evidence": compiler_evidence,
+    }
+    del library
+    return arrays, report
+
+
 def _reduction_policy(matmul_backend) -> dict[str, bool]:
     return {
         "allow_reduced_precision": bool(
@@ -770,6 +1366,7 @@ def _run_cuda(
     variant_policies: dict[str, dict[str, dict[str, bool]]] = {}
     active_policy_identity: dict[str, dict[str, bool]] | None = None
     cublas_report: dict[str, Any] | None = None
+    sm75_mma_report: dict[str, Any] | None = None
 
     def execute(name: str, fn) -> None:
         if active_policy_identity is None:
@@ -852,6 +1449,19 @@ def _run_cuda(
                     "exact_pytorch_default_full": True,
                 },
             }
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            sm75_arrays, sm75_mma_report = _run_sm75_mma_probe(
+                torch=torch,
+                x=x,
+                weight=weight,
+                default_product=default_product,
+                local_product=local_product,
+                row_index=row_index,
+            )
+            torch.cuda.synchronize()
+            timings["sm75_mma_probe"] = time.perf_counter() - started
+            outputs.update(sm75_arrays)
             active_policy_identity = _set_reduction_policy(
                 matmul_backend,
                 allow_reduced_precision=True,
@@ -886,6 +1496,7 @@ def _run_cuda(
         "default_reduction_policy": original_policy,
         "variant_reduction_policies": variant_policies,
         "cublas_explicit_algorithm_sweep": cublas_report,
+        "sm75_mma_probe": sm75_mma_report,
         "restored_reduction_policy": restored_policy,
         "timings_seconds": timings,
     }
@@ -1022,8 +1633,19 @@ def main(argv: list[str] | None = None) -> int:
         report["last_trustworthy_phase"] = "input_validated"
         report["failure_phase"] = "cuda_execution"
         outputs, runtime = _run_cuda(witness, local_full_product)
+        validate_sm75_mma_probe_arrays(
+            outputs,
+            reduction=int(witness["torso_input"].shape[1]),
+            channels=args.channels,
+        )
         analysis = analyze_outputs(
             outputs=outputs,
+            source_trace_row=witness["source_trace_row"],
+            local_trace_row=witness["local_trace_row"],
+        )
+        analysis["sm75_mma"] = analyze_sm75_mma_outputs(
+            outputs=outputs,
+            bias=witness["bias"],
             source_trace_row=witness["source_trace_row"],
             local_trace_row=witness["local_trace_row"],
         )
