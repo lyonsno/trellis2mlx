@@ -273,6 +273,47 @@ def test_shape_slat_grid_decode_preflight_invalidates_stale_outputs(tmp_path):
     assert not stale_filled.exists()
 
 
+def test_shape_slat_decoder_state_preflight_binds_raw_output_contract(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "alpha-1_beta-1.decoder-state.npz"
+    stale.write_bytes(b"stale")
+    args = _shape_slat_decode_args(tmp_path, grid, source_report, point_names)
+    args.append("--decoder-state-only")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["requested_route"]["route"] == (
+        "official-source-cuda-shape-slat-decoder-raw-state"
+    )
+    assert report["requested_route"]["decoder_state_only"] is True
+    assert report["expected_artifact_count"] == 1
+    assert report["mesh_artifacts"] == []
+    assert report["decoder_state_artifacts"] == [
+        {
+            "coordinate_key": "alpha-1_beta-1",
+            "path": str(output_dir / "alpha-1_beta-1.decoder-state.npz"),
+            "status": "not_written_no_download",
+        }
+    ]
+    assert report["effective_route"]["route"] == (
+        "official-source-cuda-shape-slat-decoder-raw-state"
+    )
+    assert report["effective_route"]["mesh_conversion"] is False
+    assert not stale.exists()
+
+
 def test_shape_slat_suffix_decode_preflight_admits_exact_switch_identity(tmp_path):
     import json
 
@@ -686,6 +727,398 @@ def test_shape_slat_grid_decode_records_direct_decoder_eval_mode(
         assert report["written_artifact_count"] == 0
 
 
+def test_shape_slat_decoder_state_writes_reopened_validated_primary(
+    tmp_path,
+    monkeypatch,
+):
+    import contextlib
+    import json
+    import sys
+    import types
+
+    import numpy as np
+
+    import scripts.source_cuda_postcond_full_decode_timing as runner
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    config_path = tmp_path / "pipeline.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "args": {
+                    "models": {
+                        "shape_slat_decoder": "ckpts/shape-decoder",
+                    }
+                }
+            }
+        )
+        + "\n"
+    )
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def __array__(self, dtype=None):
+            return np.asarray(self.values, dtype=dtype)
+
+        @property
+        def shape(self):
+            return self.values.shape
+
+        def to(self, **_kwargs):
+            return self
+
+    class FakeSparseState:
+        def __init__(self, feats, coords):
+            self.feats = FakeTensor(feats)
+            self.coords = FakeTensor(coords)
+
+    class FakeParameter:
+        def numel(self):
+            return 7
+
+    class FakeDecoder:
+        def __init__(self):
+            self.training = True
+            self.low_vram = False
+
+        def set_resolution(self, resolution):
+            self.resolution = resolution
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def to(self, _device):
+            return self
+
+        def parameters(self):
+            return [FakeParameter()]
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("raw decoder-state route must not invoke mesh wrapper")
+
+    decoder = FakeDecoder()
+    source_models = types.ModuleType("trellis2.models")
+    source_models.from_pretrained = lambda _model_ref: decoder
+    sparse_module = types.ModuleType("trellis2.modules.sparse")
+    sparse_module.SparseTensor = lambda **kwargs: kwargs
+    sparse_module.config = types.SimpleNamespace(ATTN="sdpa", CONV="none")
+    modules_package = types.ModuleType("trellis2.modules")
+    modules_package.sparse = sparse_module
+    trellis2_package = types.ModuleType("trellis2")
+    trellis2_package.models = source_models
+    trellis2_package.modules = modules_package
+
+    torch_module = types.ModuleType("torch")
+    torch_module.__version__ = "test-cuda"
+    torch_module.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_name=lambda _index: "Tesla T4",
+        synchronize=lambda: None,
+    )
+    torch_module.device = lambda value: value
+    torch_module.set_grad_enabled = lambda _enabled: None
+    torch_module.from_numpy = FakeTensor
+    torch_module.no_grad = contextlib.nullcontext
+    hub_module = types.ModuleType("huggingface_hub")
+    hub_module.hf_hub_download = lambda _repo, _path: str(config_path)
+
+    for name, module in {
+        "torch": torch_module,
+        "huggingface_hub": hub_module,
+        "trellis2": trellis2_package,
+        "trellis2.models": source_models,
+        "trellis2.modules": modules_package,
+        "trellis2.modules.sparse": sparse_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(runner, "extract_source", lambda *_args: tmp_path)
+    monkeypatch.setattr(runner, "install_mesh_override", lambda *_args: {"status": "installed"})
+    monkeypatch.setattr(
+        runner,
+        "decode_shape_slat_raw",
+        lambda effective_decoder, _shape_slat: (
+            FakeSparseState(
+                np.array(
+                    [
+                        [0.1, 0.2, 0.3, 1.0, -1.0, 0.5, 0.25],
+                        [0.4, 0.5, 0.6, -1.0, 1.0, -0.5, 0.75],
+                    ],
+                    dtype=np.float32,
+                ),
+                np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+            ),
+            [
+                FakeSparseState(
+                    np.full((2, 8), level + 1, dtype=np.float16),
+                    np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+                )
+                for level in range(4)
+            ],
+        )
+        if effective_decoder is decoder
+        else (_ for _ in ()).throw(AssertionError("wrong decoder")),
+    )
+
+    args = _shape_slat_decode_args(tmp_path, grid, source_report, point_names)
+    args.remove("--no-download")
+    args.append("--decoder-state-only")
+    rc = runner.main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    artifact = report["decoder_state_artifacts"][0]
+    state_path = tmp_path / "meshes" / "alpha-1_beta-1.decoder-state.npz"
+    assert rc == 0
+    assert report["status"] == "done"
+    assert report["written_artifact_count"] == 1
+    assert report["effective_route"]["mesh_conversion"] is False
+    assert artifact["status"] == "written"
+    assert artifact["path"] == str(state_path)
+    assert artifact["sha256"] == runner.sha256_file(state_path)
+    assert artifact["validation"]["feats_shape"] == [2, 7]
+    assert artifact["validation"]["feats_dtype"] == "float32"
+    assert artifact["validation"]["coords_shape"] == [2, 4]
+    assert artifact["validation"]["coords_dtype"] == "int32"
+    assert artifact["validation"]["subdivision_shapes"] == [[2, 8]] * 4
+    assert artifact["validation"]["subdivision_coordinate_shapes"] == [[2, 4]] * 4
+    assert artifact["validation"]["subdivision_dtypes"] == [
+        {"logits": "float16", "coords": "int32"}
+    ] * 4
+    with np.load(state_path, allow_pickle=False) as archive:
+        assert archive.files == [
+            "feats",
+            "coords",
+            "shape_subs_0",
+            "shape_subs_0_coords",
+            "shape_subs_1",
+            "shape_subs_1_coords",
+            "shape_subs_2",
+            "shape_subs_2_coords",
+            "shape_subs_3",
+            "shape_subs_3_coords",
+        ]
+        assert archive["feats"].shape == (2, 7)
+        assert archive["coords"].dtype == np.int32
+        assert archive["shape_subs_0"].dtype == np.float16
+        assert np.isfinite(archive["shape_subs_0"]).all()
+        assert np.array_equal(
+            archive["shape_subs_3_coords"],
+            np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "decode_shape_slat_raw",
+        lambda effective_decoder, _shape_slat: (
+            FakeSparseState(
+                np.empty((0, 7), dtype=np.float32),
+                np.empty((0, 4), dtype=np.int32),
+            ),
+            [],
+        )
+        if effective_decoder is decoder
+        else (_ for _ in ()).throw(AssertionError("wrong decoder")),
+    )
+
+    rc = runner.main(args)
+
+    failed_report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert failed_report["status"] == "failed"
+    assert failed_report["failure_phase"] == "decode_selected_points"
+    assert failed_report["written_artifact_count"] == 0
+    assert failed_report["decoder_state_artifacts"][0]["status"] == "not_written"
+    assert "decoder-state output must be nonempty" in failed_report["error"]
+    assert not state_path.exists()
+
+    monkeypatch.setattr(
+        runner,
+        "decode_shape_slat_raw",
+        lambda effective_decoder, _shape_slat: (
+            FakeSparseState(
+                np.ones((2, 7), dtype=np.float32),
+                np.array(
+                    [[0.0, 1.5, 2.0, 3.0], [0.0, 4.0, 5.0, 6.0]],
+                    dtype=np.float32,
+                ),
+            ),
+            [
+                FakeSparseState(
+                    np.ones((2, 8), dtype=np.float16),
+                    np.array(
+                        [[0, 1, 2, 3], [0, 4, 5, 6]],
+                        dtype=np.int32,
+                    ),
+                )
+                for _ in range(4)
+            ],
+        )
+        if effective_decoder is decoder
+        else (_ for _ in ()).throw(AssertionError("wrong decoder")),
+    )
+
+    rc = runner.main(args)
+
+    wrong_dtype_report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert wrong_dtype_report["status"] == "failed"
+    assert wrong_dtype_report["failure_phase"] == "decode_selected_points"
+    assert wrong_dtype_report["written_artifact_count"] == 0
+    assert wrong_dtype_report["decoder_state_artifacts"][0]["status"] == "not_written"
+    assert "decoder-state coords must have dtype int32" in wrong_dtype_report["error"]
+    assert not state_path.exists()
+
+
+def test_write_decoder_state_requires_four_coordinate_bound_subdivision_levels(
+    tmp_path,
+):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_decoder_state_npz
+
+    class SparseState:
+        def __init__(self, feats, coords):
+            self.feats = feats
+            self.coords = coords
+
+    final_state = SparseState(
+        np.ones((2, 7), dtype=np.float32),
+        np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+    )
+    subdivisions = [
+        SparseState(
+            np.ones((2, 8), dtype=np.float16),
+            np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32),
+        )
+        for _ in range(3)
+    ]
+
+    with pytest.raises(ValueError, match="exactly 4 subdivision levels"):
+        write_decoder_state_npz(
+            tmp_path / "missing-level.decoder-state.npz",
+            final_state,
+            subdivisions,
+        )
+
+    subdivisions.append(
+        SparseState(
+            np.empty((0, 8), dtype=np.float16),
+            np.empty((0, 4), dtype=np.int32),
+        )
+    )
+    with pytest.raises(ValueError, match="subdivision level 3 must be nonempty"):
+        write_decoder_state_npz(
+            tmp_path / "empty-level.decoder-state.npz",
+            final_state,
+            subdivisions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_dtype", "expected_error"),
+    [
+        ("feats", "float64", "decoder-state feats must have dtype float32"),
+        ("coords", "float32", "decoder-state coords must have dtype int32"),
+        (
+            "subdivision_feats",
+            "float32",
+            "decoder subdivision logits must have dtype float16 at level 0",
+        ),
+        (
+            "subdivision_coords",
+            "float32",
+            "decoder subdivision coords must have dtype int32 at level 0",
+        ),
+    ],
+)
+def test_write_decoder_state_rejects_raw_dtype_coercion(
+    tmp_path,
+    field,
+    wrong_dtype,
+    expected_error,
+):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import write_decoder_state_npz
+
+    class SparseState:
+        def __init__(self, feats, coords):
+            self.feats = feats
+            self.coords = coords
+
+    final_feats = np.ones((2, 7), dtype=np.float32)
+    final_coords = np.array(
+        [[0, 1, 2, 3], [0, 4, 5, 6]],
+        dtype=np.int32,
+    )
+    subdivision_feats = np.ones((2, 8), dtype=np.float16)
+    subdivision_coords = final_coords.copy()
+    if field == "feats":
+        final_feats = final_feats.astype(wrong_dtype)
+    elif field == "coords":
+        final_coords = final_coords.astype(wrong_dtype)
+        final_coords[0, 1] = 1.5
+    elif field == "subdivision_feats":
+        subdivision_feats = subdivision_feats.astype(wrong_dtype)
+    else:
+        subdivision_coords = subdivision_coords.astype(wrong_dtype)
+        subdivision_coords[0, 1] = 1.5
+
+    output = tmp_path / f"{field}.decoder-state.npz"
+    with pytest.raises(ValueError, match=expected_error):
+        write_decoder_state_npz(
+            output,
+            SparseState(final_feats, final_coords),
+            [
+                SparseState(subdivision_feats, subdivision_coords)
+                for _ in range(4)
+            ],
+        )
+    assert not output.exists()
+
+
+def test_write_decoder_state_reopen_failure_preserves_existing_primary(
+    tmp_path,
+    monkeypatch,
+):
+    import numpy as np
+
+    import scripts.source_cuda_postcond_full_decode_timing as runner
+
+    class SparseState:
+        def __init__(self, feats, coords):
+            self.feats = feats
+            self.coords = coords
+
+    output = tmp_path / "decoder-state.npz"
+    original = b"existing-authoritative-primary"
+    output.write_bytes(original)
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    state = SparseState(np.ones((2, 7), dtype=np.float32), coords)
+    subdivisions = [
+        SparseState(np.ones((2, 8), dtype=np.float16), coords)
+        for _ in range(4)
+    ]
+    monkeypatch.setattr(
+        runner.np,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("synthetic reopen failure")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="synthetic reopen failure"):
+        runner.write_decoder_state_npz(output, state, subdivisions)
+
+    assert output.read_bytes() == original
+    assert list(tmp_path.glob("*.tmp.npz")) == []
+
+
 def test_shape_slat_grid_decode_report_collision_uses_durable_fallback(tmp_path):
     import json
 
@@ -704,6 +1137,34 @@ def test_shape_slat_grid_decode_report_collision_uses_durable_fallback(tmp_path)
     assert source_report.read_bytes() == original
     assert report["failure_phase"] == "request_validation"
     assert report["requested_output_json"] == str(source_report)
+    assert report["effective_output_json"] == str(fallback)
+    assert "collides with protected input" in report["error"]
+
+
+def test_shape_slat_grid_decode_report_hardlink_collision_preserves_input(tmp_path):
+    import json
+    import os
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(tmp_path)
+    original = source_report.read_bytes()
+    aliased_report = tmp_path / "hardlinked-output.json"
+    os.link(source_report, aliased_report)
+    args = _shape_slat_decode_args(tmp_path, grid, source_report, point_names)
+    args[1] = str(aliased_report)
+
+    rc = main(args)
+
+    fallback = aliased_report.with_name(
+        f"{aliased_report.name}.selective-decode-failure.json"
+    )
+    report = json.loads(fallback.read_text())
+    assert rc == 1
+    assert source_report.read_bytes() == original
+    assert aliased_report.read_bytes() == original
+    assert report["failure_phase"] == "request_validation"
+    assert report["requested_output_json"] == str(aliased_report)
     assert report["effective_output_json"] == str(fallback)
     assert "collides with protected input" in report["error"]
 

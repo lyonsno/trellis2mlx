@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import tarfile
+import tempfile
 import time
 import traceback
 from typing import Any
@@ -102,6 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         help="Output directory for selective raw and hole-filled PLY artifacts.",
+    )
+    parser.add_argument(
+        "--decoder-state-only",
+        action="store_true",
+        help=(
+            "Run the official shape decoder superclass in eval mode and emit "
+            "raw sparse decoder state without mesh conversion."
+        ),
     )
     parser.add_argument(
         "--no-download",
@@ -575,10 +584,33 @@ def _resolved_path(path: Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
-def _selective_failure_report_path(requested: Path, protected: set[Path]) -> Path:
+def _existing_file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def _path_collides(path: Path, protected: tuple[Path, ...]) -> bool:
+    resolved = _resolved_path(path)
+    identity = _existing_file_identity(path)
+    for candidate in protected:
+        if resolved == _resolved_path(candidate):
+            return True
+        candidate_identity = _existing_file_identity(candidate)
+        if identity is not None and identity == candidate_identity:
+            return True
+    return False
+
+
+def _selective_failure_report_path(
+    requested: Path,
+    protected: tuple[Path, ...],
+) -> Path:
     candidate = requested.with_name(f"{requested.name}.selective-decode-failure.json")
     index = 2
-    while _resolved_path(candidate) in protected:
+    while _path_collides(candidate, protected):
         candidate = requested.with_name(
             f"{requested.name}.selective-decode-failure-{index}.json"
         )
@@ -851,6 +883,12 @@ def _load_selected_shape_slat_inputs(
 
 def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     started = time.perf_counter()
+    decoder_state_only = bool(args.decoder_state_only)
+    route_name = (
+        "official-source-cuda-shape-slat-decoder-raw-state"
+        if decoder_state_only
+        else "official-source-cuda-shape-slat-decoder"
+    )
     requested_output_json = Path(args.output_json)
     grid_path = Path(args.shape_slat_grid) if args.shape_slat_grid is not None else None
     source_report_path = (
@@ -858,15 +896,18 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         if args.shape_slat_grid_report is not None
         else None
     )
-    protected = {
-        _resolved_path(path)
+    protected_paths = tuple(
+        path
         for path in (grid_path, source_report_path, Path(args.source_tar), Path(args.mesh_override))
         if path is not None
-    }
+    )
     output_json = requested_output_json
-    collision = _resolved_path(requested_output_json) in protected
+    collision = _path_collides(requested_output_json, protected_paths)
     if collision:
-        output_json = _selective_failure_report_path(requested_output_json, protected)
+        output_json = _selective_failure_report_path(
+            requested_output_json,
+            protected_paths,
+        )
 
     report: dict[str, Any] = {
         "schema": "trellis2mlx.source_cuda_shape_slat_grid_decode.v1",
@@ -876,10 +917,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         "requested_output_json": str(requested_output_json),
         "effective_output_json": str(output_json),
         "requested_route": {
-            "route": "official-source-cuda-shape-slat-decoder",
+            "route": route_name,
             "resolution": 512,
-            "raw_meshes": True,
-            "post_fill_holes_snapshots": True,
+            "decoder_state_only": decoder_state_only,
+            "raw_meshes": not decoder_state_only,
+            "post_fill_holes_snapshots": not decoder_state_only,
+            "mesh_conversion": not decoder_state_only,
             "one_model_load": True,
             "no_download": bool(args.no_download),
         },
@@ -888,6 +931,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "primary_sha256": args.shape_slat_grid_sha256,
         },
         "mesh_artifacts": [],
+        "decoder_state_artifacts": [],
         "written_artifact_count": 0,
         "forbidden_inferences": [
             "not a textured mesh or GLB",
@@ -918,25 +962,35 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             raise ValueError("duplicate --shape-slat-point values are not allowed")
 
         output_dir = Path(args.output_dir)
-        expected_paths = [
-            output_dir / f"{point_name}.{variant}.ply"
-            for point_name in point_names
-            for variant in ("raw", "filled")
-        ]
-        resolved_expected_paths = {_resolved_path(path) for path in expected_paths}
+        if decoder_state_only:
+            expected_paths = [
+                output_dir / f"{point_name}.decoder-state.npz"
+                for point_name in point_names
+            ]
+        else:
+            expected_paths = [
+                output_dir / f"{point_name}.{variant}.ply"
+                for point_name in point_names
+                for variant in ("raw", "filled")
+            ]
         protected_output_collisions = sorted(
-            str(path) for path in resolved_expected_paths & protected
+            str(path)
+            for path in expected_paths
+            if _path_collides(path, protected_paths)
         )
         if protected_output_collisions:
             raise ValueError(
                 "expected mesh output collides with protected input: "
                 f"{protected_output_collisions}"
             )
-        expected_output_collision = _resolved_path(requested_output_json) in resolved_expected_paths
+        expected_output_collision = _path_collides(
+            requested_output_json,
+            tuple(expected_paths),
+        )
         if expected_output_collision:
             output_json = _selective_failure_report_path(
                 requested_output_json,
-                protected | resolved_expected_paths,
+                protected_paths + tuple(expected_paths),
             )
             report["effective_output_json"] = str(output_json)
 
@@ -984,18 +1038,31 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             path.unlink(missing_ok=True)
         report["selected_point_names"] = point_names
         report["expected_artifact_count"] = len(expected_paths)
-        report["mesh_artifacts"] = [
-            {
-                "coordinate_key": point_name,
-                "variant": variant,
-                "path": str(output_dir / f"{point_name}.{variant}.ply"),
-                "status": "not_written",
-            }
-            for point_name in point_names
-            for variant in ("raw", "filled")
-        ]
+        if decoder_state_only:
+            report["decoder_state_artifacts"] = [
+                {
+                    "coordinate_key": point_name,
+                    "path": str(output_dir / f"{point_name}.decoder-state.npz"),
+                    "status": "not_written",
+                }
+                for point_name in point_names
+            ]
+        else:
+            report["mesh_artifacts"] = [
+                {
+                    "coordinate_key": point_name,
+                    "variant": variant,
+                    "path": str(output_dir / f"{point_name}.{variant}.ply"),
+                    "status": "not_written",
+                }
+                for point_name in point_names
+                for variant in ("raw", "filled")
+            ]
         if expected_output_collision:
-            raise ValueError("--output-json collides with an expected mesh output")
+            output_kind = "decoder-state" if decoder_state_only else "mesh"
+            raise ValueError(
+                f"--output-json collides with an expected {output_kind} output"
+            )
 
         phase = "input_validation"
         source_report = json.loads(source_report_path.read_text())
@@ -1034,18 +1101,22 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             )
 
         if args.no_download:
-            for artifact in report["mesh_artifacts"]:
+            for artifact in (
+                report["mesh_artifacts"] + report["decoder_state_artifacts"]
+            ):
                 artifact["status"] = "not_written_no_download"
             report.update(
                 {
                     "status": "preflight_stopped",
                     "failure_phase": None,
                     "effective_route": {
-                        "route": "official-source-cuda-shape-slat-decoder",
+                        "route": route_name,
                         "device_type": "not_loaded_no_download",
                         "resolution": 512,
-                        "raw_meshes": True,
-                        "post_fill_holes_snapshots": True,
+                        "decoder_state_only": decoder_state_only,
+                        "raw_meshes": not decoder_state_only,
+                        "post_fill_holes_snapshots": not decoder_state_only,
+                        "mesh_conversion": not decoder_state_only,
                         "one_model_load": True,
                     },
                     "elapsed_seconds": elapsed(started),
@@ -1129,10 +1200,42 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             (row["coordinate_key"], row["variant"]): row
             for row in report["mesh_artifacts"]
         }
+        decoder_artifact_by_key = {
+            row["coordinate_key"]: row
+            for row in report["decoder_state_artifacts"]
+        }
         for point_name in point_names:
             point_started = time.perf_counter()
             feats_tensor = torch.from_numpy(selected_arrays[point_name].copy()).to(device=device)
             shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
+            if decoder_state_only:
+                with torch.no_grad():
+                    decoded, subs = decode_shape_slat_raw(decoder, shape_slat)
+                sync_cuda(torch)
+                state_path = output_dir / f"{point_name}.decoder-state.npz"
+                validation = write_decoder_state_npz(
+                    state_path,
+                    decoded,
+                    subs,
+                )
+                state_artifact = decoder_artifact_by_key[point_name]
+                state_artifact.update(
+                    {
+                        "status": "written",
+                        "sha256": sha256_file(state_path),
+                        "size_bytes": state_path.stat().st_size,
+                        "validation": validation,
+                    }
+                )
+                written_artifacts.append(state_artifact)
+                report["written_artifact_count"] = len(written_artifacts)
+                point_results.append(
+                    {
+                        "coordinate_key": point_name,
+                        "elapsed_seconds": elapsed(point_started),
+                    }
+                )
+                continue
             with torch.no_grad():
                 meshes, _subs = decoder(shape_slat, return_subs=True)
             sync_cuda(torch)
@@ -1188,28 +1291,36 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 f"partial output: wrote {len(written_artifacts)} of {len(expected_paths)} expected artifacts"
             )
 
+        effective_route = {
+            "route": route_name,
+            "device_type": "cuda",
+            "cuda_device": report["cuda_device"],
+            "sparse_attention_backend": report["sparse_attention_backend"],
+            "sparse_conv_backend": report["sparse_conv_backend"],
+            "model_ref": model_ref,
+            "model_training": bool(decoder.training),
+            "resolution": 512,
+            "decoder_state_only": decoder_state_only,
+            "raw_meshes": not decoder_state_only,
+            "post_fill_holes_snapshots": not decoder_state_only,
+            "mesh_conversion": not decoder_state_only,
+            "one_model_load": True,
+        }
+        if not decoder_state_only:
+            effective_route["fill_holes_effective_change_count"] = sum(
+                bool(point["fill_holes_effective_change"])
+                for point in point_results
+            )
         report.update(
             {
                 "status": "done",
                 "failure_phase": None,
-                "last_trustworthy_phase": "all_selected_meshes_written",
-                "effective_route": {
-                    "route": "official-source-cuda-shape-slat-decoder",
-                    "device_type": "cuda",
-                    "cuda_device": report["cuda_device"],
-                    "sparse_attention_backend": report["sparse_attention_backend"],
-                    "sparse_conv_backend": report["sparse_conv_backend"],
-                    "model_ref": model_ref,
-                    "model_training": bool(decoder.training),
-                    "resolution": 512,
-                    "raw_meshes": True,
-                    "post_fill_holes_snapshots": True,
-                    "fill_holes_effective_change_count": sum(
-                        bool(point["fill_holes_effective_change"])
-                        for point in point_results
-                    ),
-                    "one_model_load": True,
-                },
+                "last_trustworthy_phase": (
+                    "all_selected_decoder_states_written"
+                    if decoder_state_only
+                    else "all_selected_meshes_written"
+                ),
+                "effective_route": effective_route,
                 "elapsed_seconds": elapsed(started),
             }
         )
@@ -1287,6 +1398,164 @@ def sparse_tensor_summary(value: Any) -> dict[str, Any]:
         "feats_shape": [int(v) for v in feats.shape],
         "feats_mean": float(feats.float().mean().cpu()),
         "feats_std": float(feats.float().std().cpu()),
+    }
+
+
+def decode_shape_slat_raw(decoder: Any, shape_slat: Any) -> tuple[Any, list[Any]]:
+    from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+
+    decoded = SparseUnetVaeDecoder.forward(
+        decoder,
+        shape_slat,
+        return_subs=True,
+    )
+    if not isinstance(decoded, tuple) or len(decoded) != 2:
+        raise ValueError("raw shape decoder must return (state, subdivisions)")
+    state, subdivisions = decoded
+    if not isinstance(subdivisions, list):
+        raise ValueError("raw shape decoder subdivisions must be a list")
+    return state, subdivisions
+
+
+def write_decoder_state_npz(
+    path: Path,
+    state: Any,
+    subdivisions: list[Any],
+) -> dict[str, Any]:
+    feats = tensor_to_numpy(state.feats)
+    coords = tensor_to_numpy(state.coords)
+    if feats.dtype != np.dtype(np.float32):
+        raise ValueError(
+            f"decoder-state feats must have dtype float32, got {feats.dtype}"
+        )
+    if coords.dtype != np.dtype(np.int32):
+        raise ValueError(
+            f"decoder-state coords must have dtype int32, got {coords.dtype}"
+        )
+    if feats.ndim != 2 or feats.shape[1] != 7:
+        raise ValueError(f"decoder-state feats must have shape [N, 7], got {feats.shape}")
+    if coords.ndim != 2 or coords.shape[1] != 4:
+        raise ValueError(f"decoder-state coords must have shape [N, 4], got {coords.shape}")
+    if feats.shape[0] == 0:
+        raise ValueError("decoder-state output must be nonempty")
+    if feats.shape[0] != coords.shape[0]:
+        raise ValueError(
+            "decoder-state feats and coords row counts must match, "
+            f"got {feats.shape[0]} and {coords.shape[0]}"
+        )
+    if not np.isfinite(feats).all():
+        raise ValueError("decoder-state feats contain non-finite values")
+    if np.unique(coords, axis=0).shape[0] != coords.shape[0]:
+        raise ValueError("decoder-state coords contain duplicates")
+    if len(subdivisions) != 4:
+        raise ValueError(
+            "raw shape decoder must return exactly 4 subdivision levels, "
+            f"got {len(subdivisions)}"
+        )
+
+    arrays: dict[str, np.ndarray] = {
+        "feats": np.ascontiguousarray(feats),
+        "coords": np.ascontiguousarray(coords),
+    }
+    subdivision_shapes: list[list[int]] = []
+    subdivision_coordinate_shapes: list[list[int]] = []
+    for index, subdivision in enumerate(subdivisions):
+        if not hasattr(subdivision, "feats") or not hasattr(subdivision, "coords"):
+            raise ValueError(
+                f"decoder subdivision level {index} must carry feats and coords"
+            )
+        values = tensor_to_numpy(subdivision.feats)
+        level_coords = tensor_to_numpy(subdivision.coords)
+        if values.dtype != np.dtype(np.float16):
+            raise ValueError(
+                "decoder subdivision logits must have dtype float16 "
+                f"at level {index}, got {values.dtype}"
+            )
+        if level_coords.dtype != np.dtype(np.int32):
+            raise ValueError(
+                "decoder subdivision coords must have dtype int32 "
+                f"at level {index}, got {level_coords.dtype}"
+            )
+        if values.ndim != 2 or values.shape[1] != 8:
+            raise ValueError(
+                "decoder subdivision logits must have shape [N, 8], "
+                f"got {values.shape} at level {index}"
+            )
+        if values.shape[0] == 0:
+            raise ValueError(f"decoder subdivision level {index} must be nonempty")
+        if level_coords.ndim != 2 or level_coords.shape[1] != 4:
+            raise ValueError(
+                "decoder subdivision coords must have shape [N, 4], "
+                f"got {level_coords.shape} at level {index}"
+            )
+        if level_coords.shape[0] != values.shape[0]:
+            raise ValueError(
+                "decoder subdivision logits and coords row counts must match, "
+                f"got {values.shape[0]} and {level_coords.shape[0]} at level {index}"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"decoder subdivision logits contain non-finite values at level {index}"
+            )
+        if np.unique(level_coords, axis=0).shape[0] != level_coords.shape[0]:
+            raise ValueError(
+                f"decoder subdivision coords contain duplicates at level {index}"
+            )
+        arrays[f"shape_subs_{index}"] = np.ascontiguousarray(values)
+        arrays[f"shape_subs_{index}_coords"] = np.ascontiguousarray(level_coords)
+        subdivision_shapes.append([int(value) for value in values.shape])
+        subdivision_coordinate_shapes.append(
+            [int(value) for value in level_coords.shape]
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp.npz",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        np.savez(temporary_path, **arrays)
+
+        expected_keys = list(arrays)
+        with np.load(temporary_path, allow_pickle=False) as reopened:
+            if reopened.files != expected_keys:
+                raise ValueError(
+                    "decoder-state primary keys changed after write: "
+                    f"expected={expected_keys}, actual={reopened.files}"
+                )
+            for key, expected in arrays.items():
+                actual = np.asarray(reopened[key])
+                if actual.dtype != expected.dtype or actual.shape != expected.shape:
+                    raise ValueError(
+                        f"decoder-state primary {key!r} changed dtype or shape after write"
+                    )
+                if not np.array_equal(actual, expected):
+                    raise ValueError(
+                        f"decoder-state primary {key!r} changed values after write"
+                    )
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    return {
+        "feats_shape": [int(value) for value in feats.shape],
+        "feats_dtype": str(feats.dtype),
+        "coords_shape": [int(value) for value in coords.shape],
+        "coords_dtype": str(coords.dtype),
+        "subdivision_shapes": subdivision_shapes,
+        "subdivision_coordinate_shapes": subdivision_coordinate_shapes,
+        "subdivision_dtypes": [
+            {
+                "logits": str(arrays[f"shape_subs_{index}"].dtype),
+                "coords": str(arrays[f"shape_subs_{index}_coords"].dtype),
+            }
+            for index in range(len(subdivisions))
+        ],
+        "finite": True,
+        "reopened_exact": True,
     }
 
 
