@@ -37,6 +37,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _resolve_reported_path(value: object, report_path: Path) -> Path:
+    path = Path(str(value or ""))
+    if not path.is_absolute():
+        path = Path(report_path).resolve().parent / path
+    return path.resolve()
+
+
 def _load_report(
     label: str,
     report_path: Path,
@@ -90,7 +97,7 @@ def _load_report(
         matching_artifacts = [
             artifact
             for artifact in report.get("decoder_trace_artifacts", [])
-            if Path(str(artifact.get("path", ""))).resolve()
+            if _resolve_reported_path(artifact.get("path"), report_path)
             == Path(primary_path).resolve()
         ]
         if len(matching_artifacts) != 1:
@@ -108,7 +115,7 @@ def _load_report(
     actual_digest = _sha256_file(primary_path)
     if primary.get("sha256") != actual_digest:
         raise ValueError(f"{label} trace primary digest mismatch")
-    reported_path = Path(str(primary.get("path", ""))).resolve()
+    reported_path = _resolve_reported_path(primary.get("path"), report_path)
     if reported_path != Path(primary_path).resolve():
         raise ValueError(f"{label} trace primary path mismatch")
     input_digest = input_tensor_sha256

@@ -82,6 +82,7 @@ def _write_source_selective_report(
     *,
     primary,
     input_sha,
+    reported_path=None,
     route_overrides=None,
 ):
     import hashlib
@@ -108,7 +109,7 @@ def _write_source_selective_report(
                 "decoder_trace_artifacts": [
                     {
                         "coordinate_key": "alpha-1_beta-1",
-                        "path": str(primary),
+                        "path": str(reported_path or primary),
                         "status": "written",
                         "sha256": hashlib.sha256(
                             primary.read_bytes()
@@ -499,6 +500,33 @@ def test_three_anchor_comparison_accepts_real_source_selective_report_shape(
     assert source_route["decoder_level0_trace"] is True
     assert source_route["raw_meshes"] is False
     assert source_route["mesh_conversion"] is False
+
+
+def test_three_anchor_comparison_resolves_source_primary_from_report_directory(
+    tmp_path,
+):
+    from scripts.compare_decoder_level0_traces import compare_level0_traces
+
+    paths, reports, input_sha = _write_trace_triplet(tmp_path)
+    _write_source_selective_report(
+        reports["source"],
+        primary=paths["source"],
+        reported_path=paths["source"].name,
+        input_sha=input_sha,
+    )
+
+    report = compare_level0_traces(
+        source_path=paths["source"],
+        source_report_path=reports["source"],
+        local_fp16_path=paths["local-fp16"],
+        local_fp16_report_path=reports["local-fp16"],
+        local_fp32_path=paths["local-fp32"],
+        local_fp32_report_path=reports["local-fp32"],
+        latent_channels=4,
+        channels=8,
+    )
+
+    assert report["artifacts"]["source"]["path"] == str(paths["source"])
 
 
 @pytest.mark.parametrize(
