@@ -26,13 +26,10 @@ from ..modules.sparse_conv import SparseConv3d, build_neighbor_map
 from ..modules.norm import LayerNorm32
 
 
-def _layernorm_noaffine(x: mx.array, eps: float = 1e-6) -> mx.array:
+def _layernorm_noaffine(x: mx.array, eps: float = 1e-5) -> mx.array:
     orig_dtype = x.dtype
     x = x.astype(mx.float32)
-    mean = mx.mean(x, axis=-1, keepdims=True)
-    var = mx.var(x, axis=-1, keepdims=True)
-    x = (x - mean) * mx.rsqrt(var + eps)
-    return x.astype(orig_dtype)
+    return mx.fast.layer_norm(x, None, None, eps).astype(orig_dtype)
 
 
 class SparseConvNeXtBlock3d(nn.Module):
@@ -102,7 +99,10 @@ class SparseChannel2Spatial:
                     new_feats_list.append(feats_reshaped[i, child])
 
         if len(new_feats_list) == 0:
-            return mx.zeros((0, C)), mx.zeros((0, 4), dtype=mx.int32)
+            return (
+                mx.zeros((0, C), dtype=feats.dtype),
+                mx.zeros((0, 4), dtype=mx.int32),
+            )
 
         new_feats = mx.array(np.stack(new_feats_list))
         new_coords = mx.array(np.stack(new_coords_list).astype(np.int32))
@@ -204,6 +204,7 @@ class SLatDecoder(nn.Module):
         model_channels: list = None,
         num_blocks: list = None,
         pred_subdiv: bool = True,
+        use_fp16: bool = True,
     ):
         super().__init__()
         if model_channels is None:
@@ -214,6 +215,7 @@ class SLatDecoder(nn.Module):
         self.model_channels = model_channels
         self.num_blocks = num_blocks
         self.pred_subdiv = pred_subdiv
+        self.use_fp16 = use_fp16
 
         self.from_latent = nn.Linear(latent_channels, model_channels[0])
         self.output_layer = nn.Linear(model_channels[-1], out_channels)
@@ -227,6 +229,10 @@ class SLatDecoder(nn.Module):
                 level.append(SparseResBlockC2S3d(ch, model_channels[i + 1],
                                                  pred_subdiv=pred_subdiv))
             self.blocks.append(level)
+        if use_fp16:
+            for level in self.blocks:
+                for block in level:
+                    block.set_dtype(mx.float16)
 
     def _forward_levels(self, feats: mx.array, coords: mx.array,
                          stop_after: int = None,
@@ -292,6 +298,8 @@ class SLatDecoder(nn.Module):
             hr_coords: [N', 4] upsampled coordinates
         """
         feats = self.from_latent(feats)
+        if self.use_fp16:
+            feats = feats.astype(mx.float16)
         _, hr_coords = self._forward_levels(feats, coords,
                                             stop_after=upsample_times)
         return hr_coords
@@ -308,7 +316,10 @@ class SLatDecoder(nn.Module):
         Returns:
             (out_feats, out_coords) or (out_feats, out_coords, subs) if return_subs
         """
+        input_dtype = feats.dtype
         feats = self.from_latent(feats)
+        if self.use_fp16:
+            feats = feats.astype(mx.float16)
         result = self._forward_levels(feats, coords, guide_subs=guide_subs,
                                        return_subs=return_subs)
         if return_subs:
@@ -316,7 +327,7 @@ class SLatDecoder(nn.Module):
         else:
             feats, coords = result
 
-        feats = _layernorm_noaffine(feats)
+        feats = _layernorm_noaffine(feats.astype(input_dtype))
         out = self.output_layer(feats)
 
         if return_subs:

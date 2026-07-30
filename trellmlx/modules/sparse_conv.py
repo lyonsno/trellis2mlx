@@ -162,7 +162,7 @@ class SparseConv3d(nn.Module):
 
         # Process per kernel position to keep memory bounded
         # and avoid scatter_add issues. 27 positions for 3x3x3.
-        out = mx.zeros((N, Co))
+        out = mx.zeros((N, Co), dtype=feats.dtype)
 
         for k in range(K_total):
             # Find edges for this kernel position (on CPU to avoid Metal events)
