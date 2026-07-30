@@ -111,6 +111,19 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
         },
         {
             "input_dtype": "float16",
+            "parameter_dtype": "float16",
+            "hidden_width": 512,
+            "affine": True,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "values_per_thread": 4,
+                "accumulator_dtype": "float32",
+            },
+        },
+        {
+            "input_dtype": "float16",
             "hidden_width": 512,
             "affine": False,
             "reduction": {
@@ -231,7 +244,7 @@ def test_shape_decoder_level_zero_norms_are_exact_route_consumers():
     assert all(block.norm.decoder_layernorm for block in blocks)
 
 
-def test_shape_decoder_exact_layernorm_enrollment_stops_at_authenticated_width():
+def test_shape_decoder_exact_layernorm_enrollment_stops_below_width512():
     from trellmlx.models.shape_slat_decoder import (
         SLatDecoder,
         SparseConvNeXtBlock3d,
@@ -239,8 +252,8 @@ def test_shape_decoder_exact_layernorm_enrollment_stops_at_authenticated_width()
     )
 
     decoder = SLatDecoder(
-        model_channels=[1024, 512],
-        num_blocks=[2, 2],
+        model_channels=[1024, 512, 256],
+        num_blocks=[2, 2, 2],
         use_fp16=True,
     )
     level0_blocks = [
@@ -258,12 +271,26 @@ def test_shape_decoder_exact_layernorm_enrollment_stops_at_authenticated_width()
         for block in decoder.blocks[1]
         if isinstance(block, SparseConvNeXtBlock3d)
     ]
+    level1_upsample = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    level2_blocks = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
 
     assert len(level0_upsample) == 1
+    assert len(level1_upsample) == 1
     assert all(block.norm.decoder_layernorm for block in level0_blocks)
     assert level0_upsample[0].norm1.decoder_layernorm is True
     assert level0_upsample[0].norm2.decoder_layernorm is True
-    assert all(block.norm.decoder_layernorm is False for block in level1_blocks)
+    assert all(block.norm.decoder_layernorm for block in level1_blocks)
+    assert level1_upsample[0].norm1.decoder_layernorm is True
+    assert level1_upsample[0].norm2.decoder_layernorm is False
+    assert all(block.norm.decoder_layernorm is False for block in level2_blocks)
 
 
 def test_turing_decoder_layernorm_rejects_wrong_contract():

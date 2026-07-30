@@ -295,6 +295,19 @@ def _exact_layernorm_route(lut):
                 },
                 {
                     "input_dtype": "float16",
+                    "parameter_dtype": "float16",
+                    "hidden_width": 512,
+                    "affine": True,
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "values_per_thread": 4,
+                        "accumulator_dtype": "float32",
+                    },
+                },
+                {
+                    "input_dtype": "float16",
                     "hidden_width": 512,
                     "affine": False,
                     "reduction": {
@@ -381,7 +394,7 @@ def test_level1_comparator_rejects_missing_width512_layernorm_contract(tmp_path)
 
     with pytest.raises(
         ValueError,
-        match="authenticated width-512 non-affine contract",
+        match="authenticated width-512 affine/non-affine contracts",
     ):
         compare_level1_traces(
             source_path=source_path,

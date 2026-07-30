@@ -33,6 +33,7 @@ from ..turing_fda import turing_fda_linear
 DECODER_LINEAR_BACKEND_ENV = "TRELLIS2MLX_DECODER_LINEAR_BACKEND"
 DECODER_LINEAR_BACKENDS = frozenset(("native", "turing_fda"))
 AUTHENTICATED_DECODER_LAYERNORM_WIDTH = 1024
+AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS = frozenset((1024, 512))
 AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_WIDTH = 512
 
 
@@ -70,7 +71,7 @@ class SparseConvNeXtBlock3d(nn.Module):
             channels,
             affine=True,
             decoder_layernorm=(
-                channels == AUTHENTICATED_DECODER_LAYERNORM_WIDTH
+                channels in AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS
             ),
         )
         self.mlp_0 = nn.Linear(channels, int(channels * mlp_ratio))
@@ -160,7 +161,7 @@ class SparseResBlockC2S3d(nn.Module):
             channels,
             affine=True,
             decoder_layernorm=(
-                channels == AUTHENTICATED_DECODER_LAYERNORM_WIDTH
+                channels in AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS
             ),
         )
         self.norm2 = LayerNorm32(
