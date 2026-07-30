@@ -110,6 +110,48 @@ def test_level0_trace_contract_loads_from_flat_kaggle_capsule(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
+def test_level0_trace_contract_missing_from_flat_capsule_fails_locally(tmp_path):
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    shutil.copy2(
+        Path(source_runner.__file__),
+        capsule / "source_cuda_postcond_full_decode_timing.py",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import source_cuda_postcond_full_decode_timing as runner; "
+                "\ntry:\n"
+                "    runner.load_decoder_level0_trace_contract()\n"
+                "except ModuleNotFoundError as exc:\n"
+                "    assert exc.name == 'decoder_level0_trace_contract'\n"
+                "    assert 'adjacent contract' in str(exc)\n"
+                "else:\n"
+                "    raise AssertionError('inherited package contract was accepted')\n"
+            ),
+        ],
+        cwd=capsule,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_level0_trace_contract_package_import_keeps_package_identity():
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    contract = source_runner.load_decoder_level0_trace_contract()
+
+    assert contract.__name__ == "scripts.decoder_level0_trace_contract"
+
+
 def _shape_slat_decode_args(
     tmp_path,
     grid,

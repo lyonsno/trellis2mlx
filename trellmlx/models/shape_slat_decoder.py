@@ -18,12 +18,38 @@ Architecture (from TRELLIS.2-4B, shape_dec_next_dc_f16c32_fp16):
   output_layer: Linear(64 → 7)
 """
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from ..modules.sparse_conv import SparseConv3d, build_neighbor_map
 from ..modules.norm import LayerNorm32
+from ..decoder_turing_silu import silu as decoder_silu
+from ..turing_fda import turing_fda_linear
+
+
+DECODER_LINEAR_BACKEND_ENV = "TRELLIS2MLX_DECODER_LINEAR_BACKEND"
+DECODER_LINEAR_BACKENDS = frozenset(("native", "turing_fda"))
+
+
+def _decoder_linear(linear: nn.Linear, value: mx.array) -> mx.array:
+    backend = os.environ.get(DECODER_LINEAR_BACKEND_ENV, "native").lower()
+    if backend not in DECODER_LINEAR_BACKENDS:
+        raise ValueError(
+            "decoder linear backend must be one of "
+            f"{sorted(DECODER_LINEAR_BACKENDS)}, got {backend!r}"
+        )
+    if backend == "turing_fda":
+        if linear.bias is None:
+            raise ValueError("Turing FDA decoder linear requires an affine bias")
+        return turing_fda_linear(value, linear.weight.T, linear.bias)
+    return linear(value)
+
+
+def _decoder_silu(value: mx.array) -> mx.array:
+    return decoder_silu(value)
 
 
 def _layernorm_noaffine(x: mx.array, eps: float = 1e-5) -> mx.array:
@@ -38,14 +64,21 @@ class SparseConvNeXtBlock3d(nn.Module):
     def __init__(self, channels: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.conv = SparseConv3d(channels, channels, kernel_size=3)
-        self.norm = LayerNorm32(channels, affine=True)
+        self.norm = LayerNorm32(
+            channels,
+            affine=True,
+            decoder_layernorm=True,
+        )
         self.mlp_0 = nn.Linear(channels, int(channels * mlp_ratio))
         self.mlp_2 = nn.Linear(int(channels * mlp_ratio), channels)
 
     def __call__(self, feats: mx.array, neighbor_map: tuple) -> mx.array:
         h = self.conv(feats, neighbor_map)
         h = self.norm(h)
-        h = self.mlp_2(nn.silu(self.mlp_0(h)))
+        h = _decoder_linear(
+            self.mlp_2,
+            _decoder_silu(_decoder_linear(self.mlp_0, h)),
+        )
         return h + feats
 
 
@@ -140,7 +173,7 @@ class SparseResBlockC2S3d(nn.Module):
         """
         # Get subdivision mask
         if self.pred_subdiv:
-            subdiv_logits = self.to_subdiv(feats)  # [N, 8]
+            subdiv_logits = _decoder_linear(self.to_subdiv, feats)  # [N, 8]
             subdiv_mask = subdiv_logits > 0
         else:
             subdiv_logits = subdiv
@@ -150,7 +183,7 @@ class SparseResBlockC2S3d(nn.Module):
                 subdiv_mask = mx.ones((feats.shape[0], 8), dtype=mx.bool_)
 
         # Pre-upsample: norm → silu → conv
-        h = nn.silu(self.norm1(feats))
+        h = _decoder_silu(self.norm1(feats))
         h = self.conv1(h, neighbor_map)  # [N, out_channels * 8]
 
         # Channel to spatial upsample (also upsample skip path)
@@ -176,7 +209,7 @@ class SparseResBlockC2S3d(nn.Module):
 
         # Post-upsample: norm → silu → conv
         new_nmap = build_neighbor_map(new_coords)
-        new_h = nn.silu(self.norm2(new_h))
+        new_h = _decoder_silu(self.norm2(new_h))
         new_h = self.conv2(new_h, new_nmap)
 
         # Add skip

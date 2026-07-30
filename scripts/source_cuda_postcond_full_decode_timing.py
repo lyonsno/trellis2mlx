@@ -51,6 +51,28 @@ MODEL_NAMES_BY_PIPELINE_TYPE = {
 
 
 def load_decoder_level0_trace_contract():
+    if not __package__:
+        contract_path = Path(__file__).resolve().with_name(
+            "decoder_level0_trace_contract.py"
+        )
+        if not contract_path.is_file():
+            raise ModuleNotFoundError(
+                "standalone decoder trace runner requires adjacent contract "
+                f"{contract_path}",
+                name="decoder_level0_trace_contract",
+            )
+        spec = importlib.util.spec_from_file_location(
+            "decoder_level0_trace_contract",
+            contract_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"cannot load decoder level-zero trace contract from {contract_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     for module_name in (
         "scripts.decoder_level0_trace_contract",
         "decoder_level0_trace_contract",
@@ -1550,37 +1572,44 @@ def capture_source_decoder_level0_trace(
 
     projected_fp32 = decoder.from_latent(shape_slat)
     torso_input = projected_fp32.type(decoder.dtype)
-    block0 = convnext_blocks[0]
-    block0_conv_state = block0.conv(torso_input)
-    block0_norm = block0.norm(block0_conv_state.feats)
-    block0_mlp_fc1 = block0.mlp[0](block0_norm)
-    block0_silu = block0.mlp[1](block0_mlp_fc1)
-    block0_mlp_fc2 = block0.mlp[2](block0_silu)
-    block0_output = torso_input.replace(
-        block0_mlp_fc2 + torso_input.feats
-    )
-    natural_block0 = block0(torso_input)
-    if not np.array_equal(
-        tensor_to_numpy(block0_output.feats),
-        tensor_to_numpy(natural_block0.feats),
-    ):
-        raise RuntimeError(
-            "manual source level-zero block trace does not exactly reproduce "
-            "natural forward"
+    block_arrays = {}
+    current = torso_input
+    for block_index, block in enumerate(convnext_blocks):
+        block_input = current
+        conv_state = block.conv(block_input)
+        norm = block.norm(conv_state.feats)
+        mlp_fc1 = block.mlp[0](norm)
+        silu = block.mlp[1](mlp_fc1)
+        mlp_fc2 = block.mlp[2](silu)
+        output = block_input.replace(mlp_fc2 + block_input.feats)
+        natural = block(block_input)
+        if not np.array_equal(
+            tensor_to_numpy(output.feats),
+            tensor_to_numpy(natural.feats),
+        ):
+            raise RuntimeError(
+                "manual source level-zero block trace does not exactly "
+                f"reproduce natural forward for block {block_index}"
+            )
+        if not np.array_equal(
+            tensor_to_numpy(output.coords),
+            tensor_to_numpy(natural.coords),
+        ):
+            raise RuntimeError(
+                "manual source level-zero block trace changed sparse "
+                f"coordinates for block {block_index}"
+            )
+        block_arrays.update(
+            {
+                f"block{block_index}_conv": tensor_to_numpy(conv_state.feats),
+                f"block{block_index}_norm": tensor_to_numpy(norm),
+                f"block{block_index}_mlp_fc1": tensor_to_numpy(mlp_fc1),
+                f"block{block_index}_silu": tensor_to_numpy(silu),
+                f"block{block_index}_mlp_fc2": tensor_to_numpy(mlp_fc2),
+                f"block{block_index}_output": tensor_to_numpy(natural.feats),
+            }
         )
-    if not np.array_equal(
-        tensor_to_numpy(block0_output.coords),
-        tensor_to_numpy(natural_block0.coords),
-    ):
-        raise RuntimeError(
-            "manual source level-zero block trace changed sparse coordinates"
-        )
-
-    block_outputs = [natural_block0]
-    current = natural_block0
-    for block in convnext_blocks[1:]:
-        current = block(current)
-        block_outputs.append(current)
+        current = natural
     level0_subdiv = upsample_blocks[0].to_subdiv(current)
 
     arrays = {
@@ -1588,15 +1617,7 @@ def capture_source_decoder_level0_trace(
         "input_feats": tensor_to_numpy(shape_slat.feats),
         "from_latent_fp32": tensor_to_numpy(projected_fp32.feats),
         "torso_input": tensor_to_numpy(torso_input.feats),
-        "block0_conv": tensor_to_numpy(block0_conv_state.feats),
-        "block0_norm": tensor_to_numpy(block0_norm),
-        "block0_mlp_fc1": tensor_to_numpy(block0_mlp_fc1),
-        "block0_silu": tensor_to_numpy(block0_silu),
-        "block0_mlp_fc2": tensor_to_numpy(block0_mlp_fc2),
-        "block0_output": tensor_to_numpy(block_outputs[0].feats),
-        "block1_output": tensor_to_numpy(block_outputs[1].feats),
-        "block2_output": tensor_to_numpy(block_outputs[2].feats),
-        "block3_output": tensor_to_numpy(block_outputs[3].feats),
+        **block_arrays,
         "level0_subdiv_logits": tensor_to_numpy(level0_subdiv.feats),
     }
     return {

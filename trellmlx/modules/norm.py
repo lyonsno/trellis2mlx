@@ -18,11 +18,17 @@ class LayerNorm32(nn.Module):
         affine: bool = False,
         *,
         shape_flow_layernorm: bool = False,
+        decoder_layernorm: bool = False,
     ):
         super().__init__()
+        if shape_flow_layernorm and decoder_layernorm:
+            raise ValueError(
+                "LayerNorm32 cannot use shape-flow and decoder routes together"
+            )
         self.eps = eps
         self.affine = affine
         self.shape_flow_layernorm = shape_flow_layernorm
+        self.decoder_layernorm = decoder_layernorm
         if affine:
             self.weight = mx.ones((dims,))
             self.bias = mx.zeros((dims,))
@@ -33,6 +39,10 @@ class LayerNorm32(nn.Module):
         bias = self.bias if self.affine else None
         if self.shape_flow_layernorm and self.affine:
             from ..shape_flow_layernorm import layernorm_affine
+
+            return layernorm_affine(x, weight, bias, self.eps).astype(orig_dtype)
+        if self.decoder_layernorm and self.affine:
+            from ..decoder_turing_layernorm import layernorm_affine
 
             return layernorm_affine(x, weight, bias, self.eps).astype(orig_dtype)
         return mx.fast.layer_norm(x, weight, bias, self.eps).astype(orig_dtype)

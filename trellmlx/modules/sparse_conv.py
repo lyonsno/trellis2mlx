@@ -7,9 +7,19 @@ exist), multiply by kernel weights, and scatter-add results back.
 This is the same algorithm as trellis-mac's conv_none.py but in MLX.
 """
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from trellmlx.turing_fda import turing_fda_matmul
+
+
+SPARSE_CONV_MATMUL_BACKEND_ENV = (
+    "TRELLIS2MLX_SPARSE_CONV_MATMUL_BACKEND"
+)
+SPARSE_CONV_MATMUL_BACKENDS = frozenset(("native", "turing_fda"))
 
 
 def _pack_coords(coords_np: np.ndarray) -> np.ndarray:
@@ -155,6 +165,16 @@ class SparseConv3d(nn.Module):
         Co = self.out_channels
         Ci = self.in_channels
         K_total = self.kernel_size ** 3
+        matmul_backend = os.environ.get(
+            SPARSE_CONV_MATMUL_BACKEND_ENV,
+            "native",
+        ).lower()
+        if matmul_backend not in SPARSE_CONV_MATMUL_BACKENDS:
+            raise ValueError(
+                "sparse-convolution matmul backend must be one of "
+                f"{sorted(SPARSE_CONV_MATMUL_BACKENDS)}, "
+                f"got {matmul_backend!r}"
+            )
 
         # Reshape weight: [Co, K, K, K, Ci] → [K_total, Ci, Co]
         w = self.weight.reshape(Co, K_total, Ci)
@@ -173,7 +193,10 @@ class SparseConv3d(nn.Module):
             t_np = np.array(tgt_idx)[k_mask_np]
 
             src_f = feats[mx.array(s_np)]     # [E_k, Ci]
-            edge_out = src_f @ w[k]            # [E_k, Co]
+            if matmul_backend == "turing_fda":
+                edge_out = turing_fda_matmul(src_f, w[k]).astype(feats.dtype)
+            else:
+                edge_out = src_f @ w[k]        # [E_k, Co]
             out = out.at[mx.array(t_np)].add(edge_out)
 
         return out + self.bias

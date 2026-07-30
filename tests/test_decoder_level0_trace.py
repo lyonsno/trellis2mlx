@@ -7,19 +7,23 @@ import numpy as np
 import pytest
 
 
+FULL_BLOCK_TRACE_NAMES = tuple(
+    name
+    for block_index in range(4)
+    for name in (
+        f"block{block_index}_conv",
+        f"block{block_index}_norm",
+        f"block{block_index}_mlp_fc1",
+        f"block{block_index}_silu",
+        f"block{block_index}_mlp_fc2",
+        f"block{block_index}_output",
+    )
+)
 TRACE_NAMES = (
     "input_feats",
     "from_latent_fp32",
     "torso_input",
-    "block0_conv",
-    "block0_norm",
-    "block0_mlp_fc1",
-    "block0_silu",
-    "block0_mlp_fc2",
-    "block0_output",
-    "block1_output",
-    "block2_output",
-    "block3_output",
+    *FULL_BLOCK_TRACE_NAMES,
     "level0_subdiv_logits",
 )
 
@@ -47,7 +51,7 @@ def _trace_arrays(
     }
     for name in TRACE_NAMES[2:]:
         width = 8 if name == "level0_subdiv_logits" else channels
-        if name in {"block0_mlp_fc1", "block0_silu"}:
+        if name.endswith(("mlp_fc1", "silu")):
             width = channels * 4
         arrays[name] = np.full(
             (rows, width),
@@ -55,6 +59,14 @@ def _trace_arrays(
             dtype=torso_dtype,
         )
     return arrays
+
+
+def test_trace_contract_requires_every_internal_boundary_for_all_four_blocks():
+    from scripts.decoder_level0_trace_contract import TRACE_NAMES as CONTRACT_NAMES
+
+    positions = [CONTRACT_NAMES.index(name) for name in FULL_BLOCK_TRACE_NAMES]
+
+    assert positions == sorted(positions)
 
 
 def _write_report(path, *, primary, route, input_sha="a" * 64):
@@ -406,6 +418,57 @@ def test_three_anchor_comparison_locates_first_fork_and_nearest_island(tmp_path)
     assert report["stages"]["block0_conv"]["nearest_local_island"] == "local_fp32"
     assert report["stages"]["block0_conv"]["local_fp16"]["rms"] == pytest.approx(0.25)
     assert report["stages"]["block0_conv"]["local_fp32"]["rms"] == pytest.approx(0.125)
+
+
+def test_three_anchor_comparison_cannot_hide_later_block_internal_fork(tmp_path):
+    from scripts.compare_decoder_level0_traces import compare_level0_traces
+    from scripts.decoder_level0_trace_contract import (
+        load_decoder_level0_trace,
+        write_decoder_level0_trace_npz,
+    )
+
+    paths, reports, input_sha = _write_trace_triplet(tmp_path)
+    _write_source_selective_report(
+        reports["source"],
+        primary=paths["source"],
+        input_sha=input_sha,
+    )
+    local = load_decoder_level0_trace(
+        paths["local-fp16"],
+        latent_channels=4,
+        channels=8,
+        torso_dtype=np.float16,
+    )
+    local["block1_silu"] = local["block1_silu"].copy()
+    local["block1_silu"][0, 0] += np.float16(0.5)
+    write_decoder_level0_trace_npz(
+        paths["local-fp16"],
+        local,
+        latent_channels=4,
+        channels=8,
+        torso_dtype=np.float16,
+    )
+    _write_report(
+        reports["local-fp16"],
+        primary=paths["local-fp16"],
+        route="mlx-shape-decoder-level0-trace-fp16",
+        input_sha=input_sha,
+    )
+
+    report = compare_level0_traces(
+        source_path=paths["source"],
+        source_report_path=reports["source"],
+        local_fp16_path=paths["local-fp16"],
+        local_fp16_report_path=reports["local-fp16"],
+        local_fp32_path=paths["local-fp32"],
+        local_fp32_report_path=reports["local-fp32"],
+        latent_channels=4,
+        channels=8,
+    )
+
+    assert report["first_numeric_fork"]["local_fp16"] == "block1_silu"
+    assert report["stages"]["block1_silu"]["local_fp16"]["nonzero_count"] == 1
+    assert report["stages"]["block1_output"]["local_fp16"]["nonzero_count"] == 0
 
 
 def test_three_anchor_comparison_rejects_common_forged_input_tensor_identity(

@@ -11,19 +11,23 @@ from typing import Any, Mapping
 import numpy as np
 
 
+BLOCK_TRACE_NAMES = tuple(
+    name
+    for block_index in range(4)
+    for name in (
+        f"block{block_index}_conv",
+        f"block{block_index}_norm",
+        f"block{block_index}_mlp_fc1",
+        f"block{block_index}_silu",
+        f"block{block_index}_mlp_fc2",
+        f"block{block_index}_output",
+    )
+)
 TRACE_NAMES = (
     "input_feats",
     "from_latent_fp32",
     "torso_input",
-    "block0_conv",
-    "block0_norm",
-    "block0_mlp_fc1",
-    "block0_silu",
-    "block0_mlp_fc2",
-    "block0_output",
-    "block1_output",
-    "block2_output",
-    "block3_output",
+    *BLOCK_TRACE_NAMES,
     "level0_subdiv_logits",
 )
 REQUIRED_ARRAYS = ("coords",) + TRACE_NAMES
@@ -85,17 +89,11 @@ def validate_decoder_level0_trace(
         "input_feats": (np.dtype(np.float32), latent_channels),
         "from_latent_fp32": (np.dtype(np.float32), channels),
         "torso_input": (expected_dtype, channels),
-        "block0_conv": (expected_dtype, channels),
-        "block0_norm": (expected_dtype, channels),
-        "block0_mlp_fc1": (expected_dtype, channels * 4),
-        "block0_silu": (expected_dtype, channels * 4),
-        "block0_mlp_fc2": (expected_dtype, channels),
-        "block0_output": (expected_dtype, channels),
-        "block1_output": (expected_dtype, channels),
-        "block2_output": (expected_dtype, channels),
-        "block3_output": (expected_dtype, channels),
         "level0_subdiv_logits": (expected_dtype, 8),
     }
+    for name in BLOCK_TRACE_NAMES:
+        width = channels * 4 if name.endswith(("mlp_fc1", "silu")) else channels
+        expected_specs[name] = (expected_dtype, width)
     validated: dict[str, np.ndarray] = {
         "coords": np.ascontiguousarray(coords),
     }

@@ -6,7 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .models.shape_slat_decoder import SparseConvNeXtBlock3d
+from .models.shape_slat_decoder import (
+    SparseConvNeXtBlock3d,
+    _decoder_linear,
+    _decoder_silu,
+)
 from .modules.sparse_conv import build_neighbor_map
 
 
@@ -43,44 +47,44 @@ def capture_mlx_decoder_level0_trace(
     )
     neighbor_map = build_neighbor_map(coords)
 
-    block0 = convnext_blocks[0]
-    block0_conv = block0.conv(torso_input, neighbor_map)
-    block0_norm = block0.norm(block0_conv)
-    block0_mlp_fc1 = block0.mlp_0(block0_norm)
-    block0_silu = nn.silu(block0_mlp_fc1)
-    block0_mlp_fc2 = block0.mlp_2(block0_silu)
-    block0_output = block0_mlp_fc2 + torso_input
-    natural_block0 = block0(torso_input, neighbor_map)
-    mx.eval(
-        block0_conv,
-        block0_norm,
-        block0_mlp_fc1,
-        block0_silu,
-        block0_mlp_fc2,
-        block0_output,
-        natural_block0,
-    )
-    if not np.array_equal(
-        np.asarray(block0_output),
-        np.asarray(natural_block0),
-    ):
-        raise RuntimeError(
-            "manual level-zero block trace does not exactly reproduce natural forward"
+    block_arrays = {}
+    current = torso_input
+    for block_index, block in enumerate(convnext_blocks):
+        block_input = current
+        conv = block.conv(block_input, neighbor_map)
+        norm = block.norm(conv)
+        mlp_fc1 = _decoder_linear(block.mlp_0, norm)
+        silu = _decoder_silu(mlp_fc1)
+        mlp_fc2 = _decoder_linear(block.mlp_2, silu)
+        output = mlp_fc2 + block_input
+        natural = block(block_input, neighbor_map)
+        mx.eval(conv, norm, mlp_fc1, silu, mlp_fc2, output, natural)
+        if not np.array_equal(np.asarray(output), np.asarray(natural)):
+            raise RuntimeError(
+                "manual level-zero block trace does not exactly reproduce "
+                f"natural forward for block {block_index}"
+            )
+        block_arrays.update(
+            {
+                f"block{block_index}_conv": conv,
+                f"block{block_index}_norm": norm,
+                f"block{block_index}_mlp_fc1": mlp_fc1,
+                f"block{block_index}_silu": silu,
+                f"block{block_index}_mlp_fc2": mlp_fc2,
+                f"block{block_index}_output": natural,
+            }
         )
+        current = natural
 
-    block_outputs = [natural_block0]
-    current = natural_block0
-    for block in convnext_blocks[1:]:
-        current = block(current, neighbor_map)
-        mx.eval(current)
-        block_outputs.append(current)
-
-    level0_subdiv_logits = upsample_blocks[0].to_subdiv(current)
+    level0_subdiv_logits = _decoder_linear(
+        upsample_blocks[0].to_subdiv,
+        current,
+    )
     mx.eval(
         input_feats,
         projected_fp32,
         torso_input,
-        *block_outputs,
+        *block_arrays.values(),
         level0_subdiv_logits,
     )
 
@@ -89,15 +93,10 @@ def capture_mlx_decoder_level0_trace(
         "input_feats": np.asarray(input_feats, dtype=np.float32),
         "from_latent_fp32": np.asarray(projected_fp32, dtype=np.float32),
         "torso_input": np.asarray(torso_input),
-        "block0_conv": np.asarray(block0_conv),
-        "block0_norm": np.asarray(block0_norm),
-        "block0_mlp_fc1": np.asarray(block0_mlp_fc1),
-        "block0_silu": np.asarray(block0_silu),
-        "block0_mlp_fc2": np.asarray(block0_mlp_fc2),
-        "block0_output": np.asarray(block_outputs[0]),
-        "block1_output": np.asarray(block_outputs[1]),
-        "block2_output": np.asarray(block_outputs[2]),
-        "block3_output": np.asarray(block_outputs[3]),
+        **{
+            name: np.asarray(values)
+            for name, values in block_arrays.items()
+        },
         "level0_subdiv_logits": np.asarray(level0_subdiv_logits),
     }
     return {
