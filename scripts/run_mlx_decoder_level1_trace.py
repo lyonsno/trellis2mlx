@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     parser.add_argument("--decoder-silu-lut", required=True, type=Path)
     parser.add_argument("--expected-decoder-silu-lut-sha256", required=True)
+    parser.add_argument("--turing-rsqrt-lut", required=True, type=Path)
+    parser.add_argument("--expected-turing-rsqrt-lut-sha256", required=True)
     parser.add_argument("--expected-repo-commit", required=True)
     parser.add_argument("--output-npz", required=True, type=Path)
     parser.add_argument("--output-json", required=True, type=Path)
@@ -71,6 +73,44 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
 def _validate_digest(value: str, label: str) -> None:
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise ValueError(f"{label} must be canonical lowercase SHA256")
+
+
+def _load_turing_rsqrt_lut(
+    path: Path,
+    expected_sha256: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    _validate_digest(
+        expected_sha256,
+        "--expected-turing-rsqrt-lut-sha256",
+    )
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Turing rsqrt LUT does not exist: {path}")
+    actual_sha256 = _sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "Turing rsqrt LUT digest mismatch: "
+            f"expected={expected_sha256}, actual={actual_sha256}"
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        if "normalized_delta" not in archive.files:
+            raise ValueError("Turing rsqrt LUT NPZ omits normalized_delta")
+        correction = np.asarray(archive["normalized_delta"])
+    if correction.dtype != np.dtype(np.int8) or correction.shape != (1 << 24,):
+        raise ValueError(
+            "Turing rsqrt LUT normalized_delta must be int8[16777216], "
+            f"got dtype={correction.dtype}, shape={correction.shape}"
+        )
+    correction = np.ascontiguousarray(correction)
+    return correction, {
+        "path": str(path.resolve()),
+        "sha256": actual_sha256,
+        "normalized_delta_sha256": hashlib.sha256(
+            correction.tobytes()
+        ).hexdigest(),
+        "entries": int(correction.size),
+        "dtype": str(correction.dtype),
+    }
 
 
 def _failure_sibling(requested: Path, protected: set[Path]) -> Path:
@@ -166,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             "device_type": "metal",
             "decoder_linear_backend": "turing_fda",
             "sparse_conv_matmul_backend": "turing_fda",
-            "decoder_layernorm_backend": "mlx-fast-layer-norm",
+            "decoder_layernorm_backend": "cuda-welford-turing-t4",
             "decoder_silu_backend": "cuda-turing-t4-fp16-lut",
             "parent_state": "externally-captured-level0-trace",
         },
@@ -189,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
             args.level0_trace.resolve(),
             args.shape_decoder_checkpoint.resolve(),
             args.decoder_silu_lut.resolve(),
+            args.turing_rsqrt_lut.resolve(),
         }
         primary_path = args.output_npz.resolve()
         protected_report_paths = protected_inputs | {args.output_npz.resolve()}
@@ -215,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_decoder_silu_lut_sha256,
                 "--expected-decoder-silu-lut-sha256",
             ),
+            (
+                args.expected_turing_rsqrt_lut_sha256,
+                "--expected-turing-rsqrt-lut-sha256",
+            ),
         ):
             _validate_digest(value, label)
         report["last_trustworthy_phase"] = phase
@@ -239,6 +284,14 @@ def main(argv: list[str] | None = None) -> int:
             "parent_coords_shape": list(parent_coords.shape),
             "input_tensor_sha256": input_identity,
         }
+        report["last_trustworthy_phase"] = phase
+
+        phase = "layernorm_lut_validation"
+        turing_rsqrt_lut, turing_rsqrt_lut_identity = _load_turing_rsqrt_lut(
+            args.turing_rsqrt_lut,
+            args.expected_turing_rsqrt_lut_sha256,
+        )
+        report["turing_rsqrt_lut"] = turing_rsqrt_lut_identity
         report["last_trustworthy_phase"] = phase
 
         phase = "checkpoint_validation"
@@ -269,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         import mlx.core as mx
 
         from trellmlx.decoder_turing_layernorm import (
-            DEFAULT_BACKEND as LAYERNORM_BACKEND,
+            CUDA_WELFORD_TURING_T4_BACKEND as LAYERNORM_BACKEND,
             configure_decoder_layernorm_backend,
             decoder_layernorm_backend_identity,
         )
@@ -287,7 +340,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         os.environ["TRELLIS2MLX_DECODER_LINEAR_BACKEND"] = "turing_fda"
         os.environ["TRELLIS2MLX_SPARSE_CONV_MATMUL_BACKEND"] = "turing_fda"
-        configure_decoder_layernorm_backend(LAYERNORM_BACKEND)
+        configure_decoder_layernorm_backend(
+            LAYERNORM_BACKEND,
+            turing_rsqrt_delta_lut=mx.array(turing_rsqrt_lut),
+            turing_rsqrt_lut_artifact_sha256_attested=(
+                args.expected_turing_rsqrt_lut_sha256
+            ),
+        )
         configure_decoder_silu_backend(
             CUDA_TURING_T4_LUT_BACKEND,
             output_lut_artifact_path=args.decoder_silu_lut,
@@ -306,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                 "TRELLIS2MLX_SPARSE_CONV_MATMUL_BACKEND"
             ],
             "decoder_layernorm": decoder_layernorm_backend_identity(),
+            "decoder_layernorm_lut": turing_rsqrt_lut_identity,
             "decoder_silu": decoder_silu_backend_identity(),
             "parent_state": {
                 "path": str(args.level0_trace.resolve()),

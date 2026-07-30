@@ -27,6 +27,7 @@ from scripts.decoder_level1_trace_contract import (
 
 SOURCE_ROUTE = "official-source-cuda-shape-decoder-level1-trace"
 LOCAL_ROUTE = "mlx-shape-decoder-level1-trace"
+SHA256_HEXDIGEST_LENGTH = 64
 
 
 def _sha256_file(path: Path) -> str:
@@ -35,6 +36,14 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_canonical_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == SHA256_HEXDIGEST_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _resolve_reported_path(value: object, report_path: Path) -> Path:
@@ -86,13 +95,105 @@ def _require_local_route(
         raise ValueError("local trace route omits Metal device identity")
 
     layernorm = route.get("decoder_layernorm")
-    expected_layernorm = {
-        "backend": "mlx-fast-layer-norm",
-        "algorithm": "mlx-fast-layer-norm",
-        "experimental": False,
-    }
     if not isinstance(layernorm, dict):
         raise ValueError("local trace route omits decoder LayerNorm identity")
+    layernorm_backend = layernorm.get("backend")
+    if layernorm_backend == "mlx-fast-layer-norm":
+        expected_layernorm = {
+            "backend": "mlx-fast-layer-norm",
+            "algorithm": "mlx-fast-layer-norm",
+            "experimental": False,
+        }
+        if route.get("decoder_layernorm_lut") is not None:
+            raise ValueError("native local decoder LayerNorm unexpectedly carries a LUT")
+    elif layernorm_backend == "cuda-welford-turing-t4":
+        expected_layernorm = {
+            "backend": "cuda-welford-turing-t4",
+            "algorithm": (
+                "pytorch-2.10-vectorized-layernorm-128-thread-welford-"
+                "turing-rsqrt-on-metal"
+            ),
+            "experimental": True,
+            "cuda_source_tag": "pytorch-v2.10.0",
+            "cuda_source_kernel": "vectorized_layer_norm_kernel",
+            "cuda_architecture": "sm_75",
+            "cuda_device_anchor": "Tesla T4",
+            "cuda_rsqrt_bit_exact_for_configured_lut": True,
+            "authenticated_contract": {
+                "input_dtype": "float16",
+                "parameter_dtype": "float16",
+                "hidden_width": 1024,
+                "affine": True,
+            },
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "values_per_thread": 8,
+                "accumulator_dtype": "float32",
+            },
+            "rsqrt": "Turing MUFU.RSQ normalized signed-ULP LUT",
+            "turing_rsqrt_lut_entries": 1 << 24,
+        }
+        lut = route.get("decoder_layernorm_lut")
+        if not isinstance(lut, dict):
+            raise ValueError("exact local decoder LayerNorm route omits rsqrt LUT")
+        attested = layernorm.get(
+            "turing_rsqrt_lut_artifact_sha256_attested"
+        )
+        if (
+            not _is_canonical_sha256(attested)
+            or lut.get("sha256") != attested
+        ):
+            raise ValueError("local decoder LayerNorm rsqrt artifact identity mismatch")
+        lut_path = _resolve_reported_path(lut.get("path"), report_path)
+        if not lut_path.is_file() or _sha256_file(lut_path) != attested:
+            raise ValueError(
+                "local decoder LayerNorm rsqrt artifact bytes do not match identity"
+            )
+        normalized_delta_sha = lut.get("normalized_delta_sha256")
+        if (
+            not _is_canonical_sha256(normalized_delta_sha)
+            or layernorm.get("turing_rsqrt_lut_content_sha256")
+            != normalized_delta_sha
+        ):
+            raise ValueError(
+                "local decoder LayerNorm rsqrt payload identity mismatch"
+            )
+        if lut.get("entries") != 1 << 24 or lut.get("dtype") != "int8":
+            raise ValueError("local decoder LayerNorm rsqrt payload schema mismatch")
+        try:
+            with np.load(lut_path, allow_pickle=False) as archive:
+                if "normalized_delta" not in archive.files:
+                    raise ValueError(
+                        "local decoder LayerNorm rsqrt payload omits normalized_delta"
+                    )
+                normalized_delta = np.asarray(archive["normalized_delta"])
+        except ValueError as error:
+            if "local decoder LayerNorm" in str(error):
+                raise
+            raise ValueError(
+                "local decoder LayerNorm rsqrt payload is not a valid NPZ artifact"
+            ) from error
+        if (
+            normalized_delta.dtype != np.dtype(np.int8)
+            or normalized_delta.shape != (1 << 24,)
+        ):
+            raise ValueError(
+                "local decoder LayerNorm rsqrt payload schema mismatch: "
+                "expected int8[16777216]"
+            )
+        computed_payload_sha = hashlib.sha256(
+            np.ascontiguousarray(normalized_delta).tobytes()
+        ).hexdigest()
+        if computed_payload_sha != normalized_delta_sha:
+            raise ValueError(
+                "local decoder LayerNorm rsqrt payload bytes do not match identity"
+            )
+    else:
+        raise ValueError(
+            f"unsupported local decoder LayerNorm backend {layernorm_backend!r}"
+        )
     for field, value in expected_layernorm.items():
         if layernorm.get(field) != value:
             raise ValueError(
@@ -167,6 +268,44 @@ def _require_local_route(
     return route
 
 
+def _require_requested_local_route(
+    requested: object,
+    effective: dict[str, Any],
+) -> None:
+    if requested is None:
+        return
+    if not isinstance(requested, dict):
+        raise ValueError("local trace requested route must be an object")
+    expected_fields = {
+        "route": effective.get("route"),
+        "device_type": effective.get("device_type"),
+        "decoder_linear_backend": effective.get("decoder_linear_backend"),
+        "sparse_conv_matmul_backend": effective.get("sparse_conv_matmul_backend"),
+        "decoder_layernorm_backend": effective["decoder_layernorm"].get("backend"),
+        "decoder_silu_backend": effective["decoder_silu"].get("backend"),
+    }
+    if "device" in requested:
+        expected_fields["device"] = effective.get("device")
+    for field, effective_value in expected_fields.items():
+        if field not in requested:
+            raise ValueError(f"local trace requested route omits {field!r}")
+        requested_value = requested.get(field)
+        if requested_value != effective_value:
+            label = (
+                "requested/effective decoder LayerNorm"
+                if field == "decoder_layernorm_backend"
+                else (
+                    "requested/effective concrete device"
+                    if field == "device"
+                    else f"requested/effective local route field {field!r}"
+                )
+            )
+            raise ValueError(
+                f"{label} mismatch: "
+                f"requested={requested_value!r}, effective={effective_value!r}"
+            )
+
+
 def _load_report(
     label: str,
     report_path: Path,
@@ -231,6 +370,10 @@ def _load_report(
             report,
             Path(report_path),
             input_identity,
+        )
+        _require_requested_local_route(
+            report.get("requested_route"),
+            effective_route,
         )
     actual_digest = _sha256_file(primary_path)
     if primary.get("sha256") != actual_digest:

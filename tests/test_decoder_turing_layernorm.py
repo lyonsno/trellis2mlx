@@ -154,6 +154,40 @@ def test_shape_decoder_level_zero_norms_are_exact_route_consumers():
     assert all(block.norm.decoder_layernorm for block in blocks)
 
 
+def test_shape_decoder_exact_layernorm_enrollment_stops_at_authenticated_width():
+    from trellmlx.models.shape_slat_decoder import (
+        SLatDecoder,
+        SparseConvNeXtBlock3d,
+        SparseResBlockC2S3d,
+    )
+
+    decoder = SLatDecoder(
+        model_channels=[1024, 512],
+        num_blocks=[2, 2],
+        use_fp16=True,
+    )
+    level0_blocks = [
+        block
+        for block in decoder.blocks[0]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    level0_upsample = [
+        block
+        for block in decoder.blocks[0]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    level1_blocks = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+
+    assert len(level0_upsample) == 1
+    assert all(block.norm.decoder_layernorm for block in level0_blocks)
+    assert level0_upsample[0].norm1.decoder_layernorm is True
+    assert all(block.norm.decoder_layernorm is False for block in level1_blocks)
+
+
 def test_turing_decoder_layernorm_rejects_wrong_contract():
     import mlx.core as mx
 

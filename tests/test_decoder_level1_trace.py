@@ -253,6 +253,239 @@ def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
     return source_path, source_report, local_path, local_report
 
 
+def _exact_layernorm_route(lut):
+    with np.load(lut, allow_pickle=False) as archive:
+        normalized_delta = np.asarray(archive["normalized_delta"])
+    lut_sha = hashlib.sha256(lut.read_bytes()).hexdigest()
+    content_sha = hashlib.sha256(
+        np.ascontiguousarray(normalized_delta).tobytes()
+    ).hexdigest()
+    return {
+        "decoder_layernorm": {
+            "backend": "cuda-welford-turing-t4",
+            "algorithm": (
+                "pytorch-2.10-vectorized-layernorm-128-thread-welford-"
+                "turing-rsqrt-on-metal"
+            ),
+            "experimental": True,
+            "cuda_source_tag": "pytorch-v2.10.0",
+            "cuda_source_kernel": "vectorized_layer_norm_kernel",
+            "cuda_architecture": "sm_75",
+            "cuda_device_anchor": "Tesla T4",
+            "cuda_rsqrt_bit_exact_for_configured_lut": True,
+            "authenticated_contract": {
+                "input_dtype": "float16",
+                "parameter_dtype": "float16",
+                "hidden_width": 1024,
+                "affine": True,
+            },
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "values_per_thread": 8,
+                "accumulator_dtype": "float32",
+            },
+            "rsqrt": "Turing MUFU.RSQ normalized signed-ULP LUT",
+            "turing_rsqrt_lut_artifact_sha256_attested": lut_sha,
+            "turing_rsqrt_lut_content_sha256": content_sha,
+            "turing_rsqrt_lut_entries": 1 << 24,
+        },
+        "decoder_layernorm_lut": {
+            "path": str(lut),
+            "sha256": lut_sha,
+            "normalized_delta_sha256": content_sha,
+            "entries": 1 << 24,
+            "dtype": "int8",
+        },
+    }
+
+
+def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    lut_sha = hashlib.sha256(lut.read_bytes()).hexdigest()
+    report = json.loads(local_report.read_text())
+    report["effective_route"].update(_exact_layernorm_route(lut))
+    local_report.write_text(json.dumps(report))
+
+    comparison = compare_level1_traces(
+        source_path=source_path,
+        source_report_path=source_report,
+        local_path=local_path,
+        local_report_path=local_report,
+    )
+
+    assert comparison["first_nonexact_boundary"] is None
+    assert (
+        comparison["artifacts"]["local"]["effective_route"][
+            "decoder_layernorm_lut"
+        ]["sha256"]
+        == lut_sha
+    )
+
+
+def test_level1_comparator_rejects_substituted_exact_layernorm_artifact(tmp_path):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    report = json.loads(local_report.read_text())
+    report["effective_route"].update(_exact_layernorm_route(lut))
+    local_report.write_text(json.dumps(report))
+    lut.write_bytes(b"substituted")
+
+    with pytest.raises(
+        ValueError,
+        match="LayerNorm rsqrt artifact bytes do not match identity",
+    ):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_level1_comparator_rejects_truthfully_hashed_malformed_layernorm_artifact(
+    tmp_path,
+):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    exact_route = _exact_layernorm_route(lut)
+    lut.write_bytes(b"not an npz normalized_delta payload")
+    lut_sha = hashlib.sha256(lut.read_bytes()).hexdigest()
+    invented_payload_sha = "0" * 64
+    report = json.loads(local_report.read_text())
+    report["effective_route"].update(
+        {
+            "decoder_layernorm": {
+                **exact_route["decoder_layernorm"],
+                "turing_rsqrt_lut_artifact_sha256_attested": lut_sha,
+                "turing_rsqrt_lut_content_sha256": invented_payload_sha,
+            },
+            "decoder_layernorm_lut": {
+                "path": str(lut),
+                "sha256": lut_sha,
+                "normalized_delta_sha256": invented_payload_sha,
+                "entries": 1 << 24,
+                "dtype": "int8",
+            },
+        }
+    )
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="LayerNorm rsqrt payload"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_level1_comparator_rejects_requested_exact_effective_native_layernorm(
+    tmp_path,
+):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    report = json.loads(local_report.read_text())
+    report["requested_route"] = {
+        "route": "mlx-shape-decoder-level1-trace",
+        "device_type": "metal",
+        "decoder_linear_backend": "turing_fda",
+        "sparse_conv_matmul_backend": "turing_fda",
+        "decoder_layernorm_backend": "cuda-welford-turing-t4",
+        "decoder_silu_backend": "cuda-turing-t4-fp16-lut",
+        "parent_state": "externally-captured-level0-trace",
+    }
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="requested/effective decoder LayerNorm"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_level1_comparator_rejects_requested_effective_concrete_device_mismatch(
+    tmp_path,
+):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    report = json.loads(local_report.read_text())
+    effective = report["effective_route"]
+    report["requested_route"] = {
+        "route": effective["route"],
+        "device_type": effective["device_type"],
+        "device": "Device(cpu, 0)",
+        "decoder_linear_backend": effective["decoder_linear_backend"],
+        "sparse_conv_matmul_backend": effective["sparse_conv_matmul_backend"],
+        "decoder_layernorm_backend": effective["decoder_layernorm"]["backend"],
+        "decoder_silu_backend": effective["decoder_silu"]["backend"],
+        "parent_state": "externally-captured-level0-trace",
+    }
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="requested/effective concrete device"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_local_level1_trace_turing_rsqrt_loader_rejects_malformed_or_substituted(
+    tmp_path,
+):
+    from scripts.run_mlx_decoder_level1_trace import _load_turing_rsqrt_lut
+
+    malformed = tmp_path / "malformed.npz"
+    np.savez(malformed, normalized_delta=np.zeros((16,), dtype=np.int8))
+    malformed_sha = hashlib.sha256(malformed.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match=r"int8\[16777216\]"):
+        _load_turing_rsqrt_lut(malformed, malformed_sha)
+
+    with pytest.raises(ValueError, match="rsqrt LUT digest mismatch"):
+        _load_turing_rsqrt_lut(malformed, "0" * 64)
+
+
 def test_level1_comparator_reports_hidden_internal_boundary_first(tmp_path):
     from scripts.compare_decoder_level1_traces import compare_level1_traces
 
@@ -440,6 +673,8 @@ def test_local_level1_trace_failure_writes_phase_report_and_invalidates_stale_pr
     checkpoint.write_bytes(b"checkpoint")
     silu_lut = tmp_path / "silu.npz"
     silu_lut.write_bytes(b"silu")
+    rsqrt_lut = tmp_path / "rsqrt.npz"
+    rsqrt_lut.write_bytes(b"rsqrt")
     output_npz = tmp_path / "trace.npz"
     output_npz.write_bytes(b"stale-primary")
     output_json = tmp_path / "trace.json"
@@ -458,6 +693,10 @@ def test_local_level1_trace_failure_writes_phase_report_and_invalidates_stale_pr
             str(silu_lut),
             "--expected-decoder-silu-lut-sha256",
             hashlib.sha256(silu_lut.read_bytes()).hexdigest(),
+            "--turing-rsqrt-lut",
+            str(rsqrt_lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            hashlib.sha256(rsqrt_lut.read_bytes()).hexdigest(),
             "--expected-repo-commit",
             "b" * 40,
             "--output-npz",
@@ -499,6 +738,8 @@ def test_local_level1_trace_rejects_stale_parent_digest_before_model_load(
     checkpoint.write_bytes(b"checkpoint")
     silu_lut = tmp_path / "silu.npz"
     silu_lut.write_bytes(b"silu")
+    rsqrt_lut = tmp_path / "rsqrt.npz"
+    rsqrt_lut.write_bytes(b"rsqrt")
     output_npz = tmp_path / "trace.npz"
     output_json = tmp_path / "trace.json"
 
@@ -516,6 +757,10 @@ def test_local_level1_trace_rejects_stale_parent_digest_before_model_load(
             str(silu_lut),
             "--expected-decoder-silu-lut-sha256",
             hashlib.sha256(silu_lut.read_bytes()).hexdigest(),
+            "--turing-rsqrt-lut",
+            str(rsqrt_lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            hashlib.sha256(rsqrt_lut.read_bytes()).hexdigest(),
             "--expected-repo-commit",
             "b" * 40,
             "--output-npz",
@@ -549,6 +794,8 @@ def test_local_level1_trace_report_collision_preserves_parent_and_uses_sibling(
     checkpoint.write_bytes(b"checkpoint")
     silu_lut = tmp_path / "silu.npz"
     silu_lut.write_bytes(b"silu")
+    rsqrt_lut = tmp_path / "rsqrt.npz"
+    rsqrt_lut.write_bytes(b"rsqrt")
     output_npz = tmp_path / "trace.npz"
     output_npz.write_bytes(b"stale-primary")
     fallback = parent.with_name(parent.name + ".failure.json")
@@ -567,6 +814,10 @@ def test_local_level1_trace_report_collision_preserves_parent_and_uses_sibling(
             str(silu_lut),
             "--expected-decoder-silu-lut-sha256",
             hashlib.sha256(silu_lut.read_bytes()).hexdigest(),
+            "--turing-rsqrt-lut",
+            str(rsqrt_lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            hashlib.sha256(rsqrt_lut.read_bytes()).hexdigest(),
             "--expected-repo-commit",
             "b" * 40,
             "--output-npz",
@@ -603,6 +854,8 @@ def test_local_level1_trace_primary_report_alias_invalidates_stale_primary(
     checkpoint.write_bytes(b"checkpoint")
     silu_lut = tmp_path / "silu.npz"
     silu_lut.write_bytes(b"silu")
+    rsqrt_lut = tmp_path / "rsqrt.npz"
+    rsqrt_lut.write_bytes(b"rsqrt")
     output_npz = tmp_path / "trace.npz"
     output_npz.write_bytes(b"stale-primary")
     fallback = output_npz.with_name(output_npz.name + ".failure.json")
@@ -621,6 +874,10 @@ def test_local_level1_trace_primary_report_alias_invalidates_stale_primary(
             str(silu_lut),
             "--expected-decoder-silu-lut-sha256",
             hashlib.sha256(silu_lut.read_bytes()).hexdigest(),
+            "--turing-rsqrt-lut",
+            str(rsqrt_lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            hashlib.sha256(rsqrt_lut.read_bytes()).hexdigest(),
             "--expected-repo-commit",
             "b" * 40,
             "--output-npz",
