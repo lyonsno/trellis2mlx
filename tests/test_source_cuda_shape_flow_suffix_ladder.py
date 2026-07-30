@@ -8,6 +8,7 @@ import pytest
 MODULATION_NPZ_SHA256 = "c" * 64
 MODULATION_REPORT_SHA256 = "d" * 64
 MODULATION_SOURCE_CHECKPOINT_SHA256 = "e" * 64
+PROJECTION_BATCH_MODE = "independent-singletons"
 
 
 def _sha256(path):
@@ -26,6 +27,7 @@ def _modulation_identity():
         "source_checkpoint_sha256_effective": (
             MODULATION_SOURCE_CHECKPOINT_SHA256
         ),
+        "projection_batch_mode": PROJECTION_BATCH_MODE,
         "step_indices": list(range(8)),
         "timestep_float32_bits": [
             "0x447a0000",
@@ -57,9 +59,11 @@ def _write_capture(
     recurrence_delta=0.0,
     backend="mlx-metal",
     checkpoint_modulation_identity=None,
+    modulation_identity=None,
 ):
     steps = 8
-    modulation_identity = _modulation_identity()
+    if modulation_identity is None:
+        modulation_identity = _modulation_identity()
     if checkpoint_modulation_identity is None:
         checkpoint_modulation_identity = modulation_identity
     sample_in = np.zeros((steps, 2, 3), dtype=np.float32)
@@ -225,6 +229,34 @@ def test_load_mlx_trajectory_rejects_substituted_modulation_checkpoint_identity(
     with pytest.raises(
         ValueError,
         match="checkpoint.*timestep modulation identity",
+    ):
+        load_mlx_trajectory(
+            capture,
+            report,
+            conditioning,
+            expected_modulation_identity=_expected_modulation_identity(),
+        )
+
+
+@pytest.mark.parametrize("mode", [None, "batched-eight"])
+def test_load_mlx_trajectory_rejects_non_singleton_modulation_identity(
+    tmp_path,
+    mode,
+):
+    from scripts.source_cuda_shape_flow_suffix_ladder import load_mlx_trajectory
+
+    identity = _modulation_identity()
+    if mode is None:
+        identity.pop("projection_batch_mode")
+    else:
+        identity["projection_batch_mode"] = mode
+    capture, report, conditioning = _write_capture(
+        tmp_path,
+        modulation_identity=identity,
+    )
+
+    with pytest.raises(
+        ValueError, match="projection_batch_mode.*canonical"
     ):
         load_mlx_trajectory(
             capture,

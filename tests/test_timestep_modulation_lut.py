@@ -20,24 +20,37 @@ TIMESTEP_BITS = np.asarray(
     dtype=np.uint32,
 )
 SOURCE_CHECKPOINT_SHA256 = "e" * 64
+PROJECTION_BATCH_MODE = "independent-singletons"
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_source_pair(tmp_path: Path) -> tuple[Path, Path, str, str]:
+def _write_source_pair(
+    tmp_path: Path,
+    *,
+    report_projection_batch_mode=PROJECTION_BATCH_MODE,
+    npz_projection_batch_mode=PROJECTION_BATCH_MODE,
+) -> tuple[Path, Path, str, str]:
     npz_path = tmp_path / "cuda_result.npz"
     bits = np.zeros((8, 9216), dtype=np.uint16)
     bits[5, 450] = np.uint16(0x3E9F)
     bits[5, 5072] = np.uint16(0x3C04)
     bits[5, 5160] = np.uint16(0x399D)
     bits[5, 5392] = np.uint16(0xBB42)
+    npz_arrays = {
+        "step_indices": np.arange(8, dtype=np.int32),
+        "timestep_float32": TIMESTEP_BITS.view(np.float32),
+        "source_modulation_bfloat16_bits": bits,
+    }
+    if npz_projection_batch_mode is not None:
+        npz_arrays["projection_batch_mode"] = np.asarray(
+            npz_projection_batch_mode
+        )
     np.savez(
         npz_path,
-        step_indices=np.arange(8, dtype=np.int32),
-        timestep_float32=TIMESTEP_BITS.view(np.float32),
-        source_modulation_bfloat16_bits=bits,
+        **npz_arrays,
     )
     npz_sha256 = _sha256(npz_path)
     report_path = tmp_path / "cuda_result.json"
@@ -50,6 +63,15 @@ def _write_source_pair(tmp_path: Path) -> tuple[Path, Path, str, str]:
                     "device_type": "cuda",
                     "cuda_device": "Tesla T4",
                     "torch": "2.10.0+cu128",
+                    **(
+                        {
+                            "projection_batch_mode": (
+                                report_projection_batch_mode
+                            )
+                        }
+                        if report_projection_batch_mode is not None
+                        else {}
+                    ),
                 },
                 "inputs": {
                     "source_checkpoint_sha256_effective": (
@@ -112,6 +134,49 @@ def test_source_cuda_timestep_modulation_lut_loads_authenticated_canonical_table
         identity["source_checkpoint_sha256_effective"]
         == SOURCE_CHECKPOINT_SHA256
     )
+    assert identity["projection_batch_mode"] == PROJECTION_BATCH_MODE
+
+
+@pytest.mark.parametrize(
+    ("artifact", "mode"),
+    [
+        ("report", None),
+        ("report", "batched-eight"),
+        ("npz", None),
+        ("npz", "batched-eight"),
+    ],
+)
+def test_source_cuda_timestep_modulation_lut_rejects_non_singleton_identity(
+    tmp_path,
+    artifact,
+    mode,
+):
+    from trellmlx.timestep_modulation_lut import (
+        load_source_cuda_timestep_modulation_lut,
+    )
+
+    kwargs = {
+        (
+            "report_projection_batch_mode"
+            if artifact == "report"
+            else "npz_projection_batch_mode"
+        ): mode
+    }
+    npz_path, report_path, npz_sha256, report_sha256 = _write_source_pair(
+        tmp_path,
+        **kwargs,
+    )
+
+    with pytest.raises(
+        ValueError, match="independent-singletons projection batch mode"
+    ):
+        load_source_cuda_timestep_modulation_lut(
+            npz_path=npz_path,
+            report_path=report_path,
+            expected_npz_sha256=npz_sha256,
+            expected_report_sha256=report_sha256,
+            expected_source_checkpoint_sha256=SOURCE_CHECKPOINT_SHA256,
+        )
 
 
 def test_source_cuda_timestep_modulation_lut_rejects_substituted_primary(
@@ -308,6 +373,7 @@ def test_stage_capture_binds_effective_timestep_modulation_identity(
         "report_path": str(report_path),
         "report_sha256_effective": report_sha256,
         "source_checkpoint_sha256_effective": SOURCE_CHECKPOINT_SHA256,
+        "projection_batch_mode": PROJECTION_BATCH_MODE,
         "step_indices": list(range(8)),
         "timestep_float32_bits": [
             f"0x{int(value):08x}" for value in TIMESTEP_BITS
@@ -331,6 +397,10 @@ def test_stage_capture_binds_effective_timestep_modulation_identity(
     )
 
     assert binding["shape_timestep_modulation_route"] == identity
+    assert (
+        binding["shape_timestep_modulation_route"]["projection_batch_mode"]
+        == PROJECTION_BATCH_MODE
+    )
     assert binding["sha256"] == _sha256(checkpoint)
     assert (
         route_identity["route"][

@@ -217,6 +217,7 @@ def load_mlx_trajectory(
         canonical_identity = {
             "schema": "trellis2mlx.source_cuda_timestep_modulation_lut.v1",
             "route": "source-cuda-t4-canonical-shared-adaln-lut",
+            "projection_batch_mode": "independent-singletons",
             "step_indices": list(range(STEPS)),
             "timestep_float32_bits": [
                 "0x447a0000",

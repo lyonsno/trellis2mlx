@@ -16,6 +16,7 @@ STAGES = (
     "modulation_float32",
     "modulation_bfloat16_bits",
 )
+PROJECTION_BATCH_MODE = "independent-singletons"
 
 
 def _arrays(*, steps=3, width=4):
@@ -103,9 +104,13 @@ def test_modulation_analysis_rejects_nonfinite_or_malformed_arrays():
             {"candidate_route": "trellis2mlx/substituted-route"},
             "candidate route mismatch",
         ),
+        (
+            {"candidate_projection_batch_mode": "batched-eight"},
+            "projection batch mode mismatch",
+        ),
     ],
 )
-def test_modulation_provenance_rejects_checkpoint_or_route_substitution(
+def test_modulation_provenance_rejects_checkpoint_route_or_batch_substitution(
     mutation, message
 ):
     from scripts.cuda_timestep_modulation_witness import validate_provenance
@@ -120,7 +125,60 @@ def test_modulation_provenance_rejects_checkpoint_or_route_substitution(
             expected_source_checkpoint_sha256=expected_checkpoint,
             candidate_route=mutation.get("candidate_route", expected_route),
             expected_candidate_route=expected_route,
+            candidate_projection_batch_mode=mutation.get(
+                "candidate_projection_batch_mode", PROJECTION_BATCH_MODE
+            ),
+            requested_projection_batch_mode=PROJECTION_BATCH_MODE,
         )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_shapes"),
+    [
+        ("batched-eight", [(8,)]),
+        ("independent-singletons", [(1,)] * 8),
+    ],
+)
+def test_modulation_projection_batches_preserve_requested_gemm_shape(
+    mode, expected_shapes
+):
+    from scripts.cuda_timestep_modulation_witness import _projection_batches
+
+    timesteps = np.arange(8, dtype=np.float32)
+
+    assert [
+        batch.shape for batch in _projection_batches(timesteps, mode=mode)
+    ] == expected_shapes
+
+
+def test_modulation_candidate_requires_projection_batch_identity(tmp_path):
+    from scripts.cuda_timestep_modulation_witness import _load_candidate
+
+    candidate = tmp_path / "candidate.npz"
+    np.savez(
+        candidate,
+        step_indices=np.arange(8, dtype=np.int32),
+        timestep_float32=np.asarray(
+            [
+                0x447A0000,
+                0x446EA2E9,
+                0x44610000,
+                0x44505555,
+                0x443B8000,
+                0x4420B6DB,
+                0x43FA0000,
+                0x43960000,
+            ],
+            dtype=np.uint32,
+        ).view(np.float32),
+        candidate_route=np.asarray("trellis2mlx/source-shared-modulation"),
+        **_arrays(steps=8),
+    )
+
+    with pytest.raises(
+        ValueError, match="candidate missing required arrays.*projection_batch_mode"
+    ):
+        _load_candidate(candidate)
 
 
 def test_modulation_primary_validation_rejects_partial_or_corrupted_output(
@@ -151,6 +209,40 @@ def test_modulation_primary_validation_rejects_partial_or_corrupted_output(
             step_indices=step_indices,
             timesteps=timesteps,
             source_arrays=source_arrays,
+            projection_batch_mode=PROJECTION_BATCH_MODE,
+        )
+
+
+def test_modulation_primary_validation_rejects_batch_mode_substitution(tmp_path):
+    from scripts.cuda_timestep_modulation_witness import (
+        validate_written_primary,
+    )
+
+    step_indices = np.asarray([0, 1], dtype=np.int32)
+    timesteps = np.asarray([1.0, 0.5], dtype=np.float32)
+    source_arrays = _arrays(steps=2)
+    output = tmp_path / "cuda_result.npz"
+    np.savez(
+        output,
+        step_indices=step_indices,
+        timestep_float32=timesteps,
+        projection_batch_mode=np.asarray("batched-eight"),
+        **{
+            f"source_{name}": value
+            for name, value in source_arrays.items()
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="primary array projection_batch_mode differs from authenticated memory",
+    ):
+        validate_written_primary(
+            output,
+            step_indices=step_indices,
+            timesteps=timesteps,
+            source_arrays=source_arrays,
+            projection_batch_mode=PROJECTION_BATCH_MODE,
         )
 
 
@@ -218,6 +310,8 @@ def test_modulation_main_preserves_input_when_primary_aliases_it(
             hashlib.sha256(candidate.read_bytes()).hexdigest(),
             "--expected-candidate-route",
             "trellis2mlx/source-shared-modulation",
+            "--projection-batch-mode",
+            PROJECTION_BATCH_MODE,
             "--output-json",
             str(output_json),
             "--output-npz",
@@ -263,6 +357,8 @@ def test_modulation_main_routes_hardlinked_failure_report_away_from_input(
             hashlib.sha256(candidate.read_bytes()).hexdigest(),
             "--expected-candidate-route",
             "trellis2mlx/source-shared-modulation",
+            "--projection-batch-mode",
+            PROJECTION_BATCH_MODE,
             "--output-json",
             str(requested_json),
             "--output-npz",
@@ -299,6 +395,7 @@ def test_modulation_main_rejects_partial_schedule_before_torch_and_clears_primar
         candidate_route=np.asarray(
             "trellis2mlx/source-shared-modulation"
         ),
+        projection_batch_mode=np.asarray(PROJECTION_BATCH_MODE),
         **candidate_arrays,
     )
     monkeypatch.setattr(
@@ -326,6 +423,8 @@ def test_modulation_main_rejects_partial_schedule_before_torch_and_clears_primar
             hashlib.sha256(candidate.read_bytes()).hexdigest(),
             "--expected-candidate-route",
             "trellis2mlx/source-shared-modulation",
+            "--projection-batch-mode",
+            PROJECTION_BATCH_MODE,
             "--output-json",
             str(output_json),
             "--output-npz",
@@ -373,6 +472,8 @@ def test_modulation_main_rejects_substituted_input_and_removes_stale_primary(
             candidate_digest,
             "--expected-candidate-route",
             "trellis2mlx/source-shared-modulation",
+            "--projection-batch-mode",
+            PROJECTION_BATCH_MODE,
             "--output-json",
             str(output_json),
             "--output-npz",

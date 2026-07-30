@@ -13,6 +13,7 @@ import numpy as np
 
 SCHEMA = "trellis2mlx.source_cuda_timestep_modulation_lut.v1"
 SOURCE_REPORT_SCHEMA = "trellis2mlx.cuda_timestep_modulation_witness.v1"
+PROJECTION_BATCH_MODE = "independent-singletons"
 CANONICAL_STEP_INDICES = np.arange(8, dtype=np.int32)
 CANONICAL_TIMESTEP_BITS = np.asarray(
     [
@@ -61,6 +62,7 @@ class SourceCudaTimestepModulationLut:
     npz_sha256: str
     report_sha256: str
     source_checkpoint_sha256: str
+    projection_batch_mode: str
     timestep_bits: np.ndarray
     modulation_bfloat16_bits: np.ndarray
 
@@ -102,6 +104,7 @@ class SourceCudaTimestepModulationLut:
             "source_checkpoint_sha256_effective": (
                 self.source_checkpoint_sha256
             ),
+            "projection_batch_mode": self.projection_batch_mode,
             "step_indices": CANONICAL_STEP_INDICES.tolist(),
             "timestep_float32_bits": [
                 f"0x{int(value):08x}" for value in self.timestep_bits
@@ -152,10 +155,19 @@ def load_source_cuda_timestep_modulation_lut(
             "source-CUDA timestep modulation report is not an admitted done witness"
         )
     route = report.get("effective_route")
+    if (
+        not isinstance(route, dict)
+        or route.get("projection_batch_mode") != PROJECTION_BATCH_MODE
+    ):
+        raise ValueError(
+            "source-CUDA timestep modulation report must record "
+            "independent-singletons projection batch mode"
+        )
     if route != {
         "cuda_device": "Tesla T4",
         "device_type": "cuda",
         "torch": "2.10.0+cu128",
+        "projection_batch_mode": PROJECTION_BATCH_MODE,
     }:
         raise ValueError(
             "source-CUDA timestep modulation report has an unsupported effective route"
@@ -230,6 +242,22 @@ def load_source_cuda_timestep_modulation_lut(
         modulation_bits = np.asarray(
             source["source_modulation_bfloat16_bits"]
         )
+        projection_batch_mode = (
+            np.asarray(source["projection_batch_mode"])
+            if "projection_batch_mode" in source.files
+            else None
+        )
+
+    if (
+        projection_batch_mode is None
+        or projection_batch_mode.shape != ()
+        or projection_batch_mode.dtype.kind not in {"U", "S"}
+        or str(projection_batch_mode.item()) != PROJECTION_BATCH_MODE
+    ):
+        raise ValueError(
+            "source-CUDA timestep modulation NPZ must record "
+            "independent-singletons projection batch mode"
+        )
 
     if (
         step_indices.dtype != np.int32
@@ -261,6 +289,7 @@ def load_source_cuda_timestep_modulation_lut(
         npz_sha256=effective_npz_sha256,
         report_sha256=effective_report_sha256,
         source_checkpoint_sha256=effective_checkpoint,
+        projection_batch_mode=PROJECTION_BATCH_MODE,
         timestep_bits=timestep_bits,
         modulation_bfloat16_bits=modulation_bits,
     )

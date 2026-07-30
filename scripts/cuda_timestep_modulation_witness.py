@@ -17,6 +17,10 @@ import numpy as np
 SCHEMA = "trellis2mlx.cuda_timestep_modulation_witness.v1"
 EXPECTED_TORCH = "2.10.0+cu128"
 EXPECTED_DEVICE = "Tesla T4"
+PROJECTION_BATCH_MODES = (
+    "batched-eight",
+    "independent-singletons",
+)
 EXPECTED_STEP_INDICES = tuple(range(8))
 EXPECTED_TIMESTEP_FLOAT32_BITS = (
     0x447A0000,
@@ -154,6 +158,8 @@ def validate_provenance(
     expected_source_checkpoint_sha256: str,
     candidate_route: str,
     expected_candidate_route: str,
+    candidate_projection_batch_mode: str,
+    requested_projection_batch_mode: str,
 ) -> None:
     if source_checkpoint_sha256 != expected_source_checkpoint_sha256:
         raise ValueError(
@@ -165,6 +171,12 @@ def validate_provenance(
         raise ValueError(
             "candidate route mismatch: "
             f"expected {expected_candidate_route!r}, got {candidate_route!r}"
+        )
+    if candidate_projection_batch_mode != requested_projection_batch_mode:
+        raise ValueError(
+            "projection batch mode mismatch: "
+            f"requested {requested_projection_batch_mode!r}, "
+            f"candidate records {candidate_projection_batch_mode!r}"
         )
 
 
@@ -328,12 +340,13 @@ def _load_weights(path: Path) -> tuple[dict[str, np.ndarray], str]:
 
 def _load_candidate(
     path: Path,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], str]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], str, str]:
     with np.load(path, allow_pickle=False) as data:
         required = {
             "step_indices",
             "timestep_float32",
             "candidate_route",
+            "projection_batch_mode",
             *STAGES,
         }
         missing = sorted(required.difference(data.files))
@@ -345,6 +358,9 @@ def _load_candidate(
         candidate_route = _scalar_text(
             data["candidate_route"], name="candidate_route"
         )
+        projection_batch_mode = _scalar_text(
+            data["projection_batch_mode"], name="projection_batch_mode"
+        )
     validate_schedule(step_indices=step_indices, timesteps=timesteps)
     # Reuse the full analysis validator against itself.
     analyze_modulation(
@@ -352,7 +368,13 @@ def _load_candidate(
         candidate_arrays=arrays,
         source_arrays={name: value.copy() for name, value in arrays.items()},
     )
-    return step_indices, timesteps, arrays, candidate_route
+    return (
+        step_indices,
+        timesteps,
+        arrays,
+        candidate_route,
+        projection_batch_mode,
+    )
 
 
 def validate_written_primary(
@@ -361,10 +383,12 @@ def validate_written_primary(
     step_indices: np.ndarray,
     timesteps: np.ndarray,
     source_arrays: dict[str, np.ndarray],
+    projection_batch_mode: str,
 ) -> dict[str, str]:
     expected = {
         "step_indices": np.asarray(step_indices),
         "timestep_float32": np.asarray(timesteps),
+        "projection_batch_mode": np.asarray(projection_batch_mode),
         **{
             f"source_{name}": np.asarray(value)
             for name, value in source_arrays.items()
@@ -391,11 +415,32 @@ def validate_written_primary(
     }
 
 
+def _projection_batches(
+    timesteps: np.ndarray,
+    *,
+    mode: str,
+) -> tuple[np.ndarray, ...]:
+    value = np.asarray(timesteps)
+    if value.ndim != 1 or value.size == 0:
+        raise ValueError("timesteps must be a non-empty one-dimensional array")
+    if mode == "batched-eight":
+        if value.size != len(EXPECTED_STEP_INDICES):
+            raise ValueError("batched-eight requires exactly eight timesteps")
+        return (value,)
+    if mode == "independent-singletons":
+        return tuple(value[index : index + 1] for index in range(value.size))
+    raise ValueError(
+        f"unsupported projection batch mode {mode!r}; "
+        f"expected one of {PROJECTION_BATCH_MODES}"
+    )
+
+
 def _compute_source_cuda(
     *,
     torch: Any,
     weights: dict[str, np.ndarray],
     timesteps: np.ndarray,
+    projection_batch_mode: str,
 ) -> dict[str, np.ndarray]:
     device = torch.device("cuda")
 
@@ -409,41 +454,59 @@ def _compute_source_cuda(
     modulation_weight = tensor("modulation_weight")
     modulation_bias = tensor("modulation_bias")
 
-    t = torch.from_numpy(timesteps).to(device=device)
     half = 128
     freqs = torch.exp(
         -np.log(10000)
         * torch.arange(0, half, dtype=torch.float32)
         / half
     ).to(device=device)
-    args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    linear0 = torch.nn.functional.linear(
-        embedding, linear0_weight, linear0_bias
-    )
-    silu0 = torch.nn.functional.silu(linear0)
-    linear1 = torch.nn.functional.linear(
-        silu0, linear1_weight, linear1_bias
-    )
-    silu1 = torch.nn.functional.silu(linear1)
-    modulation = torch.nn.functional.linear(
-        silu1, modulation_weight, modulation_bias
-    )
-    modulation_bfloat16_bits = (
-        modulation.to(torch.bfloat16)
-        .view(torch.int16)
-        .cpu()
-        .numpy()
-        .view(np.uint16)
-    )
+
+    def compute_batch(batch_timesteps: np.ndarray) -> dict[str, np.ndarray]:
+        t = torch.from_numpy(batch_timesteps).to(device=device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        linear0 = torch.nn.functional.linear(
+            embedding, linear0_weight, linear0_bias
+        )
+        silu0 = torch.nn.functional.silu(linear0)
+        linear1 = torch.nn.functional.linear(
+            silu0, linear1_weight, linear1_bias
+        )
+        silu1 = torch.nn.functional.silu(linear1)
+        modulation = torch.nn.functional.linear(
+            silu1, modulation_weight, modulation_bias
+        )
+        modulation_bfloat16_bits = (
+            modulation.to(torch.bfloat16)
+            .view(torch.int16)
+            .cpu()
+            .numpy()
+            .view(np.uint16)
+        )
+        return {
+            "embedding": embedding.cpu().numpy().astype(np.float32),
+            "linear0": linear0.cpu().numpy().astype(np.float32),
+            "silu0": silu0.cpu().numpy().astype(np.float32),
+            "linear1": linear1.cpu().numpy().astype(np.float32),
+            "silu1": silu1.cpu().numpy().astype(np.float32),
+            "modulation_float32": (
+                modulation.cpu().numpy().astype(np.float32)
+            ),
+            "modulation_bfloat16_bits": modulation_bfloat16_bits,
+        }
+
+    batches = [
+        compute_batch(batch)
+        for batch in _projection_batches(
+            timesteps, mode=projection_batch_mode
+        )
+    ]
     return {
-        "embedding": embedding.cpu().numpy().astype(np.float32),
-        "linear0": linear0.cpu().numpy().astype(np.float32),
-        "silu0": silu0.cpu().numpy().astype(np.float32),
-        "linear1": linear1.cpu().numpy().astype(np.float32),
-        "silu1": silu1.cpu().numpy().astype(np.float32),
-        "modulation_float32": modulation.cpu().numpy().astype(np.float32),
-        "modulation_bfloat16_bits": modulation_bfloat16_bits,
+        stage: np.concatenate(
+            [batch[stage] for batch in batches],
+            axis=0,
+        )
+        for stage in STAGES
     }
 
 
@@ -455,6 +518,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--expected-candidate-sha256", required=True)
     parser.add_argument("--expected-candidate-route", required=True)
+    parser.add_argument(
+        "--projection-batch-mode",
+        required=True,
+        choices=PROJECTION_BATCH_MODES,
+    )
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
     return parser
@@ -504,6 +572,7 @@ def main() -> int:
         "requested_route": {
             "torch": EXPECTED_TORCH,
             "cuda_device": EXPECTED_DEVICE,
+            "projection_batch_mode": args.projection_batch_mode,
         },
         "inputs": {
             "weights": str(args.weights),
@@ -514,6 +583,7 @@ def main() -> int:
             "candidate": str(args.candidate),
             "candidate_sha256_requested": args.expected_candidate_sha256,
             "candidate_route_requested": args.expected_candidate_route,
+            "projection_batch_mode_requested": args.projection_batch_mode,
         },
     }
     try:
@@ -549,6 +619,7 @@ def main() -> int:
             timesteps,
             candidate_arrays,
             candidate_route,
+            candidate_projection_batch_mode,
         ) = _load_candidate(args.candidate)
         validate_provenance(
             source_checkpoint_sha256=source_checkpoint_sha256,
@@ -557,6 +628,10 @@ def main() -> int:
             ),
             candidate_route=candidate_route,
             expected_candidate_route=args.expected_candidate_route,
+            candidate_projection_batch_mode=(
+                candidate_projection_batch_mode
+            ),
+            requested_projection_batch_mode=args.projection_batch_mode,
         )
         report["schedule_identity"] = validate_schedule(
             step_indices=step_indices,
@@ -568,6 +643,9 @@ def main() -> int:
                     source_checkpoint_sha256
                 ),
                 "candidate_route_effective": candidate_route,
+                "projection_batch_mode_effective": (
+                    candidate_projection_batch_mode
+                ),
             }
         )
         last_trustworthy_phase = phase
@@ -586,6 +664,7 @@ def main() -> int:
             "torch": torch.__version__,
             "cuda_device": cuda_device,
             "device_type": "cuda",
+            "projection_batch_mode": args.projection_batch_mode,
         }
         last_trustworthy_phase = phase
 
@@ -595,6 +674,7 @@ def main() -> int:
                 torch=torch,
                 weights=weights,
                 timesteps=timesteps,
+                projection_batch_mode=args.projection_batch_mode,
             )
         analysis = analyze_modulation(
             step_indices=step_indices,
@@ -608,6 +688,7 @@ def main() -> int:
             args.output_npz,
             step_indices=step_indices,
             timestep_float32=timesteps,
+            projection_batch_mode=np.asarray(args.projection_batch_mode),
             **{
                 f"source_{name}": np.ascontiguousarray(value)
                 for name, value in source_arrays.items()
@@ -621,6 +702,7 @@ def main() -> int:
             step_indices=step_indices,
             timesteps=timesteps,
             source_arrays=source_arrays,
+            projection_batch_mode=args.projection_batch_mode,
         )
         primary_sha256 = sha256_file(args.output_npz)
         report.update(
