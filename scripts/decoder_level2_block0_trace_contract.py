@@ -139,6 +139,21 @@ DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS = [
             "accumulator_dtype": "float32",
         },
     },
+    {
+        "input_dtype": "float16",
+        "hidden_width": 128,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 1,
+            "active_vector_threads": 32,
+            "inactive_vector_threads": 96,
+            "accumulator_dtype": "float32",
+        },
+    },
 ]
 DECODER_LAYERNORM_STATIC_IDENTITY = {
     "backend": "cuda-welford-turing-t4",

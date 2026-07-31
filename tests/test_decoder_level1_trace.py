@@ -639,6 +639,21 @@ def _exact_layernorm_route(lut):
                         "accumulator_dtype": "float32",
                     },
                 },
+                {
+                    "input_dtype": "float16",
+                    "hidden_width": 128,
+                    "affine": False,
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "active_values_per_thread": 4,
+                        "average_values_per_launched_thread": 1,
+                        "active_vector_threads": 32,
+                        "inactive_vector_threads": 96,
+                        "accumulator_dtype": "float32",
+                    },
+                },
             ],
             "reduction": {
                 "threads": 128,
@@ -693,6 +708,35 @@ def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
         ]["sha256"]
         == lut_sha
     )
+
+
+def test_level1_comparator_rejects_missing_width128_layernorm_contract(
+    tmp_path,
+):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    lut = tmp_path / "turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    exact_route = _exact_layernorm_route(lut)
+    exact_route["decoder_layernorm"]["authenticated_contracts"].pop()
+    report = json.loads(local_report.read_text())
+    report["effective_route"].update(exact_route)
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="width-128 non-affine"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
 
 
 @pytest.mark.parametrize(

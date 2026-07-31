@@ -165,6 +165,21 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
                 "accumulator_dtype": "float32",
             },
         },
+        {
+            "input_dtype": "float16",
+            "hidden_width": 128,
+            "affine": False,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "active_values_per_thread": 4,
+                "average_values_per_launched_thread": 1,
+                "active_vector_threads": 32,
+                "inactive_vector_threads": 96,
+                "accumulator_dtype": "float32",
+            },
+        },
     ]
     assert identity["turing_rsqrt_lut_artifact_sha256_attested"] == artifact_sha256
     assert identity["turing_rsqrt_lut_content_sha256"] == hashlib.sha256(
@@ -293,6 +308,45 @@ def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width256(
     np.testing.assert_array_equal(np.asarray(actual), np.full((3, 256), 5))
 
 
+def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width128(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+
+    called = {}
+
+    def fake_turing_noaffine(x, correction, eps):
+        called["shape"] = x.shape
+        called["correction_shape"] = correction.shape
+        called["eps"] = eps
+        return mx.full(x.shape, 5, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "turing_layernorm_noaffine_fp16",
+        fake_turing_noaffine,
+    )
+    decoder_layernorm.configure_decoder_layernorm_backend(
+        decoder_layernorm.CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=_fixture_correction_lut(),
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
+    )
+
+    actual = decoder_layernorm.layernorm_noaffine(
+        mx.zeros((3, 128), dtype=mx.float16),
+    )
+    mx.eval(actual)
+
+    assert called == {
+        "shape": (3, 128),
+        "correction_shape": (1 << 24,),
+        "eps": 1e-6,
+    }
+    np.testing.assert_array_equal(np.asarray(actual), np.full((3, 128), 5))
+
+
 def test_turing_decoder_affine_dispatch_accepts_authenticated_width256(
     monkeypatch,
 ):
@@ -368,15 +422,15 @@ def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width256():
 
     decoder = SLatDecoder(
         out_channels=7,
-        model_channels=[1024, 512, 256],
-        num_blocks=[2, 2, 2],
+        model_channels=[1024, 512, 256, 128],
+        num_blocks=[2, 2, 2, 2],
         pred_subdiv=True,
         use_fp16=True,
     )
     texture_decoder = SLatDecoder(
         out_channels=6,
-        model_channels=[1024, 512, 256],
-        num_blocks=[2, 2, 2],
+        model_channels=[1024, 512, 256, 128],
+        num_blocks=[2, 2, 2, 2],
         pred_subdiv=False,
         use_fp16=True,
     )
@@ -405,9 +459,19 @@ def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width256():
         for block in decoder.blocks[2]
         if isinstance(block, SparseConvNeXtBlock3d)
     ]
+    level2_upsample = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
     texture_level1_upsample = [
         block
         for block in texture_decoder.blocks[1]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    texture_level2_upsample = [
+        block
+        for block in texture_decoder.blocks[2]
         if isinstance(block, SparseResBlockC2S3d)
     ]
 
@@ -420,8 +484,12 @@ def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width256():
     assert level1_upsample[0].norm1.decoder_layernorm is True
     assert level1_upsample[0].norm2.decoder_layernorm is True
     assert all(block.norm.decoder_layernorm is True for block in level2_blocks)
+    assert len(level2_upsample) == 1
+    assert level2_upsample[0].norm2.decoder_layernorm is True
     assert len(texture_level1_upsample) == 1
     assert texture_level1_upsample[0].norm2.decoder_layernorm is False
+    assert len(texture_level2_upsample) == 1
+    assert texture_level2_upsample[0].norm2.decoder_layernorm is False
 
 
 def test_turing_decoder_layernorm_rejects_wrong_contract():

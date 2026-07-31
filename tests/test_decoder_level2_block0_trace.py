@@ -96,6 +96,21 @@ DECODER_LAYERNORM_CONTRACTS = [
             "accumulator_dtype": "float32",
         },
     },
+    {
+        "input_dtype": "float16",
+        "hidden_width": 128,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 1,
+            "active_vector_threads": 32,
+            "inactive_vector_threads": 96,
+            "accumulator_dtype": "float32",
+        },
+    },
 ]
 
 
@@ -757,6 +772,21 @@ def test_block0_child_rejects_missing_affine_width256_layernorm_contract(
     _write_json(local_report_path, report)
 
     with pytest.raises(ValueError, match="affine width-256"):
+        _compare(inputs)
+
+
+def test_block0_child_rejects_missing_width128_layernorm_contract(
+    tmp_path,
+):
+    inputs = _valid_comparison_inputs(tmp_path)
+    local_report_path = inputs[4]
+    report = json.loads(local_report_path.read_text())
+    report["effective_route"]["decoder_layernorm"][
+        "authenticated_contracts"
+    ].pop()
+    _write_json(local_report_path, report)
+
+    with pytest.raises(ValueError, match="incomplete authenticated contract ledger"):
         _compare(inputs)
 
 
