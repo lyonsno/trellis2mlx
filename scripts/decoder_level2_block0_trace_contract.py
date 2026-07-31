@@ -50,15 +50,119 @@ CHILD_ARRAY_NAMES = (
 )
 BLOCK_BOUNDARY_NAMES = CHILD_ARRAY_NAMES[2:]
 LEVEL2_BLOCK0_NORM_BOUNDARY_ROUTE = {
-    "backend": "mlx-fast-layer-norm",
-    "algorithm": "mlx-fast-layer-norm",
+    "backend": "cuda-welford-turing-t4",
+    "algorithm": (
+        "pytorch-2.10-vectorized-layernorm-128-thread-welford-"
+        "turing-rsqrt-on-metal"
+    ),
     "input_dtype": "float16",
     "parameter_dtype": "float16",
     "hidden_width": 256,
     "affine": True,
     "shape_flow_layernorm": False,
-    "decoder_layernorm": False,
-    "authenticated": False,
+    "decoder_layernorm": True,
+    "authenticated": True,
+}
+TURING_RSQRT_LUT_SIZE = 1 << 24
+LEVEL2_BLOCK0_AFFINE_LAYERNORM_CONTRACT = {
+    "input_dtype": "float16",
+    "parameter_dtype": "float16",
+    "hidden_width": 256,
+    "affine": True,
+    "reduction": {
+        "threads": 128,
+        "warps": 4,
+        "vector_width": 4,
+        "active_values_per_thread": 4,
+        "average_values_per_launched_thread": 2,
+        "active_vector_threads": 64,
+        "inactive_vector_threads": 64,
+        "accumulator_dtype": "float32",
+    },
+}
+DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS = [
+    {
+        "input_dtype": "float16",
+        "parameter_dtype": "float16",
+        "hidden_width": 1024,
+        "affine": True,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 8,
+            "accumulator_dtype": "float32",
+        },
+    },
+    {
+        "input_dtype": "float16",
+        "parameter_dtype": "float16",
+        "hidden_width": 512,
+        "affine": True,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 4,
+            "accumulator_dtype": "float32",
+        },
+    },
+    {
+        "input_dtype": "float16",
+        "hidden_width": 512,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 4,
+            "accumulator_dtype": "float32",
+        },
+    },
+    LEVEL2_BLOCK0_AFFINE_LAYERNORM_CONTRACT,
+    {
+        "input_dtype": "float16",
+        "hidden_width": 256,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 2,
+            "active_vector_threads": 64,
+            "inactive_vector_threads": 64,
+            "accumulator_dtype": "float32",
+        },
+    },
+]
+DECODER_LAYERNORM_STATIC_IDENTITY = {
+    "backend": "cuda-welford-turing-t4",
+    "algorithm": (
+        "pytorch-2.10-vectorized-layernorm-128-thread-welford-"
+        "turing-rsqrt-on-metal"
+    ),
+    "experimental": True,
+    "cuda_source_tag": "pytorch-v2.10.0",
+    "cuda_source_kernel": "vectorized_layer_norm_kernel",
+    "cuda_architecture": "sm_75",
+    "cuda_device_anchor": "Tesla T4",
+    "cuda_rsqrt_bit_exact_for_configured_lut": True,
+    "authenticated_contract": {
+        "input_dtype": "float16",
+        "parameter_dtype": "float16",
+        "hidden_width": 1024,
+        "affine": True,
+    },
+    "reduction": {
+        "threads": 128,
+        "warps": 4,
+        "vector_width": 4,
+        "values_per_thread": 8,
+        "accumulator_dtype": "float32",
+    },
+    "rsqrt": "Turing MUFU.RSQ normalized signed-ULP LUT",
+    "turing_rsqrt_lut_entries": TURING_RSQRT_LUT_SIZE,
 }
 
 
@@ -573,6 +677,9 @@ def _load_child_report(
     label: str,
     report_path: Path,
     primary_path: Path,
+    *,
+    turing_rsqrt_lut_path: Path | None = None,
+    expected_turing_rsqrt_lut_sha256: str | None = None,
 ) -> dict[str, Any]:
     report = json.loads(Path(report_path).read_text())
     if label == "source" and report.get("schema") == (
@@ -667,10 +774,91 @@ def _load_child_report(
             "cuda-turing-t4-fp16-lut"
         ):
             raise ValueError("local child SiLU route mismatch")
-        if route.get("decoder_layernorm", {}).get("backend") != (
-            "cuda-welford-turing-t4"
-        ):
+        layernorm = route.get("decoder_layernorm")
+        if not isinstance(layernorm, Mapping):
             raise ValueError("local child predecessor LayerNorm route mismatch")
+        contracts = layernorm.get("authenticated_contracts")
+        if contracts != DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS:
+            if (
+                not isinstance(contracts, list)
+                or LEVEL2_BLOCK0_AFFINE_LAYERNORM_CONTRACT not in contracts
+            ):
+                raise ValueError(
+                    "local child LayerNorm route omits the authenticated "
+                    "affine width-256 contract"
+                )
+            raise ValueError(
+                "local child global LayerNorm identity has an incomplete "
+                "authenticated contract ledger"
+            )
+        for field, value in DECODER_LAYERNORM_STATIC_IDENTITY.items():
+            if layernorm.get(field) != value:
+                raise ValueError(
+                    "local child global LayerNorm identity field "
+                    f"{field!r} mismatch"
+                )
+        if (
+            turing_rsqrt_lut_path is None
+            or expected_turing_rsqrt_lut_sha256 is None
+        ):
+            raise ValueError(
+                "local child comparison omits caller-bound Turing rsqrt LUT"
+            )
+        expected_lut_sha256 = _canonical_sha256(
+            expected_turing_rsqrt_lut_sha256,
+            "expected Turing rsqrt LUT SHA256",
+        )
+        lut_path = Path(turing_rsqrt_lut_path).resolve()
+        if not lut_path.is_file():
+            raise FileNotFoundError(
+                f"Turing rsqrt LUT does not exist: {lut_path}"
+            )
+        if _sha256_file(lut_path) != expected_lut_sha256:
+            raise ValueError("Turing rsqrt LUT artifact SHA256 mismatch")
+        lut = route.get("decoder_layernorm_lut")
+        if not isinstance(lut, Mapping):
+            raise ValueError("local child LayerNorm route omits rsqrt LUT")
+        if _resolve_reported_path(lut.get("path"), Path(report_path)) != lut_path:
+            raise ValueError("local child LayerNorm rsqrt LUT path mismatch")
+        if (
+            lut.get("sha256") != expected_lut_sha256
+            or layernorm.get(
+                "turing_rsqrt_lut_artifact_sha256_attested"
+            )
+            != expected_lut_sha256
+            or lut.get("entries") != TURING_RSQRT_LUT_SIZE
+            or lut.get("dtype") != "int8"
+            or layernorm.get("turing_rsqrt_lut_entries")
+            != TURING_RSQRT_LUT_SIZE
+        ):
+            raise ValueError("local child LayerNorm rsqrt LUT identity mismatch")
+        try:
+            with np.load(lut_path, allow_pickle=False) as archive:
+                if "normalized_delta" not in archive.files:
+                    raise ValueError(
+                        "Turing rsqrt LUT omits normalized_delta"
+                    )
+                normalized_delta = np.asarray(archive["normalized_delta"])
+        except (OSError, ValueError) as error:
+            if "Turing rsqrt LUT" in str(error):
+                raise
+            raise ValueError(
+                "Turing rsqrt LUT is not a valid NPZ artifact"
+            ) from error
+        if (
+            normalized_delta.dtype != np.dtype(np.int8)
+            or normalized_delta.shape != (TURING_RSQRT_LUT_SIZE,)
+        ):
+            raise ValueError("Turing rsqrt LUT payload schema mismatch")
+        content_sha256 = hashlib.sha256(
+            np.ascontiguousarray(normalized_delta).tobytes()
+        ).hexdigest()
+        if (
+            lut.get("normalized_delta_sha256") != content_sha256
+            or layernorm.get("turing_rsqrt_lut_content_sha256")
+            != content_sha256
+        ):
+            raise ValueError("Turing rsqrt LUT payload identity mismatch")
         norm = route.get("boundary_routes", {}).get("level2_block0_norm")
         if norm != LEVEL2_BLOCK0_NORM_BOUNDARY_ROUTE:
             raise ValueError(
@@ -716,6 +904,8 @@ def compare_decoder_level2_block0_traces(
     local_report_path: Path,
     parent_receipt_path: Path,
     expected_parent_receipt_sha256: str,
+    turing_rsqrt_lut_path: Path,
+    expected_turing_rsqrt_lut_sha256: str,
 ) -> dict[str, Any]:
     parent_receipt, receipt_file = authenticate_parent_receipt_file(
         parent_receipt_path,
@@ -735,6 +925,10 @@ def compare_decoder_level2_block0_traces(
             "local",
             Path(local_report_path),
             paths["local"],
+            turing_rsqrt_lut_path=Path(turing_rsqrt_lut_path),
+            expected_turing_rsqrt_lut_sha256=(
+                expected_turing_rsqrt_lut_sha256
+            ),
         ),
     }
     arrays = {

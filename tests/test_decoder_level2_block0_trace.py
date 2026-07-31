@@ -25,6 +25,78 @@ from scripts.decoder_level2_block0_trace_contract import (
 
 
 PARENT_COMMIT = "f382af6000d77e48ce105fe7084fa90096ed2a44"
+WIDTH256_AFFINE_CONTRACT = {
+    "input_dtype": "float16",
+    "parameter_dtype": "float16",
+    "hidden_width": 256,
+    "affine": True,
+    "reduction": {
+        "threads": 128,
+        "warps": 4,
+        "vector_width": 4,
+        "active_values_per_thread": 4,
+        "average_values_per_launched_thread": 2,
+        "active_vector_threads": 64,
+        "inactive_vector_threads": 64,
+        "accumulator_dtype": "float32",
+    },
+}
+DECODER_LAYERNORM_CONTRACTS = [
+    {
+        "input_dtype": "float16",
+        "parameter_dtype": "float16",
+        "hidden_width": 1024,
+        "affine": True,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 8,
+            "accumulator_dtype": "float32",
+        },
+    },
+    {
+        "input_dtype": "float16",
+        "parameter_dtype": "float16",
+        "hidden_width": 512,
+        "affine": True,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 4,
+            "accumulator_dtype": "float32",
+        },
+    },
+    {
+        "input_dtype": "float16",
+        "hidden_width": 512,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "values_per_thread": 4,
+            "accumulator_dtype": "float32",
+        },
+    },
+    copy.deepcopy(WIDTH256_AFFINE_CONTRACT),
+    {
+        "input_dtype": "float16",
+        "hidden_width": 256,
+        "affine": False,
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 2,
+            "active_vector_threads": 64,
+            "inactive_vector_threads": 64,
+            "accumulator_dtype": "float32",
+        },
+    },
+]
 
 
 def _sha256(path: Path) -> str:
@@ -238,7 +310,7 @@ def _write_parent_receipts(tmp_path: Path, parent_boundaries=None):
     return receipt
 
 
-def _child_route(label):
+def _child_route(label, *, turing_rsqrt_lut=None):
     if label == "source":
         return {
             "route": "official-source-cuda-shape-decoder-level2-block0-trace",
@@ -247,13 +319,55 @@ def _child_route(label):
             "decoder_level2_block0_trace": True,
             "sparse_conv_backend": "none",
         }
+    assert turing_rsqrt_lut is not None
+    with np.load(turing_rsqrt_lut, allow_pickle=False) as archive:
+        normalized_delta = np.asarray(archive["normalized_delta"])
+    lut_sha256 = _sha256(turing_rsqrt_lut)
+    content_sha256 = hashlib.sha256(
+        np.ascontiguousarray(normalized_delta).tobytes()
+    ).hexdigest()
     return {
         "route": "mlx-shape-decoder-level2-block0-trace",
         "device_type": "metal",
         "device": "Device(gpu, 0)",
         "decoder_linear_backend": "turing_fda",
         "sparse_conv_matmul_backend": "turing_fda",
-        "decoder_layernorm": {"backend": "cuda-welford-turing-t4"},
+        "decoder_layernorm": {
+            "backend": "cuda-welford-turing-t4",
+            "algorithm": (
+                "pytorch-2.10-vectorized-layernorm-128-thread-welford-"
+                "turing-rsqrt-on-metal"
+            ),
+            "experimental": True,
+            "cuda_source_tag": "pytorch-v2.10.0",
+            "cuda_source_kernel": "vectorized_layer_norm_kernel",
+            "cuda_architecture": "sm_75",
+            "cuda_device_anchor": "Tesla T4",
+            "cuda_rsqrt_bit_exact_for_configured_lut": True,
+            "authenticated_contract": {
+                "input_dtype": "float16",
+                "parameter_dtype": "float16",
+                "hidden_width": 1024,
+                "affine": True,
+            },
+            "authenticated_contracts": copy.deepcopy(
+                DECODER_LAYERNORM_CONTRACTS
+            ),
+            "reduction": copy.deepcopy(
+                DECODER_LAYERNORM_CONTRACTS[0]["reduction"]
+            ),
+            "rsqrt": "Turing MUFU.RSQ normalized signed-ULP LUT",
+            "turing_rsqrt_lut_artifact_sha256_attested": lut_sha256,
+            "turing_rsqrt_lut_content_sha256": content_sha256,
+            "turing_rsqrt_lut_entries": 1 << 24,
+        },
+        "decoder_layernorm_lut": {
+            "path": str(turing_rsqrt_lut),
+            "sha256": lut_sha256,
+            "normalized_delta_sha256": content_sha256,
+            "entries": 1 << 24,
+            "dtype": "int8",
+        },
         "decoder_silu": {"backend": "cuda-turing-t4-fp16-lut"},
         "boundary_routes": {
             "level2_block0_norm": dict(LEVEL2_BLOCK0_NORM_BOUNDARY_ROUTE)
@@ -265,7 +379,18 @@ def _write_child(tmp_path, label, arrays, *, manual_equal=True, route=None):
     primary = tmp_path / f"{label}-child.npz"
     validation = write_decoder_level2_block0_trace_npz(primary, arrays)
     report = tmp_path / f"{label}-child.json"
-    effective_route = route or _child_route(label)
+    turing_rsqrt_lut = None
+    if label == "local" and route is None:
+        turing_rsqrt_lut = tmp_path / "child-turing-rsqrt.npz"
+        if not turing_rsqrt_lut.exists():
+            np.savez_compressed(
+                turing_rsqrt_lut,
+                normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+            )
+    effective_route = route or _child_route(
+        label,
+        turing_rsqrt_lut=turing_rsqrt_lut,
+    )
     primary_row = {
         "path": str(primary),
         "status": "written",
@@ -328,12 +453,23 @@ def _valid_comparison_inputs(tmp_path):
     return receipt, source_primary, source_report, local_primary, local_report
 
 
-def _compare(inputs):
+def _local_lut_identity(inputs):
+    local_report = Path(inputs[4])
+    report = json.loads(local_report.read_text())
+    lut = report["effective_route"]["decoder_layernorm_lut"]
+    path = Path(lut["path"])
+    if not path.is_absolute():
+        path = local_report.parent / path
+    return path.resolve(), lut["sha256"]
+
+
+def _compare(inputs, *, expected_lut_sha256=None):
     receipt, source_primary, source_report, local_primary, local_report = inputs
     receipt_path = Path(receipt["source_parent_report"]["path"]).with_name(
         "parent-receipt.json"
     )
     _write_json(receipt_path, receipt)
+    lut_path, reported_lut_sha256 = _local_lut_identity(inputs)
     return compare_decoder_level2_block0_traces(
         source_path=source_primary,
         source_report_path=source_report,
@@ -341,6 +477,10 @@ def _compare(inputs):
         local_report_path=local_report,
         parent_receipt_path=receipt_path,
         expected_parent_receipt_sha256=_sha256(receipt_path),
+        turing_rsqrt_lut_path=lut_path,
+        expected_turing_rsqrt_lut_sha256=(
+            expected_lut_sha256 or reported_lut_sha256
+        ),
     )
 
 
@@ -414,6 +554,8 @@ def test_block0_comparator_requires_caller_bound_parent_receipt_sha256():
     }
 
     assert actions["--expected-parent-receipt-sha256"].required is True
+    assert actions["--turing-rsqrt-lut"].required is True
+    assert actions["--expected-turing-rsqrt-lut-sha256"].required is True
 
 
 def test_block0_comparator_rejects_foreign_internally_coherent_receipt(
@@ -432,6 +574,7 @@ def test_block0_comparator_rejects_foreign_internally_coherent_receipt(
     _write_json(manifest_path, manifest)
     inputs[0]["local_command_manifest"]["sha256"] = _sha256(manifest_path)
     _write_json(receipt_path, inputs[0])
+    lut_path, lut_sha256 = _local_lut_identity(inputs)
 
     output = tmp_path / "comparison.json"
     rc = main(
@@ -448,6 +591,10 @@ def test_block0_comparator_rejects_foreign_internally_coherent_receipt(
             str(receipt_path),
             "--expected-parent-receipt-sha256",
             trusted_sha256,
+            "--turing-rsqrt-lut",
+            str(lut_path),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_sha256,
             "--output",
             str(output),
         ]
@@ -584,6 +731,98 @@ def test_block0_child_rejects_manual_natural_or_route_lie(tmp_path):
         _compare(inputs)
 
 
+def test_block0_child_rejects_missing_affine_width256_layernorm_contract(
+    tmp_path,
+):
+    inputs = _valid_comparison_inputs(tmp_path)
+    local_report_path = inputs[4]
+    report = json.loads(local_report_path.read_text())
+    report["effective_route"]["decoder_layernorm"][
+        "authenticated_contracts"
+    ].clear()
+    _write_json(local_report_path, report)
+
+    with pytest.raises(ValueError, match="affine width-256"):
+        _compare(inputs)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("algorithm", "impersonating-layernorm"),
+        ("cuda_source_kernel", None),
+        ("experimental", False),
+    ],
+)
+def test_block0_child_rejects_malformed_global_layernorm_identity(
+    tmp_path,
+    field,
+    replacement,
+):
+    inputs = _valid_comparison_inputs(tmp_path)
+    local_report_path = inputs[4]
+    report = json.loads(local_report_path.read_text())
+    layernorm = report["effective_route"]["decoder_layernorm"]
+    if replacement is None:
+        layernorm.pop(field)
+    else:
+        layernorm[field] = replacement
+    _write_json(local_report_path, report)
+
+    with pytest.raises(ValueError, match="global LayerNorm identity"):
+        _compare(inputs)
+
+
+def test_block0_child_rejects_self_consistent_substituted_turing_lut(
+    tmp_path,
+):
+    inputs = _valid_comparison_inputs(tmp_path)
+    lut_path, trusted_sha256 = _local_lut_identity(inputs)
+    with np.load(lut_path, allow_pickle=False) as archive:
+        normalized_delta = np.asarray(archive["normalized_delta"]).copy()
+    normalized_delta[0] = np.int8(1)
+    np.savez_compressed(lut_path, normalized_delta=normalized_delta)
+    substituted_sha256 = _sha256(lut_path)
+    content_sha256 = hashlib.sha256(
+        np.ascontiguousarray(normalized_delta).tobytes()
+    ).hexdigest()
+    report = json.loads(inputs[4].read_text())
+    layernorm = report["effective_route"]["decoder_layernorm"]
+    lut = report["effective_route"]["decoder_layernorm_lut"]
+    layernorm["turing_rsqrt_lut_artifact_sha256_attested"] = (
+        substituted_sha256
+    )
+    layernorm["turing_rsqrt_lut_content_sha256"] = content_sha256
+    lut["sha256"] = substituted_sha256
+    lut["normalized_delta_sha256"] = content_sha256
+    _write_json(inputs[4], report)
+
+    with pytest.raises(ValueError, match="artifact SHA256 mismatch"):
+        _compare(inputs, expected_lut_sha256=trusted_sha256)
+
+
+def test_block0_child_rejects_truthfully_hashed_malformed_turing_lut(
+    tmp_path,
+):
+    inputs = _valid_comparison_inputs(tmp_path)
+    lut_path, _ = _local_lut_identity(inputs)
+    normalized_delta = np.zeros((4,), dtype=np.int8)
+    np.savez_compressed(lut_path, normalized_delta=normalized_delta)
+    lut_sha256 = _sha256(lut_path)
+    content_sha256 = hashlib.sha256(normalized_delta.tobytes()).hexdigest()
+    report = json.loads(inputs[4].read_text())
+    layernorm = report["effective_route"]["decoder_layernorm"]
+    lut = report["effective_route"]["decoder_layernorm_lut"]
+    layernorm["turing_rsqrt_lut_artifact_sha256_attested"] = lut_sha256
+    layernorm["turing_rsqrt_lut_content_sha256"] = content_sha256
+    lut["sha256"] = lut_sha256
+    lut["normalized_delta_sha256"] = content_sha256
+    _write_json(inputs[4], report)
+
+    with pytest.raises(ValueError, match="payload schema mismatch"):
+        _compare(inputs, expected_lut_sha256=lut_sha256)
+
+
 def test_block0_child_rejects_source_local_input_disagreement(tmp_path):
     inputs = _valid_comparison_inputs(tmp_path)
     local_arrays = load_decoder_level2_block0_trace(inputs[3])
@@ -619,7 +858,7 @@ def test_block0_child_npz_rejects_extra_or_missing_arrays(tmp_path):
         write_decoder_level2_block0_trace_npz(tmp_path / "missing.npz", arrays)
 
 
-def test_actual_decoder_reports_native_unauthenticated_affine_width256_norm():
+def test_actual_decoder_reports_authenticated_affine_width256_norm():
     from scripts.run_mlx_decoder_level2_block0_trace import (
         _level2_block0_norm_route_identity,
     )
@@ -639,6 +878,7 @@ def test_block0_comparator_preserves_colliding_input_and_writes_failure(tmp_path
     receipt_path = tmp_path / "receipt.json"
     _write_json(receipt_path, inputs[0])
     source_before = inputs[1].read_bytes()
+    lut_path, lut_sha256 = _local_lut_identity(inputs)
 
     rc = main(
         [
@@ -654,6 +894,10 @@ def test_block0_comparator_preserves_colliding_input_and_writes_failure(tmp_path
             str(receipt_path),
             "--expected-parent-receipt-sha256",
             _sha256(receipt_path),
+            "--turing-rsqrt-lut",
+            str(lut_path),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_sha256,
             "--output",
             str(inputs[1]),
         ]
@@ -662,6 +906,48 @@ def test_block0_comparator_preserves_colliding_input_and_writes_failure(tmp_path
     failure = inputs[1].with_name(inputs[1].name + ".failure.json")
     assert rc == 1
     assert inputs[1].read_bytes() == source_before
+    assert json.loads(failure.read_text())["failure_phase"] == (
+        "request_validation"
+    )
+
+
+def test_block0_comparator_preserves_colliding_turing_lut_and_writes_failure(
+    tmp_path,
+):
+    from scripts.compare_decoder_level2_block0_traces import main
+
+    inputs = _valid_comparison_inputs(tmp_path)
+    receipt_path = tmp_path / "receipt.json"
+    _write_json(receipt_path, inputs[0])
+    lut_path, lut_sha256 = _local_lut_identity(inputs)
+    lut_before = lut_path.read_bytes()
+
+    rc = main(
+        [
+            "--source",
+            str(inputs[1]),
+            "--source-report",
+            str(inputs[2]),
+            "--local",
+            str(inputs[3]),
+            "--local-report",
+            str(inputs[4]),
+            "--parent-receipt",
+            str(receipt_path),
+            "--expected-parent-receipt-sha256",
+            _sha256(receipt_path),
+            "--turing-rsqrt-lut",
+            str(lut_path),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_sha256,
+            "--output",
+            str(lut_path),
+        ]
+    )
+
+    failure = lut_path.with_name(lut_path.name + ".failure.json")
+    assert rc == 1
+    assert lut_path.read_bytes() == lut_before
     assert json.loads(failure.read_text())["failure_phase"] == (
         "request_validation"
     )
@@ -677,6 +963,7 @@ def test_block0_comparator_replaces_stale_output_with_durable_failure(tmp_path):
     receipt_sha256 = _sha256(receipt_path)
     output = tmp_path / "comparison.json"
     _write_json(output, {"status": "done", "stale": True})
+    lut_path, lut_sha256 = _local_lut_identity(inputs)
 
     rc = main(
         [
@@ -692,6 +979,10 @@ def test_block0_comparator_replaces_stale_output_with_durable_failure(tmp_path):
             str(receipt_path),
             "--expected-parent-receipt-sha256",
             receipt_sha256,
+            "--turing-rsqrt-lut",
+            str(lut_path),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_sha256,
             "--output",
             str(output),
         ]

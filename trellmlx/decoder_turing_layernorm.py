@@ -166,6 +166,22 @@ def decoder_layernorm_backend_identity(
             },
             {
                 "input_dtype": "float16",
+                "parameter_dtype": "float16",
+                "hidden_width": 256,
+                "affine": True,
+                "reduction": {
+                    "threads": 128,
+                    "warps": 4,
+                    "vector_width": 4,
+                    "active_values_per_thread": 4,
+                    "average_values_per_launched_thread": 2,
+                    "active_vector_threads": 64,
+                    "inactive_vector_threads": 64,
+                    "accumulator_dtype": "float32",
+                },
+            },
+            {
+                "input_dtype": "float16",
                 "hidden_width": 256,
                 "affine": False,
                 "reduction": {
@@ -205,11 +221,11 @@ def layernorm_affine(
     """Dispatch an affine decoder LayerNorm through the configured backend."""
     if _backend == DEFAULT_BACKEND:
         return mx.fast.layer_norm(x, weight, bias, eps).astype(x.dtype)
-    if x.ndim != 2 or x.shape[1] not in (1024, 512):
+    if x.ndim != 2 or x.shape[1] not in (1024, 512, 256):
         shape = x.shape if x.ndim == 2 else None
         raise ValueError(
             f"{_backend} affine route is authenticated only for "
-            f"2D width-1024 or width-512 rows, got {shape}"
+            f"2D width-1024, width-512, or width-256 rows, got {shape}"
         )
     if _turing_rsqrt_delta_lut is None:
         raise RuntimeError(f"{_backend} correction LUT is not configured")

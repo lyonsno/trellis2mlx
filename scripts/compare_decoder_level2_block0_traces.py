@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Caller-bound SHA256 of the exact parent receipt file",
     )
+    parser.add_argument("--turing-rsqrt-lut", required=True, type=Path)
+    parser.add_argument(
+        "--expected-turing-rsqrt-lut-sha256",
+        required=True,
+        help="Caller-bound SHA256 of the exact Turing rsqrt LUT artifact",
+    )
     parser.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -81,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
             "expected_parent_receipt_sha256": (
                 args.expected_parent_receipt_sha256
             ),
+            "turing_rsqrt_lut": str(args.turing_rsqrt_lut),
+            "expected_turing_rsqrt_lut_sha256": (
+                args.expected_turing_rsqrt_lut_sha256
+            ),
             "output": str(args.output),
         },
         "effective_output": str(effective_output),
@@ -93,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             args.local.resolve(),
             args.local_report.resolve(),
             args.parent_receipt.resolve(),
+            args.turing_rsqrt_lut.resolve(),
         }
         if args.output.resolve() in protected:
             effective_output = _failure_sibling(args.output, protected)
@@ -118,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
             parent_receipt_path=args.parent_receipt,
             expected_parent_receipt_sha256=(
                 args.expected_parent_receipt_sha256
+            ),
+            turing_rsqrt_lut_path=args.turing_rsqrt_lut,
+            expected_turing_rsqrt_lut_sha256=(
+                args.expected_turing_rsqrt_lut_sha256
             ),
         )
         report.update(

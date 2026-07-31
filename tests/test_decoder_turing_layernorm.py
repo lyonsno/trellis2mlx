@@ -136,6 +136,22 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
         },
         {
             "input_dtype": "float16",
+            "parameter_dtype": "float16",
+            "hidden_width": 256,
+            "affine": True,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "active_values_per_thread": 4,
+                "average_values_per_launched_thread": 2,
+                "active_vector_threads": 64,
+                "inactive_vector_threads": 64,
+                "accumulator_dtype": "float32",
+            },
+        },
+        {
+            "input_dtype": "float16",
             "hidden_width": 256,
             "affine": False,
             "reduction": {
@@ -277,6 +293,51 @@ def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width256(
     np.testing.assert_array_equal(np.asarray(actual), np.full((3, 256), 5))
 
 
+def test_turing_decoder_affine_dispatch_accepts_authenticated_width256(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+
+    called = {}
+
+    def fake_turing_affine(x, weight, bias, correction, eps):
+        called["shape"] = x.shape
+        called["weight_shape"] = weight.shape
+        called["bias_shape"] = bias.shape
+        called["correction_shape"] = correction.shape
+        called["eps"] = eps
+        return mx.full(x.shape, 6, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "turing_layernorm_affine_fp16",
+        fake_turing_affine,
+    )
+    decoder_layernorm.configure_decoder_layernorm_backend(
+        decoder_layernorm.CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=_fixture_correction_lut(),
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
+    )
+
+    actual = decoder_layernorm.layernorm_affine(
+        mx.zeros((3, 256), dtype=mx.float16),
+        mx.ones((256,), dtype=mx.float16),
+        mx.zeros((256,), dtype=mx.float16),
+    )
+    mx.eval(actual)
+
+    assert called == {
+        "shape": (3, 256),
+        "weight_shape": (256,),
+        "bias_shape": (256,),
+        "correction_shape": (1 << 24,),
+        "eps": 1e-6,
+    }
+    np.testing.assert_array_equal(np.asarray(actual), np.full((3, 256), 6))
+
+
 def test_shape_decoder_level_zero_norms_are_exact_route_consumers():
     from trellmlx.models.shape_slat_decoder import (
         SLatDecoder,
@@ -298,7 +359,7 @@ def test_shape_decoder_level_zero_norms_are_exact_route_consumers():
     assert all(block.norm.decoder_layernorm for block in blocks)
 
 
-def test_shape_decoder_exact_layernorm_enrollment_is_shape_only_at_width256():
+def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width256():
     from trellmlx.models.shape_slat_decoder import (
         SLatDecoder,
         SparseConvNeXtBlock3d,
@@ -358,7 +419,7 @@ def test_shape_decoder_exact_layernorm_enrollment_is_shape_only_at_width256():
     assert all(block.norm.decoder_layernorm for block in level1_blocks)
     assert level1_upsample[0].norm1.decoder_layernorm is True
     assert level1_upsample[0].norm2.decoder_layernorm is True
-    assert all(block.norm.decoder_layernorm is False for block in level2_blocks)
+    assert all(block.norm.decoder_layernorm is True for block in level2_blocks)
     assert len(texture_level1_upsample) == 1
     assert texture_level1_upsample[0].norm2.decoder_layernorm is False
 

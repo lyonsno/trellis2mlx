@@ -610,6 +610,22 @@ def _exact_layernorm_route(lut):
                 },
                 {
                     "input_dtype": "float16",
+                    "parameter_dtype": "float16",
+                    "hidden_width": 256,
+                    "affine": True,
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "active_values_per_thread": 4,
+                        "average_values_per_launched_thread": 2,
+                        "active_vector_threads": 64,
+                        "inactive_vector_threads": 64,
+                        "accumulator_dtype": "float32",
+                    },
+                },
+                {
+                    "input_dtype": "float16",
                     "hidden_width": 256,
                     "affine": False,
                     "reduction": {
@@ -679,7 +695,15 @@ def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
     )
 
 
-def test_level1_comparator_rejects_missing_width256_layernorm_contract(tmp_path):
+@pytest.mark.parametrize(
+    ("contract_index", "contract_kind"),
+    [(3, "affine"), (4, "non-affine")],
+)
+def test_level1_comparator_rejects_missing_width256_layernorm_contract(
+    tmp_path,
+    contract_index,
+    contract_kind,
+):
     from scripts.compare_decoder_level1_traces import compare_level1_traces
 
     arrays = _valid_trace()
@@ -692,14 +716,16 @@ def test_level1_comparator_rejects_missing_width256_layernorm_contract(tmp_path)
         normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
     )
     exact_route = _exact_layernorm_route(lut)
-    exact_route["decoder_layernorm"]["authenticated_contracts"].pop()
+    exact_route["decoder_layernorm"]["authenticated_contracts"].pop(
+        contract_index
+    )
     report = json.loads(local_report.read_text())
     report["effective_route"].update(exact_route)
     local_report.write_text(json.dumps(report))
 
     with pytest.raises(
         ValueError,
-        match="authenticated width-256 non-affine contract",
+        match="authenticated width-256 affine or non-affine contract",
     ):
         compare_level1_traces(
             source_path=source_path,
