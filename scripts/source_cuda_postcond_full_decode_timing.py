@@ -120,6 +120,42 @@ def load_decoder_level1_trace_contract():
     raise ModuleNotFoundError("decoder_level1_trace_contract")
 
 
+def load_decoder_level2_block0_trace_contract():
+    if not __package__:
+        contract_path = Path(__file__).resolve().with_name(
+            "decoder_level2_block0_trace_contract.py"
+        )
+        if not contract_path.is_file():
+            raise ModuleNotFoundError(
+                "standalone decoder trace runner requires adjacent contract "
+                f"{contract_path}",
+                name="decoder_level2_block0_trace_contract",
+            )
+        spec = importlib.util.spec_from_file_location(
+            "decoder_level2_block0_trace_contract",
+            contract_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                "cannot load decoder level-two block0 trace contract from "
+                f"{contract_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    for module_name in (
+        "scripts.decoder_level2_block0_trace_contract",
+        "decoder_level2_block0_trace_contract",
+    ):
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {module_name, module_name.split(".", 1)[0]}:
+                raise
+    raise ModuleNotFoundError("decoder_level2_block0_trace_contract")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", required=True, type=Path)
@@ -201,6 +237,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Capture the official shape decoder's first channel-to-spatial "
             "upsample and level-one block 0 without mesh conversion."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-level2-block0-trace",
+        action="store_true",
+        help=(
+            "Capture the inherited second-upsample state and every internal "
+            "operation of official source-CUDA level-two block 0."
         ),
     )
     parser.add_argument(
@@ -977,9 +1021,16 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     decoder_state_only = bool(args.decoder_state_only)
     decoder_level0_trace = bool(args.decoder_level0_trace)
     decoder_level1_trace = bool(args.decoder_level1_trace)
-    decoder_trace_mode = decoder_level0_trace or decoder_level1_trace
+    decoder_level2_block0_trace = bool(args.decoder_level2_block0_trace)
+    decoder_trace_mode = (
+        decoder_level0_trace
+        or decoder_level1_trace
+        or decoder_level2_block0_trace
+    )
     route_name = (
-        "official-source-cuda-shape-decoder-level1-trace"
+        "official-source-cuda-shape-decoder-level2-block0-trace"
+        if decoder_level2_block0_trace
+        else "official-source-cuda-shape-decoder-level1-trace"
         if decoder_level1_trace
         else "official-source-cuda-shape-decoder-level0-trace"
         if decoder_level0_trace
@@ -1020,6 +1071,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
             "decoder_level1_trace": decoder_level1_trace,
+            "decoder_level2_block0_trace": decoder_level2_block0_trace,
             "raw_meshes": not decoder_state_only and not decoder_trace_mode,
             "post_fill_holes_snapshots": (
                 not decoder_state_only and not decoder_trace_mode
@@ -1054,11 +1106,13 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 decoder_state_only,
                 decoder_level0_trace,
                 decoder_level1_trace,
+                decoder_level2_block0_trace,
             )
         ) > 1:
             raise ValueError(
                 "--decoder-state-only, --decoder-level0-trace, and "
-                "--decoder-level1-trace are mutually exclusive"
+                "--decoder-level1-trace, and "
+                "--decoder-level2-block0-trace are mutually exclusive"
             )
         if grid_path is None:
             raise ValueError("--shape-slat-grid is required for selective decode")
@@ -1076,7 +1130,12 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             raise ValueError("duplicate --shape-slat-point values are not allowed")
 
         output_dir = Path(args.output_dir)
-        if decoder_level1_trace:
+        if decoder_level2_block0_trace:
+            expected_paths = [
+                output_dir / f"{point_name}.decoder-level2-block0-trace.npz"
+                for point_name in point_names
+            ]
+        elif decoder_level1_trace:
             expected_paths = [
                 output_dir / f"{point_name}.decoder-level1-trace.npz"
                 for point_name in point_names
@@ -1163,13 +1222,18 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         report["selected_point_names"] = point_names
         report["expected_artifact_count"] = len(expected_paths)
         if decoder_trace_mode:
-            trace_level = 1 if decoder_level1_trace else 0
+            trace_stem = (
+                "decoder-level2-block0-trace"
+                if decoder_level2_block0_trace
+                else "decoder-level1-trace"
+                if decoder_level1_trace
+                else "decoder-level0-trace"
+            )
             report["decoder_trace_artifacts"] = [
                 {
                     "coordinate_key": point_name,
                     "path": str(
-                        output_dir
-                        / f"{point_name}.decoder-level{trace_level}-trace.npz"
+                        output_dir / f"{point_name}.{trace_stem}.npz"
                     ),
                     "status": "not_written",
                 }
@@ -1197,7 +1261,9 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             ]
         if expected_output_collision:
             output_kind = (
-                "decoder-level1-trace"
+                "decoder-level2-block0-trace"
+                if decoder_level2_block0_trace
+                else "decoder-level1-trace"
                 if decoder_level1_trace
                 else "decoder-level0-trace"
                 if decoder_level0_trace
@@ -1263,6 +1329,9 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "decoder_state_only": decoder_state_only,
                         "decoder_level0_trace": decoder_level0_trace,
                         "decoder_level1_trace": decoder_level1_trace,
+                        "decoder_level2_block0_trace": (
+                            decoder_level2_block0_trace
+                        ),
                         "raw_meshes": (
                             not decoder_state_only and not decoder_trace_mode
                         ),
@@ -1369,13 +1438,20 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
             if decoder_trace_mode:
                 trace_contract = (
-                    load_decoder_level1_trace_contract()
+                    load_decoder_level2_block0_trace_contract()
+                    if decoder_level2_block0_trace
+                    else load_decoder_level1_trace_contract()
                     if decoder_level1_trace
                     else load_decoder_level0_trace_contract()
                 )
                 with torch.no_grad():
                     trace_result = (
-                        capture_source_decoder_level1_trace(
+                        capture_source_decoder_level2_block0_trace(
+                            decoder,
+                            shape_slat,
+                        )
+                        if decoder_level2_block0_trace
+                        else capture_source_decoder_level1_trace(
                             decoder,
                             shape_slat,
                             trace_contract=trace_contract,
@@ -1387,12 +1463,25 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         )
                     )
                 sync_cuda(torch)
-                trace_level = 1 if decoder_level1_trace else 0
-                trace_path = (
-                    output_dir
-                    / f"{point_name}.decoder-level{trace_level}-trace.npz"
+                trace_stem = (
+                    "decoder-level2-block0-trace"
+                    if decoder_level2_block0_trace
+                    else "decoder-level1-trace"
+                    if decoder_level1_trace
+                    else "decoder-level0-trace"
                 )
-                if decoder_level1_trace:
+                trace_path = output_dir / f"{point_name}.{trace_stem}.npz"
+                if decoder_level2_block0_trace:
+                    trace_arrays, manual_equality = trace_result
+                    hash_ledger = None
+                    validation = (
+                        trace_contract.write_decoder_level2_block0_trace_npz(
+                            trace_path,
+                            trace_arrays,
+                        )
+                    )
+                    input_tensor_sha256 = None
+                elif decoder_level1_trace:
                     trace_arrays, hash_entries = trace_result
                     hash_ledger = (
                         trace_contract.validate_decoder_level1_hash_ledger(
@@ -1439,10 +1528,17 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "status": "written",
                         "sha256": sha256_file(trace_path),
                         "size_bytes": trace_path.stat().st_size,
-                        "input_tensor_sha256": input_tensor_sha256,
                         "validation": validation,
                     }
                 )
+                if decoder_level2_block0_trace:
+                    trace_artifact[
+                        "manual_natural_equality"
+                    ] = manual_equality
+                else:
+                    trace_artifact[
+                        "input_tensor_sha256"
+                    ] = input_tensor_sha256
                 if hash_ledger is not None:
                     trace_artifact["hash_ledger"] = hash_ledger
                 written_artifacts.append(trace_artifact)
@@ -1549,6 +1645,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
             "decoder_level1_trace": decoder_level1_trace,
+            "decoder_level2_block0_trace": decoder_level2_block0_trace,
             "raw_meshes": not decoder_state_only and not decoder_trace_mode,
             "post_fill_holes_snapshots": (
                 not decoder_state_only and not decoder_trace_mode
@@ -1734,6 +1831,104 @@ def capture_source_decoder_level0_trace(
         name: np.ascontiguousarray(values)
         for name, values in arrays.items()
     }
+
+
+def capture_source_decoder_level2_block0_trace(
+    decoder: Any,
+    shape_slat: Any,
+) -> tuple[dict[str, np.ndarray], dict[str, bool]]:
+    from trellis2.models.sc_vaes.sparse_unet_vae import (
+        SparseConvNeXtBlock3d,
+        SparseResBlockC2S3d,
+    )
+
+    level0_blocks = [
+        block
+        for block in decoder.blocks[0]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    first_upsamples = [
+        block
+        for block in decoder.blocks[0]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    level1_blocks = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    second_upsamples = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    level2_blocks = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    counts = (
+        len(level0_blocks),
+        len(first_upsamples),
+        len(level1_blocks),
+        len(second_upsamples),
+        len(level2_blocks),
+    )
+    if counts != (4, 1, 16, 1, 8):
+        raise ValueError(
+            "source focused block0 trace requires decoder topology "
+            f"(4, 1, 16, 1, 8), got {counts}"
+        )
+
+    current = decoder.from_latent(shape_slat).type(decoder.dtype)
+    for block in level0_blocks:
+        current = block(current)
+    level1_output, _ = first_upsamples[0](current)
+    for block in level1_blocks:
+        level1_output = block(level1_output)
+    block0_input, _ = second_upsamples[0](level1_output)
+
+    block0 = level2_blocks[0]
+    conv_state = block0.conv(block0_input)
+    norm = block0.norm(conv_state.feats)
+    fc1 = block0.mlp[0](norm)
+    silu = block0.mlp[1](fc1)
+    fc2 = block0.mlp[2](silu)
+    output = block0_input.replace(fc2 + block0_input.feats)
+    natural = block0(block0_input)
+    features_equal = np.array_equal(
+        tensor_to_numpy(output.feats),
+        tensor_to_numpy(natural.feats),
+    )
+    coordinates_equal = np.array_equal(
+        tensor_to_numpy(output.coords),
+        tensor_to_numpy(natural.coords),
+    )
+    if not features_equal or not coordinates_equal:
+        raise RuntimeError(
+            "manual source level-two block0 decomposition does not exactly "
+            "reproduce natural forward"
+        )
+    arrays = {
+        "level2_child_coords": tensor_to_numpy(block0_input.coords),
+        "level1_upsample_output": tensor_to_numpy(block0_input.feats),
+        "level2_block0_conv": tensor_to_numpy(conv_state.feats),
+        "level2_block0_norm": tensor_to_numpy(norm),
+        "level2_block0_mlp_fc1": tensor_to_numpy(fc1),
+        "level2_block0_silu": tensor_to_numpy(silu),
+        "level2_block0_mlp_fc2": tensor_to_numpy(fc2),
+        "level2_block0_output": tensor_to_numpy(natural.feats),
+    }
+    return (
+        {
+            name: np.ascontiguousarray(values)
+            for name, values in arrays.items()
+        },
+        {
+            "features": features_equal,
+            "coordinates": coordinates_equal,
+        },
+    )
 
 
 def capture_source_decoder_level1_trace(
