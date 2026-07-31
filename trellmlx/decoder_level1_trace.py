@@ -1,4 +1,4 @@
-"""Exact operation-boundary capture for the first decoder upsample and level one."""
+"""Exact operation-boundary capture for the early shape-decoder frontier."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def capture_mlx_decoder_level1_trace(
     *,
     hash_entry,
 ) -> tuple[dict[str, np.ndarray], list[dict]]:
-    """Capture the first upsample and level-one block 0 from an exact parent state."""
+    """Capture exact early-decoder boundaries from an exact parent state."""
     level0_upsample = [
         block
         for block in decoder.blocks[0]
@@ -52,6 +52,26 @@ def capture_mlx_decoder_level1_trace(
         raise ValueError(
             "level-one trace requires exactly one level-one upsample block, "
             f"got {len(level1_upsample)}"
+        )
+    level2_blocks = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    if len(level2_blocks) != 8:
+        raise ValueError(
+            "level-one trace requires exactly eight level-two ConvNeXt "
+            f"blocks, got {len(level2_blocks)}"
+        )
+    level2_upsample = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
+    if len(level2_upsample) != 1:
+        raise ValueError(
+            "level-one trace requires exactly one level-two upsample block, "
+            f"got {len(level2_upsample)}"
         )
     upsample = level0_upsample[0]
     block0 = level1_blocks[0]
@@ -243,6 +263,109 @@ def capture_mlx_decoder_level1_trace(
     hash_entries.extend(
         hash_entry(name, np.asarray(values))
         for name, values in next_boundaries.items()
+    )
+
+    level2_output = natural_next_output
+    for index, block in enumerate(level2_blocks):
+        level2_output = block(level2_output, next_child_nmap)
+        mx.eval(level2_output)
+        hash_entries.append(
+            hash_entry(
+                f"level2_block{index}_output",
+                np.asarray(level2_output),
+            )
+        )
+
+    final_upsample = level2_upsample[0]
+    final_subdiv_logits = _decoder_linear(
+        final_upsample.to_subdiv,
+        level2_output,
+    )
+    final_subdiv_mask = final_subdiv_logits > 0
+    final_norm1 = final_upsample.norm1(level2_output)
+    final_silu1 = _decoder_silu(final_norm1)
+    final_conv1 = final_upsample.conv1(final_silu1, next_child_nmap)
+    final_h_c2s, final_child_coords = SparseChannel2Spatial.upsample(
+        final_conv1,
+        next_child_coords,
+        final_subdiv_mask,
+    )
+    final_skip_c2s, final_skip_coords = SparseChannel2Spatial.upsample(
+        level2_output,
+        next_child_coords,
+        final_subdiv_mask,
+    )
+    if not np.array_equal(
+        np.asarray(final_child_coords),
+        np.asarray(final_skip_coords),
+    ):
+        raise RuntimeError("third-upsample feature and skip coordinates differ")
+    final_channels_per_child = final_upsample.channels // 8
+    final_repeat_factor = (
+        final_upsample.out_channels // final_channels_per_child
+    )
+    final_skip_repeated = mx.repeat(
+        final_skip_c2s,
+        final_repeat_factor,
+        axis=1,
+    )
+    final_norm2 = final_upsample.norm2(final_h_c2s)
+    final_silu2 = _decoder_silu(final_norm2)
+    final_child_nmap = build_neighbor_map(final_child_coords)
+    final_conv2 = final_upsample.conv2(final_silu2, final_child_nmap)
+    final_upsample_output = final_conv2 + final_skip_repeated
+    (
+        natural_final_output,
+        natural_final_coords,
+        natural_final_subdiv,
+    ) = final_upsample(
+        level2_output,
+        next_child_coords,
+        next_child_nmap,
+    )
+    mx.eval(
+        final_subdiv_logits,
+        final_norm1,
+        final_silu1,
+        final_conv1,
+        final_h_c2s,
+        final_skip_c2s,
+        final_skip_repeated,
+        final_norm2,
+        final_silu2,
+        final_conv2,
+        final_upsample_output,
+        natural_final_output,
+        natural_final_coords,
+        natural_final_subdiv,
+    )
+    for name, manual, natural in (
+        ("features", final_upsample_output, natural_final_output),
+        ("coordinates", final_child_coords, natural_final_coords),
+        ("subdivision logits", final_subdiv_logits, natural_final_subdiv),
+    ):
+        if not np.array_equal(np.asarray(manual), np.asarray(natural)):
+            raise RuntimeError(
+                "manual third-upsample trace does not exactly reproduce "
+                f"natural {name}"
+            )
+    final_boundaries = {
+        "level2_upsample_subdiv_logits": final_subdiv_logits,
+        "level2_upsample_norm1": final_norm1,
+        "level2_upsample_silu1": final_silu1,
+        "level2_upsample_conv1": final_conv1,
+        "level3_child_coords": final_child_coords,
+        "level2_upsample_h_c2s": final_h_c2s,
+        "level2_upsample_skip_c2s": final_skip_c2s,
+        "level2_upsample_skip_repeated": final_skip_repeated,
+        "level2_upsample_norm2": final_norm2,
+        "level2_upsample_silu2": final_silu2,
+        "level2_upsample_conv2": final_conv2,
+        "level2_upsample_output": natural_final_output,
+    }
+    hash_entries.extend(
+        hash_entry(name, np.asarray(values))
+        for name, values in final_boundaries.items()
     )
 
     arrays = {

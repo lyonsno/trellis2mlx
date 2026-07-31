@@ -1,4 +1,4 @@
-"""Pure-Numpy artifact contract for the first decoder upsample and level one."""
+"""Pure-Numpy artifact contract for the early shape-decoder frontier."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ CHILD_TRACE_NAMES = (
 )
 TRACE_NAMES = PARENT_TRACE_NAMES + CHILD_TRACE_NAMES
 REQUIRED_ARRAYS = ("parent_coords", "child_coords") + TRACE_NAMES
-LEVEL1_HASH_LEDGER_SCHEMA = "trellis2mlx.decoder_level1_hash_ledger.v1"
+LEVEL1_HASH_LEDGER_SCHEMA = "trellis2mlx.decoder_level1_hash_ledger.v2"
 LEVEL1_HASH_BOUNDARY_NAMES = tuple(
     f"level1_block{index}_output" for index in range(16)
 ) + (
@@ -51,6 +51,21 @@ LEVEL1_HASH_BOUNDARY_NAMES = tuple(
     "level1_upsample_silu2",
     "level1_upsample_conv2",
     "level1_upsample_output",
+) + tuple(
+    f"level2_block{index}_output" for index in range(8)
+) + (
+    "level2_upsample_subdiv_logits",
+    "level2_upsample_norm1",
+    "level2_upsample_silu1",
+    "level2_upsample_conv1",
+    "level3_child_coords",
+    "level2_upsample_h_c2s",
+    "level2_upsample_skip_c2s",
+    "level2_upsample_skip_repeated",
+    "level2_upsample_norm2",
+    "level2_upsample_silu2",
+    "level2_upsample_conv2",
+    "level2_upsample_output",
 )
 
 
@@ -99,7 +114,8 @@ def decoder_level1_hash_entry(
 
 def _expected_hash_ledger_specs(
     child_rows: int,
-    next_rows: int,
+    level2_rows: int,
+    level3_rows: int,
 ) -> dict[str, tuple[tuple[int, ...], str]]:
     specs = {
         f"level1_block{index}_output": ((child_rows, 512), "float16")
@@ -111,17 +127,66 @@ def _expected_hash_ledger_specs(
             "level1_upsample_norm1": ((child_rows, 512), "float16"),
             "level1_upsample_silu1": ((child_rows, 512), "float16"),
             "level1_upsample_conv1": ((child_rows, 2048), "float16"),
-            "level2_child_coords": ((next_rows, 4), "int32"),
-            "level1_upsample_h_c2s": ((next_rows, 256), "float16"),
-            "level1_upsample_skip_c2s": ((next_rows, 64), "float16"),
-            "level1_upsample_skip_repeated": ((next_rows, 256), "float16"),
-            "level1_upsample_norm2": ((next_rows, 256), "float16"),
-            "level1_upsample_silu2": ((next_rows, 256), "float16"),
-            "level1_upsample_conv2": ((next_rows, 256), "float16"),
-            "level1_upsample_output": ((next_rows, 256), "float16"),
+            "level2_child_coords": ((level2_rows, 4), "int32"),
+            "level1_upsample_h_c2s": ((level2_rows, 256), "float16"),
+            "level1_upsample_skip_c2s": ((level2_rows, 64), "float16"),
+            "level1_upsample_skip_repeated": ((level2_rows, 256), "float16"),
+            "level1_upsample_norm2": ((level2_rows, 256), "float16"),
+            "level1_upsample_silu2": ((level2_rows, 256), "float16"),
+            "level1_upsample_conv2": ((level2_rows, 256), "float16"),
+            "level1_upsample_output": ((level2_rows, 256), "float16"),
+        }
+    )
+    specs.update(
+        {
+            f"level2_block{index}_output": (
+                (level2_rows, 256),
+                "float16",
+            )
+            for index in range(8)
+        }
+    )
+    specs.update(
+        {
+            "level2_upsample_subdiv_logits": (
+                (level2_rows, 8),
+                "float16",
+            ),
+            "level2_upsample_norm1": ((level2_rows, 256), "float16"),
+            "level2_upsample_silu1": ((level2_rows, 256), "float16"),
+            "level2_upsample_conv1": ((level2_rows, 1024), "float16"),
+            "level3_child_coords": ((level3_rows, 4), "int32"),
+            "level2_upsample_h_c2s": ((level3_rows, 128), "float16"),
+            "level2_upsample_skip_c2s": ((level3_rows, 32), "float16"),
+            "level2_upsample_skip_repeated": (
+                (level3_rows, 128),
+                "float16",
+            ),
+            "level2_upsample_norm2": ((level3_rows, 128), "float16"),
+            "level2_upsample_silu2": ((level3_rows, 128), "float16"),
+            "level2_upsample_conv2": ((level3_rows, 128), "float16"),
+            "level2_upsample_output": ((level3_rows, 128), "float16"),
         }
     )
     return specs
+
+
+def _ledger_row_count(
+    entries: list[Any],
+    name: str,
+) -> int:
+    entry = entries[LEVEL1_HASH_BOUNDARY_NAMES.index(name)]
+    shape = entry.get("shape") if isinstance(entry, Mapping) else None
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 2
+        or not isinstance(shape[0], int)
+        or shape[0] <= 0
+    ):
+        raise ValueError(
+            f"decoder level-one hash ledger row count for {name} is invalid"
+        )
+    return shape[0]
 
 
 def validate_decoder_level1_hash_ledger(
@@ -147,20 +212,11 @@ def validate_decoder_level1_hash_ledger(
             "decoder level-one hash ledger must contain the exact ordered boundaries"
         )
 
-    first_shape = entries[0].get("shape")
-    coords_shape = entries[20].get("shape")
-    if (
-        not isinstance(first_shape, list)
-        or len(first_shape) != 2
-        or not isinstance(first_shape[0], int)
-        or first_shape[0] <= 0
-        or not isinstance(coords_shape, list)
-        or len(coords_shape) != 2
-        or not isinstance(coords_shape[0], int)
-        or coords_shape[0] <= 0
-    ):
-        raise ValueError("decoder level-one hash ledger row counts are invalid")
-    specs = _expected_hash_ledger_specs(first_shape[0], coords_shape[0])
+    specs = _expected_hash_ledger_specs(
+        _ledger_row_count(entries, "level1_block0_output"),
+        _ledger_row_count(entries, "level2_child_coords"),
+        _ledger_row_count(entries, "level3_child_coords"),
+    )
 
     normalized_entries = []
     for entry in entries:

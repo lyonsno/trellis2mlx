@@ -30,6 +30,21 @@ LEVEL1_HASH_BOUNDARY_NAMES = tuple(
     "level1_upsample_silu2",
     "level1_upsample_conv2",
     "level1_upsample_output",
+) + tuple(
+    f"level2_block{index}_output" for index in range(8)
+) + (
+    "level2_upsample_subdiv_logits",
+    "level2_upsample_norm1",
+    "level2_upsample_silu1",
+    "level2_upsample_conv1",
+    "level3_child_coords",
+    "level2_upsample_h_c2s",
+    "level2_upsample_skip_c2s",
+    "level2_upsample_skip_repeated",
+    "level2_upsample_norm2",
+    "level2_upsample_silu2",
+    "level2_upsample_conv2",
+    "level2_upsample_output",
 )
 
 
@@ -51,7 +66,11 @@ def _hash_boundary(name, values):
     }
 
 
-def _valid_hash_boundary_arrays(child_rows=5, next_rows=7):
+def _valid_hash_boundary_arrays(
+    child_rows=5,
+    level2_rows=7,
+    level3_rows=9,
+):
     arrays = {
         f"level1_block{index}_output": np.full(
             (child_rows, 512),
@@ -79,35 +98,97 @@ def _valid_hash_boundary_arrays(child_rows=5, next_rows=7):
                 dtype=np.float16,
             ),
             "level2_child_coords": np.arange(
-                next_rows * 4,
+                level2_rows * 4,
                 dtype=np.int32,
-            ).reshape(next_rows, 4),
+            ).reshape(level2_rows, 4),
             "level1_upsample_h_c2s": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
                 dtype=np.float16,
             ),
             "level1_upsample_skip_c2s": np.zeros(
-                (next_rows, 64),
+                (level2_rows, 64),
                 dtype=np.float16,
             ),
             "level1_upsample_skip_repeated": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
                 dtype=np.float16,
             ),
             "level1_upsample_norm2": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
                 dtype=np.float16,
             ),
             "level1_upsample_silu2": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
                 dtype=np.float16,
             ),
             "level1_upsample_conv2": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
                 dtype=np.float16,
             ),
             "level1_upsample_output": np.zeros(
-                (next_rows, 256),
+                (level2_rows, 256),
+                dtype=np.float16,
+            ),
+        }
+    )
+    arrays.update(
+        {
+            f"level2_block{index}_output": np.full(
+                (level2_rows, 256),
+                index,
+                dtype=np.float16,
+            )
+            for index in range(8)
+        }
+    )
+    arrays.update(
+        {
+            "level2_upsample_subdiv_logits": np.zeros(
+                (level2_rows, 8),
+                dtype=np.float16,
+            ),
+            "level2_upsample_norm1": np.zeros(
+                (level2_rows, 256),
+                dtype=np.float16,
+            ),
+            "level2_upsample_silu1": np.zeros(
+                (level2_rows, 256),
+                dtype=np.float16,
+            ),
+            "level2_upsample_conv1": np.zeros(
+                (level2_rows, 1024),
+                dtype=np.float16,
+            ),
+            "level3_child_coords": np.arange(
+                level3_rows * 4,
+                dtype=np.int32,
+            ).reshape(level3_rows, 4),
+            "level2_upsample_h_c2s": np.zeros(
+                (level3_rows, 128),
+                dtype=np.float16,
+            ),
+            "level2_upsample_skip_c2s": np.zeros(
+                (level3_rows, 32),
+                dtype=np.float16,
+            ),
+            "level2_upsample_skip_repeated": np.zeros(
+                (level3_rows, 128),
+                dtype=np.float16,
+            ),
+            "level2_upsample_norm2": np.zeros(
+                (level3_rows, 128),
+                dtype=np.float16,
+            ),
+            "level2_upsample_silu2": np.zeros(
+                (level3_rows, 128),
+                dtype=np.float16,
+            ),
+            "level2_upsample_conv2": np.zeros(
+                (level3_rows, 128),
+                dtype=np.float16,
+            ),
+            "level2_upsample_output": np.zeros(
+                (level3_rows, 128),
                 dtype=np.float16,
             ),
         }
@@ -118,7 +199,7 @@ def _valid_hash_boundary_arrays(child_rows=5, next_rows=7):
 def _valid_hash_ledger():
     arrays = _valid_hash_boundary_arrays()
     return {
-        "schema": "trellis2mlx.decoder_level1_hash_ledger.v1",
+        "schema": "trellis2mlx.decoder_level1_hash_ledger.v2",
         "entries": [
             _hash_boundary(name, arrays[name])
             for name in LEVEL1_HASH_BOUNDARY_NAMES
@@ -269,11 +350,14 @@ def test_level1_hash_ledger_contract_rejects_partial_and_binds_boundary_bytes():
     )
 
     changed = _valid_hash_boundary_arrays()
-    changed["level1_block7_output"][0, 0] += np.float16(1)
+    changed["level2_block3_output"][0, 0] += np.float16(1)
     changed_ledger = build_decoder_level1_hash_ledger(changed)
+    changed_index = LEVEL1_HASH_BOUNDARY_NAMES.index(
+        "level2_block3_output"
+    )
     assert (
-        changed_ledger["entries"][7]["sha256"]
-        != ledger["entries"][7]["sha256"]
+        changed_ledger["entries"][changed_index]["sha256"]
+        != ledger["entries"][changed_index]["sha256"]
     )
 
     partial = {

@@ -1766,6 +1766,16 @@ def capture_source_decoder_level1_trace(
         for block in decoder.blocks[1]
         if isinstance(block, SparseResBlockC2S3d)
     ]
+    level2_blocks = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseConvNeXtBlock3d)
+    ]
+    level2_upsample = [
+        block
+        for block in decoder.blocks[2]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
     if len(level0_blocks) != 4 or len(level0_upsample) != 1:
         raise ValueError(
             "source level-one trace requires four level-zero ConvNeXt blocks "
@@ -1781,6 +1791,16 @@ def capture_source_decoder_level1_trace(
         raise ValueError(
             "source level-one trace requires one level-one upsample, "
             f"got {len(level1_upsample)}"
+        )
+    if len(level2_blocks) != 8:
+        raise ValueError(
+            "source level-one trace requires eight level-two ConvNeXt "
+            f"blocks, got {len(level2_blocks)}"
+        )
+    if len(level2_upsample) != 1:
+        raise ValueError(
+            "source level-one trace requires one level-two upsample, "
+            f"got {len(level2_upsample)}"
         )
 
     current = decoder.from_latent(shape_slat).type(decoder.dtype)
@@ -1923,6 +1943,92 @@ def capture_source_decoder_level1_trace(
             tensor_to_numpy(values),
         )
         for name, values in next_boundaries.items()
+    )
+
+    level2_output = natural_next_output
+    for index, block in enumerate(level2_blocks):
+        level2_output = block(level2_output)
+        hash_entries.append(
+            trace_contract.decoder_level1_hash_entry(
+                f"level2_block{index}_output",
+                tensor_to_numpy(level2_output.feats),
+            )
+        )
+
+    final_upsample = level2_upsample[0]
+    final_subdiv = final_upsample.to_subdiv(level2_output)
+    final_norm1 = final_upsample.norm1(level2_output.feats)
+    final_silu1 = torch_functional.silu(final_norm1)
+    final_conv1 = final_upsample.conv1(
+        level2_output.replace(final_silu1)
+    )
+    final_subdiv_binarized = final_subdiv.replace(final_subdiv.feats > 0)
+    final_h_c2s = final_upsample.updown(
+        final_conv1,
+        final_subdiv_binarized,
+    )
+    final_skip_c2s = final_upsample.updown(
+        level2_output,
+        final_subdiv_binarized,
+    )
+    final_norm2 = final_upsample.norm2(final_h_c2s.feats)
+    final_silu2 = torch_functional.silu(final_norm2)
+    final_conv2 = final_upsample.conv2(final_h_c2s.replace(final_silu2))
+    final_skip_repeated = final_upsample.skip_connection(final_skip_c2s)
+    final_upsample_output = final_conv2 + final_skip_repeated
+    natural_final_output, natural_final_subdiv = final_upsample(level2_output)
+    for name, manual, natural in (
+        (
+            "features",
+            final_upsample_output.feats,
+            natural_final_output.feats,
+        ),
+        (
+            "coordinates",
+            final_upsample_output.coords,
+            natural_final_output.coords,
+        ),
+        (
+            "subdivision logits",
+            final_subdiv.feats,
+            natural_final_subdiv.feats,
+        ),
+    ):
+        if not np.array_equal(
+            tensor_to_numpy(manual),
+            tensor_to_numpy(natural),
+        ):
+            raise RuntimeError(
+                "manual source third-upsample trace does not exactly "
+                f"reproduce natural {name}"
+            )
+    if not np.array_equal(
+        tensor_to_numpy(final_h_c2s.coords),
+        tensor_to_numpy(final_skip_c2s.coords),
+    ):
+        raise RuntimeError(
+            "source third-upsample feature and skip coordinates differ"
+        )
+    final_boundaries = {
+        "level2_upsample_subdiv_logits": final_subdiv.feats,
+        "level2_upsample_norm1": final_norm1,
+        "level2_upsample_silu1": final_silu1,
+        "level2_upsample_conv1": final_conv1.feats,
+        "level3_child_coords": natural_final_output.coords,
+        "level2_upsample_h_c2s": final_h_c2s.feats,
+        "level2_upsample_skip_c2s": final_skip_c2s.feats,
+        "level2_upsample_skip_repeated": final_skip_repeated.feats,
+        "level2_upsample_norm2": final_norm2,
+        "level2_upsample_silu2": final_silu2,
+        "level2_upsample_conv2": final_conv2.feats,
+        "level2_upsample_output": natural_final_output.feats,
+    }
+    hash_entries.extend(
+        trace_contract.decoder_level1_hash_entry(
+            name,
+            tensor_to_numpy(values),
+        )
+        for name, values in final_boundaries.items()
     )
 
     arrays = {
