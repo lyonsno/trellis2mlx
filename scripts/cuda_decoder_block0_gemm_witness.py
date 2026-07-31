@@ -726,6 +726,7 @@ def _invoke_cublas_gemm_ex(
     output,
     algorithm_id: int,
     output_cuda_type: int = CUDA_R_16F,
+    beta: float = 0.0,
 ) -> int:
     if len(x.shape) != 2 or len(weight.shape) != 2 or len(output.shape) != 2:
         raise ValueError("cuBLAS GEMM tensors must all be two-dimensional")
@@ -750,7 +751,7 @@ def _invoke_cublas_gemm_ex(
         )
 
     alpha = ctypes.c_float(1.0)
-    beta = ctypes.c_float(0.0)
+    beta_value = ctypes.c_float(beta)
     status = gemm_ex(
         ctypes.c_void_p(handle),
         ctypes.c_int(CUBLAS_OP_N),
@@ -765,7 +766,7 @@ def _invoke_cublas_gemm_ex(
         ctypes.c_void_p(x.data_ptr()),
         ctypes.c_int(CUDA_R_16F),
         ctypes.c_int(reduction),
-        ctypes.byref(beta),
+        ctypes.byref(beta_value),
         ctypes.c_void_p(output.data_ptr()),
         ctypes.c_int(output_cuda_type),
         ctypes.c_int(channels),

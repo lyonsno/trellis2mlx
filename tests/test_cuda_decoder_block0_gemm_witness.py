@@ -283,6 +283,46 @@ def test_cublas_gemm_ex_can_publish_fp32_output_without_changing_inputs():
     assert integer(call[17]) == CUDA_R_32F
 
 
+def test_cublas_gemm_ex_accepts_fused_beta_epilogue():
+    import ctypes
+
+    from scripts.cuda_decoder_block0_gemm_witness import (
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        _invoke_cublas_gemm_ex,
+    )
+
+    class PointerTensor:
+        def __init__(self, shape, pointer):
+            self.shape = shape
+            self._pointer = pointer
+
+        def data_ptr(self):
+            return self._pointer
+
+        def is_contiguous(self):
+            return True
+
+    calls = []
+
+    def gemm_ex(*args):
+        beta = ctypes.cast(args[13], ctypes.POINTER(ctypes.c_float)).contents.value
+        calls.append(beta)
+        return 0
+
+    status = _invoke_cublas_gemm_ex(
+        gemm_ex,
+        handle=44,
+        x=PointerTensor((2, 256), 11),
+        weight=PointerTensor((256, 8), 22),
+        output=PointerTensor((2, 8), 33),
+        algorithm_id=CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        beta=1.0,
+    )
+
+    assert status == 0
+    assert calls == [1.0]
+
+
 def test_sm75_compiler_evidence_requires_wmma_ptx_and_hmma_1688_sass():
     from scripts import cuda_decoder_block0_gemm_witness as witness
 
