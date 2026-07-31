@@ -32,9 +32,13 @@ from ..turing_fda import turing_fda_linear
 
 DECODER_LINEAR_BACKEND_ENV = "TRELLIS2MLX_DECODER_LINEAR_BACKEND"
 DECODER_LINEAR_BACKENDS = frozenset(("native", "turing_fda"))
-AUTHENTICATED_DECODER_LAYERNORM_WIDTH = 1024
 AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS = frozenset((1024, 512))
-AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_WIDTH = 512
+AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_TRANSITIONS = frozenset(
+    ((1024, 512),)
+)
+AUTHENTICATED_SHAPE_DECODER_NOAFFINE_LAYERNORM_TRANSITIONS = frozenset(
+    ((512, 256),)
+)
 
 
 def _decoder_linear(linear: nn.Linear, value: mx.array) -> mx.array:
@@ -151,7 +155,13 @@ class SparseChannel2Spatial:
 class SparseResBlockC2S3d(nn.Module):
     """Upsample block: Norm→SiLU→Conv→Channel2Spatial→Norm→SiLU→Conv + skip."""
 
-    def __init__(self, channels: int, out_channels: int, pred_subdiv: bool = True):
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        pred_subdiv: bool = True,
+        decoder_role: str = "generic",
+    ):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels
@@ -167,8 +177,13 @@ class SparseResBlockC2S3d(nn.Module):
         self.norm2 = LayerNorm32(
             out_channels,
             decoder_layernorm=(
-                channels == AUTHENTICATED_DECODER_LAYERNORM_WIDTH
-                and out_channels == AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_WIDTH
+                (channels, out_channels)
+                in AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_TRANSITIONS
+                or (
+                    decoder_role == "shape"
+                    and (channels, out_channels)
+                    in AUTHENTICATED_SHAPE_DECODER_NOAFFINE_LAYERNORM_TRANSITIONS
+                )
             ),
         )
         self.conv1 = SparseConv3d(channels, out_channels * 8, kernel_size=3)
@@ -266,6 +281,12 @@ class SLatDecoder(nn.Module):
         self.num_blocks = num_blocks
         self.pred_subdiv = pred_subdiv
         self.use_fp16 = use_fp16
+        if out_channels == 7 and pred_subdiv:
+            self.decoder_role = "shape"
+        elif out_channels == 6 and not pred_subdiv:
+            self.decoder_role = "texture"
+        else:
+            self.decoder_role = "generic"
 
         self.from_latent = nn.Linear(latent_channels, model_channels[0])
         self.output_layer = nn.Linear(model_channels[-1], out_channels)
@@ -276,8 +297,14 @@ class SLatDecoder(nn.Module):
             for _ in range(n_blocks):
                 level.append(SparseConvNeXtBlock3d(ch))
             if i < len(model_channels) - 1:
-                level.append(SparseResBlockC2S3d(ch, model_channels[i + 1],
-                                                 pred_subdiv=pred_subdiv))
+                level.append(
+                    SparseResBlockC2S3d(
+                        ch,
+                        model_channels[i + 1],
+                        pred_subdiv=pred_subdiv,
+                        decoder_role=self.decoder_role,
+                    )
+                )
             self.blocks.append(level)
         if use_fp16:
             for level in self.blocks:

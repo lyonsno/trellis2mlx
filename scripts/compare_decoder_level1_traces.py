@@ -176,11 +176,26 @@ def _require_local_route(
                     "accumulator_dtype": "float32",
                 },
             },
+            {
+                "input_dtype": "float16",
+                "hidden_width": 256,
+                "affine": False,
+                "reduction": {
+                    "threads": 128,
+                    "warps": 4,
+                    "vector_width": 4,
+                    "active_values_per_thread": 4,
+                    "average_values_per_launched_thread": 2,
+                    "active_vector_threads": 64,
+                    "inactive_vector_threads": 64,
+                    "accumulator_dtype": "float32",
+                },
+            },
         ]
         if layernorm.get("authenticated_contracts") != expected_contracts:
             raise ValueError(
                 "local decoder LayerNorm omits the authenticated "
-                "width-512 affine/non-affine contracts"
+                "width-256 non-affine contract"
             )
         lut = route.get("decoder_layernorm_lut")
         if not isinstance(lut, dict):
