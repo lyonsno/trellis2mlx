@@ -36,7 +36,11 @@ PARENT_RECEIPT_SCHEMA = (
 )
 TRACE_RUN_SCHEMA = "trellis2mlx.decoder_level2_block0_trace_run.v1"
 COMPARISON_SCHEMA = (
-    "trellis2mlx.decoder_level2_block0_trace_comparison.v1"
+    "trellis2mlx.decoder_level2_block0_trace_comparison.v2"
+)
+PARENT_FORK_DISPOSITIONS = (
+    "historical-fork",
+    "corrected-child-exact-to-source",
 )
 CHILD_ARRAY_NAMES = (
     PARENT_COORD_BOUNDARY,
@@ -565,7 +569,10 @@ def validate_parent_receipt(
     receipt_file: Mapping[str, str],
     source_arrays: Mapping[str, np.ndarray],
     local_arrays: Mapping[str, np.ndarray],
+    parent_fork_disposition: str,
 ) -> dict[str, Any]:
+    if parent_fork_disposition not in PARENT_FORK_DISPOSITIONS:
+        raise ValueError("unknown parent fork disposition")
     if not isinstance(receipt, Mapping):
         raise ValueError("parent receipt must be an object")
     required = {
@@ -650,11 +657,20 @@ def validate_parent_receipt(
         raise ValueError(
             "source child block0 output parent boundary hash mismatch"
         )
-    if child_output_identity["local"] != local["entries"][
-        PARENT_FORK_BOUNDARY
-    ]:
+    historical_output_identity = {
+        "source": source["entries"][PARENT_FORK_BOUNDARY],
+        "local": local["entries"][PARENT_FORK_BOUNDARY],
+    }
+    if parent_fork_disposition == "historical-fork":
+        if child_output_identity["local"] != historical_output_identity[
+            "local"
+        ]:
+            raise ValueError(
+                "local child block0 output parent boundary hash mismatch"
+            )
+    elif child_output_identity["local"] != child_output_identity["source"]:
         raise ValueError(
-            "local child block0 output parent boundary hash mismatch"
+            "corrected local block0 output does not match source"
         )
     return {
         "schema": PARENT_RECEIPT_SCHEMA,
@@ -670,6 +686,12 @@ def validate_parent_receipt(
         },
         "child_input_identity": child_identity,
         "child_output_identity": child_output_identity,
+        "parent_fork_disposition": {
+            "requested": parent_fork_disposition,
+            "effective": parent_fork_disposition,
+            "historical": historical_output_identity,
+            "current": child_output_identity,
+        },
     }
 
 
@@ -906,6 +928,7 @@ def compare_decoder_level2_block0_traces(
     expected_parent_receipt_sha256: str,
     turing_rsqrt_lut_path: Path,
     expected_turing_rsqrt_lut_sha256: str,
+    parent_fork_disposition: str,
 ) -> dict[str, Any]:
     parent_receipt, receipt_file = authenticate_parent_receipt_file(
         parent_receipt_path,
@@ -940,6 +963,7 @@ def compare_decoder_level2_block0_traces(
         receipt_file=receipt_file,
         source_arrays=arrays["source"],
         local_arrays=arrays["local"],
+        parent_fork_disposition=parent_fork_disposition,
     )
     stages = {}
     first_nonexact = None
@@ -948,6 +972,19 @@ def compare_decoder_level2_block0_traces(
         stages[name] = delta
         if first_nonexact is None and delta["nonzero_count"]:
             first_nonexact = name
+    all_block_boundaries_exact = first_nonexact is None
+    if (
+        parent_fork_disposition == "corrected-child-exact-to-source"
+        and not all_block_boundaries_exact
+    ):
+        raise ValueError(
+            "corrected child trace is not exact to source; "
+            f"first nonexact boundary is {first_nonexact}"
+        )
+    fork_disposition = dict(receipt["parent_fork_disposition"])
+    fork_disposition["all_block_boundaries_exact_to_source"] = (
+        all_block_boundaries_exact
+    )
     return {
         "schema": COMPARISON_SCHEMA,
         "status": "done",
@@ -965,6 +1002,7 @@ def compare_decoder_level2_block0_traces(
         },
         "child_input_identity": receipt["child_input_identity"],
         "child_output_identity": receipt["child_output_identity"],
+        "parent_fork_disposition": fork_disposition,
         "artifacts": {
             label: {
                 "path": str(paths[label].resolve()),

@@ -463,7 +463,12 @@ def _local_lut_identity(inputs):
     return path.resolve(), lut["sha256"]
 
 
-def _compare(inputs, *, expected_lut_sha256=None):
+def _compare(
+    inputs,
+    *,
+    expected_lut_sha256=None,
+    parent_fork_disposition="historical-fork",
+):
     receipt, source_primary, source_report, local_primary, local_report = inputs
     receipt_path = Path(receipt["source_parent_report"]["path"]).with_name(
         "parent-receipt.json"
@@ -481,6 +486,7 @@ def _compare(inputs, *, expected_lut_sha256=None):
         expected_turing_rsqrt_lut_sha256=(
             expected_lut_sha256 or reported_lut_sha256
         ),
+        parent_fork_disposition=parent_fork_disposition,
     )
 
 
@@ -556,6 +562,12 @@ def test_block0_comparator_requires_caller_bound_parent_receipt_sha256():
     assert actions["--expected-parent-receipt-sha256"].required is True
     assert actions["--turing-rsqrt-lut"].required is True
     assert actions["--expected-turing-rsqrt-lut-sha256"].required is True
+    disposition = actions["--parent-fork-disposition"]
+    assert disposition.required is True
+    assert disposition.choices == (
+        "historical-fork",
+        "corrected-child-exact-to-source",
+    )
 
 
 def test_block0_comparator_rejects_foreign_internally_coherent_receipt(
@@ -595,6 +607,8 @@ def test_block0_comparator_rejects_foreign_internally_coherent_receipt(
             str(lut_path),
             "--expected-turing-rsqrt-lut-sha256",
             lut_sha256,
+            "--parent-fork-disposition",
+            "historical-fork",
             "--output",
             str(output),
         ]
@@ -847,6 +861,89 @@ def test_block0_child_rejects_output_detached_from_parent_fork(tmp_path):
         _compare(inputs)
 
 
+def _corrected_comparison_inputs(tmp_path):
+    parents = _parent_boundaries()
+    receipt = _write_parent_receipts(tmp_path, parents)
+    exact_arrays = _child_arrays(parents)
+    source_primary, source_report = _write_child(
+        tmp_path,
+        "source",
+        exact_arrays,
+    )
+    local_primary, local_report = _write_child(
+        tmp_path,
+        "local",
+        exact_arrays,
+    )
+    return receipt, source_primary, source_report, local_primary, local_report
+
+
+def test_block0_child_accepts_exact_correction_against_historical_fork(
+    tmp_path,
+):
+    result = _compare(
+        _corrected_comparison_inputs(tmp_path),
+        parent_fork_disposition="corrected-child-exact-to-source",
+    )
+
+    disposition = result["parent_fork_disposition"]
+    assert result["status"] == "done"
+    assert result["first_nonexact_boundary"] is None
+    assert disposition["requested"] == "corrected-child-exact-to-source"
+    assert disposition["effective"] == "corrected-child-exact-to-source"
+    assert disposition["historical"]["source"]["sha256"] != disposition[
+        "historical"
+    ]["local"]["sha256"]
+    assert disposition["current"]["source"] == disposition["current"]["local"]
+    assert disposition["current"]["local"] == disposition["historical"][
+        "source"
+    ]
+    assert disposition["current"]["local"] != disposition["historical"][
+        "local"
+    ]
+    assert disposition["all_block_boundaries_exact_to_source"] is True
+
+
+def test_block0_child_correction_rejects_arbitrary_new_output(tmp_path):
+    inputs = _corrected_comparison_inputs(tmp_path)
+    local_arrays = load_decoder_level2_block0_trace(inputs[3])
+    local_arrays["level2_block0_output"][0, 0] += np.float16(1)
+    write_decoder_level2_block0_trace_npz(inputs[3], local_arrays)
+    local_report = json.loads(inputs[4].read_text())
+    local_report["primary"]["sha256"] = _sha256(inputs[3])
+    _write_json(inputs[4], local_report)
+
+    with pytest.raises(
+        ValueError,
+        match="corrected local block0 output does not match source",
+    ):
+        _compare(
+            inputs,
+            parent_fork_disposition="corrected-child-exact-to-source",
+        )
+
+
+def test_block0_child_correction_rejects_hidden_intermediate_divergence(
+    tmp_path,
+):
+    inputs = _corrected_comparison_inputs(tmp_path)
+    local_arrays = load_decoder_level2_block0_trace(inputs[3])
+    local_arrays["level2_block0_norm"][0, 0] += np.float16(1)
+    write_decoder_level2_block0_trace_npz(inputs[3], local_arrays)
+    local_report = json.loads(inputs[4].read_text())
+    local_report["primary"]["sha256"] = _sha256(inputs[3])
+    _write_json(inputs[4], local_report)
+
+    with pytest.raises(
+        ValueError,
+        match="corrected child trace is not exact to source",
+    ):
+        _compare(
+            inputs,
+            parent_fork_disposition="corrected-child-exact-to-source",
+        )
+
+
 def test_block0_child_npz_rejects_extra_or_missing_arrays(tmp_path):
     arrays = _child_arrays()
     arrays["unexpected"] = np.zeros((1,), dtype=np.float16)
@@ -898,6 +995,8 @@ def test_block0_comparator_preserves_colliding_input_and_writes_failure(tmp_path
             str(lut_path),
             "--expected-turing-rsqrt-lut-sha256",
             lut_sha256,
+            "--parent-fork-disposition",
+            "historical-fork",
             "--output",
             str(inputs[1]),
         ]
@@ -940,6 +1039,8 @@ def test_block0_comparator_preserves_colliding_turing_lut_and_writes_failure(
             str(lut_path),
             "--expected-turing-rsqrt-lut-sha256",
             lut_sha256,
+            "--parent-fork-disposition",
+            "historical-fork",
             "--output",
             str(lut_path),
         ]
@@ -983,6 +1084,8 @@ def test_block0_comparator_replaces_stale_output_with_durable_failure(tmp_path):
             str(lut_path),
             "--expected-turing-rsqrt-lut-sha256",
             lut_sha256,
+            "--parent-fork-disposition",
+            "historical-fork",
             "--output",
             str(output),
         ]

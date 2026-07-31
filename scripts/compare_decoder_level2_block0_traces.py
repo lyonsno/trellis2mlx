@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.decoder_level2_block0_trace_contract import (
     COMPARISON_SCHEMA,
+    PARENT_FORK_DISPOSITIONS,
     authenticate_parent_receipt_file,
     compare_decoder_level2_block0_traces,
 )
@@ -39,6 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-turing-rsqrt-lut-sha256",
         required=True,
         help="Caller-bound SHA256 of the exact Turing rsqrt LUT artifact",
+    )
+    parser.add_argument(
+        "--parent-fork-disposition",
+        required=True,
+        choices=PARENT_FORK_DISPOSITIONS,
+        help=(
+            "Authenticate either the historical local fork or a child trace "
+            "corrected exactly to source"
+        ),
     )
     parser.add_argument("--output", required=True, type=Path)
     return parser
@@ -91,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             "expected_turing_rsqrt_lut_sha256": (
                 args.expected_turing_rsqrt_lut_sha256
             ),
+            "parent_fork_disposition": args.parent_fork_disposition,
             "output": str(args.output),
         },
         "effective_output": str(effective_output),
@@ -134,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_turing_rsqrt_lut_sha256=(
                 args.expected_turing_rsqrt_lut_sha256
             ),
+            parent_fork_disposition=args.parent_fork_disposition,
         )
         report.update(
             {
