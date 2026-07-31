@@ -35,6 +35,23 @@ CHILD_TRACE_NAMES = (
 )
 TRACE_NAMES = PARENT_TRACE_NAMES + CHILD_TRACE_NAMES
 REQUIRED_ARRAYS = ("parent_coords", "child_coords") + TRACE_NAMES
+LEVEL1_HASH_LEDGER_SCHEMA = "trellis2mlx.decoder_level1_hash_ledger.v1"
+LEVEL1_HASH_BOUNDARY_NAMES = tuple(
+    f"level1_block{index}_output" for index in range(16)
+) + (
+    "level1_upsample_subdiv_logits",
+    "level1_upsample_norm1",
+    "level1_upsample_silu1",
+    "level1_upsample_conv1",
+    "level2_child_coords",
+    "level1_upsample_h_c2s",
+    "level1_upsample_skip_c2s",
+    "level1_upsample_skip_repeated",
+    "level1_upsample_norm2",
+    "level1_upsample_silu2",
+    "level1_upsample_conv2",
+    "level1_upsample_output",
+)
 
 
 def decoder_level1_trace_input_sha256(
@@ -55,6 +72,158 @@ def decoder_level1_trace_input_sha256(
         )
         digest.update(contiguous.tobytes())
     return digest.hexdigest()
+
+
+def decoder_level1_hash_entry(
+    name: str,
+    values: Any,
+) -> dict[str, Any]:
+    if name not in LEVEL1_HASH_BOUNDARY_NAMES:
+        raise ValueError(f"unknown decoder level-one hash boundary {name!r}")
+    contiguous = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(name.encode("ascii") + b"\0")
+    digest.update(contiguous.dtype.str.encode("ascii") + b"\0")
+    digest.update(
+        ",".join(str(value) for value in contiguous.shape).encode("ascii")
+        + b"\0"
+    )
+    digest.update(contiguous.tobytes())
+    return {
+        "name": name,
+        "dtype": str(contiguous.dtype),
+        "shape": [int(value) for value in contiguous.shape],
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _expected_hash_ledger_specs(
+    child_rows: int,
+    next_rows: int,
+) -> dict[str, tuple[tuple[int, ...], str]]:
+    specs = {
+        f"level1_block{index}_output": ((child_rows, 512), "float16")
+        for index in range(16)
+    }
+    specs.update(
+        {
+            "level1_upsample_subdiv_logits": ((child_rows, 8), "float16"),
+            "level1_upsample_norm1": ((child_rows, 512), "float16"),
+            "level1_upsample_silu1": ((child_rows, 512), "float16"),
+            "level1_upsample_conv1": ((child_rows, 2048), "float16"),
+            "level2_child_coords": ((next_rows, 4), "int32"),
+            "level1_upsample_h_c2s": ((next_rows, 256), "float16"),
+            "level1_upsample_skip_c2s": ((next_rows, 64), "float16"),
+            "level1_upsample_skip_repeated": ((next_rows, 256), "float16"),
+            "level1_upsample_norm2": ((next_rows, 256), "float16"),
+            "level1_upsample_silu2": ((next_rows, 256), "float16"),
+            "level1_upsample_conv2": ((next_rows, 256), "float16"),
+            "level1_upsample_output": ((next_rows, 256), "float16"),
+        }
+    )
+    return specs
+
+
+def validate_decoder_level1_hash_ledger(
+    ledger: Any,
+) -> dict[str, Any]:
+    if not isinstance(ledger, Mapping):
+        raise ValueError("decoder level-one hash ledger must be an object")
+    if set(ledger) != {"schema", "entries"}:
+        raise ValueError(
+            "decoder level-one hash ledger must contain only schema and entries"
+        )
+    if ledger.get("schema") != LEVEL1_HASH_LEDGER_SCHEMA:
+        raise ValueError("decoder level-one hash ledger schema mismatch")
+    entries = ledger.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("decoder level-one hash ledger entries must be a list")
+    names = [
+        entry.get("name") if isinstance(entry, Mapping) else None
+        for entry in entries
+    ]
+    if names != list(LEVEL1_HASH_BOUNDARY_NAMES):
+        raise ValueError(
+            "decoder level-one hash ledger must contain the exact ordered boundaries"
+        )
+
+    first_shape = entries[0].get("shape")
+    coords_shape = entries[20].get("shape")
+    if (
+        not isinstance(first_shape, list)
+        or len(first_shape) != 2
+        or not isinstance(first_shape[0], int)
+        or first_shape[0] <= 0
+        or not isinstance(coords_shape, list)
+        or len(coords_shape) != 2
+        or not isinstance(coords_shape[0], int)
+        or coords_shape[0] <= 0
+    ):
+        raise ValueError("decoder level-one hash ledger row counts are invalid")
+    specs = _expected_hash_ledger_specs(first_shape[0], coords_shape[0])
+
+    normalized_entries = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("decoder level-one hash ledger entry must be an object")
+        if set(entry) != {"name", "dtype", "shape", "sha256"}:
+            raise ValueError(
+                "decoder level-one hash ledger entries require "
+                "name, dtype, shape, and sha256"
+            )
+        name = entry["name"]
+        expected_shape, expected_dtype = specs[name]
+        if entry["shape"] != list(expected_shape):
+            raise ValueError(
+                f"decoder hash boundary {name} shape mismatch: "
+                f"expected={expected_shape}, actual={entry['shape']}"
+            )
+        if entry["dtype"] != expected_dtype:
+            raise ValueError(
+                f"decoder hash boundary {name} dtype mismatch: "
+                f"expected={expected_dtype}, actual={entry['dtype']}"
+            )
+        digest = entry["sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                f"decoder hash boundary {name} SHA256 is not canonical"
+            )
+        normalized_entries.append(
+            {
+                "name": name,
+                "dtype": expected_dtype,
+                "shape": list(expected_shape),
+                "sha256": digest,
+            }
+        )
+    return {
+        "schema": LEVEL1_HASH_LEDGER_SCHEMA,
+        "entries": normalized_entries,
+    }
+
+
+def build_decoder_level1_hash_ledger(
+    boundaries: Mapping[str, Any],
+) -> dict[str, Any]:
+    missing = sorted(set(LEVEL1_HASH_BOUNDARY_NAMES) - set(boundaries))
+    extra = sorted(set(boundaries) - set(LEVEL1_HASH_BOUNDARY_NAMES))
+    if missing or extra:
+        raise ValueError(
+            "decoder level-one hash ledger boundaries mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+    ledger = {
+        "schema": LEVEL1_HASH_LEDGER_SCHEMA,
+        "entries": [
+            decoder_level1_hash_entry(name, boundaries[name])
+            for name in LEVEL1_HASH_BOUNDARY_NAMES
+        ],
+    }
+    return validate_decoder_level1_hash_ledger(ledger)
 
 
 def _validate_coords(name: str, values: Any) -> np.ndarray:

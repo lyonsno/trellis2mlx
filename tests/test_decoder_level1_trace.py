@@ -15,6 +15,116 @@ from scripts.decoder_level1_trace_contract import (
     write_decoder_level1_trace_npz,
 )
 
+LEVEL1_HASH_BOUNDARY_NAMES = tuple(
+    f"level1_block{index}_output" for index in range(16)
+) + (
+    "level1_upsample_subdiv_logits",
+    "level1_upsample_norm1",
+    "level1_upsample_silu1",
+    "level1_upsample_conv1",
+    "level2_child_coords",
+    "level1_upsample_h_c2s",
+    "level1_upsample_skip_c2s",
+    "level1_upsample_skip_repeated",
+    "level1_upsample_norm2",
+    "level1_upsample_silu2",
+    "level1_upsample_conv2",
+    "level1_upsample_output",
+)
+
+
+def _hash_boundary(name, values):
+    contiguous = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(name.encode("ascii") + b"\0")
+    digest.update(contiguous.dtype.str.encode("ascii") + b"\0")
+    digest.update(
+        ",".join(str(value) for value in contiguous.shape).encode("ascii")
+        + b"\0"
+    )
+    digest.update(contiguous.tobytes())
+    return {
+        "name": name,
+        "dtype": str(contiguous.dtype),
+        "shape": list(contiguous.shape),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _valid_hash_boundary_arrays(child_rows=5, next_rows=7):
+    arrays = {
+        f"level1_block{index}_output": np.full(
+            (child_rows, 512),
+            index,
+            dtype=np.float16,
+        )
+        for index in range(16)
+    }
+    arrays.update(
+        {
+            "level1_upsample_subdiv_logits": np.zeros(
+                (child_rows, 8),
+                dtype=np.float16,
+            ),
+            "level1_upsample_norm1": np.zeros(
+                (child_rows, 512),
+                dtype=np.float16,
+            ),
+            "level1_upsample_silu1": np.zeros(
+                (child_rows, 512),
+                dtype=np.float16,
+            ),
+            "level1_upsample_conv1": np.zeros(
+                (child_rows, 2048),
+                dtype=np.float16,
+            ),
+            "level2_child_coords": np.arange(
+                next_rows * 4,
+                dtype=np.int32,
+            ).reshape(next_rows, 4),
+            "level1_upsample_h_c2s": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+            "level1_upsample_skip_c2s": np.zeros(
+                (next_rows, 64),
+                dtype=np.float16,
+            ),
+            "level1_upsample_skip_repeated": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+            "level1_upsample_norm2": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+            "level1_upsample_silu2": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+            "level1_upsample_conv2": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+            "level1_upsample_output": np.zeros(
+                (next_rows, 256),
+                dtype=np.float16,
+            ),
+        }
+    )
+    return arrays
+
+
+def _valid_hash_ledger():
+    arrays = _valid_hash_boundary_arrays()
+    return {
+        "schema": "trellis2mlx.decoder_level1_hash_ledger.v1",
+        "entries": [
+            _hash_boundary(name, arrays[name])
+            for name in LEVEL1_HASH_BOUNDARY_NAMES
+        ],
+    }
+
 
 def _valid_trace():
     parent_coords = np.array(
@@ -145,6 +255,35 @@ def test_level1_trace_input_identity_binds_parent_values_and_coords():
     )
 
 
+def test_level1_hash_ledger_contract_rejects_partial_and_binds_boundary_bytes():
+    from scripts.decoder_level1_trace_contract import (
+        build_decoder_level1_hash_ledger,
+        validate_decoder_level1_hash_ledger,
+    )
+
+    arrays = _valid_hash_boundary_arrays()
+    ledger = build_decoder_level1_hash_ledger(arrays)
+    assert validate_decoder_level1_hash_ledger(ledger) == ledger
+    assert [entry["name"] for entry in ledger["entries"]] == list(
+        LEVEL1_HASH_BOUNDARY_NAMES
+    )
+
+    changed = _valid_hash_boundary_arrays()
+    changed["level1_block7_output"][0, 0] += np.float16(1)
+    changed_ledger = build_decoder_level1_hash_ledger(changed)
+    assert (
+        changed_ledger["entries"][7]["sha256"]
+        != ledger["entries"][7]["sha256"]
+    )
+
+    partial = {
+        **ledger,
+        "entries": ledger["entries"][:-1],
+    }
+    with pytest.raises(ValueError, match="ordered boundaries"):
+        validate_decoder_level1_hash_ledger(partial)
+
+
 def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
     source_path = tmp_path / "source.npz"
     local_path = tmp_path / "local.npz"
@@ -164,6 +303,7 @@ def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
         "reopened_exact": True,
         "child_expansion_exact": True,
     }
+    hash_ledger = _valid_hash_ledger()
     source_report = tmp_path / "source.json"
     source_report.write_text(
         json.dumps(
@@ -190,6 +330,7 @@ def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
                         "input_tensor_sha256": input_identity,
                         "status": "written",
                         "validation": validation,
+                        "hash_ledger": hash_ledger,
                     }
                 ],
             }
@@ -246,11 +387,76 @@ def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
                     "sha256": hashlib.sha256(local_path.read_bytes()).hexdigest(),
                     "status": "written",
                     "validation": validation,
+                    "hash_ledger": hash_ledger,
                 },
             }
         )
     )
     return source_path, source_report, local_path, local_report
+
+
+def test_level1_comparator_rejects_missing_hash_ledger(tmp_path):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    report = json.loads(local_report.read_text())
+    report["primary"].pop("hash_ledger")
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="hash ledger"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_level1_comparator_names_first_nonexact_hash_boundary(tmp_path):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    report = json.loads(local_report.read_text())
+    report["primary"]["hash_ledger"]["entries"][7]["sha256"] = "f" * 64
+    local_report.write_text(json.dumps(report))
+
+    comparison = compare_level1_traces(
+        source_path=source_path,
+        source_report_path=source_report,
+        local_path=local_path,
+        local_report_path=local_report,
+    )
+
+    assert (
+        comparison["first_nonexact_hash_boundary"]
+        == "level1_block7_output"
+    )
+
+
+def test_level1_comparator_rejects_ledger_detached_from_primary_trace(tmp_path):
+    from scripts.compare_decoder_level1_traces import compare_level1_traces
+
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    report = json.loads(local_report.read_text())
+    report["primary"]["hash_ledger"]["entries"][0]["sha256"] = "f" * 64
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="does not match primary"):
+        compare_level1_traces(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
 
 
 def _exact_layernorm_route(lut):

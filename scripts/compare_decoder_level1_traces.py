@@ -20,8 +20,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.decoder_level1_trace_contract import (
     TRACE_NAMES,
+    decoder_level1_hash_entry,
     decoder_level1_trace_input_sha256,
     load_decoder_level1_trace,
+    validate_decoder_level1_hash_ledger,
 )
 
 
@@ -433,10 +435,14 @@ def _load_report(
         or len(input_identity) != 64
     ):
         raise ValueError(f"{label} trace input tensor identity is invalid")
+    hash_ledger = validate_decoder_level1_hash_ledger(
+        primary.get("hash_ledger")
+    )
     return {
         "report": report,
         "effective_route": effective_route,
         "input_tensor_sha256": input_identity,
+        "hash_ledger": hash_ledger,
     }
 
 
@@ -500,6 +506,16 @@ def compare_level1_traces(
     for name in ("parent_coords", "child_coords", "level0_output"):
         if not np.array_equal(traces["source"][name], traces["local"][name]):
             raise ValueError(f"local trace {name} does not exactly match source")
+    for label in ("source", "local"):
+        primary_block0 = decoder_level1_hash_entry(
+            "level1_block0_output",
+            traces[label]["level1_block0_output"],
+        )
+        reported_block0 = reports[label]["hash_ledger"]["entries"][0]
+        if primary_block0 != reported_block0:
+            raise ValueError(
+                f"{label} hash ledger block-zero boundary does not match primary"
+            )
 
     first_nonexact_boundary = None
     stages: dict[str, Any] = {}
@@ -509,11 +525,31 @@ def compare_level1_traces(
             first_nonexact_boundary = name
         stages[name] = delta
 
+    first_nonexact_hash_boundary = None
+    hash_boundaries = []
+    source_entries = reports["source"]["hash_ledger"]["entries"]
+    local_entries = reports["local"]["hash_ledger"]["entries"]
+    for source_entry, local_entry in zip(source_entries, local_entries):
+        exact = source_entry["sha256"] == local_entry["sha256"]
+        if first_nonexact_hash_boundary is None and not exact:
+            first_nonexact_hash_boundary = source_entry["name"]
+        hash_boundaries.append(
+            {
+                "name": source_entry["name"],
+                "dtype": source_entry["dtype"],
+                "shape": source_entry["shape"],
+                "source_sha256": source_entry["sha256"],
+                "local_sha256": local_entry["sha256"],
+                "exact": exact,
+            }
+        )
+
     return {
         "schema": "trellis2mlx.decoder_level1_trace_comparison.v1",
         "status": "done",
         "input_tensor_sha256": recomputed["source"],
         "first_nonexact_boundary": first_nonexact_boundary,
+        "first_nonexact_hash_boundary": first_nonexact_hash_boundary,
         "artifacts": {
             label: {
                 "path": str(paths[label]),
@@ -523,6 +559,7 @@ def compare_level1_traces(
             for label in ("source", "local")
         },
         "stages": stages,
+        "hash_boundaries": hash_boundaries,
     }
 
 

@@ -1368,11 +1368,17 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             feats_tensor = torch.from_numpy(selected_arrays[point_name].copy()).to(device=device)
             shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
             if decoder_trace_mode:
+                trace_contract = (
+                    load_decoder_level1_trace_contract()
+                    if decoder_level1_trace
+                    else load_decoder_level0_trace_contract()
+                )
                 with torch.no_grad():
-                    trace_arrays = (
+                    trace_result = (
                         capture_source_decoder_level1_trace(
                             decoder,
                             shape_slat,
+                            trace_contract=trace_contract,
                         )
                         if decoder_level1_trace
                         else capture_source_decoder_level0_trace(
@@ -1387,7 +1393,17 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     / f"{point_name}.decoder-level{trace_level}-trace.npz"
                 )
                 if decoder_level1_trace:
-                    trace_contract = load_decoder_level1_trace_contract()
+                    trace_arrays, hash_entries = trace_result
+                    hash_ledger = (
+                        trace_contract.validate_decoder_level1_hash_ledger(
+                            {
+                                "schema": (
+                                    trace_contract.LEVEL1_HASH_LEDGER_SCHEMA
+                                ),
+                                "entries": hash_entries,
+                            }
+                        )
+                    )
                     validation = trace_contract.write_decoder_level1_trace_npz(
                         trace_path,
                         trace_arrays,
@@ -1402,7 +1418,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         )
                     )
                 else:
-                    trace_contract = load_decoder_level0_trace_contract()
+                    trace_arrays = trace_result
+                    hash_ledger = None
                     validation = trace_contract.write_decoder_level0_trace_npz(
                         trace_path,
                         trace_arrays,
@@ -1426,6 +1443,8 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "validation": validation,
                     }
                 )
+                if hash_ledger is not None:
+                    trace_artifact["hash_ledger"] = hash_ledger
                 written_artifacts.append(trace_artifact)
                 report["written_artifact_count"] = len(written_artifacts)
                 point_results.append(
@@ -1720,7 +1739,9 @@ def capture_source_decoder_level0_trace(
 def capture_source_decoder_level1_trace(
     decoder: Any,
     shape_slat: Any,
-) -> dict[str, np.ndarray]:
+    *,
+    trace_contract: Any,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
     import torch.nn.functional as torch_functional
 
     from trellis2.models.sc_vaes.sparse_unet_vae import (
@@ -1740,6 +1761,11 @@ def capture_source_decoder_level1_trace(
         for block in decoder.blocks[1]
         if isinstance(block, SparseConvNeXtBlock3d)
     ]
+    level1_upsample = [
+        block
+        for block in decoder.blocks[1]
+        if isinstance(block, SparseResBlockC2S3d)
+    ]
     if len(level0_blocks) != 4 or len(level0_upsample) != 1:
         raise ValueError(
             "source level-one trace requires four level-zero ConvNeXt blocks "
@@ -1750,6 +1776,11 @@ def capture_source_decoder_level1_trace(
         raise ValueError(
             "source level-one trace requires sixteen level-one ConvNeXt "
             f"blocks, got {len(level1_blocks)}"
+        )
+    if len(level1_upsample) != 1:
+        raise ValueError(
+            "source level-one trace requires one level-one upsample, "
+            f"got {len(level1_upsample)}"
         )
 
     current = decoder.from_latent(shape_slat).type(decoder.dtype)
@@ -1815,6 +1846,84 @@ def capture_source_decoder_level1_trace(
                 "manual source level-one block-0 trace does not exactly "
                 f"reproduce natural {name}"
             )
+    hash_entries = [
+        trace_contract.decoder_level1_hash_entry(
+            "level1_block0_output",
+            tensor_to_numpy(natural_block0.feats),
+        )
+    ]
+    level1_output = natural_block0
+    for index, block in enumerate(level1_blocks[1:], start=1):
+        level1_output = block(level1_output)
+        hash_entries.append(
+            trace_contract.decoder_level1_hash_entry(
+                f"level1_block{index}_output",
+                tensor_to_numpy(level1_output.feats),
+            )
+        )
+
+    next_upsample = level1_upsample[0]
+    next_subdiv = next_upsample.to_subdiv(level1_output)
+    next_norm1 = next_upsample.norm1(level1_output.feats)
+    next_silu1 = torch_functional.silu(next_norm1)
+    next_conv1 = next_upsample.conv1(level1_output.replace(next_silu1))
+    next_subdiv_binarized = next_subdiv.replace(next_subdiv.feats > 0)
+    next_h_c2s = next_upsample.updown(next_conv1, next_subdiv_binarized)
+    next_skip_c2s = next_upsample.updown(
+        level1_output,
+        next_subdiv_binarized,
+    )
+    next_norm2 = next_upsample.norm2(next_h_c2s.feats)
+    next_silu2 = torch_functional.silu(next_norm2)
+    next_conv2 = next_upsample.conv2(next_h_c2s.replace(next_silu2))
+    next_skip_repeated = next_upsample.skip_connection(next_skip_c2s)
+    next_upsample_output = next_conv2 + next_skip_repeated
+    natural_next_output, natural_next_subdiv = next_upsample(level1_output)
+    for name, manual, natural in (
+        ("features", next_upsample_output.feats, natural_next_output.feats),
+        (
+            "coordinates",
+            next_upsample_output.coords,
+            natural_next_output.coords,
+        ),
+        ("subdivision logits", next_subdiv.feats, natural_next_subdiv.feats),
+    ):
+        if not np.array_equal(
+            tensor_to_numpy(manual),
+            tensor_to_numpy(natural),
+        ):
+            raise RuntimeError(
+                "manual source second-upsample trace does not exactly "
+                f"reproduce natural {name}"
+            )
+    if not np.array_equal(
+        tensor_to_numpy(next_h_c2s.coords),
+        tensor_to_numpy(next_skip_c2s.coords),
+    ):
+        raise RuntimeError(
+            "source second-upsample feature and skip coordinates differ"
+        )
+    next_boundaries = {
+        "level1_upsample_subdiv_logits": next_subdiv.feats,
+        "level1_upsample_norm1": next_norm1,
+        "level1_upsample_silu1": next_silu1,
+        "level1_upsample_conv1": next_conv1.feats,
+        "level2_child_coords": natural_next_output.coords,
+        "level1_upsample_h_c2s": next_h_c2s.feats,
+        "level1_upsample_skip_c2s": next_skip_c2s.feats,
+        "level1_upsample_skip_repeated": next_skip_repeated.feats,
+        "level1_upsample_norm2": next_norm2,
+        "level1_upsample_silu2": next_silu2,
+        "level1_upsample_conv2": next_conv2.feats,
+        "level1_upsample_output": natural_next_output.feats,
+    }
+    hash_entries.extend(
+        trace_contract.decoder_level1_hash_entry(
+            name,
+            tensor_to_numpy(values),
+        )
+        for name, values in next_boundaries.items()
+    )
 
     arrays = {
         "parent_coords": tensor_to_numpy(level0_output.coords),
@@ -1838,10 +1947,11 @@ def capture_source_decoder_level1_trace(
         "level1_block0_mlp_fc2": tensor_to_numpy(block0_fc2),
         "level1_block0_output": tensor_to_numpy(natural_block0.feats),
     }
-    return {
+    trace = {
         name: np.ascontiguousarray(values)
         for name, values in arrays.items()
     }
+    return trace, hash_entries
 
 
 def decode_shape_slat_raw(decoder: Any, shape_slat: Any) -> tuple[Any, list[Any]]:

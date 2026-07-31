@@ -21,7 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.decoder_level1_trace_contract import (
+    LEVEL1_HASH_LEDGER_SCHEMA,
+    decoder_level1_hash_entry,
     decoder_level1_trace_input_sha256,
+    validate_decoder_level1_hash_ledger,
     write_decoder_level1_trace_npz,
 )
 
@@ -401,10 +404,17 @@ def main(argv: list[str] | None = None) -> int:
             capture_mlx_decoder_level1_trace,
         )
 
-        arrays = capture_mlx_decoder_level1_trace(
+        arrays, hash_entries = capture_mlx_decoder_level1_trace(
             decoder,
             mx.array(level0_output),
             mx.array(parent_coords),
+            hash_entry=decoder_level1_hash_entry,
+        )
+        hash_ledger = validate_decoder_level1_hash_ledger(
+            {
+                "schema": LEVEL1_HASH_LEDGER_SCHEMA,
+                "entries": hash_entries,
+            }
         )
         validation = write_decoder_level1_trace_npz(
             args.output_npz,
@@ -418,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
             "sha256": primary_sha,
             "size_bytes": args.output_npz.stat().st_size,
             "validation": validation,
+            "hash_ledger": hash_ledger,
         }
         report.update(
             {
