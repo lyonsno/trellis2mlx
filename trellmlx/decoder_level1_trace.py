@@ -11,8 +11,31 @@ from .models.shape_slat_decoder import (
     SparseResBlockC2S3d,
     _decoder_linear,
     _decoder_silu,
+    _layernorm_noaffine,
 )
 from .modules.sparse_conv import build_neighbor_map
+
+
+def _decoder_output_head(decoder, values: mx.array) -> mx.array:
+    if values.dtype != mx.float32:
+        raise ValueError(
+            "terminal decoder output head requires float32 input, "
+            f"got {values.dtype}"
+        )
+    for name in ("weight", "bias"):
+        parameter = getattr(decoder.output_layer, name, None)
+        if parameter is not None and parameter.dtype != mx.float32:
+            raise ValueError(
+                "terminal decoder output head requires float32 parameters, "
+                f"got {name}={parameter.dtype}"
+            )
+    output = decoder.output_layer(values)
+    if output.dtype != mx.float32:
+        raise ValueError(
+            "terminal decoder output head must produce float32, "
+            f"got {output.dtype}"
+        )
+    return output
 
 
 def capture_mlx_decoder_level1_trace(
@@ -21,7 +44,8 @@ def capture_mlx_decoder_level1_trace(
     parent_coords: mx.array,
     *,
     hash_entry,
-) -> tuple[dict[str, np.ndarray], list[dict]]:
+    full_hash_entry=None,
+) -> tuple:
     """Capture exact early-decoder boundaries from an exact parent state."""
     level0_upsample = [
         block
@@ -73,6 +97,27 @@ def capture_mlx_decoder_level1_trace(
             "level-one trace requires exactly one level-two upsample block, "
             f"got {len(level2_upsample)}"
         )
+    if full_hash_entry is not None:
+        level3_blocks = [
+            block
+            for block in decoder.blocks[3]
+            if isinstance(block, SparseConvNeXtBlock3d)
+        ]
+        level3_upsample = [
+            block
+            for block in decoder.blocks[3]
+            if isinstance(block, SparseResBlockC2S3d)
+        ]
+        if len(level3_blocks) != 4:
+            raise ValueError(
+                "full-decoder trace requires exactly four level-three "
+                f"ConvNeXt blocks, got {len(level3_blocks)}"
+            )
+        if len(level3_upsample) != 1:
+            raise ValueError(
+                "full-decoder trace requires exactly one level-three "
+                f"upsample block, got {len(level3_upsample)}"
+            )
     upsample = level0_upsample[0]
     block0 = level1_blocks[0]
     parent_nmap = build_neighbor_map(parent_coords)
@@ -394,4 +439,270 @@ def capture_mlx_decoder_level1_trace(
         name: np.ascontiguousarray(values)
         for name, values in arrays.items()
     }
+
+    full_hash_entries = None
+    if full_hash_entry is not None:
+        del (
+            subdiv_logits,
+            norm1,
+            silu1,
+            conv1,
+            h_c2s,
+            skip_c2s,
+            skip_repeated,
+            norm2,
+            silu2,
+            conv2,
+            upsample_output,
+            natural_output,
+            natural_coords,
+            natural_subdiv,
+            block0_conv,
+            block0_norm,
+            block0_fc1,
+            block0_silu,
+            block0_fc2,
+            block0_output,
+            natural_block0,
+            level1_output,
+            next_subdiv_logits,
+            next_norm1,
+            next_silu1,
+            next_conv1,
+            next_h_c2s,
+            next_skip_c2s,
+            next_skip_repeated,
+            next_norm2,
+            next_silu2,
+            next_conv2,
+            next_upsample_output,
+            natural_next_output,
+            natural_next_coords,
+            natural_next_subdiv,
+            next_boundaries,
+            level2_output,
+            final_subdiv_logits,
+            final_norm1,
+            final_silu1,
+            final_conv1,
+            final_h_c2s,
+            final_skip_c2s,
+            final_skip_repeated,
+            final_norm2,
+            final_silu2,
+            final_conv2,
+            final_upsample_output,
+            natural_final_coords,
+            natural_final_subdiv,
+            final_boundaries,
+            parent_nmap,
+            child_nmap,
+            next_child_nmap,
+        )
+        full_hash_entries = []
+
+        def append_full_hash(name, values):
+            mx.eval(values)
+            full_hash_entries.append(
+                full_hash_entry(name, np.asarray(values))
+            )
+
+        append_full_hash(
+            "level2_upsample_output",
+            natural_final_output,
+        )
+        level3_block0 = level3_blocks[0]
+        level3_block0_conv = level3_block0.conv(
+            natural_final_output,
+            final_child_nmap,
+        )
+        append_full_hash("level3_block0_conv", level3_block0_conv)
+        level3_block0_norm = level3_block0.norm(level3_block0_conv)
+        append_full_hash("level3_block0_norm", level3_block0_norm)
+        level3_block0_fc1 = _decoder_linear(
+            level3_block0.mlp_0,
+            level3_block0_norm,
+        )
+        append_full_hash("level3_block0_mlp_fc1", level3_block0_fc1)
+        level3_block0_silu = _decoder_silu(level3_block0_fc1)
+        append_full_hash("level3_block0_silu", level3_block0_silu)
+        level3_block0_fc2 = _decoder_linear(
+            level3_block0.mlp_2,
+            level3_block0_silu,
+        )
+        append_full_hash("level3_block0_mlp_fc2", level3_block0_fc2)
+        manual_level3_block0 = level3_block0_fc2 + natural_final_output
+        natural_level3_block0 = level3_block0(
+            natural_final_output,
+            final_child_nmap,
+        )
+        mx.eval(manual_level3_block0, natural_level3_block0)
+        if not np.array_equal(
+            np.asarray(manual_level3_block0),
+            np.asarray(natural_level3_block0),
+        ):
+            raise RuntimeError(
+                "manual level-three block-0 trace does not exactly "
+                "reproduce natural forward"
+            )
+        append_full_hash(
+            "level3_block0_output",
+            natural_level3_block0,
+        )
+        del (
+            level3_block0_conv,
+            level3_block0_norm,
+            level3_block0_fc1,
+            level3_block0_silu,
+            level3_block0_fc2,
+            manual_level3_block0,
+        )
+
+        level3_output = natural_level3_block0
+        for index, block in enumerate(level3_blocks[1:], start=1):
+            previous_level3_output = level3_output
+            level3_output = block(
+                previous_level3_output,
+                final_child_nmap,
+            )
+            append_full_hash(
+                f"level3_block{index}_output",
+                level3_output,
+            )
+            del previous_level3_output
+        del natural_level3_block0
+
+        level3_to_level4 = level3_upsample[0]
+        level3_subdiv_logits = _decoder_linear(
+            level3_to_level4.to_subdiv,
+            level3_output,
+        )
+        append_full_hash(
+            "level3_upsample_subdiv_logits",
+            level3_subdiv_logits,
+        )
+        level3_subdiv_mask = level3_subdiv_logits > 0
+        level3_norm1 = level3_to_level4.norm1(level3_output)
+        append_full_hash("level3_upsample_norm1", level3_norm1)
+        level3_silu1 = _decoder_silu(level3_norm1)
+        append_full_hash("level3_upsample_silu1", level3_silu1)
+        level3_conv1 = level3_to_level4.conv1(
+            level3_silu1,
+            final_child_nmap,
+        )
+        append_full_hash("level3_upsample_conv1", level3_conv1)
+        del level3_norm1, level3_silu1
+        level4_h_c2s, level4_child_coords = SparseChannel2Spatial.upsample(
+            level3_conv1,
+            final_child_coords,
+            level3_subdiv_mask,
+        )
+        level4_skip_c2s, level4_skip_coords = (
+            SparseChannel2Spatial.upsample(
+                level3_output,
+                final_child_coords,
+                level3_subdiv_mask,
+            )
+        )
+        if not np.array_equal(
+            np.asarray(level4_child_coords),
+            np.asarray(level4_skip_coords),
+        ):
+            raise RuntimeError(
+                "final-upsample feature and skip coordinates differ"
+            )
+        append_full_hash("level4_child_coords", level4_child_coords)
+        append_full_hash("level3_upsample_h_c2s", level4_h_c2s)
+        append_full_hash(
+            "level3_upsample_skip_c2s",
+            level4_skip_c2s,
+        )
+        del level3_conv1
+        level3_channels_per_child = level3_to_level4.channels // 8
+        level3_repeat_factor = (
+            level3_to_level4.out_channels
+            // level3_channels_per_child
+        )
+        level4_skip_repeated = mx.repeat(
+            level4_skip_c2s,
+            level3_repeat_factor,
+            axis=1,
+        )
+        append_full_hash(
+            "level3_upsample_skip_repeated",
+            level4_skip_repeated,
+        )
+        level3_norm2 = level3_to_level4.norm2(level4_h_c2s)
+        append_full_hash("level3_upsample_norm2", level3_norm2)
+        level3_silu2 = _decoder_silu(level3_norm2)
+        append_full_hash("level3_upsample_silu2", level3_silu2)
+        level4_child_nmap = build_neighbor_map(level4_child_coords)
+        level3_conv2 = level3_to_level4.conv2(
+            level3_silu2,
+            level4_child_nmap,
+        )
+        append_full_hash("level3_upsample_conv2", level3_conv2)
+        del level3_norm2, level3_silu2
+        manual_level3_upsample_output = (
+            level3_conv2 + level4_skip_repeated
+        )
+        (
+            natural_level3_upsample_output,
+            natural_level4_coords,
+            natural_level3_subdiv,
+        ) = level3_to_level4(
+            level3_output,
+            final_child_coords,
+            final_child_nmap,
+        )
+        mx.eval(
+            manual_level3_upsample_output,
+            natural_level3_upsample_output,
+            natural_level4_coords,
+            natural_level3_subdiv,
+        )
+        for name, manual, natural in (
+            (
+                "features",
+                manual_level3_upsample_output,
+                natural_level3_upsample_output,
+            ),
+            (
+                "coordinates",
+                level4_child_coords,
+                natural_level4_coords,
+            ),
+            (
+                "subdivision logits",
+                level3_subdiv_logits,
+                natural_level3_subdiv,
+            ),
+        ):
+            if not np.array_equal(
+                np.asarray(manual),
+                np.asarray(natural),
+            ):
+                raise RuntimeError(
+                    "manual final-upsample trace does not exactly reproduce "
+                    f"natural {name}"
+                )
+        append_full_hash(
+            "level3_upsample_output",
+            natural_level3_upsample_output,
+        )
+        decoder_final_layernorm = _layernorm_noaffine(
+            natural_level3_upsample_output.astype(mx.float32)
+        )
+        append_full_hash(
+            "decoder_final_layernorm",
+            decoder_final_layernorm,
+        )
+        decoder_output = _decoder_output_head(
+            decoder,
+            decoder_final_layernorm,
+        )
+        append_full_hash("decoder_output", decoder_output)
+
+    if full_hash_entries is not None:
+        return trace, hash_entries, full_hash_entries
     return trace, hash_entries

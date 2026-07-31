@@ -414,8 +414,16 @@ def _load_report(
         ):
             raise ValueError("source level-one trace report is not done")
         route = report.get("effective_route")
+        full_decoder_hash_ledger = (
+            isinstance(route, dict)
+            and route.get("full_decoder_hash_ledger") is True
+        )
         expected = {
-            "route": SOURCE_ROUTE,
+            "route": (
+                "official-source-cuda-shape-decoder-full-hash-ledger"
+                if full_decoder_hash_ledger
+                else SOURCE_ROUTE
+            ),
             "device_type": "cuda",
             "sparse_conv_backend": "none",
             "decoder_state_only": False,

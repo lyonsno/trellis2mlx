@@ -233,6 +233,119 @@ def test_parser_exposes_decoder_level1_trace_mode():
     assert args.decoder_level1_trace is True
 
 
+def test_full_decoder_hash_contract_loads_from_flat_kaggle_capsule(tmp_path):
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    runner_path = Path(source_runner.__file__)
+    shutil.copy2(
+        runner_path,
+        capsule / "source_cuda_postcond_full_decode_timing.py",
+    )
+    shutil.copy2(
+        runner_path.with_name("decoder_full_hash_ledger_contract.py"),
+        capsule / "decoder_full_hash_ledger_contract.py",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import source_cuda_postcond_full_decode_timing as runner; "
+                "contract = runner.load_decoder_full_hash_ledger_contract(); "
+                "assert contract.__name__ == "
+                "'decoder_full_hash_ledger_contract'"
+            ),
+        ],
+        cwd=capsule,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_parser_exposes_full_decoder_hash_ledger_modifier():
+    from scripts import source_cuda_postcond_full_decode_timing as source_runner
+
+    args = source_runner.build_parser().parse_args(
+        [
+            "--output-json",
+            "report.json",
+            "--decoder-level1-trace",
+            "--full-decoder-hash-ledger",
+        ]
+    )
+
+    assert args.decoder_level1_trace is True
+    assert args.full_decoder_hash_ledger is True
+
+
+def test_full_decoder_hash_ledger_requires_level1_trace_mode(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.append("--full-decoder-hash-ledger")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "--decoder-level1-trace" in report["error"]
+
+
+def test_full_decoder_hash_ledger_preflight_records_distinct_route(tmp_path):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    grid, source_report, point_names = _write_shape_slat_grid_fixture(
+        tmp_path,
+        points=[("alpha-1_beta-1", 1.0, 1.0)],
+    )
+    args = _shape_slat_decode_args(
+        tmp_path,
+        grid,
+        source_report,
+        point_names,
+    )
+    args.extend(
+        ["--decoder-level1-trace", "--full-decoder-hash-ledger"]
+    )
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["requested_route"]["full_decoder_hash_ledger"] is True
+    assert report["requested_route"]["decoder_output_head_backend"] == (
+        "torch-sparse-linear-fp32"
+    )
+    assert report["effective_route"]["route"] == (
+        "official-source-cuda-shape-decoder-full-hash-ledger"
+    )
+    assert report["effective_route"]["full_decoder_hash_ledger"] is True
+    assert report["effective_route"]["decoder_output_head_backend"] == (
+        "torch-sparse-linear-fp32"
+    )
+
+
 def test_level2_block0_trace_contract_loads_from_flat_kaggle_capsule(tmp_path):
     from scripts import source_cuda_postcond_full_decode_timing as source_runner
 

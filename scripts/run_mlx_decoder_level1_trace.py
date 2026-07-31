@@ -27,6 +27,11 @@ from scripts.decoder_level1_trace_contract import (
     validate_decoder_level1_hash_ledger,
     write_decoder_level1_trace_npz,
 )
+from scripts.decoder_full_hash_ledger_contract import (
+    FULL_DECODER_HASH_LEDGER_SCHEMA,
+    decoder_full_hash_entry,
+    validate_decoder_full_hash_ledger,
+)
 
 
 SCHEMA = "trellis2mlx.decoder_level1_trace_run.v1"
@@ -44,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turing-rsqrt-lut", required=True, type=Path)
     parser.add_argument("--expected-turing-rsqrt-lut-sha256", required=True)
     parser.add_argument("--expected-repo-commit", required=True)
+    parser.add_argument(
+        "--full-decoder-hash-ledger",
+        action="store_true",
+        help="Hash remaining decoder boundaries through final output",
+    )
     parser.add_argument("--output-npz", required=True, type=Path)
     parser.add_argument("--output-json", required=True, type=Path)
     return parser
@@ -211,7 +221,13 @@ def main(argv: list[str] | None = None) -> int:
             "sparse_conv_matmul_backend": "turing_fda",
             "decoder_layernorm_backend": "cuda-welford-turing-t4",
             "decoder_silu_backend": "cuda-turing-t4-fp16-lut",
+            "decoder_output_head_backend": (
+                "mlx-native-fp32"
+                if args.full_decoder_hash_ledger
+                else None
+            ),
             "parent_state": "externally-captured-level0-trace",
+            "full_decoder_hash_ledger": args.full_decoder_hash_ledger,
         },
         "effective_route": None,
         "input_tensor_sha256": None,
@@ -370,11 +386,17 @@ def main(argv: list[str] | None = None) -> int:
             "decoder_layernorm": decoder_layernorm_backend_identity(),
             "decoder_layernorm_lut": turing_rsqrt_lut_identity,
             "decoder_silu": decoder_silu_backend_identity(),
+            "decoder_output_head_backend": (
+                "mlx-native-fp32"
+                if args.full_decoder_hash_ledger
+                else None
+            ),
             "parent_state": {
                 "path": str(args.level0_trace.resolve()),
                 "sha256": parent_sha,
                 "input_tensor_sha256": input_identity,
             },
+            "full_decoder_hash_ledger": args.full_decoder_hash_ledger,
         }
         report["effective_route"] = effective_route
         report["last_trustworthy_phase"] = phase
@@ -404,12 +426,28 @@ def main(argv: list[str] | None = None) -> int:
             capture_mlx_decoder_level1_trace,
         )
 
-        arrays, hash_entries = capture_mlx_decoder_level1_trace(
+        trace_result = capture_mlx_decoder_level1_trace(
             decoder,
             mx.array(level0_output),
             mx.array(parent_coords),
             hash_entry=decoder_level1_hash_entry,
+            full_hash_entry=(
+                decoder_full_hash_entry
+                if args.full_decoder_hash_ledger
+                else None
+            ),
         )
+        if args.full_decoder_hash_ledger:
+            arrays, hash_entries, full_hash_entries = trace_result
+            full_hash_ledger = validate_decoder_full_hash_ledger(
+                {
+                    "schema": FULL_DECODER_HASH_LEDGER_SCHEMA,
+                    "entries": full_hash_entries,
+                }
+            )
+        else:
+            arrays, hash_entries = trace_result
+            full_hash_ledger = None
         hash_ledger = validate_decoder_level1_hash_ledger(
             {
                 "schema": LEVEL1_HASH_LEDGER_SCHEMA,
@@ -430,6 +468,10 @@ def main(argv: list[str] | None = None) -> int:
             "validation": validation,
             "hash_ledger": hash_ledger,
         }
+        if full_hash_ledger is not None:
+            report["primary"][
+                "full_decoder_hash_ledger"
+            ] = full_hash_ledger
         report.update(
             {
                 "status": "done",

@@ -120,6 +120,42 @@ def load_decoder_level1_trace_contract():
     raise ModuleNotFoundError("decoder_level1_trace_contract")
 
 
+def load_decoder_full_hash_ledger_contract():
+    if not __package__:
+        contract_path = Path(__file__).resolve().with_name(
+            "decoder_full_hash_ledger_contract.py"
+        )
+        if not contract_path.is_file():
+            raise ModuleNotFoundError(
+                "standalone decoder trace runner requires adjacent contract "
+                f"{contract_path}",
+                name="decoder_full_hash_ledger_contract",
+            )
+        spec = importlib.util.spec_from_file_location(
+            "decoder_full_hash_ledger_contract",
+            contract_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                "cannot load decoder full hash ledger contract from "
+                f"{contract_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    for module_name in (
+        "scripts.decoder_full_hash_ledger_contract",
+        "decoder_full_hash_ledger_contract",
+    ):
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {module_name, module_name.split(".", 1)[0]}:
+                raise
+    raise ModuleNotFoundError("decoder_full_hash_ledger_contract")
+
+
 def load_decoder_level2_block0_trace_contract():
     if not __package__:
         contract_path = Path(__file__).resolve().with_name(
@@ -309,6 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Capture the official shape decoder's first channel-to-spatial "
             "upsample and level-one block 0 without mesh conversion."
+        ),
+    )
+    parser.add_argument(
+        "--full-decoder-hash-ledger",
+        action="store_true",
+        help=(
+            "Extend the decoder level-one trace with hash-only boundaries "
+            "through the final decoder output."
         ),
     )
     parser.add_argument(
@@ -1109,6 +1153,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     decoder_state_only = bool(args.decoder_state_only)
     decoder_level0_trace = bool(args.decoder_level0_trace)
     decoder_level1_trace = bool(args.decoder_level1_trace)
+    full_decoder_hash_ledger = bool(args.full_decoder_hash_ledger)
     decoder_level2_block0_trace = bool(args.decoder_level2_block0_trace)
     decoder_level2_subdiv_trace = bool(args.decoder_level2_subdiv_trace)
     decoder_level2_norm2_trace = bool(args.decoder_level2_norm2_trace)
@@ -1120,7 +1165,9 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         or decoder_level2_norm2_trace
     )
     route_name = (
-        "official-source-cuda-shape-decoder-level2-norm2-trace"
+        "official-source-cuda-shape-decoder-full-hash-ledger"
+        if full_decoder_hash_ledger
+        else "official-source-cuda-shape-decoder-level2-norm2-trace"
         if decoder_level2_norm2_trace
         else "official-source-cuda-shape-decoder-level2-subdiv-trace"
         if decoder_level2_subdiv_trace
@@ -1167,6 +1214,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
             "decoder_level1_trace": decoder_level1_trace,
+            "full_decoder_hash_ledger": full_decoder_hash_ledger,
             "decoder_level2_block0_trace": decoder_level2_block0_trace,
             "decoder_level2_subdiv_trace": decoder_level2_subdiv_trace,
             "decoder_level2_norm2_trace": decoder_level2_norm2_trace,
@@ -1176,8 +1224,15 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 else None
             ),
             "normalization_backend": (
-                "official-source-module-layernorm"
+                "torch-F.layer_norm-final"
+                if full_decoder_hash_ledger
+                else "official-source-module-layernorm"
                 if decoder_level2_norm2_trace
+                else None
+            ),
+            "decoder_output_head_backend": (
+                "torch-sparse-linear-fp32"
+                if full_decoder_hash_ledger
                 else None
             ),
             "raw_meshes": not decoder_state_only and not decoder_trace_mode,
@@ -1225,6 +1280,10 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 "--decoder-level2-block0-trace, and "
                 "--decoder-level2-subdiv-trace, and "
                 "--decoder-level2-norm2-trace are mutually exclusive"
+            )
+        if full_decoder_hash_ledger and not decoder_level1_trace:
+            raise ValueError(
+                "--full-decoder-hash-ledger requires --decoder-level1-trace"
             )
         if grid_path is None:
             raise ValueError("--shape-slat-grid is required for selective decode")
@@ -1459,6 +1518,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                         "decoder_state_only": decoder_state_only,
                         "decoder_level0_trace": decoder_level0_trace,
                         "decoder_level1_trace": decoder_level1_trace,
+                        "full_decoder_hash_ledger": full_decoder_hash_ledger,
                         "decoder_level2_block0_trace": (
                             decoder_level2_block0_trace
                         ),
@@ -1474,8 +1534,15 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                             else None
                         ),
                         "normalization_backend": (
-                            "official-source-module-layernorm"
+                            "torch-F.layer_norm-final"
+                            if full_decoder_hash_ledger
+                            else "official-source-module-layernorm"
                             if decoder_level2_norm2_trace
+                            else None
+                        ),
+                        "decoder_output_head_backend": (
+                            "torch-sparse-linear-fp32"
+                            if full_decoder_hash_ledger
                             else None
                         ),
                         "raw_meshes": (
@@ -1623,6 +1690,11 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                             decoder,
                             shape_slat,
                             trace_contract=trace_contract,
+                            full_trace_contract=(
+                                load_decoder_full_hash_ledger_contract()
+                                if full_decoder_hash_ledger
+                                else None
+                            ),
                         )
                         if decoder_level1_trace
                         else capture_source_decoder_level0_trace(
@@ -1643,6 +1715,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     else "decoder-level0-trace"
                 )
                 trace_path = output_dir / f"{point_name}.{trace_stem}.npz"
+                full_hash_ledger = None
                 if decoder_level2_norm2_trace:
                     _, _, trace_arrays = trace_result
                     hash_ledger = None
@@ -1674,7 +1747,28 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     )
                     input_tensor_sha256 = None
                 elif decoder_level1_trace:
-                    trace_arrays, hash_entries = trace_result
+                    if full_decoder_hash_ledger:
+                        (
+                            trace_arrays,
+                            hash_entries,
+                            full_hash_entries,
+                        ) = trace_result
+                        full_contract = (
+                            load_decoder_full_hash_ledger_contract()
+                        )
+                        full_hash_ledger = (
+                            full_contract.validate_decoder_full_hash_ledger(
+                                {
+                                    "schema": (
+                                        full_contract
+                                        .FULL_DECODER_HASH_LEDGER_SCHEMA
+                                    ),
+                                    "entries": full_hash_entries,
+                                }
+                            )
+                        )
+                    else:
+                        trace_arrays, hash_entries = trace_result
                     hash_ledger = (
                         trace_contract.validate_decoder_level1_hash_ledger(
                             {
@@ -1739,6 +1833,10 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     ] = input_tensor_sha256
                 if hash_ledger is not None:
                     trace_artifact["hash_ledger"] = hash_ledger
+                if full_hash_ledger is not None:
+                    trace_artifact[
+                        "full_decoder_hash_ledger"
+                    ] = full_hash_ledger
                 written_artifacts.append(trace_artifact)
                 report["written_artifact_count"] = len(written_artifacts)
                 point_results.append(
@@ -1843,6 +1941,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "decoder_state_only": decoder_state_only,
             "decoder_level0_trace": decoder_level0_trace,
             "decoder_level1_trace": decoder_level1_trace,
+            "full_decoder_hash_ledger": full_decoder_hash_ledger,
             "decoder_level2_block0_trace": decoder_level2_block0_trace,
             "decoder_level2_subdiv_trace": decoder_level2_subdiv_trace,
             "decoder_level2_norm2_trace": decoder_level2_norm2_trace,
@@ -1852,8 +1951,15 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 else None
             ),
             "normalization_backend": (
-                "official-source-module-layernorm"
+                "torch-F.layer_norm-final"
+                if full_decoder_hash_ledger
+                else "official-source-module-layernorm"
                 if decoder_level2_norm2_trace
+                else None
+            ),
+            "decoder_output_head_backend": (
+                "torch-sparse-linear-fp32"
+                if full_decoder_hash_ledger
                 else None
             ),
             "raw_meshes": not decoder_state_only and not decoder_trace_mode,
@@ -2148,6 +2254,7 @@ def capture_source_decoder_level1_trace(
     trace_contract: Any,
     include_level2_subdiv: bool = False,
     include_level2_norm2: bool = False,
+    full_trace_contract: Any | None = None,
 ) -> (
     tuple[dict[str, np.ndarray], list[dict[str, Any]]]
     | tuple[
@@ -2156,10 +2263,16 @@ def capture_source_decoder_level1_trace(
         dict[str, np.ndarray],
     ]
 ):
-    if include_level2_subdiv and include_level2_norm2:
+    if sum(
+        (
+            include_level2_subdiv,
+            include_level2_norm2,
+            full_trace_contract is not None,
+        )
+    ) > 1:
         raise ValueError(
-            "focused level-two subdivision and norm2 captures are "
-            "mutually exclusive"
+            "focused level-two subdivision, norm2, and full-decoder "
+            "captures are mutually exclusive"
         )
     import torch.nn.functional as torch_functional
 
@@ -2195,6 +2308,17 @@ def capture_source_decoder_level1_trace(
         for block in decoder.blocks[2]
         if isinstance(block, SparseResBlockC2S3d)
     ]
+    if full_trace_contract is not None:
+        level3_blocks = [
+            block
+            for block in decoder.blocks[3]
+            if isinstance(block, SparseConvNeXtBlock3d)
+        ]
+        level3_upsample = [
+            block
+            for block in decoder.blocks[3]
+            if isinstance(block, SparseResBlockC2S3d)
+        ]
     if len(level0_blocks) != 4 or len(level0_upsample) != 1:
         raise ValueError(
             "source level-one trace requires four level-zero ConvNeXt blocks "
@@ -2221,6 +2345,17 @@ def capture_source_decoder_level1_trace(
             "source level-one trace requires one level-two upsample, "
             f"got {len(level2_upsample)}"
         )
+    if full_trace_contract is not None:
+        if len(level3_blocks) != 4:
+            raise ValueError(
+                "source full-decoder trace requires four level-three "
+                f"ConvNeXt blocks, got {len(level3_blocks)}"
+            )
+        if len(level3_upsample) != 1:
+            raise ValueError(
+                "source full-decoder trace requires one level-three "
+                f"upsample, got {len(level3_upsample)}"
+            )
 
     current = decoder.from_latent(shape_slat).type(decoder.dtype)
     for block in level0_blocks:
@@ -2479,6 +2614,252 @@ def capture_source_decoder_level1_trace(
         name: np.ascontiguousarray(values)
         for name, values in arrays.items()
     }
+
+    full_hash_entries = None
+    if full_trace_contract is not None:
+        del (
+            current,
+            level0_output,
+            subdiv,
+            norm1,
+            silu1,
+            conv1,
+            subdiv_binarized,
+            h_c2s,
+            skip_c2s,
+            norm2,
+            silu2,
+            conv2,
+            skip_repeated,
+            upsample_output,
+            natural_output,
+            natural_subdiv,
+            block0_conv_state,
+            block0_norm,
+            block0_fc1,
+            block0_silu,
+            block0_fc2,
+            block0_output,
+            natural_block0,
+            level1_output,
+            next_subdiv,
+            next_norm1,
+            next_silu1,
+            next_conv1,
+            next_subdiv_binarized,
+            next_h_c2s,
+            next_skip_c2s,
+            next_norm2,
+            next_silu2,
+            next_conv2,
+            next_skip_repeated,
+            next_upsample_output,
+            natural_next_output,
+            natural_next_subdiv,
+            next_boundaries,
+            level2_output,
+            level2_block0_output,
+            final_subdiv,
+            final_norm1,
+            final_silu1,
+            final_conv1,
+            final_subdiv_binarized,
+            final_h_c2s,
+            final_skip_c2s,
+            final_norm2,
+            final_silu2,
+            final_conv2,
+            final_skip_repeated,
+            final_upsample_output,
+            natural_final_subdiv,
+            final_boundaries,
+        )
+        if shape_slat.feats.is_cuda:
+            import torch
+
+            torch.cuda.empty_cache()
+        full_hash_entries = []
+
+        def append_full_hash(name: str, values: Any) -> None:
+            full_hash_entries.append(
+                full_trace_contract.decoder_full_hash_entry(
+                    name,
+                    tensor_to_numpy(values),
+                )
+            )
+
+        append_full_hash(
+            "level2_upsample_output",
+            natural_final_output.feats,
+        )
+        level3_block0 = level3_blocks[0]
+        level3_block0_conv_state = level3_block0.conv(natural_final_output)
+        append_full_hash(
+            "level3_block0_conv",
+            level3_block0_conv_state.feats,
+        )
+        level3_block0_norm = level3_block0.norm(
+            level3_block0_conv_state.feats
+        )
+        append_full_hash("level3_block0_norm", level3_block0_norm)
+        level3_block0_fc1 = level3_block0.mlp[0](level3_block0_norm)
+        append_full_hash("level3_block0_mlp_fc1", level3_block0_fc1)
+        level3_block0_silu = level3_block0.mlp[1](level3_block0_fc1)
+        append_full_hash("level3_block0_silu", level3_block0_silu)
+        level3_block0_fc2 = level3_block0.mlp[2](level3_block0_silu)
+        append_full_hash("level3_block0_mlp_fc2", level3_block0_fc2)
+        manual_level3_block0 = natural_final_output.replace(
+            level3_block0_fc2 + natural_final_output.feats
+        )
+        natural_level3_block0 = level3_block0(natural_final_output)
+        for name, manual, natural in (
+            (
+                "features",
+                manual_level3_block0.feats,
+                natural_level3_block0.feats,
+            ),
+            (
+                "coordinates",
+                manual_level3_block0.coords,
+                natural_level3_block0.coords,
+            ),
+        ):
+            if not np.array_equal(
+                tensor_to_numpy(manual),
+                tensor_to_numpy(natural),
+            ):
+                raise RuntimeError(
+                    "manual source level-three block-0 trace does not "
+                    f"exactly reproduce natural {name}"
+                )
+        append_full_hash(
+            "level3_block0_output",
+            natural_level3_block0.feats,
+        )
+        del (
+            level3_block0_conv_state,
+            level3_block0_norm,
+            level3_block0_fc1,
+            level3_block0_silu,
+            level3_block0_fc2,
+            manual_level3_block0,
+        )
+
+        level3_output = natural_level3_block0
+        for index, block in enumerate(level3_blocks[1:], start=1):
+            previous_level3_output = level3_output
+            level3_output = block(previous_level3_output)
+            append_full_hash(
+                f"level3_block{index}_output",
+                level3_output.feats,
+            )
+            del previous_level3_output
+        del natural_level3_block0
+
+        level3_to_level4 = level3_upsample[0]
+        level3_subdiv = level3_to_level4.to_subdiv(level3_output)
+        append_full_hash(
+            "level3_upsample_subdiv_logits",
+            level3_subdiv.feats,
+        )
+        level3_norm1 = level3_to_level4.norm1(level3_output.feats)
+        append_full_hash("level3_upsample_norm1", level3_norm1)
+        level3_silu1 = torch_functional.silu(level3_norm1)
+        append_full_hash("level3_upsample_silu1", level3_silu1)
+        level3_conv1 = level3_to_level4.conv1(
+            level3_output.replace(level3_silu1)
+        )
+        append_full_hash("level3_upsample_conv1", level3_conv1.feats)
+        del level3_norm1, level3_silu1
+        level3_subdiv_binarized = level3_subdiv.replace(
+            level3_subdiv.feats > 0
+        )
+        level4_h_c2s = level3_to_level4.updown(
+            level3_conv1,
+            level3_subdiv_binarized,
+        )
+        level4_skip_c2s = level3_to_level4.updown(
+            level3_output,
+            level3_subdiv_binarized,
+        )
+        if not np.array_equal(
+            tensor_to_numpy(level4_h_c2s.coords),
+            tensor_to_numpy(level4_skip_c2s.coords),
+        ):
+            raise RuntimeError(
+                "source final-upsample feature and skip coordinates differ"
+            )
+        append_full_hash("level4_child_coords", level4_h_c2s.coords)
+        append_full_hash("level3_upsample_h_c2s", level4_h_c2s.feats)
+        append_full_hash(
+            "level3_upsample_skip_c2s",
+            level4_skip_c2s.feats,
+        )
+        del level3_conv1
+        level4_skip_repeated = level3_to_level4.skip_connection(
+            level4_skip_c2s
+        )
+        append_full_hash(
+            "level3_upsample_skip_repeated",
+            level4_skip_repeated.feats,
+        )
+        level3_norm2 = level3_to_level4.norm2(level4_h_c2s.feats)
+        append_full_hash("level3_upsample_norm2", level3_norm2)
+        level3_silu2 = torch_functional.silu(level3_norm2)
+        append_full_hash("level3_upsample_silu2", level3_silu2)
+        level3_conv2 = level3_to_level4.conv2(
+            level4_h_c2s.replace(level3_silu2)
+        )
+        append_full_hash("level3_upsample_conv2", level3_conv2.feats)
+        del level3_norm2, level3_silu2
+        manual_level3_upsample_output = level3_conv2 + level4_skip_repeated
+        (
+            natural_level3_upsample_output,
+            natural_level3_subdiv,
+        ) = level3_to_level4(level3_output)
+        for name, manual, natural in (
+            (
+                "features",
+                manual_level3_upsample_output.feats,
+                natural_level3_upsample_output.feats,
+            ),
+            (
+                "coordinates",
+                manual_level3_upsample_output.coords,
+                natural_level3_upsample_output.coords,
+            ),
+            (
+                "subdivision logits",
+                level3_subdiv.feats,
+                natural_level3_subdiv.feats,
+            ),
+        ):
+            if not np.array_equal(
+                tensor_to_numpy(manual),
+                tensor_to_numpy(natural),
+            ):
+                raise RuntimeError(
+                    "manual source final-upsample trace does not exactly "
+                    f"reproduce natural {name}"
+                )
+        append_full_hash(
+            "level3_upsample_output",
+            natural_level3_upsample_output.feats,
+        )
+        final_float = natural_level3_upsample_output.type(shape_slat.dtype)
+        decoder_final_layernorm = torch_functional.layer_norm(
+            final_float.feats,
+            final_float.feats.shape[-1:],
+        )
+        append_full_hash(
+            "decoder_final_layernorm",
+            decoder_final_layernorm,
+        )
+        decoder_output = decoder.output_layer(
+            final_float.replace(decoder_final_layernorm)
+        )
+        append_full_hash("decoder_output", decoder_output.feats)
+
     if include_level2_norm2:
         focused_arrays = {
             "level3_child_coords": tensor_to_numpy(
@@ -2524,6 +2905,8 @@ def capture_source_decoder_level1_trace(
                 for name, values in focused_arrays.items()
             },
         )
+    if full_hash_entries is not None:
+        return trace, hash_entries, full_hash_entries
     return trace, hash_entries
 
 

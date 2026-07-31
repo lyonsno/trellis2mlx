@@ -479,6 +479,272 @@ def _write_comparison_inputs(tmp_path, source_arrays, local_arrays):
     return source_path, source_report, local_path, local_report
 
 
+def _valid_full_decoder_hash_ledger(
+    *,
+    first_value=0,
+    fork_name=None,
+):
+    from scripts.decoder_full_hash_ledger_contract import (
+        FULL_DECODER_HASH_BOUNDARY_NAMES,
+        build_decoder_full_hash_ledger,
+    )
+
+    level3_rows = 9
+    level4_rows = 11
+    shapes = {
+        "level2_upsample_output": (level3_rows, 128),
+        "level3_block0_conv": (level3_rows, 128),
+        "level3_block0_norm": (level3_rows, 128),
+        "level3_block0_mlp_fc1": (level3_rows, 512),
+        "level3_block0_silu": (level3_rows, 512),
+        "level3_block0_mlp_fc2": (level3_rows, 128),
+        "level3_block0_output": (level3_rows, 128),
+        "level3_block1_output": (level3_rows, 128),
+        "level3_block2_output": (level3_rows, 128),
+        "level3_block3_output": (level3_rows, 128),
+        "level3_upsample_subdiv_logits": (level3_rows, 8),
+        "level3_upsample_norm1": (level3_rows, 128),
+        "level3_upsample_silu1": (level3_rows, 128),
+        "level3_upsample_conv1": (level3_rows, 512),
+        "level4_child_coords": (level4_rows, 4),
+        "level3_upsample_h_c2s": (level4_rows, 64),
+        "level3_upsample_skip_c2s": (level4_rows, 16),
+        "level3_upsample_skip_repeated": (level4_rows, 64),
+        "level3_upsample_norm2": (level4_rows, 64),
+        "level3_upsample_silu2": (level4_rows, 64),
+        "level3_upsample_conv2": (level4_rows, 64),
+        "level3_upsample_output": (level4_rows, 64),
+        "decoder_final_layernorm": (level4_rows, 64),
+        "decoder_output": (level4_rows, 7),
+    }
+    boundaries = {}
+    for name in FULL_DECODER_HASH_BOUNDARY_NAMES:
+        dtype = np.int32 if name == "level4_child_coords" else (
+            np.float32
+            if name in {"decoder_final_layernorm", "decoder_output"}
+            else np.float16
+        )
+        value = first_value if name == "level2_upsample_output" else 0
+        if name == fork_name:
+            value = 1
+        boundaries[name] = np.full(shapes[name], value, dtype=dtype)
+    return build_decoder_full_hash_ledger(boundaries)
+
+
+def _write_full_decoder_comparison_inputs(
+    tmp_path,
+    *,
+    source_full_ledger=None,
+    local_full_ledger=None,
+):
+    arrays = _valid_trace()
+    source_path, source_report, local_path, local_report = (
+        _write_comparison_inputs(tmp_path, arrays, arrays)
+    )
+    source_full_ledger = (
+        source_full_ledger or _valid_full_decoder_hash_ledger()
+    )
+    local_full_ledger = (
+        local_full_ledger or _valid_full_decoder_hash_ledger()
+    )
+
+    source = json.loads(source_report.read_text())
+    source["requested_route"] = {
+        "route": "official-source-cuda-shape-decoder-full-hash-ledger",
+        "full_decoder_hash_ledger": True,
+        "decoder_output_head_backend": "torch-sparse-linear-fp32",
+    }
+    source["effective_route"]["route"] = (
+        "official-source-cuda-shape-decoder-full-hash-ledger"
+    )
+    source["effective_route"]["full_decoder_hash_ledger"] = True
+    source["effective_route"]["decoder_output_head_backend"] = (
+        "torch-sparse-linear-fp32"
+    )
+    source["decoder_trace_artifacts"][0][
+        "full_decoder_hash_ledger"
+    ] = source_full_ledger
+    source_report.write_text(json.dumps(source))
+
+    local = json.loads(local_report.read_text())
+    local["requested_route"] = {
+        "route": "mlx-shape-decoder-level1-trace",
+        "device_type": "metal",
+        "decoder_linear_backend": "turing_fda",
+        "sparse_conv_matmul_backend": "turing_fda",
+        "decoder_layernorm_backend": "mlx-fast-layer-norm",
+        "decoder_silu_backend": "cuda-turing-t4-fp16-lut",
+        "full_decoder_hash_ledger": True,
+        "decoder_output_head_backend": "mlx-native-fp32",
+    }
+    local["effective_route"]["full_decoder_hash_ledger"] = True
+    local["effective_route"]["decoder_output_head_backend"] = (
+        "mlx-native-fp32"
+    )
+    local["primary"]["full_decoder_hash_ledger"] = local_full_ledger
+    local_report.write_text(json.dumps(local))
+    return source_path, source_report, local_path, local_report
+
+
+def test_full_decoder_comparator_names_first_surviving_boundary(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    local_ledger = _valid_full_decoder_hash_ledger(
+        fork_name="level3_block0_norm"
+    )
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(
+            tmp_path,
+            local_full_ledger=local_ledger,
+        )
+    )
+
+    comparison = compare_decoder_full_hash_reports(
+        source_path=source_path,
+        source_report_path=source_report,
+        local_path=local_path,
+        local_report_path=local_report,
+    )
+
+    assert comparison["parent_exact"] is True
+    assert comparison["first_nonexact_boundary"] == "level3_block0_norm"
+    assert comparison["baseline"]["first_nonexact_hash_boundary"] is None
+
+
+def test_full_decoder_comparator_rejects_missing_ledger(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    report["primary"].pop("full_decoder_hash_ledger")
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="full-decoder hash ledger"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_full_decoder_comparator_rejects_terminal_head_route_lie(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    report["effective_route"]["decoder_output_head_backend"] = "turing_fda"
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="terminal output-head route"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_full_decoder_comparator_rejects_detached_self_consistent_parent(
+    tmp_path,
+):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    detached = _valid_full_decoder_hash_ledger(first_value=1)
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(
+            tmp_path,
+            source_full_ledger=detached,
+            local_full_ledger=detached,
+        )
+    )
+
+    with pytest.raises(ValueError, match="authenticated level-two output"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_full_decoder_comparator_failed_run_replaces_stale_output(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import main
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    report["effective_route"]["full_decoder_hash_ledger"] = False
+    local_report.write_text(json.dumps(report))
+    output = tmp_path / "comparison.json"
+    output.write_text('{"status":"done","stale":true}\n')
+
+    rc = main(
+        [
+            "--source",
+            str(source_path),
+            "--source-report",
+            str(source_report),
+            "--local",
+            str(local_path),
+            "--local-report",
+            str(local_report),
+            "--output",
+            str(output),
+        ]
+    )
+
+    failed = json.loads(output.read_text())
+    assert rc == 1
+    assert failed["status"] == "failed"
+    assert failed["failure_phase"] == "comparison"
+    assert "stale" not in failed
+
+
+def test_full_decoder_comparator_refuses_output_input_collision(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import main
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    source_before = source_path.read_bytes()
+
+    rc = main(
+        [
+            "--source",
+            str(source_path),
+            "--source-report",
+            str(source_report),
+            "--local",
+            str(local_path),
+            "--local-report",
+            str(local_report),
+            "--output",
+            str(source_path),
+        ]
+    )
+
+    assert rc == 1
+    assert source_path.read_bytes() == source_before
+    failure = Path(str(source_path) + ".failure.json")
+    report = json.loads(failure.read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "request_validation"
+
+
 def test_level1_comparator_rejects_missing_hash_ledger(tmp_path):
     from scripts.compare_decoder_level1_traces import compare_level1_traces
 
