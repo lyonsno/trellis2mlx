@@ -33,6 +33,7 @@ from ..turing_fda import turing_fda_linear
 DECODER_LINEAR_BACKEND_ENV = "TRELLIS2MLX_DECODER_LINEAR_BACKEND"
 DECODER_LINEAR_BACKENDS = frozenset(("native", "turing_fda"))
 AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS = frozenset((1024, 512, 256))
+AUTHENTICATED_SHAPE_DECODER_AFFINE_LAYERNORM_WIDTHS = frozenset((128,))
 AUTHENTICATED_DECODER_NOAFFINE_LAYERNORM_TRANSITIONS = frozenset(
     ((1024, 512),)
 )
@@ -68,7 +69,12 @@ def _layernorm_noaffine(x: mx.array, eps: float = 1e-5) -> mx.array:
 class SparseConvNeXtBlock3d(nn.Module):
     """ConvNeXt-style sparse block: Conv → Norm → MLP + skip."""
 
-    def __init__(self, channels: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        channels: int,
+        mlp_ratio: float = 4.0,
+        decoder_role: str = "generic",
+    ):
         super().__init__()
         self.conv = SparseConv3d(channels, channels, kernel_size=3)
         self.norm = LayerNorm32(
@@ -76,6 +82,11 @@ class SparseConvNeXtBlock3d(nn.Module):
             affine=True,
             decoder_layernorm=(
                 channels in AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS
+                or (
+                    decoder_role == "shape"
+                    and channels
+                    in AUTHENTICATED_SHAPE_DECODER_AFFINE_LAYERNORM_WIDTHS
+                )
             ),
         )
         self.mlp_0 = nn.Linear(channels, int(channels * mlp_ratio))
@@ -172,6 +183,11 @@ class SparseResBlockC2S3d(nn.Module):
             affine=True,
             decoder_layernorm=(
                 channels in AUTHENTICATED_DECODER_AFFINE_LAYERNORM_WIDTHS
+                or (
+                    decoder_role == "shape"
+                    and channels
+                    in AUTHENTICATED_SHAPE_DECODER_AFFINE_LAYERNORM_WIDTHS
+                )
             ),
         )
         self.norm2 = LayerNorm32(
@@ -295,7 +311,12 @@ class SLatDecoder(nn.Module):
         for i, (ch, n_blocks) in enumerate(zip(model_channels, num_blocks)):
             level = []
             for _ in range(n_blocks):
-                level.append(SparseConvNeXtBlock3d(ch))
+                level.append(
+                    SparseConvNeXtBlock3d(
+                        ch,
+                        decoder_role=self.decoder_role,
+                    )
+                )
             if i < len(model_channels) - 1:
                 level.append(
                     SparseResBlockC2S3d(

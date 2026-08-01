@@ -78,6 +78,23 @@ def _require_full_route(
             raise ValueError(
                 f"{label} {route_label} terminal output-head route mismatch"
             )
+        if label == "local":
+            if route_label == "requested":
+                layernorm_backend = route.get(
+                    "decoder_layernorm_backend"
+                )
+            else:
+                layernorm = route.get("decoder_layernorm")
+                layernorm_backend = (
+                    layernorm.get("backend")
+                    if isinstance(layernorm, Mapping)
+                    else None
+                )
+            if layernorm_backend != "cuda-welford-turing-t4":
+                raise ValueError(
+                    "local full-decoder LayerNorm route must be "
+                    "cuda-welford-turing-t4"
+                )
 
 
 def _load_full_primary(

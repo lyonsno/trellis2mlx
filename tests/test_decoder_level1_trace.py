@@ -572,11 +572,17 @@ def _write_full_decoder_comparison_inputs(
         "device_type": "metal",
         "decoder_linear_backend": "turing_fda",
         "sparse_conv_matmul_backend": "turing_fda",
-        "decoder_layernorm_backend": "mlx-fast-layer-norm",
+        "decoder_layernorm_backend": "cuda-welford-turing-t4",
         "decoder_silu_backend": "cuda-turing-t4-fp16-lut",
         "full_decoder_hash_ledger": True,
         "decoder_output_head_backend": "mlx-native-fp32",
     }
+    lut = tmp_path / "full-decoder-turing-rsqrt.npz"
+    np.savez_compressed(
+        lut,
+        normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
+    )
+    local["effective_route"].update(_exact_layernorm_route(lut))
     local["effective_route"]["full_decoder_hash_ledger"] = True
     local["effective_route"]["decoder_output_head_backend"] = (
         "mlx-native-fp32"
@@ -647,6 +653,61 @@ def test_full_decoder_comparator_rejects_terminal_head_route_lie(tmp_path):
     local_report.write_text(json.dumps(report))
 
     with pytest.raises(ValueError, match="terminal output-head route"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_full_decoder_comparator_rejects_native_layernorm_route(tmp_path):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    report["requested_route"]["decoder_layernorm_backend"] = (
+        "mlx-fast-layer-norm"
+    )
+    report["effective_route"]["decoder_layernorm"] = {
+        "backend": "mlx-fast-layer-norm",
+        "algorithm": "mlx-fast-layer-norm",
+        "experimental": False,
+    }
+    report["effective_route"]["decoder_layernorm_lut"] = None
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="full-decoder LayerNorm route"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
+def test_full_decoder_comparator_rejects_missing_width128_affine_contract(
+    tmp_path,
+):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    contracts = report["effective_route"]["decoder_layernorm"][
+        "authenticated_contracts"
+    ]
+    contracts.pop(5)
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="width-128 affine"):
         compare_decoder_full_hash_reports(
             source_path=source_path,
             source_report_path=source_report,
@@ -907,6 +968,22 @@ def _exact_layernorm_route(lut):
                 },
                 {
                     "input_dtype": "float16",
+                    "parameter_dtype": "float16",
+                    "hidden_width": 128,
+                    "affine": True,
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "active_values_per_thread": 4,
+                        "average_values_per_launched_thread": 1,
+                        "active_vector_threads": 32,
+                        "inactive_vector_threads": 96,
+                        "accumulator_dtype": "float32",
+                    },
+                },
+                {
+                    "input_dtype": "float16",
                     "hidden_width": 128,
                     "affine": False,
                     "reduction": {
@@ -976,8 +1053,14 @@ def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("contract_index", "contract_kind"),
+    [(5, "affine"), (6, "non-affine")],
+)
 def test_level1_comparator_rejects_missing_width128_layernorm_contract(
     tmp_path,
+    contract_index,
+    contract_kind,
 ):
     from scripts.compare_decoder_level1_traces import compare_level1_traces
 
@@ -991,12 +1074,17 @@ def test_level1_comparator_rejects_missing_width128_layernorm_contract(
         normalized_delta=np.zeros((1 << 24,), dtype=np.int8),
     )
     exact_route = _exact_layernorm_route(lut)
-    exact_route["decoder_layernorm"]["authenticated_contracts"].pop()
+    exact_route["decoder_layernorm"]["authenticated_contracts"].pop(
+        contract_index
+    )
     report = json.loads(local_report.read_text())
     report["effective_route"].update(exact_route)
     local_report.write_text(json.dumps(report))
 
-    with pytest.raises(ValueError, match="width-128 non-affine"):
+    with pytest.raises(
+        ValueError,
+        match="width-128 affine or non-affine contract",
+    ):
         compare_level1_traces(
             source_path=source_path,
             source_report_path=source_report,
