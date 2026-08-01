@@ -25,7 +25,10 @@ def _write_input(path: Path) -> None:
     )
 
 
-def _runtime(patch_sha256: str):
+def _runtime(
+    patch_sha256: str,
+    schema: str = "trellis2mlx.cumesh_qem_cost_instrumentation.v1",
+):
     return SimpleNamespace(
         effective_route={
             "trellis_commit": "5565d240c4a494caaf9ece7a554542b76ffa36d3",
@@ -40,7 +43,7 @@ def _runtime(patch_sha256: str):
             "cuda_capability": [7, 5],
             "device_type": "cuda",
             "cumesh_instrumentation": {
-                "schema": "trellis2mlx.cumesh_qem_cost_instrumentation.v1",
+                "schema": schema,
                 "patch_sha256": patch_sha256,
                 "changed_files": [
                     "cumesh/cumesh.py",
@@ -58,6 +61,20 @@ def _arrays() -> dict[str, np.ndarray]:
         "vert2face": np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
         "qems": np.arange(30, dtype=np.float32).reshape(3, 10),
         "edge_collapse_costs": np.array([0.25, np.inf, 0.5], dtype=np.float32),
+    }
+
+
+def _component_arrays() -> dict[str, np.ndarray]:
+    total = np.array([0.25, np.inf, 0.5], dtype=np.float32)
+    return {
+        "vert2face": np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
+        "qems": np.arange(30, dtype=np.float32).reshape(3, 10),
+        "edge_collapse_costs": total,
+        "component_edge_collapse_costs": total.copy(),
+        "qem_costs": np.array([0.2, 0.3, 0.4], dtype=np.float32),
+        "edge_length2": np.array([4.0, 5.0, 6.0], dtype=np.float32),
+        "skinny_avgs": np.array([10.0, np.inf, 20.0], dtype=np.float32),
+        "skinny_terms": np.array([0.01, np.inf, 0.04], dtype=np.float32),
     }
 
 
@@ -124,6 +141,79 @@ def test_qem_cost_witness_rejects_substituted_patch_before_runtime(tmp_path):
     assert report["failure_phase"] == "patch_validation"
     assert report["primary_output_status"] == "not_started"
     assert not output_npz.exists()
+
+
+def test_component_witness_rejects_backend_self_inconsistency_before_output(
+    tmp_path,
+):
+    input_ply = tmp_path / "input.ply"
+    patch = tmp_path / "trace.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    patch.write_text("component instrumentation patch\n")
+    patch_sha256 = sha256_file(patch)
+    arrays = _component_arrays()
+    arrays["component_edge_collapse_costs"][0] = np.nextafter(
+        arrays["component_edge_collapse_costs"][0],
+        np.float32(np.inf),
+    )
+
+    with pytest.raises(WitnessError, match="component total differs"):
+        run_witness(
+            input_ply=input_ply,
+            instrumentation_patch=patch,
+            output_npz=output_npz,
+            output_json=output_json,
+            expected_input_sha256=sha256_file(input_ply),
+            expected_patch_sha256=patch_sha256,
+            work_dir=tmp_path / "build",
+            component_trace=True,
+            runtime_factory=lambda **kwargs: _runtime(
+                patch_sha256,
+                "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2",
+            ),
+            collector=lambda runtime, vertices, faces: arrays,
+        )
+
+    report = json.loads(output_json.read_text())
+    assert report["failure_phase"] == "backend_self_consistency"
+    assert report["primary_output_status"] == "not_started"
+    assert not output_npz.exists()
+
+
+def test_component_witness_records_self_consistent_arrays(tmp_path):
+    input_ply = tmp_path / "input.ply"
+    patch = tmp_path / "trace.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    patch.write_text("component instrumentation patch\n")
+    patch_sha256 = sha256_file(patch)
+
+    report = run_witness(
+        input_ply=input_ply,
+        instrumentation_patch=patch,
+        output_npz=output_npz,
+        output_json=output_json,
+        expected_input_sha256=sha256_file(input_ply),
+        expected_patch_sha256=patch_sha256,
+        work_dir=tmp_path / "build",
+        component_trace=True,
+        runtime_factory=lambda **kwargs: _runtime(
+            patch_sha256,
+            "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2",
+        ),
+        collector=lambda runtime, vertices, faces: _component_arrays(),
+    )
+
+    assert report["schema"].endswith(".v2")
+    assert report["backend_self_consistency"]["bit_exact"] is True
+    assert report["effective_route"]["geometry_route"].endswith(
+        "qem-cost-component-trace-instrumented"
+    )
+    with np.load(output_npz, allow_pickle=False) as archive:
+        assert set(archive.files) == set(_component_arrays())
 
 
 def test_instrumentation_callback_resolves_patch_before_git_changes_directory(

@@ -30,8 +30,14 @@ from trellmlx.source_route_identity import (
 
 HEX_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 CUDA_GEOMETRY_ROUTE = "release-cumesh-qem-cost-trace-instrumented"
+CUDA_COMPONENT_GEOMETRY_ROUTE = (
+    "release-cumesh-qem-cost-component-trace-instrumented"
+)
 CUDA_INSTRUMENTATION_SCHEMA = (
     "trellis2mlx.cumesh_qem_cost_instrumentation.v1"
+)
+CUDA_COMPONENT_INSTRUMENTATION_SCHEMA = (
+    "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2"
 )
 CUDA_ARRAY_DTYPES = {
     "vert2face": np.dtype(np.int32),
@@ -42,6 +48,19 @@ METAL_ARRAY_DTYPES = {
     "qems": np.dtype(np.float32),
     "edge_collapse_costs": np.dtype(np.float32),
 }
+CUDA_COMPONENT_ARRAY_DTYPES = {
+    **CUDA_ARRAY_DTYPES,
+    "component_edge_collapse_costs": np.dtype(np.float32),
+    "qem_costs": np.dtype(np.float32),
+    "edge_length2": np.dtype(np.float32),
+    "skinny_avgs": np.dtype(np.float32),
+    "skinny_terms": np.dtype(np.float32),
+}
+METAL_COMPONENT_ARRAY_DTYPES = {
+    name: dtype
+    for name, dtype in CUDA_COMPONENT_ARRAY_DTYPES.items()
+    if name != "vert2face"
+}
 Runner = Callable[
     [np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray | None],
     tuple[dict[str, np.ndarray], dict[str, Any]],
@@ -49,6 +68,12 @@ Runner = Callable[
 NATIVE_METAL_ROUTE = "metal-mtlmesh-cuda-adjacency-qem-cost-trace"
 TURING_RSQRT_ROUTE = (
     "metal-mtlmesh-cuda-adjacency-turing-rsqrt-qem-cost-trace"
+)
+NATIVE_METAL_COMPONENT_ROUTE = (
+    "metal-mtlmesh-cuda-adjacency-qem-cost-component-trace"
+)
+TURING_RSQRT_COMPONENT_ROUTE = (
+    "metal-mtlmesh-cuda-adjacency-turing-rsqrt-qem-cost-component-trace"
 )
 
 
@@ -250,14 +275,24 @@ def _load_cuda_trace(
     if report.get("input_mesh", {}).get("sha256") != expected_input_sha256:
         raise WitnessError("CUDA QEM input SHA256 mismatch")
     route = report.get("effective_route") or {}
-    if route.get("geometry_route") != CUDA_GEOMETRY_ROUTE:
+    cuda_geometry_route = route.get("geometry_route")
+    if cuda_geometry_route not in {
+        CUDA_GEOMETRY_ROUTE,
+        CUDA_COMPONENT_GEOMETRY_ROUTE,
+    }:
         raise WitnessError("CUDA QEM geometry route is not authenticated")
     if route.get("cuda_available") is not True:
         raise WitnessError("CUDA QEM route did not use CUDA")
     if route.get("cuda_device_name") != "Tesla T4":
         raise WitnessError("CUDA QEM route did not use the requested Tesla T4")
     instrumentation = route.get("cumesh_instrumentation") or {}
-    if instrumentation.get("schema") != CUDA_INSTRUMENTATION_SCHEMA:
+    component_trace = cuda_geometry_route == CUDA_COMPONENT_GEOMETRY_ROUTE
+    expected_instrumentation_schema = (
+        CUDA_COMPONENT_INSTRUMENTATION_SCHEMA
+        if component_trace
+        else CUDA_INSTRUMENTATION_SCHEMA
+    )
+    if instrumentation.get("schema") != expected_instrumentation_schema:
         raise WitnessError("CUDA QEM instrumentation schema mismatch")
     patch_sha256 = instrumentation.get("patch_sha256")
     if not isinstance(patch_sha256, str) or not HEX_SHA256.fullmatch(
@@ -280,11 +315,14 @@ def _load_cuda_trace(
             name: np.ascontiguousarray(archive[name])
             for name in archive.files
         }
-    if set(arrays) != set(CUDA_ARRAY_DTYPES):
+    array_dtypes = (
+        CUDA_COMPONENT_ARRAY_DTYPES if component_trace else CUDA_ARRAY_DTYPES
+    )
+    if set(arrays) != set(array_dtypes):
         raise WitnessError("CUDA QEM NPZ array set mismatch")
     if set(arrays) != set(report.get("arrays") or {}):
         raise WitnessError("CUDA QEM report/NPZ array set mismatch")
-    for name, dtype in CUDA_ARRAY_DTYPES.items():
+    for name, dtype in array_dtypes.items():
         array = arrays[name]
         record = report["arrays"][name]
         if array.dtype != dtype:
@@ -301,6 +339,21 @@ def _load_cuda_trace(
         raise WitnessError("CUDA QEM coefficient shape mismatch")
     if arrays["edge_collapse_costs"].ndim != 1:
         raise WitnessError("CUDA edge-collapse costs must be one-dimensional")
+    edge_shape = arrays["edge_collapse_costs"].shape
+    for name in set(array_dtypes) - {"vert2face", "qems"}:
+        if arrays[name].shape != edge_shape:
+            raise WitnessError(f"CUDA QEM {name} edge shape mismatch")
+    if component_trace:
+        ordinary = arrays["edge_collapse_costs"].view(np.uint32)
+        component = arrays["component_edge_collapse_costs"].view(np.uint32)
+        if not np.array_equal(ordinary, component):
+            raise WitnessError(
+                "CUDA component total differs from the ordinary edge-cost kernel"
+            )
+        if report.get("backend_self_consistency", {}).get("bit_exact") is not True:
+            raise WitnessError(
+                "CUDA report does not attest component self-consistency"
+            )
     return report, arrays
 
 
@@ -374,18 +427,34 @@ def _default_runner(
     if not np.array_equal(readback, cuda_arrays["vert2face"]):
         raise WitnessError("Metal adjacency injection readback differs from CUDA")
 
-    if rsqrt_delta is None:
+    component_trace = "component_edge_collapse_costs" in cuda_arrays
+    if rsqrt_delta is None and component_trace:
+        trace = mesh.read_qem_cost_component_trace_turing(
+            torch.zeros(1 << 24, dtype=torch.int8),
+            reuse_vertex_face_adjacency=True,
+        )
+        qem_kernel = "metal-native-rsqrt"
+    elif rsqrt_delta is None:
         trace = mesh.read_qem_cost_trace(reuse_vertex_face_adjacency=True)
         qem_kernel = "metal-native-rsqrt"
+    elif component_trace:
+        trace = mesh.read_qem_cost_component_trace_turing(
+            torch.from_numpy(rsqrt_delta),
+            reuse_vertex_face_adjacency=True,
+        )
+        qem_kernel = "turing-rsqrt-lut"
     else:
         trace = mesh.read_qem_cost_trace_turing(
             torch.from_numpy(rsqrt_delta),
             reuse_vertex_face_adjacency=True,
         )
         qem_kernel = "turing-rsqrt-lut"
+    metal_array_dtypes = (
+        METAL_COMPONENT_ARRAY_DTYPES if component_trace else METAL_ARRAY_DTYPES
+    )
     arrays = {
         name: np.ascontiguousarray(trace[name].detach().cpu().numpy())
-        for name in METAL_ARRAY_DTYPES
+        for name in metal_array_dtypes
     }
     metallib_path = Path(cumesh_extension.__file__).with_name("cumesh.metallib")
     return arrays, {
@@ -475,6 +544,7 @@ def run_witness(
         "injection": None,
         "metal_arrays": None,
         "comparison": None,
+        "backend_self_consistency": None,
         "output_npz": None,
         "elapsed_seconds": None,
     }
@@ -562,6 +632,28 @@ def run_witness(
             num_faces=len(faces),
         )
         cuda_route = cuda_report["effective_route"]
+        component_trace = (
+            cuda_route["geometry_route"] == CUDA_COMPONENT_GEOMETRY_ROUTE
+        )
+        if component_trace and rsqrt_lut_npz is None:
+            raise WitnessError(
+                "cost-component comparison requires an authenticated Turing "
+                "rsqrt LUT"
+            )
+        if component_trace:
+            geometry_route = (
+                TURING_RSQRT_COMPONENT_ROUTE
+                if turing_route_requested
+                else NATIVE_METAL_COMPONENT_ROUTE
+            )
+            report["schema"] = (
+                "trellis2mlx.source_metal_cuda_qem_cost_witness.v2"
+            )
+            report["requested_route"]["geometry_route"] = geometry_route
+            report["backend_self_consistency"] = {
+                "cuda": {"bit_exact": True},
+                "metal": None,
+            }
         report["cuda_trace"] = {
             "report_path": str(cuda_report_json),
             "report_sha256": expected_cuda_report_sha256,
@@ -655,8 +747,15 @@ def run_witness(
                 "metallib_sha256"
             ] = expected_metallib_sha256
             report["effective_route"]["metal_math_profile"] = metal_math_profile
+        metal_array_dtypes = (
+            METAL_COMPONENT_ARRAY_DTYPES
+            if component_trace
+            else METAL_ARRAY_DTYPES
+        )
+        if set(metal_arrays) != set(metal_array_dtypes):
+            raise WitnessError("Metal trace array set mismatch")
         normalized: dict[str, np.ndarray] = {}
-        for name, dtype in METAL_ARRAY_DTYPES.items():
+        for name, dtype in metal_array_dtypes.items():
             array = np.asarray(metal_arrays.get(name))
             if array.dtype != dtype:
                 raise WitnessError(f"Metal {name} dtype mismatch")
@@ -668,7 +767,42 @@ def run_witness(
             != cuda_arrays["edge_collapse_costs"].shape
         ):
             raise WitnessError("Metal edge-collapse cost shape mismatch")
+        edge_shape = normalized["edge_collapse_costs"].shape
+        for name in set(metal_array_dtypes) - {"qems"}:
+            if normalized[name].shape != edge_shape:
+                raise WitnessError(f"Metal {name} edge shape mismatch")
         metal_arrays = normalized
+        if component_trace:
+            phase = "backend_self_consistency"
+            ordinary = metal_arrays["edge_collapse_costs"].view(np.uint32)
+            component = metal_arrays[
+                "component_edge_collapse_costs"
+            ].view(np.uint32)
+            mismatch = ordinary != component
+            mismatch_count = int(np.count_nonzero(mismatch))
+            metal_self_consistency = {
+                "bit_exact": mismatch_count == 0,
+                "bit_mismatch_count": mismatch_count,
+                "first_bit_mismatch_index": (
+                    int(np.flatnonzero(mismatch)[0])
+                    if mismatch_count
+                    else None
+                ),
+                "ordinary_sha256": _array_sha256(
+                    metal_arrays["edge_collapse_costs"]
+                ),
+                "component_sha256": _array_sha256(
+                    metal_arrays["component_edge_collapse_costs"]
+                ),
+            }
+            report["backend_self_consistency"][
+                "metal"
+            ] = metal_self_consistency
+            if not metal_self_consistency["bit_exact"]:
+                raise WitnessError(
+                    "Metal component total differs from the ordinary edge-cost "
+                    f"kernel at {mismatch_count} edges"
+                )
         report["injection"] = injection
         report["metal_arrays"] = {
             name: {
@@ -682,7 +816,7 @@ def run_witness(
         }
         report["comparison"] = {
             name: compare_float32_arrays(cuda_arrays[name], metal_arrays[name])
-            for name in METAL_ARRAY_DTYPES
+            for name in metal_array_dtypes
         }
         report["last_trustworthy_phase"] = "metal_trace_compared"
         report["primary_output_status"] = "partial"

@@ -42,6 +42,22 @@ ARRAY_DTYPES = {
     "qems": np.dtype(np.float32),
     "edge_collapse_costs": np.dtype(np.float32),
 }
+COMPONENT_ARRAY_DTYPES = {
+    **ARRAY_DTYPES,
+    "component_edge_collapse_costs": np.dtype(np.float32),
+    "qem_costs": np.dtype(np.float32),
+    "edge_length2": np.dtype(np.float32),
+    "skinny_avgs": np.dtype(np.float32),
+    "skinny_terms": np.dtype(np.float32),
+}
+BASE_INSTRUMENTATION_SCHEMA = "trellis2mlx.cumesh_qem_cost_instrumentation.v1"
+COMPONENT_INSTRUMENTATION_SCHEMA = (
+    "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2"
+)
+BASE_GEOMETRY_ROUTE = "release-cumesh-qem-cost-trace-instrumented"
+COMPONENT_GEOMETRY_ROUTE = (
+    "release-cumesh-qem-cost-component-trace-instrumented"
+)
 INSTRUMENTED_FILES = (
     "cumesh/cumesh.py",
     "src/cumesh.h",
@@ -59,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-input-sha256", required=True)
     parser.add_argument("--expected-patch-sha256", required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--component-trace", action="store_true")
     return parser
 
 
@@ -94,6 +111,8 @@ def _run(command: list[str], report: dict[str, Any]) -> subprocess.CompletedProc
 def _instrumentation_callback(
     patch: Path,
     expected_patch_sha256: str,
+    *,
+    component_trace: bool = False,
 ) -> Callable[[Path, dict[str, Any]], dict[str, Any]]:
     patch = Path(patch).resolve(strict=False)
 
@@ -124,7 +143,11 @@ def _instrumentation_callback(
                 f"expected {sorted(INSTRUMENTED_FILES)}, got {changed_files}"
             )
         return {
-            "schema": "trellis2mlx.cumesh_qem_cost_instrumentation.v1",
+            "schema": (
+                COMPONENT_INSTRUMENTATION_SCHEMA
+                if component_trace
+                else BASE_INSTRUMENTATION_SCHEMA
+            ),
             "patch_path": str(patch),
             "patch_sha256": expected_patch_sha256,
             "changed_files": changed_files,
@@ -139,6 +162,8 @@ def _default_collector(
     runtime: Any,
     vertices: np.ndarray,
     faces: np.ndarray,
+    *,
+    component_trace: bool = False,
 ) -> dict[str, np.ndarray]:
     torch = runtime.torch
     mesh = runtime.cumesh.CuMesh()
@@ -146,17 +171,28 @@ def _default_collector(
         torch.from_numpy(vertices).cuda(),
         torch.from_numpy(faces).cuda(),
     )
-    trace = mesh.read_qem_cost_trace()
+    trace = (
+        mesh.read_qem_cost_component_trace()
+        if component_trace
+        else mesh.read_qem_cost_trace()
+    )
     cache = mesh.read_all_cache()
-    return {
+    arrays = {
         "vert2face": np.ascontiguousarray(
             cache["vert2face"].detach().cpu().numpy()
         ),
-        "qems": np.ascontiguousarray(trace["qems"].detach().cpu().numpy()),
-        "edge_collapse_costs": np.ascontiguousarray(
-            trace["edge_collapse_costs"].detach().cpu().numpy()
-        ),
     }
+    trace_names = (
+        COMPONENT_ARRAY_DTYPES if component_trace else ARRAY_DTYPES
+    )
+    arrays.update(
+        {
+            name: np.ascontiguousarray(trace[name].detach().cpu().numpy())
+            for name in trace_names
+            if name != "vert2face"
+        }
+    )
+    return arrays
 
 
 def _validate_arrays(
@@ -164,14 +200,18 @@ def _validate_arrays(
     *,
     num_vertices: int,
     num_faces: int,
+    component_trace: bool = False,
 ) -> dict[str, np.ndarray]:
-    if set(arrays) != set(ARRAY_DTYPES):
+    array_dtypes = (
+        COMPONENT_ARRAY_DTYPES if component_trace else ARRAY_DTYPES
+    )
+    if set(arrays) != set(array_dtypes):
         raise WitnessError(
             "collector array set mismatch: "
-            f"expected {sorted(ARRAY_DTYPES)}, got {sorted(arrays)}"
+            f"expected {sorted(array_dtypes)}, got {sorted(arrays)}"
         )
     normalized: dict[str, np.ndarray] = {}
-    for name, dtype in ARRAY_DTYPES.items():
+    for name, dtype in array_dtypes.items():
         array = np.asarray(arrays[name])
         if array.dtype != dtype:
             raise WitnessError(
@@ -186,7 +226,32 @@ def _validate_arrays(
         raise WitnessError("edge_collapse_costs must be one-dimensional")
     if len(normalized["edge_collapse_costs"]) == 0:
         raise WitnessError("edge_collapse_costs is empty")
+    edge_shape = normalized["edge_collapse_costs"].shape
+    for name in set(array_dtypes) - {"vert2face", "qems"}:
+        if normalized[name].shape != edge_shape:
+            raise WitnessError(
+                f"{name} shape must equal edge_collapse_costs shape"
+            )
     return normalized
+
+
+def _component_self_consistency(
+    arrays: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    ordinary = arrays["edge_collapse_costs"].view(np.uint32)
+    component = arrays["component_edge_collapse_costs"].view(np.uint32)
+    mismatch = ordinary != component
+    mismatch_count = int(np.count_nonzero(mismatch))
+    first = int(np.flatnonzero(mismatch)[0]) if mismatch_count else None
+    return {
+        "bit_exact": mismatch_count == 0,
+        "bit_mismatch_count": mismatch_count,
+        "first_bit_mismatch_index": first,
+        "ordinary_sha256": _array_sha256(arrays["edge_collapse_costs"]),
+        "component_sha256": _array_sha256(
+            arrays["component_edge_collapse_costs"]
+        ),
+    }
 
 
 def run_witness(
@@ -198,6 +263,7 @@ def run_witness(
     expected_input_sha256: str,
     expected_patch_sha256: str,
     work_dir: Path,
+    component_trace: bool = False,
     runtime_factory: Callable[..., Any] | None = None,
     collector: Callable[[Any, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     | None = None,
@@ -208,8 +274,15 @@ def run_witness(
     output_npz = Path(output_npz)
     output_json = Path(output_json)
     work_dir = Path(work_dir)
+    geometry_route = (
+        COMPONENT_GEOMETRY_ROUTE if component_trace else BASE_GEOMETRY_ROUTE
+    )
     report: dict[str, Any] = {
-        "schema": "trellis2mlx.source_cuda_cumesh_qem_cost_witness.v1",
+        "schema": (
+            "trellis2mlx.source_cuda_cumesh_qem_cost_witness.v2"
+            if component_trace
+            else "trellis2mlx.source_cuda_cumesh_qem_cost_witness.v1"
+        ),
         "status": "failed",
         "failure_phase": None,
         "last_trustworthy_phase": "request_received",
@@ -223,13 +296,14 @@ def run_witness(
             "expected_patch_sha256": expected_patch_sha256,
             "work_dir": str(work_dir),
             "cumesh_commit": CUMESH_COMMIT,
-            "geometry_route": "release-cumesh-qem-cost-trace-instrumented",
+            "geometry_route": geometry_route,
             "target_faces": 1,
         },
         "effective_route": None,
         "input_mesh": None,
         "instrumentation_patch": None,
         "arrays": None,
+        "backend_self_consistency": None,
         "output_npz": None,
         "runtime_cleanup": None,
         "elapsed_seconds": None,
@@ -310,6 +384,7 @@ def run_witness(
             cumesh_instrumentation=_instrumentation_callback(
                 instrumentation_patch,
                 expected_patch_sha256,
+                component_trace=component_trace,
             ),
         )
         _validate_effective_route(runtime.effective_route)
@@ -318,25 +393,51 @@ def run_witness(
             raise WitnessError("effective route is missing CuMesh instrumentation")
         if instrumentation.get("patch_sha256") != expected_patch_sha256:
             raise WitnessError("effective instrumentation patch SHA256 mismatch")
+        expected_instrumentation_schema = (
+            COMPONENT_INSTRUMENTATION_SCHEMA
+            if component_trace
+            else BASE_INSTRUMENTATION_SCHEMA
+        )
+        if instrumentation.get("schema") != expected_instrumentation_schema:
+            raise WitnessError("effective instrumentation schema mismatch")
         if instrumentation.get("changed_files") != list(INSTRUMENTED_FILES):
             raise WitnessError("effective instrumentation changed-file set mismatch")
         report["effective_route"] = {
             **runtime.effective_route,
             "input_ply": str(input_ply),
             "input_sha256": actual_input_sha256,
-            "geometry_route": "release-cumesh-qem-cost-trace-instrumented",
+            "geometry_route": geometry_route,
         }
         report["status"] = "running"
         report["last_trustworthy_phase"] = "runtime_validated"
         _write_report(output_json, report)
 
         phase = "trace_collection"
-        collect = collector or _default_collector
+        collected = (
+            collector(runtime, vertices, faces)
+            if collector is not None
+            else _default_collector(
+                runtime,
+                vertices,
+                faces,
+                component_trace=component_trace,
+            )
+        )
         arrays = _validate_arrays(
-            collect(runtime, vertices, faces),
+            collected,
             num_vertices=len(vertices),
             num_faces=len(faces),
+            component_trace=component_trace,
         )
+        if component_trace:
+            phase = "backend_self_consistency"
+            self_consistency = _component_self_consistency(arrays)
+            report["backend_self_consistency"] = self_consistency
+            if not self_consistency["bit_exact"]:
+                raise WitnessError(
+                    "CUDA component total differs from the ordinary edge-cost "
+                    f"kernel at {self_consistency['bit_mismatch_count']} edges"
+                )
         report["arrays"] = {
             name: {
                 "shape": list(array.shape),
@@ -413,6 +514,7 @@ def main() -> int:
         expected_input_sha256=args.expected_input_sha256,
         expected_patch_sha256=args.expected_patch_sha256,
         work_dir=args.work_dir,
+        component_trace=args.component_trace,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
