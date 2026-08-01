@@ -43,9 +43,13 @@ METAL_ARRAY_DTYPES = {
     "edge_collapse_costs": np.dtype(np.float32),
 }
 Runner = Callable[
-    [np.ndarray, np.ndarray, dict[str, np.ndarray]],
+    [np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray | None],
     tuple[dict[str, np.ndarray], dict[str, Any]],
 ]
+NATIVE_METAL_ROUTE = "metal-mtlmesh-cuda-adjacency-qem-cost-trace"
+TURING_RSQRT_ROUTE = (
+    "metal-mtlmesh-cuda-adjacency-turing-rsqrt-qem-cost-trace"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-cuda-npz-sha256", required=True)
     parser.add_argument("--expected-source-root", type=Path, required=True)
     parser.add_argument("--expected-source-commit", required=True)
+    parser.add_argument("--rsqrt-lut-npz", type=Path)
+    parser.add_argument("--expected-rsqrt-lut-sha256")
     return parser
 
 
@@ -296,10 +302,38 @@ def _load_cuda_trace(
     return report, arrays
 
 
+def _load_turing_rsqrt_lut(
+    path: Path,
+    *,
+    expected_sha256: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise WitnessError("Turing rsqrt LUT NPZ SHA256 mismatch")
+    with np.load(path, allow_pickle=False) as archive:
+        if "normalized_delta" not in archive.files:
+            raise WitnessError("Turing rsqrt LUT NPZ lacks normalized_delta")
+        delta = np.ascontiguousarray(archive["normalized_delta"])
+    if delta.dtype != np.int8 or delta.shape != (1 << 24,):
+        raise WitnessError(
+            "Turing rsqrt normalized_delta must be int8 with 2^24 entries"
+        )
+    return delta, {
+        "npz_path": str(path),
+        "npz_sha256": actual_sha256,
+        "normalized_delta": {
+            "shape": list(delta.shape),
+            "dtype": str(delta.dtype),
+            "sha256": _array_sha256(delta),
+        },
+    }
+
+
 def _default_runner(
     vertices: np.ndarray,
     faces: np.ndarray,
     cuda_arrays: dict[str, np.ndarray],
+    rsqrt_delta: np.ndarray | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import torch
     from cumesh import CuMesh
@@ -337,7 +371,15 @@ def _default_runner(
     if not np.array_equal(readback, cuda_arrays["vert2face"]):
         raise WitnessError("Metal adjacency injection readback differs from CUDA")
 
-    trace = mesh.read_qem_cost_trace(reuse_vertex_face_adjacency=True)
+    if rsqrt_delta is None:
+        trace = mesh.read_qem_cost_trace(reuse_vertex_face_adjacency=True)
+        qem_kernel = "metal-native-rsqrt"
+    else:
+        trace = mesh.read_qem_cost_trace_turing(
+            torch.from_numpy(rsqrt_delta),
+            reuse_vertex_face_adjacency=True,
+        )
+        qem_kernel = "turing-rsqrt-lut"
     arrays = {
         name: np.ascontiguousarray(trace[name].detach().cpu().numpy())
         for name in METAL_ARRAY_DTYPES
@@ -346,6 +388,7 @@ def _default_runner(
         "injected_readback_exact": True,
         "segment_multisets_exact": True,
         "pre_injection_order_delta": order,
+        "qem_kernel": qem_kernel,
     }
 
 
@@ -361,6 +404,8 @@ def run_witness(
     expected_cuda_npz_sha256: str,
     expected_source_root: Path,
     expected_source_commit: str,
+    rsqrt_lut_npz: Path | None = None,
+    expected_rsqrt_lut_sha256: str | None = None,
     identity_probe: Callable[[], dict[str, Any]] | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
@@ -371,9 +416,22 @@ def run_witness(
     output_npz = Path(output_npz)
     requested_report_json = Path(report_json)
     expected_source_root = Path(expected_source_root).resolve(strict=False)
+    rsqrt_lut_npz = Path(rsqrt_lut_npz) if rsqrt_lut_npz is not None else None
+    turing_route_requested = (
+        rsqrt_lut_npz is not None or expected_rsqrt_lut_sha256 is not None
+    )
+    geometry_route = (
+        TURING_RSQRT_ROUTE if turing_route_requested else NATIVE_METAL_ROUTE
+    )
     effective_report_json, report_rerouted = _effective_report_path(
         requested_report_json,
-        protected_paths=[input_ply, cuda_report_json, cuda_npz, output_npz],
+        protected_paths=[
+            input_ply,
+            cuda_report_json,
+            cuda_npz,
+            output_npz,
+            *([rsqrt_lut_npz] if rsqrt_lut_npz is not None else []),
+        ],
     )
     report: dict[str, Any] = {
         "schema": "trellis2mlx.source_metal_cuda_qem_cost_witness.v1",
@@ -394,11 +452,16 @@ def run_witness(
             "expected_cuda_npz_sha256": expected_cuda_npz_sha256,
             "expected_source_root": str(expected_source_root),
             "expected_source_commit": expected_source_commit,
-            "geometry_route": "metal-mtlmesh-cuda-adjacency-qem-cost-trace",
+            "geometry_route": geometry_route,
+            "rsqrt_lut_npz": (
+                str(rsqrt_lut_npz) if rsqrt_lut_npz is not None else None
+            ),
+            "expected_rsqrt_lut_sha256": expected_rsqrt_lut_sha256,
         },
         "effective_route": None,
         "input_mesh": None,
         "cuda_trace": None,
+        "rsqrt_lut": None,
         "injection": None,
         "metal_arrays": None,
         "comparison": None,
@@ -408,7 +471,13 @@ def run_witness(
     phase = "request_validation"
 
     try:
+        if (rsqrt_lut_npz is None) != (expected_rsqrt_lut_sha256 is None):
+            raise WitnessError(
+                "--rsqrt-lut-npz and --expected-rsqrt-lut-sha256 must both be supplied"
+            )
         protected = [input_ply, cuda_report_json, cuda_npz]
+        if rsqrt_lut_npz is not None:
+            protected.append(rsqrt_lut_npz)
         if any(_same_path(output_npz, path) for path in protected):
             raise WitnessError("output NPZ aliases a protected input")
         if output_npz.suffix != ".npz":
@@ -422,6 +491,13 @@ def run_witness(
                 raise WitnessError(
                     f"{name} must be 64 lowercase hex characters"
                 )
+        if (
+            expected_rsqrt_lut_sha256 is not None
+            and not HEX_SHA256.fullmatch(expected_rsqrt_lut_sha256)
+        ):
+            raise WitnessError(
+                "--expected-rsqrt-lut-sha256 must be 64 lowercase hex characters"
+            )
         if not HEX_GIT_COMMIT.fullmatch(expected_source_commit):
             raise WitnessError(
                 "--expected-source-commit must be 40 lowercase hex characters"
@@ -475,6 +551,17 @@ def run_witness(
         report["last_trustworthy_phase"] = "cuda_trace_validated"
         _write_report(effective_report_json, report)
 
+        rsqrt_delta = None
+        if rsqrt_lut_npz is not None:
+            phase = "rsqrt_lut_validation"
+            rsqrt_delta, rsqrt_record = _load_turing_rsqrt_lut(
+                rsqrt_lut_npz,
+                expected_sha256=expected_rsqrt_lut_sha256,
+            )
+            report["rsqrt_lut"] = rsqrt_record
+            report["last_trustworthy_phase"] = "rsqrt_lut_validated"
+            _write_report(effective_report_json, report)
+
         phase = "runtime_validation"
         probe = identity_probe or probe_cumesh_route_identity
         try:
@@ -498,7 +585,12 @@ def run_witness(
             raise WitnessError("effective route does not expose MtlMesh")
         report["effective_route"] = {
             **identity,
-            "geometry_route": "metal-mtlmesh-cuda-adjacency-qem-cost-trace",
+            "geometry_route": geometry_route,
+            "qem_kernel": (
+                "turing-rsqrt-lut"
+                if rsqrt_delta is not None
+                else "metal-native-rsqrt"
+            ),
             "cuda_geometry_route": cuda_route["geometry_route"],
             "cuda_device_name": cuda_route["cuda_device_name"],
             "input_sha256": actual_input_sha256,
@@ -509,11 +601,22 @@ def run_witness(
 
         phase = "metal_trace_collection"
         execute = runner or _default_runner
-        metal_arrays, injection = execute(vertices, faces, cuda_arrays)
+        metal_arrays, injection = execute(
+            vertices,
+            faces,
+            cuda_arrays,
+            rsqrt_delta,
+        )
         if injection.get("injected_readback_exact") is not True:
             raise WitnessError("runner did not attest exact adjacency readback")
         if injection.get("segment_multisets_exact") is not True:
             raise WitnessError("runner did not attest adjacency membership parity")
+        expected_qem_kernel = report["effective_route"]["qem_kernel"]
+        if injection.get("qem_kernel") != expected_qem_kernel:
+            raise WitnessError(
+                "runner QEM kernel route mismatch: "
+                f"expected {expected_qem_kernel}, got {injection.get('qem_kernel')}"
+            )
         normalized: dict[str, np.ndarray] = {}
         for name, dtype in METAL_ARRAY_DTYPES.items():
             array = np.asarray(metal_arrays.get(name))
@@ -602,6 +705,8 @@ def main() -> int:
         expected_cuda_npz_sha256=args.expected_cuda_npz_sha256,
         expected_source_root=args.expected_source_root,
         expected_source_commit=args.expected_source_commit,
+        rsqrt_lut_npz=args.rsqrt_lut_npz,
+        expected_rsqrt_lut_sha256=args.expected_rsqrt_lut_sha256,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

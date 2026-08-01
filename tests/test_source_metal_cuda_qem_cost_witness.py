@@ -141,9 +141,10 @@ def test_witness_injects_cuda_order_compares_native_arrays_and_reopens_npz(
         np.float32(np.inf),
     )
 
-    def runner(actual_vertices, actual_faces, actual_cuda_arrays):
+    def runner(actual_vertices, actual_faces, actual_cuda_arrays, rsqrt_delta):
         assert np.array_equal(actual_vertices, vertices)
         assert np.array_equal(actual_faces, faces)
+        assert rsqrt_delta is None
         assert np.array_equal(
             actual_cuda_arrays["vert2face"],
             cuda_arrays["vert2face"],
@@ -151,6 +152,7 @@ def test_witness_injects_cuda_order_compares_native_arrays_and_reopens_npz(
         return metal_arrays, {
             "injected_readback_exact": True,
             "segment_multisets_exact": True,
+            "qem_kernel": "metal-native-rsqrt",
         }
 
     report = run_witness(
@@ -222,3 +224,134 @@ def test_witness_rejects_non_cuda_qem_route_before_runner_or_output(tmp_path):
         )
 
     assert not output_npz.exists()
+
+
+def test_witness_records_authenticated_turing_rsqrt_route(tmp_path):
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    input_ply = tmp_path / "input.ply"
+    _write_input(input_ply)
+    cuda_report, cuda_npz = _write_cuda_trace(
+        tmp_path,
+        sha256_file(input_ply),
+    )
+    cuda_arrays = _cuda_arrays()
+    rsqrt_lut = tmp_path / "cuda_rsqrt_result.npz"
+    expected_delta = np.zeros(1 << 24, dtype=np.int8)
+    np.savez_compressed(rsqrt_lut, normalized_delta=expected_delta)
+
+    def runner(_vertices, _faces, _cuda_arrays, rsqrt_delta):
+        assert np.array_equal(rsqrt_delta, expected_delta)
+        return {
+            "qems": cuda_arrays["qems"].copy(),
+            "edge_collapse_costs": cuda_arrays["edge_collapse_costs"].copy(),
+        }, {
+            "injected_readback_exact": True,
+            "segment_multisets_exact": True,
+            "qem_kernel": "turing-rsqrt-lut",
+        }
+
+    report = run_witness(
+        input_ply=input_ply,
+        cuda_report_json=cuda_report,
+        cuda_npz=cuda_npz,
+        output_npz=tmp_path / "metal_qem_cost.npz",
+        report_json=tmp_path / "comparison.json",
+        expected_input_sha256=sha256_file(input_ply),
+        expected_cuda_report_sha256=sha256_file(cuda_report),
+        expected_cuda_npz_sha256=sha256_file(cuda_npz),
+        expected_source_root=source_root,
+        expected_source_commit=SOURCE_COMMIT,
+        rsqrt_lut_npz=rsqrt_lut,
+        expected_rsqrt_lut_sha256=sha256_file(rsqrt_lut),
+        identity_probe=lambda: _identity(source_root),
+        runner=runner,
+    )
+
+    assert report["effective_route"]["qem_kernel"] == "turing-rsqrt-lut"
+    assert report["rsqrt_lut"]["npz_sha256"] == sha256_file(rsqrt_lut)
+    assert report["rsqrt_lut"]["normalized_delta"]["shape"] == [1 << 24]
+    assert report["primary_output_status"] == "validated"
+
+
+def test_witness_rejects_native_kernel_attestation_on_turing_route(tmp_path):
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    input_ply = tmp_path / "input.ply"
+    _write_input(input_ply)
+    cuda_report, cuda_npz = _write_cuda_trace(
+        tmp_path,
+        sha256_file(input_ply),
+    )
+    rsqrt_lut = tmp_path / "cuda_rsqrt_result.npz"
+    np.savez_compressed(
+        rsqrt_lut,
+        normalized_delta=np.zeros(1 << 24, dtype=np.int8),
+    )
+    output_npz = tmp_path / "metal_qem_cost.npz"
+
+    def fallback_runner(*_args):
+        cuda_arrays = _cuda_arrays()
+        return {
+            "qems": cuda_arrays["qems"].copy(),
+            "edge_collapse_costs": cuda_arrays["edge_collapse_costs"].copy(),
+        }, {
+            "injected_readback_exact": True,
+            "segment_multisets_exact": True,
+            "qem_kernel": "metal-native-rsqrt",
+        }
+
+    with pytest.raises(WitnessError, match="runner QEM kernel route mismatch"):
+        run_witness(
+            input_ply=input_ply,
+            cuda_report_json=cuda_report,
+            cuda_npz=cuda_npz,
+            output_npz=output_npz,
+            report_json=tmp_path / "comparison.json",
+            expected_input_sha256=sha256_file(input_ply),
+            expected_cuda_report_sha256=sha256_file(cuda_report),
+            expected_cuda_npz_sha256=sha256_file(cuda_npz),
+            expected_source_root=source_root,
+            expected_source_commit=SOURCE_COMMIT,
+            rsqrt_lut_npz=rsqrt_lut,
+            expected_rsqrt_lut_sha256=sha256_file(rsqrt_lut),
+            identity_probe=lambda: _identity(source_root),
+            runner=fallback_runner,
+        )
+
+    assert not output_npz.exists()
+
+
+def test_witness_rejects_turing_route_without_authenticated_lut_before_runner(
+    tmp_path,
+):
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    input_ply = tmp_path / "input.ply"
+    _write_input(input_ply)
+    cuda_report, cuda_npz = _write_cuda_trace(
+        tmp_path,
+        sha256_file(input_ply),
+    )
+    rsqrt_lut = tmp_path / "cuda_rsqrt_result.npz"
+    np.savez_compressed(
+        rsqrt_lut,
+        normalized_delta=np.zeros(1 << 24, dtype=np.int8),
+    )
+
+    with pytest.raises(WitnessError, match="both be supplied"):
+        run_witness(
+            input_ply=input_ply,
+            cuda_report_json=cuda_report,
+            cuda_npz=cuda_npz,
+            output_npz=tmp_path / "metal_qem_cost.npz",
+            report_json=tmp_path / "comparison.json",
+            expected_input_sha256=sha256_file(input_ply),
+            expected_cuda_report_sha256=sha256_file(cuda_report),
+            expected_cuda_npz_sha256=sha256_file(cuda_npz),
+            expected_source_root=source_root,
+            expected_source_commit=SOURCE_COMMIT,
+            rsqrt_lut_npz=rsqrt_lut,
+            identity_probe=lambda: _identity(source_root),
+            runner=lambda *args: pytest.fail("runner should not execute"),
+        )
