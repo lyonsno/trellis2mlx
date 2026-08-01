@@ -52,6 +52,45 @@ def capture_level3_norm2_width64_candidate(
     }
 
 
+def capture_decoder_terminal_layernorm_candidate(
+    values: mx.array,
+    candidate,
+) -> dict[str, np.ndarray]:
+    """Run a terminal float32 candidate twice and retain exact full values."""
+    if (
+        values.dtype != mx.float16
+        or values.ndim != 2
+        or values.shape[0] == 0
+        or values.shape[1] != 64
+    ):
+        raise ValueError(
+            "terminal LayerNorm candidate requires nonempty float16[N, 64], "
+            f"got dtype={values.dtype}, shape={values.shape}"
+        )
+    first = candidate(values)
+    second = candidate(values)
+    mx.eval(first, second)
+    first_values = np.ascontiguousarray(np.asarray(first))
+    second_values = np.ascontiguousarray(np.asarray(second))
+    if first_values.dtype != np.dtype(np.float32) or first_values.shape != (
+        values.shape
+    ):
+        raise ValueError(
+            "terminal LayerNorm candidate returned an invalid float32 output "
+            "contract"
+        )
+    if not np.isfinite(first_values).all():
+        raise ValueError(
+            "terminal LayerNorm candidate returned non-finite values"
+        )
+    if not np.array_equal(first_values, second_values):
+        raise RuntimeError("terminal LayerNorm candidate replay is nondeterministic")
+    return {
+        "level3_upsample_output": np.ascontiguousarray(np.asarray(values)),
+        "decoder_final_layernorm_candidate": first_values,
+    }
+
+
 def _decoder_output_head(decoder, values: mx.array) -> mx.array:
     if values.dtype != mx.float32:
         raise ValueError(
@@ -82,12 +121,22 @@ def capture_mlx_decoder_level1_trace(
     hash_entry,
     full_hash_entry=None,
     level3_norm2_candidate=None,
+    terminal_layernorm_candidate=None,
 ) -> tuple:
     """Capture exact early-decoder boundaries from an exact parent state."""
     if level3_norm2_candidate is not None and full_hash_entry is None:
         raise ValueError(
             "width-64 norm2 candidate requires full-prefix hash capture"
         )
+    if terminal_layernorm_candidate is not None and full_hash_entry is None:
+        raise ValueError(
+            "terminal LayerNorm candidate requires full-prefix hash capture"
+        )
+    if (
+        level3_norm2_candidate is not None
+        and terminal_layernorm_candidate is not None
+    ):
+        raise ValueError("decoder trace accepts only one focused candidate")
     level0_upsample = [
         block
         for block in decoder.blocks[0]
@@ -747,6 +796,22 @@ def capture_mlx_decoder_level1_trace(
             "level3_upsample_output",
             natural_level3_upsample_output,
         )
+        if terminal_layernorm_candidate is not None:
+            witness = capture_decoder_terminal_layernorm_candidate(
+                natural_level3_upsample_output,
+                terminal_layernorm_candidate,
+            )
+            candidate_entry = full_hash_entry(
+                "decoder_final_layernorm",
+                witness["decoder_final_layernorm_candidate"],
+            )
+            return (
+                trace,
+                hash_entries,
+                full_hash_entries,
+                witness,
+                candidate_entry,
+            )
         decoder_final_layernorm = _layernorm_noaffine(
             natural_level3_upsample_output.astype(mx.float32)
         )

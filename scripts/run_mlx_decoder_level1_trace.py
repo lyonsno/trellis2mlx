@@ -39,12 +39,21 @@ from scripts.decoder_level3_norm2_width64_witness_contract import (
     load_source_width64_contract,
     write_decoder_level3_norm2_width64_witness_npz,
 )
+from scripts.decoder_terminal_layernorm_witness_contract import (
+    WITNESS_SCHEMA as TERMINAL_LAYERNORM_WITNESS_SCHEMA,
+    compare_decoder_terminal_layernorm_witness,
+    load_source_terminal_layernorm_contract,
+    write_decoder_terminal_layernorm_witness_npz,
+)
 
 
 SCHEMA = "trellis2mlx.decoder_level1_trace_run.v1"
 ROUTE = "mlx-shape-decoder-level1-trace"
 WIDTH64_WITNESS_ROUTE = (
     "mlx-shape-decoder-level3-norm2-width64-witness"
+)
+TERMINAL_LAYERNORM_WITNESS_ROUTE = (
+    "mlx-shape-decoder-terminal-layernorm-witness"
 )
 
 
@@ -71,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Stop at the final-upsample width-64 norm2 candidate after "
             "proving the exact source-CUDA prefix"
+        ),
+    )
+    mode.add_argument(
+        "--terminal-layernorm-witness",
+        action="store_true",
+        help=(
+            "Stop after a float32 terminal LayerNorm candidate over the "
+            "source-exact final-upsample parent"
         ),
     )
     parser.add_argument("--source-full-ledger-report", type=Path)
@@ -232,7 +249,15 @@ def main(argv: list[str] | None = None) -> int:
     route = (
         WIDTH64_WITNESS_ROUTE
         if args.level3_norm2_width64_witness
-        else ROUTE
+        else (
+            TERMINAL_LAYERNORM_WITNESS_ROUTE
+            if args.terminal_layernorm_witness
+            else ROUTE
+        )
+    )
+    focused_witness = (
+        args.level3_norm2_width64_witness
+        or args.terminal_layernorm_witness
     )
     effective_report_path = args.output_json
     report: dict[str, Any] = {
@@ -257,13 +282,18 @@ def main(argv: list[str] | None = None) -> int:
             "level3_norm2_width64_witness": (
                 args.level3_norm2_width64_witness
             ),
+            "terminal_layernorm_witness": args.terminal_layernorm_witness,
             "candidate_layernorm_backend": (
-                "direct-cuda-welford-turing-t4-unenrolled"
-                if args.level3_norm2_width64_witness
-                else None
+                "direct-cuda-welford-turing-t4-float32-unenrolled"
+                if args.terminal_layernorm_witness
+                else (
+                    "direct-cuda-welford-turing-t4-unenrolled"
+                    if args.level3_norm2_width64_witness
+                    else None
+                )
             ),
             "candidate_production_enrollment": (
-                False if args.level3_norm2_width64_witness else None
+                False if focused_witness else None
             ),
         },
         "effective_route": None,
@@ -308,19 +338,19 @@ def main(argv: list[str] | None = None) -> int:
             args.source_full_ledger_report,
             args.expected_source_full_ledger_report_sha256,
         )
-        if args.level3_norm2_width64_witness and any(
+        if focused_witness and any(
             value is None for value in source_report_args
         ):
             raise ValueError(
-                "width-64 witness requires a source full-ledger report and "
+                "focused witness requires a source full-ledger report and "
                 "its expected SHA256"
             )
-        if not args.level3_norm2_width64_witness and any(
+        if not focused_witness and any(
             value is not None for value in source_report_args
         ):
             raise ValueError(
                 "source full-ledger report arguments are valid only for "
-                "the width-64 witness"
+                "a focused decoder witness"
             )
         for value, label in (
             (
@@ -338,8 +368,8 @@ def main(argv: list[str] | None = None) -> int:
             ),
         ):
             _validate_digest(value, label)
-        source_width64_contract = None
-        if args.level3_norm2_width64_witness:
+        source_witness_contract = None
+        if focused_witness:
             _validate_digest(
                 args.expected_source_full_ledger_report_sha256,
                 "--expected-source-full-ledger-report-sha256",
@@ -349,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
                 != CANONICAL_SOURCE_REPORT_SHA256
             ):
                 raise ValueError(
-                    "width-64 witness requires canonical source report "
+                    "focused witness requires canonical source report "
                     f"SHA256 {CANONICAL_SOURCE_REPORT_SHA256}"
                 )
             if not args.source_full_ledger_report.is_file():
@@ -371,13 +401,16 @@ def main(argv: list[str] | None = None) -> int:
                     f"actual={source_report_sha}"
                 )
             with args.source_full_ledger_report.open() as handle:
-                source_width64_contract = load_source_width64_contract(
-                    json.load(handle)
-                )
+                source_report = json.load(handle)
+            source_witness_contract = (
+                load_source_width64_contract(source_report)
+                if args.level3_norm2_width64_witness
+                else load_source_terminal_layernorm_contract(source_report)
+            )
             report["source_full_ledger_report"] = {
                 "path": str(args.source_full_ledger_report.resolve()),
                 "sha256": source_report_sha,
-                **source_width64_contract,
+                **source_witness_contract,
             }
         report["last_trustworthy_phase"] = phase
 
@@ -443,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
             configure_decoder_layernorm_backend,
             decoder_layernorm_backend_identity,
             turing_layernorm_noaffine_fp16,
+            turing_layernorm_noaffine_fp32_width64,
         )
         from trellmlx.decoder_turing_silu import (
             CUDA_TURING_T4_LUT_BACKEND,
@@ -499,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
             "level3_norm2_width64_witness": (
                 args.level3_norm2_width64_witness
             ),
+            "terminal_layernorm_witness": args.terminal_layernorm_witness,
         }
         if args.level3_norm2_width64_witness:
             effective_route["candidate"] = {
@@ -507,6 +542,19 @@ def main(argv: list[str] | None = None) -> int:
                 "hidden_width": 64,
                 "affine": False,
                 "eps": 1e-6,
+                "production_enrollment": False,
+                "double_execution_required": True,
+                "downstream_tail_executed": False,
+            }
+        if args.terminal_layernorm_witness:
+            effective_route["candidate"] = {
+                "boundary": "decoder_final_layernorm",
+                "backend": "direct-cuda-welford-turing-t4-float32-unenrolled",
+                "input_dtype": "float32",
+                "output_dtype": "float32",
+                "hidden_width": 64,
+                "affine": False,
+                "eps": 1e-5,
                 "production_enrollment": False,
                 "double_execution_required": True,
                 "downstream_tail_executed": False,
@@ -540,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         width64_candidate = None
+        terminal_candidate = None
         if args.level3_norm2_width64_witness:
             correction_lut = mx.array(turing_rsqrt_lut)
 
@@ -548,6 +597,15 @@ def main(argv: list[str] | None = None) -> int:
                     values,
                     correction_lut,
                     1e-6,
+                )
+        if args.terminal_layernorm_witness:
+            correction_lut = mx.array(turing_rsqrt_lut)
+
+            def terminal_candidate(values):
+                return turing_layernorm_noaffine_fp32_width64(
+                    values.astype(mx.float32),
+                    correction_lut,
+                    1e-5,
                 )
 
         trace_result = capture_mlx_decoder_level1_trace(
@@ -559,13 +617,14 @@ def main(argv: list[str] | None = None) -> int:
                 decoder_full_hash_entry
                 if (
                     args.full_decoder_hash_ledger
-                    or args.level3_norm2_width64_witness
+                    or focused_witness
                 )
                 else None
             ),
             level3_norm2_candidate=width64_candidate,
+            terminal_layernorm_candidate=terminal_candidate,
         )
-        if args.level3_norm2_width64_witness:
+        if focused_witness:
             (
                 arrays,
                 hash_entries,
@@ -573,10 +632,18 @@ def main(argv: list[str] | None = None) -> int:
                 witness_arrays,
                 candidate_entry,
             ) = trace_result
-            comparison = compare_decoder_level3_norm2_width64_witness(
-                source_width64_contract["full_decoder_hash_ledger"],
-                full_prefix_entries,
-                candidate_entry,
+            comparison = (
+                compare_decoder_level3_norm2_width64_witness(
+                    source_witness_contract["full_decoder_hash_ledger"],
+                    full_prefix_entries,
+                    candidate_entry,
+                )
+                if args.level3_norm2_width64_witness
+                else compare_decoder_terminal_layernorm_witness(
+                    source_witness_contract["full_decoder_hash_ledger"],
+                    full_prefix_entries,
+                    candidate_entry,
+                )
             )
             full_hash_ledger = None
         elif args.full_decoder_hash_ledger:
@@ -603,6 +670,11 @@ def main(argv: list[str] | None = None) -> int:
                     witness_arrays,
                 )
             )
+        elif args.terminal_layernorm_witness:
+            validation = write_decoder_terminal_layernorm_witness_npz(
+                args.output_npz,
+                witness_arrays,
+            )
         else:
             validation = write_decoder_level1_trace_npz(
                 args.output_npz,
@@ -627,6 +699,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             report["primary"]["candidate_hash_entry"] = candidate_entry
             report["width64_witness_comparison"] = comparison
+        if args.terminal_layernorm_witness:
+            report["primary"]["schema"] = TERMINAL_LAYERNORM_WITNESS_SCHEMA
+            report["primary"]["full_prefix_hash_entries"] = (
+                full_prefix_entries
+            )
+            report["primary"]["candidate_hash_entry"] = candidate_entry
+            report["terminal_layernorm_witness_comparison"] = comparison
         if full_hash_ledger is not None:
             report["primary"][
                 "full_decoder_hash_ledger"

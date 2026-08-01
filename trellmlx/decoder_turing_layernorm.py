@@ -28,6 +28,7 @@ _affine_kernel = None
 _affine_stats_kernel = None
 _noaffine_kernel = None
 _noaffine_stats_kernel = None
+_noaffine_float32_width64_kernel = None
 
 
 def configure_decoder_layernorm_backend(
@@ -456,6 +457,46 @@ def turing_layernorm_noaffine_fp16_with_stats(
     )
 
 
+def turing_layernorm_noaffine_fp32_width64(
+    x: mx.array,
+    rsqrt_delta_lut: mx.array,
+    eps: float = 1e-5,
+) -> mx.array:
+    """Evaluate the terminal PyTorch CUDA float32 width-64 candidate."""
+    global _noaffine_float32_width64_kernel
+    if x.dtype != mx.float32:
+        raise ValueError(
+            "Turing terminal decoder LayerNorm requires float32 input, "
+            f"got {x.dtype}"
+        )
+    if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] != 64:
+        raise ValueError(
+            "Turing terminal decoder LayerNorm requires nonempty 2D "
+            f"width 64 input, got shape {x.shape}"
+        )
+    _validate_turing_rsqrt_lut(rsqrt_delta_lut)
+    if _noaffine_float32_width64_kernel is None:
+        _noaffine_float32_width64_kernel = _build_kernel(
+            affine=False,
+            include_stats=False,
+            kernel_dtype="float32",
+        )
+    rows = x.shape[0]
+    return _noaffine_float32_width64_kernel(
+        inputs=[
+            x,
+            mx.array([eps], dtype=mx.float32),
+            rsqrt_delta_lut,
+            mx.array([64], dtype=mx.uint32),
+        ],
+        template=[("T", mx.float32)],
+        grid=(32, 4, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def _run_affine_kernel(
     kernel,
     x: mx.array,
@@ -532,7 +573,17 @@ def _build_noaffine_kernel(*, include_stats: bool):
     return _build_kernel(affine=False, include_stats=include_stats)
 
 
-def _build_kernel(*, affine: bool, include_stats: bool):
+def _build_kernel(
+    *,
+    affine: bool,
+    include_stats: bool,
+    kernel_dtype: str = "float16",
+):
+    if kernel_dtype not in {"float16", "float32"}:
+        raise ValueError(
+            "unsupported decoder LayerNorm kernel dtype "
+            f"{kernel_dtype}"
+        )
     header = r"""
         struct WelfordDataDecoder {
             float mean;
@@ -711,11 +762,12 @@ def _build_kernel(*, affine: bool, include_stats: bool):
     if affine:
         input_names.extend(("weight", "bias"))
     input_names.extend(("rsqrt_delta", "width"))
+    dtype_name = "f16" if kernel_dtype == "float16" else "f32"
     return mx.fast.metal_kernel(
         name=(
-            f"decoder_turing_welford_layernorm_f16_{route}_stats"
+            f"decoder_turing_welford_layernorm_{dtype_name}_{route}_stats"
             if include_stats
-            else f"decoder_turing_welford_layernorm_f16_{route}"
+            else f"decoder_turing_welford_layernorm_{dtype_name}_{route}"
         ),
         input_names=input_names,
         output_names=output_names,
