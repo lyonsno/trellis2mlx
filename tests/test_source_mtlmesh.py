@@ -47,7 +47,7 @@ def test_source_native_simplify_can_run_in_reference_python_subprocess(monkeypat
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
     assert cmd[-2:] == ["1", "/ref/mtlmesh"]
-    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+    assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
 
 
 def test_source_native_orient_can_run_in_reference_python_subprocess(monkeypatch):
@@ -90,7 +90,7 @@ def test_source_native_orient_can_run_in_reference_python_subprocess(monkeypatch
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
     assert cmd[-1] == "/ref/mtlmesh"
-    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+    assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
 
 
 def test_source_native_cleanup_can_run_in_reference_python_subprocess(monkeypatch):
@@ -131,7 +131,7 @@ def test_source_native_cleanup_can_run_in_reference_python_subprocess(monkeypatc
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
     assert cmd[-1] == "/ref/mtlmesh"
-    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+    assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
 
 
 def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkeypatch):
@@ -177,7 +177,7 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
     assert cmd[-2:] == ["1", "/ref/mtlmesh"]
-    assert "/private/tmp/trellis2mlx-trellis-winding-source-successor-0706" in env["PYTHONPATH"]
+    assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
 
 
 def test_source_native_subprocess_failure_names_reference_python(monkeypatch):
@@ -465,3 +465,99 @@ def test_source_native_postprocess_uses_one_mesh_object_and_records_trace(monkey
     ]
     assert trace[1]["simplifier_route"] == "high_level_simplify"
     assert trace[3]["simplifier_route"] == "high_level_simplify"
+
+
+def test_source_native_postprocess_exposes_every_release_geometry_stage(monkeypatch):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        def __init__(self):
+            self.num_faces = 10
+
+        def init(self, vertices, faces):
+            pass
+
+        def simplify(self, target_faces, *, verbose=False, options=None):
+            self.num_faces = 6 if target_faces == 9 else 3
+
+        def remove_duplicate_faces(self):
+            pass
+
+        def repair_non_manifold_edges(self):
+            pass
+
+        def remove_small_connected_components(self, min_area):
+            pass
+
+        def fill_holes(self, max_hole_perimeter):
+            pass
+
+        def unify_face_orientations(self):
+            pass
+
+        def read(self):
+            return (
+                np.zeros((4, 3), dtype=np.float32),
+                np.zeros((self.num_faces, 3), dtype=np.int32),
+            )
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(source_mtlmesh, "_load_source_mesh_class", lambda **kwargs: FakeMesh)
+    stages = []
+
+    source_mtlmesh.postprocess_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((10, 3), dtype=np.int32),
+        3,
+        verbose=False,
+        stage_callback=lambda operation, input_faces, output_faces, details, vertices, faces: stages.append(
+            (operation, input_faces, output_faces, details, vertices, faces)
+        ),
+    )
+
+    assert [stage[0] for stage in stages] == [
+        "prefill_holes",
+        "simplify_coarse",
+        "remove_duplicate_faces_initial",
+        "repair_non_manifold_edges_initial",
+        "remove_small_connected_components_initial",
+        "fill_holes_initial",
+        "simplify_final",
+        "remove_duplicate_faces_final",
+        "repair_non_manifold_edges_final",
+        "remove_small_connected_components_final",
+        "fill_holes_final",
+        "unify_face_orientations",
+    ]
+    assert stages[0][1:3] == (10, 10)
+    assert stages[1][1:3] == (10, 6)
+    assert stages[1][3]["requested_target_faces"] == 9
+    assert stages[6][1:3] == (6, 3)
+    assert stages[6][3]["requested_target_faces"] == 3
+    assert all(stage[4].shape == (4, 3) for stage in stages)
+    assert [stage[5].shape for stage in stages] == [
+        (10, 3),
+        (6, 3),
+        (6, 3),
+        (6, 3),
+        (6, 3),
+        (6, 3),
+        (3, 3),
+        (3, 3),
+        (3, 3),
+        (3, 3),
+        (3, 3),
+        (3, 3),
+    ]

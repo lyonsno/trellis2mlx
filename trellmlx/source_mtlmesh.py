@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import importlib
 import os
 from pathlib import Path
@@ -688,9 +689,19 @@ def postprocess_source_native(
     thresh: float = 1e-8,
     expected_source_root: str | Path | None = None,
     reference_python: str | Path | None = None,
+    stage_callback: Callable[
+        [str, int, int, dict, np.ndarray, np.ndarray],
+        None,
+    ]
+    | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Run source-native simplify/cleanup/orientation in one mesh object."""
     if reference_python is not None:
+        if stage_callback is not None:
+            raise ValueError(
+                "stage_callback requires direct source-native execution; "
+                "launch this function with the reference Python instead"
+            )
         return _run_source_native_postprocess_subprocess(
             vertices,
             faces,
@@ -715,8 +726,36 @@ def postprocess_source_native(
     mesh.init(verts_t, faces_t)
     trace: list[dict] = []
 
+    def emit_stage(
+        operation: str,
+        input_faces: int,
+        details: dict | None = None,
+    ) -> None:
+        if stage_callback is None:
+            return
+        stage_vertices, stage_faces = _read_source_mesh(mesh)
+        output_faces = _mesh_face_count(mesh)
+        if len(stage_faces) != output_faces:
+            raise RuntimeError(
+                f"{operation} readback has {len(stage_faces)} faces, "
+                f"but source mesh reports {output_faces}"
+            )
+        stage_callback(
+            operation,
+            int(input_faces),
+            int(output_faces),
+            details or {},
+            stage_vertices,
+            stage_faces,
+        )
+
     input_faces = _mesh_face_count(mesh)
     mesh.fill_holes(max_hole_perimeter=3e-2)
+    emit_stage(
+        "prefill_holes",
+        input_faces,
+        {"max_hole_perimeter": 3e-2},
+    )
     trace.append({
         "operation": "prefill_holes_source_native",
         "input_faces": int(input_faces),
@@ -724,62 +763,109 @@ def postprocess_source_native(
     })
 
     coarse_target = int(target_faces) * 3
-    if _mesh_face_count(mesh) > coarse_target:
-        input_faces = _mesh_face_count(mesh)
-        simplify_trace = _simplify_source_mesh(
-            mesh,
-            coarse_target,
-            verbose=verbose,
-            lambda_edge_length=float(lambda_edge_length),
-            lambda_skinny=float(lambda_skinny),
-            thresh=float(thresh),
-        )
-        trace.append({
-            "operation": "simplify_coarse_source_native_qem",
-            "input_faces": int(input_faces),
-            "requested_target_faces": int(coarse_target),
-            "output_faces": int(_mesh_face_count(mesh)),
-            **simplify_trace,
-        })
-
     input_faces = _mesh_face_count(mesh)
-    _cleanup_source_mesh(mesh)
+    simplify_trace = _simplify_source_mesh(
+        mesh,
+        coarse_target,
+        verbose=verbose,
+        lambda_edge_length=float(lambda_edge_length),
+        lambda_skinny=float(lambda_skinny),
+        thresh=float(thresh),
+    )
+    simplify_details = {
+        "requested_target_faces": int(coarse_target),
+        **simplify_trace,
+    }
+    emit_stage("simplify_coarse", input_faces, simplify_details)
+    trace.append({
+        "operation": "simplify_coarse_source_native_qem",
+        "input_faces": int(input_faces),
+        "requested_target_faces": int(coarse_target),
+        "output_faces": int(_mesh_face_count(mesh)),
+        **simplify_trace,
+    })
+
+    cleanup_input_faces = _mesh_face_count(mesh)
+    input_faces = _mesh_face_count(mesh)
+    mesh.remove_duplicate_faces()
+    emit_stage("remove_duplicate_faces_initial", input_faces)
+    input_faces = _mesh_face_count(mesh)
+    mesh.repair_non_manifold_edges()
+    emit_stage("repair_non_manifold_edges_initial", input_faces)
+    input_faces = _mesh_face_count(mesh)
+    mesh.remove_small_connected_components(1e-5)
+    emit_stage(
+        "remove_small_connected_components_initial",
+        input_faces,
+        {"threshold": 1e-5},
+    )
+    input_faces = _mesh_face_count(mesh)
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+    emit_stage(
+        "fill_holes_initial",
+        input_faces,
+        {"max_hole_perimeter": 3e-2},
+    )
     trace.append({
         "operation": "cleanup_initial_source_native",
-        "input_faces": int(input_faces),
+        "input_faces": int(cleanup_input_faces),
         "output_faces": int(_mesh_face_count(mesh)),
         "do_fix_normals": False,
     })
 
-    if _mesh_face_count(mesh) > int(target_faces):
-        input_faces = _mesh_face_count(mesh)
-        simplify_trace = _simplify_source_mesh(
-            mesh,
-            int(target_faces),
-            verbose=verbose,
-            lambda_edge_length=float(lambda_edge_length),
-            lambda_skinny=float(lambda_skinny),
-            thresh=float(thresh),
-        )
-        trace.append({
-            "operation": "simplify_final_source_native_qem",
-            "input_faces": int(input_faces),
-            "requested_target_faces": int(target_faces),
-            "output_faces": int(_mesh_face_count(mesh)),
-            **simplify_trace,
-        })
-
     input_faces = _mesh_face_count(mesh)
-    _cleanup_source_mesh(mesh)
+    simplify_trace = _simplify_source_mesh(
+        mesh,
+        int(target_faces),
+        verbose=verbose,
+        lambda_edge_length=float(lambda_edge_length),
+        lambda_skinny=float(lambda_skinny),
+        thresh=float(thresh),
+    )
+    simplify_details = {
+        "requested_target_faces": int(target_faces),
+        **simplify_trace,
+    }
+    emit_stage("simplify_final", input_faces, simplify_details)
+    trace.append({
+        "operation": "simplify_final_source_native_qem",
+        "input_faces": int(input_faces),
+        "requested_target_faces": int(target_faces),
+        "output_faces": int(_mesh_face_count(mesh)),
+        **simplify_trace,
+    })
+
+    cleanup_input_faces = _mesh_face_count(mesh)
+    input_faces = _mesh_face_count(mesh)
+    mesh.remove_duplicate_faces()
+    emit_stage("remove_duplicate_faces_final", input_faces)
+    input_faces = _mesh_face_count(mesh)
+    mesh.repair_non_manifold_edges()
+    emit_stage("repair_non_manifold_edges_final", input_faces)
+    input_faces = _mesh_face_count(mesh)
+    mesh.remove_small_connected_components(1e-5)
+    emit_stage(
+        "remove_small_connected_components_final",
+        input_faces,
+        {"threshold": 1e-5},
+    )
+    input_faces = _mesh_face_count(mesh)
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+    emit_stage(
+        "fill_holes_final",
+        input_faces,
+        {"max_hole_perimeter": 3e-2},
+    )
     trace.append({
         "operation": "cleanup_final_source_native",
-        "input_faces": int(input_faces),
+        "input_faces": int(cleanup_input_faces),
         "output_faces": int(_mesh_face_count(mesh)),
         "do_fix_normals": False,
     })
 
     input_faces = _mesh_face_count(mesh)
     mesh.unify_face_orientations()
+    emit_stage("unify_face_orientations", input_faces)
     trace.append({
         "operation": "orient_faces_source_native",
         "input_faces": int(input_faces),

@@ -1,0 +1,156 @@
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+import scripts.source_cuda_cumesh_qem_cost_witness as witness_module
+from scripts.source_cuda_cumesh_postprocess_witness import (
+    WitnessError,
+    sha256_file,
+    write_binary_ply,
+)
+from scripts.source_cuda_cumesh_qem_cost_witness import run_witness
+
+
+def _write_input(path: Path) -> None:
+    write_binary_ply(
+        path,
+        np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        ),
+        np.array([[0, 1, 2], [0, 2, 1]], dtype=np.int32),
+    )
+
+
+def _runtime(patch_sha256: str):
+    return SimpleNamespace(
+        effective_route={
+            "trellis_commit": "5565d240c4a494caaf9ece7a554542b76ffa36d3",
+            "trellis_postprocess_sha256": (
+                "ef51a1ba0f2748ffb4c265b47d382cee956f23c6a52d0f3587e6d8beccb7e54a"
+            ),
+            "trellis_source_clean": True,
+            "cumesh_commit": "c4ad6125924fcedfd13f0bd61520ca2d24eb7a87",
+            "cumesh_source_clean_before_build": True,
+            "cuda_available": True,
+            "cuda_device_name": "Tesla T4",
+            "cuda_capability": [7, 5],
+            "device_type": "cuda",
+            "cumesh_instrumentation": {
+                "schema": "trellis2mlx.cumesh_qem_cost_instrumentation.v1",
+                "patch_sha256": patch_sha256,
+                "changed_files": [
+                    "cumesh/cumesh.py",
+                    "src/cumesh.h",
+                    "src/ext.cpp",
+                    "src/simplify.cu",
+                ],
+            },
+        }
+    )
+
+
+def _arrays() -> dict[str, np.ndarray]:
+    return {
+        "vert2face": np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
+        "qems": np.arange(30, dtype=np.float32).reshape(3, 10),
+        "edge_collapse_costs": np.array([0.25, np.inf, 0.5], dtype=np.float32),
+    }
+
+
+def test_qem_cost_witness_records_instrumented_t4_route_and_reopens_npz(tmp_path):
+    input_ply = tmp_path / "input.ply"
+    patch = tmp_path / "trace.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    patch.write_text("instrumentation patch\n")
+    patch_sha256 = sha256_file(patch)
+
+    report = run_witness(
+        input_ply=input_ply,
+        instrumentation_patch=patch,
+        output_npz=output_npz,
+        output_json=output_json,
+        expected_input_sha256=sha256_file(input_ply),
+        expected_patch_sha256=patch_sha256,
+        work_dir=tmp_path / "build",
+        runtime_factory=lambda **kwargs: _runtime(patch_sha256),
+        collector=lambda runtime, vertices, faces: _arrays(),
+    )
+
+    assert report["status"] == "done"
+    assert report["effective_route"]["cuda_device_name"] == "Tesla T4"
+    assert (
+        report["effective_route"]["cumesh_instrumentation"]["patch_sha256"]
+        == patch_sha256
+    )
+    assert report["arrays"]["qems"]["shape"] == [3, 10]
+    assert report["arrays"]["edge_collapse_costs"]["nonfinite"] == 1
+    with np.load(output_npz, allow_pickle=False) as archive:
+        for name, expected in _arrays().items():
+            assert np.array_equal(archive[name], expected, equal_nan=True)
+    assert json.loads(output_json.read_text()) == report
+
+
+def test_qem_cost_witness_rejects_substituted_patch_before_runtime(tmp_path):
+    input_ply = tmp_path / "input.ply"
+    patch = tmp_path / "trace.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    patch.write_text("substituted\n")
+
+    with pytest.raises(WitnessError, match="instrumentation patch SHA256"):
+        run_witness(
+            input_ply=input_ply,
+            instrumentation_patch=patch,
+            output_npz=output_npz,
+            output_json=output_json,
+            expected_input_sha256=sha256_file(input_ply),
+            expected_patch_sha256="a" * 64,
+            work_dir=tmp_path / "build",
+            runtime_factory=lambda **kwargs: pytest.fail(
+                "runtime should not be created"
+            ),
+            collector=lambda *args: pytest.fail("collector should not run"),
+        )
+
+    report = json.loads(output_json.read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "patch_validation"
+    assert report["primary_output_status"] == "not_started"
+    assert not output_npz.exists()
+
+
+def test_instrumentation_callback_resolves_patch_before_git_changes_directory(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, report):
+        commands.append(command)
+        stdout = ""
+        if "status" in command:
+            stdout = "".join(
+                f" M {name}\n"
+                for name in witness_module.INSTRUMENTED_FILES
+            )
+        return SimpleNamespace(stdout=stdout)
+
+    monkeypatch.setattr(witness_module, "_run", fake_run)
+    callback = witness_module._instrumentation_callback(
+        Path("cumesh-qem-cost-trace.patch"),
+        "a" * 64,
+    )
+
+    callback(tmp_path / "CuMesh", {"setup_commands": []})
+
+    assert commands[0][-1] == str(
+        (tmp_path / "cumesh-qem-cost-trace.patch").resolve()
+    )
