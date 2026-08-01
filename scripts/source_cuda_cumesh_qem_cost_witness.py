@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-patch-sha256", required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--component-trace", action="store_true")
+    parser.add_argument("--allow-masked-attribution", action="store_true")
     return parser
 
 
@@ -264,6 +265,7 @@ def run_witness(
     expected_patch_sha256: str,
     work_dir: Path,
     component_trace: bool = False,
+    allow_masked_attribution: bool = False,
     runtime_factory: Callable[..., Any] | None = None,
     collector: Callable[[Any, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     | None = None,
@@ -298,12 +300,14 @@ def run_witness(
             "cumesh_commit": CUMESH_COMMIT,
             "geometry_route": geometry_route,
             "target_faces": 1,
+            "allow_masked_attribution": allow_masked_attribution,
         },
         "effective_route": None,
         "input_mesh": None,
         "instrumentation_patch": None,
         "arrays": None,
         "backend_self_consistency": None,
+        "component_attribution": None,
         "output_npz": None,
         "runtime_cleanup": None,
         "elapsed_seconds": None,
@@ -323,6 +327,10 @@ def run_witness(
                 raise WitnessError(message)
         if output_npz.suffix != ".npz":
             raise WitnessError("--output-npz must end in .npz")
+        if allow_masked_attribution and not component_trace:
+            raise WitnessError(
+                "--allow-masked-attribution requires --component-trace"
+            )
         if not HEX_SHA256.fullmatch(expected_input_sha256):
             raise WitnessError(
                 "--expected-input-sha256 must be 64 lowercase hex characters"
@@ -433,7 +441,24 @@ def run_witness(
             phase = "backend_self_consistency"
             self_consistency = _component_self_consistency(arrays)
             report["backend_self_consistency"] = self_consistency
-            if not self_consistency["bit_exact"]:
+            report["component_attribution"] = {
+                "global_admitted": self_consistency["bit_exact"],
+                "masked_admitted": (
+                    allow_masked_attribution
+                    and not self_consistency["bit_exact"]
+                ),
+                "rejected_edge_count": self_consistency[
+                    "bit_mismatch_count"
+                ],
+                "mask_predicate": (
+                    "component_edge_collapse_costs bits equal "
+                    "edge_collapse_costs bits"
+                ),
+            }
+            if (
+                not self_consistency["bit_exact"]
+                and not allow_masked_attribution
+            ):
                 raise WitnessError(
                     "CUDA component total differs from the ordinary edge-cost "
                     f"kernel at {self_consistency['bit_mismatch_count']} edges"
@@ -515,6 +540,7 @@ def main() -> int:
         expected_patch_sha256=args.expected_patch_sha256,
         work_dir=args.work_dir,
         component_trace=args.component_trace,
+        allow_masked_attribution=args.allow_masked_attribution,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

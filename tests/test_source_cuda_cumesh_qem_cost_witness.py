@@ -216,6 +216,54 @@ def test_component_witness_records_self_consistent_arrays(tmp_path):
         assert set(archive.files) == set(_component_arrays())
 
 
+def test_component_witness_can_preserve_explicitly_masked_non_global_trace(
+    tmp_path,
+):
+    input_ply = tmp_path / "input.ply"
+    patch = tmp_path / "trace.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    patch.write_text("component instrumentation patch\n")
+    patch_sha256 = sha256_file(patch)
+    arrays = _component_arrays()
+    arrays["component_edge_collapse_costs"][0] = np.nextafter(
+        arrays["component_edge_collapse_costs"][0],
+        np.float32(np.inf),
+    )
+
+    report = run_witness(
+        input_ply=input_ply,
+        instrumentation_patch=patch,
+        output_npz=output_npz,
+        output_json=output_json,
+        expected_input_sha256=sha256_file(input_ply),
+        expected_patch_sha256=patch_sha256,
+        work_dir=tmp_path / "build",
+        component_trace=True,
+        allow_masked_attribution=True,
+        runtime_factory=lambda **kwargs: _runtime(
+            patch_sha256,
+            "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2",
+        ),
+        collector=lambda runtime, vertices, faces: arrays,
+    )
+
+    assert report["status"] == "done"
+    assert report["backend_self_consistency"]["bit_exact"] is False
+    assert report["component_attribution"] == {
+        "global_admitted": False,
+        "masked_admitted": True,
+        "rejected_edge_count": 1,
+        "mask_predicate": (
+            "component_edge_collapse_costs bits equal "
+            "edge_collapse_costs bits"
+        ),
+    }
+    assert report["primary_output_status"] == "validated"
+    assert output_npz.is_file()
+
+
 def test_instrumentation_callback_resolves_patch_before_git_changes_directory(
     tmp_path,
     monkeypatch,
