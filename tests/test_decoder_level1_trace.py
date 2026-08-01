@@ -716,6 +716,32 @@ def test_full_decoder_comparator_rejects_missing_width128_affine_contract(
         )
 
 
+def test_full_decoder_comparator_rejects_missing_width64_nonaffine_contract(
+    tmp_path,
+):
+    from scripts.compare_decoder_full_hash_ledgers import (
+        compare_decoder_full_hash_reports,
+    )
+
+    source_path, source_report, local_path, local_report = (
+        _write_full_decoder_comparison_inputs(tmp_path)
+    )
+    report = json.loads(local_report.read_text())
+    contracts = report["effective_route"]["decoder_layernorm"][
+        "authenticated_contracts"
+    ]
+    contracts.pop()
+    local_report.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="width-64 non-affine"):
+        compare_decoder_full_hash_reports(
+            source_path=source_path,
+            source_report_path=source_report,
+            local_path=local_path,
+            local_report_path=local_report,
+        )
+
+
 def test_full_decoder_comparator_rejects_detached_self_consistent_parent(
     tmp_path,
 ):
@@ -997,6 +1023,21 @@ def _exact_layernorm_route(lut):
                         "accumulator_dtype": "float32",
                     },
                 },
+                {
+                    "input_dtype": "float16",
+                    "hidden_width": 64,
+                    "affine": False,
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "active_values_per_thread": 4,
+                        "average_values_per_launched_thread": 0.5,
+                        "active_vector_threads": 16,
+                        "inactive_vector_threads": 112,
+                        "accumulator_dtype": "float32",
+                    },
+                },
             ],
             "reduction": {
                 "threads": 128,
@@ -1055,9 +1096,13 @@ def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
 
 @pytest.mark.parametrize(
     ("contract_index", "contract_kind"),
-    [(5, "affine"), (6, "non-affine")],
+    [
+        (5, "width-128 affine"),
+        (6, "width-128 non-affine"),
+        (7, "width-64 non-affine"),
+    ],
 )
-def test_level1_comparator_rejects_missing_width128_layernorm_contract(
+def test_level1_comparator_rejects_missing_late_layernorm_contract(
     tmp_path,
     contract_index,
     contract_kind,
@@ -1083,7 +1128,7 @@ def test_level1_comparator_rejects_missing_width128_layernorm_contract(
 
     with pytest.raises(
         ValueError,
-        match="width-128 affine or non-affine contract",
+        match="width-64 non-affine contract",
     ):
         compare_level1_traces(
             source_path=source_path,

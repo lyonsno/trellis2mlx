@@ -196,6 +196,21 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
                 "accumulator_dtype": "float32",
             },
         },
+        {
+            "input_dtype": "float16",
+            "hidden_width": 64,
+            "affine": False,
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "active_values_per_thread": 4,
+                "average_values_per_launched_thread": 0.5,
+                "active_vector_threads": 16,
+                "inactive_vector_threads": 112,
+                "accumulator_dtype": "float32",
+            },
+        },
     ]
     assert identity["turing_rsqrt_lut_artifact_sha256_attested"] == artifact_sha256
     assert identity["turing_rsqrt_lut_content_sha256"] == hashlib.sha256(
@@ -361,6 +376,45 @@ def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width128(
         "eps": 1e-6,
     }
     np.testing.assert_array_equal(np.asarray(actual), np.full((3, 128), 5))
+
+
+def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width64(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+
+    called = {}
+
+    def fake_turing_noaffine(x, correction, eps):
+        called["shape"] = x.shape
+        called["correction_shape"] = correction.shape
+        called["eps"] = eps
+        return mx.full(x.shape, 5, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "turing_layernorm_noaffine_fp16",
+        fake_turing_noaffine,
+    )
+    decoder_layernorm.configure_decoder_layernorm_backend(
+        decoder_layernorm.CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=_fixture_correction_lut(),
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
+    )
+
+    actual = decoder_layernorm.layernorm_noaffine(
+        mx.zeros((3, 64), dtype=mx.float16),
+    )
+    mx.eval(actual)
+
+    assert called == {
+        "shape": (3, 64),
+        "correction_shape": (1 << 24,),
+        "eps": 1e-6,
+    }
+    np.testing.assert_array_equal(np.asarray(actual), np.full((3, 64), 5))
 
 
 def test_turing_decoder_affine_dispatch_accepts_authenticated_width256(
@@ -570,6 +624,7 @@ def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width128():
     assert all(block.norm.decoder_layernorm is True for block in level3_blocks)
     assert len(level3_upsample) == 1
     assert level3_upsample[0].norm1.decoder_layernorm is True
+    assert level3_upsample[0].norm2.decoder_layernorm is True
     assert all(
         block.norm.decoder_layernorm is False for block in texture_level3_blocks
     )
@@ -579,6 +634,7 @@ def test_shape_decoder_exact_layernorm_enrollment_includes_shape_width128():
     assert texture_level2_upsample[0].norm2.decoder_layernorm is False
     assert len(texture_level3_upsample) == 1
     assert texture_level3_upsample[0].norm1.decoder_layernorm is False
+    assert texture_level3_upsample[0].norm2.decoder_layernorm is False
 
 
 def test_turing_decoder_layernorm_rejects_wrong_contract():

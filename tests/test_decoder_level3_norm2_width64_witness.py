@@ -280,7 +280,7 @@ def test_width64_candidate_runs_twice_and_rejects_nondeterminism():
     assert calls == 2
 
 
-def test_width64_candidate_is_not_enrolled_in_production_dispatch():
+def test_width64_production_dispatch_enrolls_only_nonaffine_route():
     import mlx.core as mx
 
     import trellmlx.decoder_turing_layernorm as decoder_layernorm
@@ -294,9 +294,19 @@ def test_width64_candidate_is_not_enrolled_in_production_dispatch():
         turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
     )
     try:
+        actual = decoder_layernorm.layernorm_noaffine(
+            mx.zeros((2, 64), dtype=mx.float16),
+        )
+        mx.eval(actual)
+        np.testing.assert_array_equal(
+            np.asarray(actual),
+            np.zeros((2, 64), dtype=np.float16),
+        )
         with pytest.raises(ValueError, match="authenticated only"):
-            decoder_layernorm.layernorm_noaffine(
+            decoder_layernorm.layernorm_affine(
                 mx.zeros((2, 64), dtype=mx.float16),
+                mx.ones((64,), dtype=mx.float16),
+                mx.zeros((64,), dtype=mx.float16),
             )
     finally:
         decoder_layernorm.configure_decoder_layernorm_backend(
