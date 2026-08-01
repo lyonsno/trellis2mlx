@@ -1038,6 +1038,23 @@ def _exact_layernorm_route(lut):
                         "accumulator_dtype": "float32",
                     },
                 },
+                {
+                    "input_dtype": "float32",
+                    "hidden_width": 64,
+                    "affine": False,
+                    "eps": 1e-5,
+                    "consumer": "shape-decoder-terminal",
+                    "reduction": {
+                        "threads": 128,
+                        "warps": 4,
+                        "vector_width": 4,
+                        "active_values_per_thread": 4,
+                        "average_values_per_launched_thread": 0.5,
+                        "active_vector_threads": 16,
+                        "inactive_vector_threads": 112,
+                        "accumulator_dtype": "float32",
+                    },
+                },
             ],
             "reduction": {
                 "threads": 128,
@@ -1100,6 +1117,7 @@ def test_level1_comparator_accepts_file_bound_exact_layernorm_route(tmp_path):
         (5, "width-128 affine"),
         (6, "width-128 non-affine"),
         (7, "width-64 non-affine"),
+        (8, "terminal float32 width-64 non-affine"),
     ],
 )
 def test_level1_comparator_rejects_missing_late_layernorm_contract(

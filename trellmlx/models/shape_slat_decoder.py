@@ -60,9 +60,20 @@ def _decoder_silu(value: mx.array) -> mx.array:
     return decoder_silu(value)
 
 
-def _layernorm_noaffine(x: mx.array, eps: float = 1e-5) -> mx.array:
+def _layernorm_noaffine(
+    x: mx.array,
+    eps: float = 1e-5,
+    *,
+    decoder_role: str = "generic",
+) -> mx.array:
     orig_dtype = x.dtype
     x = x.astype(mx.float32)
+    if decoder_role == "shape":
+        from ..decoder_turing_layernorm import (
+            layernorm_noaffine_terminal_shape,
+        )
+
+        return layernorm_noaffine_terminal_shape(x, eps)
     return mx.fast.layer_norm(x, None, None, eps).astype(orig_dtype)
 
 
@@ -425,7 +436,10 @@ class SLatDecoder(nn.Module):
         else:
             feats, coords = result
 
-        feats = _layernorm_noaffine(feats.astype(input_dtype))
+        feats = _layernorm_noaffine(
+            feats.astype(input_dtype),
+            decoder_role=self.decoder_role,
+        )
         out = self.output_layer(feats)
 
         if return_subs:

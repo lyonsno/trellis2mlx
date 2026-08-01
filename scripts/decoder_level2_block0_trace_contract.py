@@ -185,6 +185,23 @@ DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS = [
             "accumulator_dtype": "float32",
         },
     },
+    {
+        "input_dtype": "float32",
+        "hidden_width": 64,
+        "affine": False,
+        "eps": 1e-5,
+        "consumer": "shape-decoder-terminal",
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 0.5,
+            "active_vector_threads": 16,
+            "inactive_vector_threads": 112,
+            "accumulator_dtype": "float32",
+        },
+    },
 ]
 DECODER_LAYERNORM_STATIC_IDENTITY = {
     "backend": "cuda-welford-turing-t4",
@@ -854,6 +871,11 @@ def _load_child_report(
                 raise ValueError(
                     "local child LayerNorm route omits the authenticated "
                     "affine width-256 contract"
+                )
+            if DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS[-1] not in contracts:
+                raise ValueError(
+                    "local child LayerNorm route omits the terminal float32 "
+                    "width-64 non-affine shape-decoder contract"
                 )
             raise ValueError(
                 "local child global LayerNorm identity has an incomplete "

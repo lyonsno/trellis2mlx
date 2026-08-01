@@ -142,6 +142,23 @@ DECODER_LAYERNORM_CONTRACTS = [
             "accumulator_dtype": "float32",
         },
     },
+    {
+        "input_dtype": "float32",
+        "hidden_width": 64,
+        "affine": False,
+        "eps": 1e-5,
+        "consumer": "shape-decoder-terminal",
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 0.5,
+            "active_vector_threads": 16,
+            "inactive_vector_threads": 112,
+            "accumulator_dtype": "float32",
+        },
+    },
 ]
 
 
@@ -814,7 +831,7 @@ def test_block0_child_rejects_missing_width128_layernorm_contract(
     report = json.loads(local_report_path.read_text())
     report["effective_route"]["decoder_layernorm"][
         "authenticated_contracts"
-    ].pop()
+    ].pop(6)
     _write_json(local_report_path, report)
 
     with pytest.raises(ValueError, match="incomplete authenticated contract ledger"):
@@ -829,10 +846,49 @@ def test_block0_child_rejects_missing_width64_layernorm_contract(
     report = json.loads(local_report_path.read_text())
     report["effective_route"]["decoder_layernorm"][
         "authenticated_contracts"
-    ].pop()
+    ].pop(7)
     _write_json(local_report_path, report)
 
     with pytest.raises(ValueError, match="incomplete authenticated contract ledger"):
+        _compare(inputs)
+
+
+def test_block0_child_requires_terminal_float32_layernorm_contract(tmp_path):
+    from scripts.decoder_level2_block0_trace_contract import (
+        DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS,
+    )
+
+    assert len(DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS) == 9
+    assert DECODER_LAYERNORM_AUTHENTICATED_CONTRACTS[-1] == {
+        "input_dtype": "float32",
+        "hidden_width": 64,
+        "affine": False,
+        "eps": 1e-5,
+        "consumer": "shape-decoder-terminal",
+        "reduction": {
+            "threads": 128,
+            "warps": 4,
+            "vector_width": 4,
+            "active_values_per_thread": 4,
+            "average_values_per_launched_thread": 0.5,
+            "active_vector_threads": 16,
+            "inactive_vector_threads": 112,
+            "accumulator_dtype": "float32",
+        },
+    }
+
+    inputs = _valid_comparison_inputs(tmp_path)
+    local_report_path = inputs[4]
+    report = json.loads(local_report_path.read_text())
+    report["effective_route"]["decoder_layernorm"][
+        "authenticated_contracts"
+    ].pop(8)
+    _write_json(local_report_path, report)
+
+    with pytest.raises(
+        ValueError,
+        match="terminal float32 width-64 non-affine",
+    ):
         _compare(inputs)
 
 

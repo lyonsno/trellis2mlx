@@ -211,6 +211,23 @@ def test_turing_decoder_backend_requires_attested_lut_and_reports_identity():
                 "accumulator_dtype": "float32",
             },
         },
+        {
+            "input_dtype": "float32",
+            "hidden_width": 64,
+            "affine": False,
+            "eps": 1e-5,
+            "consumer": "shape-decoder-terminal",
+            "reduction": {
+                "threads": 128,
+                "warps": 4,
+                "vector_width": 4,
+                "active_values_per_thread": 4,
+                "average_values_per_launched_thread": 0.5,
+                "active_vector_threads": 16,
+                "inactive_vector_threads": 112,
+                "accumulator_dtype": "float32",
+            },
+        },
     ]
     assert identity["turing_rsqrt_lut_artifact_sha256_attested"] == artifact_sha256
     assert identity["turing_rsqrt_lut_content_sha256"] == hashlib.sha256(
@@ -415,6 +432,161 @@ def test_turing_decoder_noaffine_dispatch_accepts_authenticated_width64(
         "eps": 1e-6,
     }
     np.testing.assert_array_equal(np.asarray(actual), np.full((3, 64), 5))
+
+
+def test_shape_terminal_dispatch_accepts_only_proven_float32_contract(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+
+    called = {}
+
+    def fake_terminal(x, correction, eps):
+        called["shape"] = x.shape
+        called["dtype"] = x.dtype
+        called["correction_shape"] = correction.shape
+        called["eps"] = eps
+        return mx.full(x.shape, 9, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "turing_layernorm_noaffine_fp32_width64",
+        fake_terminal,
+    )
+    decoder_layernorm.configure_decoder_layernorm_backend(
+        decoder_layernorm.CUDA_WELFORD_TURING_T4_BACKEND,
+        turing_rsqrt_delta_lut=_fixture_correction_lut(),
+        turing_rsqrt_lut_artifact_sha256_attested="a" * 64,
+    )
+
+    actual = decoder_layernorm.layernorm_noaffine_terminal_shape(
+        mx.zeros((3, 64), dtype=mx.float32),
+        eps=1e-5,
+    )
+    mx.eval(actual)
+
+    assert called == {
+        "shape": (3, 64),
+        "dtype": mx.float32,
+        "correction_shape": (1 << 24,),
+        "eps": 1e-5,
+    }
+    np.testing.assert_array_equal(np.asarray(actual), np.full((3, 64), 9))
+    with pytest.raises(ValueError, match="float32.*width 64"):
+        decoder_layernorm.layernorm_noaffine_terminal_shape(
+            mx.zeros((3, 128), dtype=mx.float32),
+            eps=1e-5,
+        )
+    with pytest.raises(ValueError, match="eps"):
+        decoder_layernorm.layernorm_noaffine_terminal_shape(
+            mx.zeros((3, 64), dtype=mx.float32),
+            eps=1e-6,
+        )
+
+
+def test_shape_terminal_helper_routes_shape_only(monkeypatch):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+    from trellmlx.models.shape_slat_decoder import _layernorm_noaffine
+
+    calls = []
+
+    def fake_terminal(x, eps):
+        calls.append((x.shape, x.dtype, eps))
+        return mx.full(x.shape, 4, dtype=x.dtype)
+
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "layernorm_noaffine_terminal_shape",
+        fake_terminal,
+        raising=False,
+    )
+    values = mx.arange(128, dtype=mx.float32).reshape(2, 64)
+
+    shape_actual = _layernorm_noaffine(
+        values,
+        decoder_role="shape",
+    )
+    texture_actual = _layernorm_noaffine(
+        values,
+        decoder_role="texture",
+    )
+    texture_fp16_actual = _layernorm_noaffine(
+        values.astype(mx.float16),
+        decoder_role="texture",
+    )
+    mx.eval(shape_actual, texture_actual, texture_fp16_actual)
+
+    assert calls == [((2, 64), mx.float32, 1e-5)]
+    np.testing.assert_array_equal(
+        np.asarray(shape_actual),
+        np.full((2, 64), 4, dtype=np.float32),
+    )
+    assert not np.array_equal(
+        np.asarray(texture_actual),
+        np.asarray(shape_actual),
+    )
+    assert texture_fp16_actual.dtype == mx.float16
+
+
+def test_shape_decoder_fp16_caller_keeps_terminal_output_head_float32(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    import trellmlx.decoder_turing_layernorm as decoder_layernorm
+    from trellmlx.models.shape_slat_decoder import SLatDecoder
+
+    class IdentityProjection:
+        def __call__(self, values):
+            return values
+
+    class CapturingOutputHead:
+        def __init__(self):
+            self.input_dtype = None
+
+        def __call__(self, values):
+            self.input_dtype = values.dtype
+            return values[:, :7]
+
+    def fake_terminal(values, eps):
+        assert values.dtype == mx.float32
+        assert eps == 1e-5
+        return values
+
+    decoder = SLatDecoder(
+        out_channels=7,
+        latent_channels=64,
+        model_channels=[64],
+        num_blocks=[0],
+        pred_subdiv=True,
+        use_fp16=True,
+    )
+    decoder.from_latent = IdentityProjection()
+    decoder.output_layer = CapturingOutputHead()
+    decoder._forward_levels = (
+        lambda feats, coords, guide_subs=None, return_subs=False: (
+            feats,
+            coords,
+        )
+    )
+    monkeypatch.setattr(
+        decoder_layernorm,
+        "layernorm_noaffine_terminal_shape",
+        fake_terminal,
+    )
+
+    output, output_coords = decoder(
+        mx.ones((2, 64), dtype=mx.float16),
+        mx.array([[0, 0, 0, 0], [0, 0, 0, 1]], dtype=mx.int32),
+    )
+    mx.eval(output, output_coords)
+
+    assert decoder.output_layer.input_dtype == mx.float32
+    assert output.dtype == mx.float32
 
 
 def test_turing_decoder_affine_dispatch_accepts_authenticated_width256(

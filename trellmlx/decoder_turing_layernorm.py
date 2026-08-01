@@ -1,4 +1,4 @@
-"""Turing-exact FP16 LayerNorm for the shape decoder.
+"""Turing-exact LayerNorm for the shape decoder.
 
 PyTorch 2.10's vectorized CUDA LayerNorm uses 128 threads arranged as four
 warps, four values per vector, FP32 Welford state, and CUDA ``rsqrtf``. This
@@ -242,6 +242,23 @@ def decoder_layernorm_backend_identity(
                     "accumulator_dtype": "float32",
                 },
             },
+            {
+                "input_dtype": "float32",
+                "hidden_width": 64,
+                "affine": False,
+                "eps": 1e-5,
+                "consumer": "shape-decoder-terminal",
+                "reduction": {
+                    "threads": 128,
+                    "warps": 4,
+                    "vector_width": 4,
+                    "active_values_per_thread": 4,
+                    "average_values_per_launched_thread": 0.5,
+                    "active_vector_threads": 16,
+                    "inactive_vector_threads": 112,
+                    "accumulator_dtype": "float32",
+                },
+            },
         ],
         "reduction": {
             "threads": 128,
@@ -303,6 +320,33 @@ def layernorm_noaffine(
     if _turing_rsqrt_delta_lut is None:
         raise RuntimeError(f"{_backend} correction LUT is not configured")
     return turing_layernorm_noaffine_fp16(
+        x,
+        _turing_rsqrt_delta_lut,
+        eps,
+    )
+
+
+def layernorm_noaffine_terminal_shape(
+    x: mx.array,
+    eps: float = 1e-5,
+) -> mx.array:
+    """Dispatch the authenticated shape-decoder terminal LayerNorm."""
+    if _backend == DEFAULT_BACKEND:
+        return mx.fast.layer_norm(x, None, None, eps).astype(x.dtype)
+    if x.dtype != mx.float32 or x.ndim != 2 or x.shape[1] != 64:
+        shape = x.shape if x.ndim == 2 else None
+        raise ValueError(
+            f"{_backend} shape terminal route requires float32 2D width 64 "
+            f"rows, got dtype={x.dtype}, shape={shape}"
+        )
+    if eps != 1e-5:
+        raise ValueError(
+            f"{_backend} shape terminal route is authenticated only for "
+            f"eps=1e-5, got {eps}"
+        )
+    if _turing_rsqrt_delta_lut is None:
+        raise RuntimeError(f"{_backend} correction LUT is not configured")
+    return turing_layernorm_noaffine_fp32_width64(
         x,
         _turing_rsqrt_delta_lut,
         eps,

@@ -813,7 +813,8 @@ def capture_mlx_decoder_level1_trace(
                 candidate_entry,
             )
         decoder_final_layernorm = _layernorm_noaffine(
-            natural_level3_upsample_output.astype(mx.float32)
+            natural_level3_upsample_output.astype(mx.float32),
+            decoder_role="shape",
         )
         append_full_hash(
             "decoder_final_layernorm",
