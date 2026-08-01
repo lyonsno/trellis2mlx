@@ -18,6 +18,7 @@ from scripts.source_metal_cuda_qem_cost_witness import (
 
 SOURCE_COMMIT = "1" * 40
 PATCH_SHA256 = "2" * 64
+METALLIB_SHA256 = "3" * 64
 
 
 def _identity(root: Path) -> dict:
@@ -249,6 +250,8 @@ def test_witness_records_authenticated_turing_rsqrt_route(tmp_path):
             "injected_readback_exact": True,
             "segment_multisets_exact": True,
             "qem_kernel": "turing-rsqrt-lut",
+            "metallib_path": "/tmp/cumesh.metallib",
+            "metallib_sha256": METALLIB_SHA256,
         }
 
     report = run_witness(
@@ -264,6 +267,8 @@ def test_witness_records_authenticated_turing_rsqrt_route(tmp_path):
         expected_source_commit=SOURCE_COMMIT,
         rsqrt_lut_npz=rsqrt_lut,
         expected_rsqrt_lut_sha256=sha256_file(rsqrt_lut),
+        expected_metallib_sha256=METALLIB_SHA256,
+        metal_math_profile="safe-precise-fp32-contract-on",
         identity_probe=lambda: _identity(source_root),
         runner=runner,
     )
@@ -271,6 +276,11 @@ def test_witness_records_authenticated_turing_rsqrt_route(tmp_path):
     assert report["effective_route"]["qem_kernel"] == "turing-rsqrt-lut"
     assert report["rsqrt_lut"]["npz_sha256"] == sha256_file(rsqrt_lut)
     assert report["rsqrt_lut"]["normalized_delta"]["shape"] == [1 << 24]
+    assert report["effective_route"]["metallib_sha256"] == METALLIB_SHA256
+    assert (
+        report["effective_route"]["metal_math_profile"]
+        == "safe-precise-fp32-contract-on"
+    )
     assert report["primary_output_status"] == "validated"
 
 

@@ -66,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-source-commit", required=True)
     parser.add_argument("--rsqrt-lut-npz", type=Path)
     parser.add_argument("--expected-rsqrt-lut-sha256")
+    parser.add_argument("--expected-metallib-sha256")
+    parser.add_argument("--metal-math-profile")
     return parser
 
 
@@ -336,6 +338,7 @@ def _default_runner(
     rsqrt_delta: np.ndarray | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import torch
+    import cumesh._C as cumesh_extension
     from cumesh import CuMesh
 
     mesh = CuMesh()
@@ -384,11 +387,14 @@ def _default_runner(
         name: np.ascontiguousarray(trace[name].detach().cpu().numpy())
         for name in METAL_ARRAY_DTYPES
     }
+    metallib_path = Path(cumesh_extension.__file__).with_name("cumesh.metallib")
     return arrays, {
         "injected_readback_exact": True,
         "segment_multisets_exact": True,
         "pre_injection_order_delta": order,
         "qem_kernel": qem_kernel,
+        "metallib_path": str(metallib_path),
+        "metallib_sha256": sha256_file(metallib_path),
     }
 
 
@@ -406,6 +412,8 @@ def run_witness(
     expected_source_commit: str,
     rsqrt_lut_npz: Path | None = None,
     expected_rsqrt_lut_sha256: str | None = None,
+    expected_metallib_sha256: str | None = None,
+    metal_math_profile: str | None = None,
     identity_probe: Callable[[], dict[str, Any]] | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
@@ -457,6 +465,8 @@ def run_witness(
                 str(rsqrt_lut_npz) if rsqrt_lut_npz is not None else None
             ),
             "expected_rsqrt_lut_sha256": expected_rsqrt_lut_sha256,
+            "expected_metallib_sha256": expected_metallib_sha256,
+            "metal_math_profile": metal_math_profile,
         },
         "effective_route": None,
         "input_mesh": None,
@@ -474,6 +484,10 @@ def run_witness(
         if (rsqrt_lut_npz is None) != (expected_rsqrt_lut_sha256 is None):
             raise WitnessError(
                 "--rsqrt-lut-npz and --expected-rsqrt-lut-sha256 must both be supplied"
+            )
+        if (expected_metallib_sha256 is None) != (metal_math_profile is None):
+            raise WitnessError(
+                "--expected-metallib-sha256 and --metal-math-profile must both be supplied"
             )
         protected = [input_ply, cuda_report_json, cuda_npz]
         if rsqrt_lut_npz is not None:
@@ -498,6 +512,15 @@ def run_witness(
             raise WitnessError(
                 "--expected-rsqrt-lut-sha256 must be 64 lowercase hex characters"
             )
+        if (
+            expected_metallib_sha256 is not None
+            and not HEX_SHA256.fullmatch(expected_metallib_sha256)
+        ):
+            raise WitnessError(
+                "--expected-metallib-sha256 must be 64 lowercase hex characters"
+            )
+        if metal_math_profile is not None and not metal_math_profile.strip():
+            raise WitnessError("--metal-math-profile must not be empty")
         if not HEX_GIT_COMMIT.fullmatch(expected_source_commit):
             raise WitnessError(
                 "--expected-source-commit must be 40 lowercase hex characters"
@@ -617,6 +640,21 @@ def run_witness(
                 "runner QEM kernel route mismatch: "
                 f"expected {expected_qem_kernel}, got {injection.get('qem_kernel')}"
             )
+        if expected_metallib_sha256 is not None:
+            if injection.get("metallib_sha256") != expected_metallib_sha256:
+                raise WitnessError(
+                    "runner metallib route mismatch: "
+                    f"expected {expected_metallib_sha256}, "
+                    f"got {injection.get('metallib_sha256')}"
+                )
+            metallib_path = injection.get("metallib_path")
+            if not isinstance(metallib_path, str) or not metallib_path:
+                raise WitnessError("runner did not attest the metallib path")
+            report["effective_route"]["metallib_path"] = metallib_path
+            report["effective_route"][
+                "metallib_sha256"
+            ] = expected_metallib_sha256
+            report["effective_route"]["metal_math_profile"] = metal_math_profile
         normalized: dict[str, np.ndarray] = {}
         for name, dtype in METAL_ARRAY_DTYPES.items():
             array = np.asarray(metal_arrays.get(name))
@@ -707,6 +745,8 @@ def main() -> int:
         expected_source_commit=args.expected_source_commit,
         rsqrt_lut_npz=args.rsqrt_lut_npz,
         expected_rsqrt_lut_sha256=args.expected_rsqrt_lut_sha256,
+        expected_metallib_sha256=args.expected_metallib_sha256,
+        metal_math_profile=args.metal_math_profile,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
