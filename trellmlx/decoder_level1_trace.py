@@ -16,6 +16,42 @@ from .models.shape_slat_decoder import (
 from .modules.sparse_conv import build_neighbor_map
 
 
+def capture_level3_norm2_width64_candidate(
+    values: mx.array,
+    candidate,
+) -> dict[str, np.ndarray]:
+    """Run an unenrolled width-64 candidate twice and retain exact values."""
+    if (
+        values.dtype != mx.float16
+        or values.ndim != 2
+        or values.shape[0] == 0
+        or values.shape[1] != 64
+    ):
+        raise ValueError(
+            "width-64 norm2 candidate requires nonempty float16[N, 64], "
+            f"got dtype={values.dtype}, shape={values.shape}"
+        )
+    first = candidate(values)
+    second = candidate(values)
+    mx.eval(first, second)
+    first_values = np.ascontiguousarray(np.asarray(first))
+    second_values = np.ascontiguousarray(np.asarray(second))
+    if first_values.dtype != np.dtype(np.float16) or first_values.shape != (
+        values.shape
+    ):
+        raise ValueError(
+            "width-64 norm2 candidate returned an invalid output contract"
+        )
+    if not np.isfinite(first_values).all():
+        raise ValueError("width-64 norm2 candidate returned non-finite values")
+    if not np.array_equal(first_values, second_values):
+        raise RuntimeError("width-64 norm2 candidate replay is nondeterministic")
+    return {
+        "level3_upsample_h_c2s": np.ascontiguousarray(np.asarray(values)),
+        "level3_upsample_norm2_candidate": first_values,
+    }
+
+
 def _decoder_output_head(decoder, values: mx.array) -> mx.array:
     if values.dtype != mx.float32:
         raise ValueError(
@@ -45,8 +81,13 @@ def capture_mlx_decoder_level1_trace(
     *,
     hash_entry,
     full_hash_entry=None,
+    level3_norm2_candidate=None,
 ) -> tuple:
     """Capture exact early-decoder boundaries from an exact parent state."""
+    if level3_norm2_candidate is not None and full_hash_entry is None:
+        raise ValueError(
+            "width-64 norm2 candidate requires full-prefix hash capture"
+        )
     level0_upsample = [
         block
         for block in decoder.blocks[0]
@@ -613,6 +654,22 @@ def capture_mlx_decoder_level1_trace(
             )
         append_full_hash("level4_child_coords", level4_child_coords)
         append_full_hash("level3_upsample_h_c2s", level4_h_c2s)
+        if level3_norm2_candidate is not None:
+            witness = capture_level3_norm2_width64_candidate(
+                level4_h_c2s,
+                level3_norm2_candidate,
+            )
+            candidate_entry = full_hash_entry(
+                "level3_upsample_norm2",
+                witness["level3_upsample_norm2_candidate"],
+            )
+            return (
+                trace,
+                hash_entries,
+                full_hash_entries,
+                witness,
+                candidate_entry,
+            )
         append_full_hash(
             "level3_upsample_skip_c2s",
             level4_skip_c2s,
