@@ -22,6 +22,20 @@ import mlx.core as mx
 import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+from trellmlx.decoder_turing_layernorm import (
+    CUDA_WELFORD_TURING_T4_BACKEND as DECODER_CUDA_WELFORD_TURING_T4_BACKEND,
+    DEFAULT_BACKEND as DEFAULT_DECODER_LAYERNORM_BACKEND,
+    SUPPORTED_BACKENDS as DECODER_LAYERNORM_BACKENDS,
+    configure_decoder_layernorm_backend,
+    decoder_layernorm_backend_identity,
+)
+from trellmlx.decoder_turing_silu import (
+    CUDA_TURING_T4_LUT_BACKEND,
+    DEFAULT_BACKEND as DEFAULT_DECODER_SILU_BACKEND,
+    SUPPORTED_BACKENDS as DECODER_SILU_BACKENDS,
+    configure_decoder_silu_backend,
+    decoder_silu_backend_identity,
+)
 from trellmlx.modules.attention import (
     DEFAULT_QK_NORM_BACKEND,
     SUPPORTED_QK_NORM_BACKENDS,
@@ -724,6 +738,89 @@ def _load_turing_rope_phase_lut(
     return mx.array(phase_pairs), digest
 
 
+def _configure_decoder_route(
+    args,
+    parser,
+    *,
+    turing_rsqrt_lut,
+    turing_rsqrt_lut_sha256,
+) -> dict:
+    os.environ["TRELLIS2MLX_DECODER_LINEAR_BACKEND"] = (
+        args.decoder_linear_backend
+    )
+    os.environ["TRELLIS2MLX_SPARSE_CONV_MATMUL_BACKEND"] = (
+        args.decoder_sparse_conv_matmul_backend
+    )
+
+    if (
+        args.decoder_layernorm_backend
+        == DECODER_CUDA_WELFORD_TURING_T4_BACKEND
+    ):
+        if turing_rsqrt_lut is None or turing_rsqrt_lut_sha256 is None:
+            parser.error(
+                f"--decoder-layernorm-backend "
+                f"{DECODER_CUDA_WELFORD_TURING_T4_BACKEND} requires the "
+                "Turing rsqrt LUT and expected SHA256"
+            )
+        configure_decoder_layernorm_backend(
+            args.decoder_layernorm_backend,
+            turing_rsqrt_delta_lut=turing_rsqrt_lut,
+            turing_rsqrt_lut_artifact_sha256_attested=(
+                turing_rsqrt_lut_sha256
+            ),
+        )
+    else:
+        configure_decoder_layernorm_backend(args.decoder_layernorm_backend)
+
+    if args.decoder_silu_backend == CUDA_TURING_T4_LUT_BACKEND:
+        if (
+            not args.decoder_silu_lut
+            or not args.expected_decoder_silu_lut_sha256
+        ):
+            parser.error(
+                f"--decoder-silu-backend {CUDA_TURING_T4_LUT_BACKEND} "
+                "requires --decoder-silu-lut and "
+                "--expected-decoder-silu-lut-sha256"
+            )
+        try:
+            configure_decoder_silu_backend(
+                args.decoder_silu_backend,
+                output_lut_artifact_path=args.decoder_silu_lut,
+                output_lut_artifact_sha256_attested=(
+                    args.expected_decoder_silu_lut_sha256
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    else:
+        if (
+            args.decoder_silu_lut
+            or args.expected_decoder_silu_lut_sha256
+        ):
+            parser.error(
+                "--decoder-silu-lut and its expected SHA256 only apply to "
+                f"{CUDA_TURING_T4_LUT_BACKEND}"
+            )
+        configure_decoder_silu_backend(args.decoder_silu_backend)
+
+    return {
+        "decoder_linear_backend": args.decoder_linear_backend,
+        "sparse_conv_matmul_backend": (
+            args.decoder_sparse_conv_matmul_backend
+        ),
+        "decoder_layernorm": decoder_layernorm_backend_identity(),
+        "decoder_silu": decoder_silu_backend_identity(),
+        "decoder_output_head_backend": (
+            "mlx-native-fp32"
+            if (
+                args.decoder_layernorm_backend
+                == DECODER_CUDA_WELFORD_TURING_T4_BACKEND
+            )
+            else "mlx-native-caller-dtype"
+        ),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate 3D mesh from image via MLX")
     parser.add_argument("--image", nargs="+", help="Input image(s) — multiple images enable multi-view conditioning")
@@ -949,6 +1046,42 @@ def main():
             "Require the Turing rsqrt LUT NPZ to match this exact SHA256."
         ),
     )
+    parser.add_argument(
+        "--decoder-linear-backend",
+        choices=["native", "turing_fda"],
+        default="native",
+        help="Shape decoder dense linear backend.",
+    )
+    parser.add_argument(
+        "--decoder-sparse-conv-matmul-backend",
+        choices=["native", "turing_fda"],
+        default="native",
+        help="Shape decoder sparse-convolution matrix multiplication backend.",
+    )
+    parser.add_argument(
+        "--decoder-layernorm-backend",
+        choices=DECODER_LAYERNORM_BACKENDS,
+        default=DEFAULT_DECODER_LAYERNORM_BACKEND,
+        help="Shape decoder LayerNorm backend.",
+    )
+    parser.add_argument(
+        "--decoder-silu-backend",
+        choices=DECODER_SILU_BACKENDS,
+        default=DEFAULT_DECODER_SILU_BACKEND,
+        help="Shape decoder SiLU backend.",
+    )
+    parser.add_argument(
+        "--decoder-silu-lut",
+        metavar="NPZ",
+        help=(
+            "Required with cuda-turing-t4-fp16-lut: NPZ containing the "
+            "authenticated Tesla T4 FP16 SiLU output table."
+        ),
+    )
+    parser.add_argument(
+        "--expected-decoder-silu-lut-sha256",
+        help="Require the decoder SiLU LUT NPZ to match this exact SHA256.",
+    )
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
@@ -1088,14 +1221,22 @@ def main():
             "shape-flow attention selectors require "
             "--stop-after-stage shape_flow_block_trace"
         )
-    if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
+    turing_rsqrt_required = (
+        args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
+        or (
+            args.decoder_layernorm_backend
+            == DECODER_CUDA_WELFORD_TURING_T4_BACKEND
+        )
+    )
+    turing_lut = None
+    turing_lut_sha256 = None
+    if turing_rsqrt_required:
         if (
             not args.turing_rsqrt_lut
             or not args.expected_turing_rsqrt_lut_sha256
         ):
             parser.error(
-                f"--shape-flow-layernorm-backend "
-                f"{CUDA_WELFORD_TURING_T4_BACKEND} requires "
+                "Turing LayerNorm backends require "
                 "--turing-rsqrt-lut and "
                 "--expected-turing-rsqrt-lut-sha256"
             )
@@ -1104,6 +1245,19 @@ def main():
                 args.turing_rsqrt_lut,
                 args.expected_turing_rsqrt_lut_sha256,
             )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    elif (
+        args.turing_rsqrt_lut
+        or args.expected_turing_rsqrt_lut_sha256
+    ):
+        parser.error(
+            "--turing-rsqrt-lut and its expected SHA256 require a "
+            "cuda-welford-turing-t4 LayerNorm consumer"
+        )
+
+    if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
+        try:
             configure_shape_flow_layernorm_backend(
                 args.shape_flow_layernorm_backend,
                 turing_rsqrt_delta_lut=turing_lut,
@@ -1112,17 +1266,15 @@ def main():
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
     else:
-        if (
-            args.turing_rsqrt_lut
-            or args.expected_turing_rsqrt_lut_sha256
-        ):
-            parser.error(
-                "--turing-rsqrt-lut and its expected SHA256 only apply to "
-                f"{CUDA_WELFORD_TURING_T4_BACKEND}"
-            )
         configure_shape_flow_layernorm_backend(
             args.shape_flow_layernorm_backend
         )
+    decoder_route = _configure_decoder_route(
+        args,
+        parser,
+        turing_rsqrt_lut=turing_lut,
+        turing_rsqrt_lut_sha256=turing_lut_sha256,
+    )
     if args.rope_backend == CUDA_POLAR_TURING_T4_BACKEND:
         if (
             not args.turing_rope_phase_lut
@@ -1355,6 +1507,9 @@ def main():
             coords=np.array(dec_coords).astype(np.int32, copy=False),
             shape_subs=[np.array(mask) for mask in shape_subs],
             mesh_grid_size=mesh_grid_size,
+            decoder_route_json=np.array(
+                json.dumps(decoder_route, sort_keys=True)
+            ),
         )
         print("  Stop after stage: decoder_output", flush=True)
         return
@@ -2542,6 +2697,9 @@ def main():
             coords=dec_coords_np.astype(np.int32, copy=False),
             shape_subs=[np.array(mask) for mask in shape_subs],
             mesh_grid_size=mesh_grid_size,
+            decoder_route_json=np.array(
+                json.dumps(decoder_route, sort_keys=True)
+            ),
         )
         if args.stop_after_stage == "decoder_output":
             print("  Stop after stage: decoder_output", flush=True)
