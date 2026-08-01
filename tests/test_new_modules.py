@@ -244,6 +244,65 @@ class TestWeightLoader:
 
 
 class TestMeshExtract:
+    def test_sigmoid_matches_source_cuda_turing_bits(self):
+        from trellmlx.mesh_extract import _sigmoid
+
+        input_bits = np.array(
+            [
+                0x3EB9286E,
+                0x3E0990DD,
+                0x3E5DD71D,
+                0xBE3B7B97,
+                0xBE4FAB70,
+                0xC02F21A1,
+                0xBD12EC20,
+                0xBEE81A94,
+                0x3E435300,
+                0x3E319BB0,
+                0x3F4B3789,
+                0x3EF2ABF6,
+            ],
+            dtype=np.uint32,
+        )
+        expected_bits = np.array(
+            [
+                0x3F16E551,
+                0x3F0895BF,
+                0x3F0DCFA0,
+                0x3EE8A140,
+                0x3EE62140,
+                0x3D7945FC,
+                0x3EFB68C0,
+                0x3EC6F2A0,
+                0x3F0C2BC0,
+                0x3F0B12A0,
+                0x3F304B5F,
+                0x3F1DC751,
+            ],
+            dtype=np.uint32,
+        )
+
+        actual = _sigmoid(input_bits.view(np.float32))
+
+        np.testing.assert_array_equal(actual.view(np.uint32), expected_bits)
+
+    def test_softplus_matches_pytorch_threshold_semantics(self):
+        from trellmlx.mesh_extract import _softplus
+
+        values = np.array(
+            [-30.0, -1.0, 0.0, 19.0, 20.0, 20.0001, 38.762077, 100.0],
+            dtype=np.float32,
+        )
+        expected = np.empty_like(values)
+        linear = values > np.float32(20.0)
+        expected[linear] = values[linear]
+        expected[~linear] = np.log1p(np.exp(values[~linear]))
+
+        with np.errstate(over="raise"):
+            actual = _softplus(values)
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_dense_cube_connected(self):
         """A dense 2x2x2 cube must produce a single connected mesh."""
         from trellmlx.mesh_extract import flexible_dual_grid_to_mesh

@@ -13,6 +13,10 @@ All computation is numpy (CPU) — no GPU needed for mesh extraction.
 
 import numpy as np
 
+import mlx.core as mx
+
+from .source_cuda_ex2 import SOURCE_CUDA_EX2_METAL_HEADER
+
 
 # Static lookup: for each of the 3 edge directions, the 4 corner voxels
 # that form a quad when the edge is intersected
@@ -24,6 +28,7 @@ _EDGE_NEIGHBOR_OFFSETS = np.array([
 
 _QUAD_SPLIT_1 = np.array([0, 1, 2, 0, 2, 3], dtype=np.int64)
 _QUAD_SPLIT_2 = np.array([0, 1, 3, 3, 1, 2], dtype=np.int64)
+_SOURCE_CUDA_SIGMOID_KERNEL = None
 
 
 def decoder_output_to_mesh(
@@ -175,8 +180,41 @@ def flexible_dual_grid_to_mesh(
 
 
 def _sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
+    values = np.ascontiguousarray(np.asarray(x, dtype=np.float32))
+    if values.size == 0:
+        return values.copy()
+
+    global _SOURCE_CUDA_SIGMOID_KERNEL
+    if _SOURCE_CUDA_SIGMOID_KERNEL is None:
+        _SOURCE_CUDA_SIGMOID_KERNEL = mx.fast.metal_kernel(
+            name="mesh_source_cuda_sigmoid",
+            input_names=["values"],
+            output_names=["out"],
+            header=SOURCE_CUDA_EX2_METAL_HEADER,
+            source=r"""
+                uint index = thread_position_in_grid.x;
+                float value = values[index];
+                out[index] =
+                    1.0f / (1.0f + source_cuda_expf(-value));
+            """,
+        )
+
+    result = _SOURCE_CUDA_SIGMOID_KERNEL(
+        inputs=[mx.array(values)],
+        template=[],
+        grid=(values.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[values.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+    mx.eval(result)
+    return np.array(result)
 
 
 def _softplus(x):
-    return np.log1p(np.exp(np.clip(x, -20, 20)))
+    values = np.asarray(x, dtype=np.float32)
+    result = np.empty_like(values)
+    linear = values > np.float32(20.0)
+    result[linear] = values[linear]
+    result[~linear] = np.log1p(np.exp(values[~linear]))
+    return result
