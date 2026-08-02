@@ -106,6 +106,8 @@ def execute_geometry_sequence(
     mesh: Any,
     target_faces: int,
     snapshot: Callable[[str, int, int, dict[str, Any]], None],
+    *,
+    simplification_runner: Callable[[Any, int], dict[str, Any]] | None = None,
 ) -> None:
     def run(
         operation: str,
@@ -116,15 +118,40 @@ def execute_geometry_sequence(
         mutation()
         snapshot(operation, input_faces, int(mesh.num_faces), details or {})
 
+    def simplify(requested_target_faces: int) -> dict[str, Any]:
+        if simplification_runner is None:
+            mesh.simplify(requested_target_faces, verbose=False)
+            return {
+                "requested_target_faces": int(requested_target_faces),
+                "verbose": False,
+                "simplifier_route": "release-high-level-simplify",
+            }
+        details = simplification_runner(mesh, int(requested_target_faces))
+        if not isinstance(details, dict):
+            raise WitnessError(
+                "explicit simplification runner must return route details"
+            )
+        return {
+            "requested_target_faces": int(requested_target_faces),
+            **details,
+        }
+
+    def run_simplification(
+        operation: str,
+        requested_target_faces: int,
+    ) -> None:
+        input_faces = int(mesh.num_faces)
+        details = simplify(requested_target_faces)
+        snapshot(operation, input_faces, int(mesh.num_faces), details)
+
     run(
         "prefill_holes",
         lambda: mesh.fill_holes(max_hole_perimeter=3e-2),
         {"max_hole_perimeter": 3e-2},
     )
-    run(
+    run_simplification(
         "simplify_coarse",
-        lambda: mesh.simplify(target_faces * 3, verbose=False),
-        {"requested_target_faces": int(target_faces * 3), "verbose": False},
+        target_faces * 3,
     )
     run("remove_duplicate_faces_initial", mesh.remove_duplicate_faces)
     run("repair_non_manifold_edges_initial", mesh.repair_non_manifold_edges)
@@ -138,10 +165,9 @@ def execute_geometry_sequence(
         lambda: mesh.fill_holes(max_hole_perimeter=3e-2),
         {"max_hole_perimeter": 3e-2},
     )
-    run(
+    run_simplification(
         "simplify_final",
-        lambda: mesh.simplify(target_faces, verbose=False),
-        {"requested_target_faces": int(target_faces), "verbose": False},
+        target_faces,
     )
     run("remove_duplicate_faces_final", mesh.remove_duplicate_faces)
     run("repair_non_manifold_edges_final", mesh.repair_non_manifold_edges)
@@ -168,6 +194,7 @@ def run_witness(
     work_dir: Path,
     runtime_factory: Callable[..., Any] | None = None,
     sequence_runner: Callable[..., Any] | None = None,
+    requested_route_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     input_ply = Path(input_ply)
@@ -210,9 +237,31 @@ def run_witness(
         "forbidden_inferences": FORBIDDEN_INFERENCES,
         "setup_commands": [],
     }
+    route_overrides = dict(requested_route_overrides or {})
+    protected_route_keys = {
+        "input_ply",
+        "expected_input_sha256",
+        "output_dir",
+        "target_faces",
+        "trellis_repository",
+        "trellis_commit",
+        "trellis_postprocess_path",
+        "trellis_postprocess_sha256",
+        "cumesh_repository",
+        "cumesh_commit",
+        "cuda_device_name",
+        "cuda_capability",
+    }
+    forbidden_overrides = sorted(protected_route_keys & route_overrides.keys())
+    report["requested_route"].update(route_overrides)
     phase = "request_validation"
 
     try:
+        if forbidden_overrides:
+            raise WitnessError(
+                "requested route overrides cannot replace protected identity: "
+                + ", ".join(forbidden_overrides)
+            )
         if _same_path(requested_report_json, input_ply):
             raise WitnessError("report path aliases protected input")
         for operation, stage_path in stage_paths.items():

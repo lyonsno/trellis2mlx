@@ -141,10 +141,10 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
 
     def fake_run(cmd, *, capture_output, text, check, env):
         calls.append((cmd, env))
-        input_npz = Path(cmd[-5])
-        output_npz = Path(cmd[-4])
-        trace_json = Path(cmd[-3])
-        target_faces = int(cmd[-2])
+        input_npz = Path(cmd[-6])
+        output_npz = Path(cmd[-5])
+        trace_json = Path(cmd[-4])
+        target_faces = int(cmd[-3])
         data = np.load(input_npz)
         np.savez_compressed(
             output_npz,
@@ -176,8 +176,62 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
     assert trace == [{"operation": "source_full"}]
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
-    assert cmd[-2:] == ["1", "/ref/mtlmesh"]
+    assert cmd[-3:] == ["1", "/ref/mtlmesh", ""]
     assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
+
+
+def test_source_native_postprocess_carries_turing_lut_through_subprocess(
+    monkeypatch,
+):
+    from trellmlx.source_mtlmesh import postprocess_source_native
+
+    observed = {}
+    lut = np.arange(16, dtype=np.int8)
+
+    def fake_run(cmd, *, capture_output, text, check, env):
+        input_npz = Path(cmd[-6])
+        output_npz = Path(cmd[-5])
+        trace_json = Path(cmd[-4])
+        data = np.load(input_npz)
+        observed["lut"] = np.asarray(
+            data["turing_rsqrt_delta_lut"],
+            dtype=np.int8,
+        )
+        observed["sha256"] = cmd[-1]
+        np.savez_compressed(
+            output_npz,
+            vertices=np.asarray(data["vertices"], dtype=np.float32),
+            faces=np.asarray(data["faces"], dtype=np.int32),
+        )
+        trace_json.write_text(
+            '[{"simplifier_route": '
+            '"canonical-adjacency-turing-rsqrt-step-loop"}]\n'
+        )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="route ok\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _, _, trace = postprocess_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((2, 3), dtype=np.int32),
+        1,
+        verbose=False,
+        reference_python="/ref/python",
+        expected_source_root="/ref/mtlmesh",
+        turing_rsqrt_delta_lut=lut,
+        turing_rsqrt_lut_sha256="c" * 64,
+    )
+
+    np.testing.assert_array_equal(observed["lut"], lut)
+    assert observed["sha256"] == "c" * 64
+    assert trace[0]["simplifier_route"] == (
+        "canonical-adjacency-turing-rsqrt-step-loop"
+    )
 
 
 def test_source_native_subprocess_failure_names_reference_python(monkeypatch):
@@ -561,3 +615,174 @@ def test_source_native_postprocess_exposes_every_release_geometry_stage(monkeypa
         (3, 3),
         (3, 3),
     ]
+
+
+def test_source_native_postprocess_accepts_one_explicit_simplification_runner(
+    monkeypatch,
+):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        def __init__(self):
+            self.num_faces = 10
+
+        def init(self, vertices, faces):
+            pass
+
+        def remove_duplicate_faces(self):
+            pass
+
+        def repair_non_manifold_edges(self):
+            pass
+
+        def remove_small_connected_components(self, min_area):
+            pass
+
+        def fill_holes(self, max_hole_perimeter):
+            pass
+
+        def unify_face_orientations(self):
+            pass
+
+        def read(self):
+            return (
+                np.zeros((4, 3), dtype=np.float32),
+                np.zeros((self.num_faces, 3), dtype=np.int32),
+            )
+
+    calls = []
+
+    def runner(mesh, target_faces, **kwargs):
+        calls.append((target_faces, kwargs))
+        mesh.num_faces = 6 if target_faces == 9 else 3
+        return {
+            "simplifier_route": "canonical_adjacency_step_loop",
+            "simplifier_step_trace": [{"target": target_faces}],
+        }
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        source_mtlmesh,
+        "_load_source_mesh_class",
+        lambda **kwargs: FakeMesh,
+    )
+
+    _, _, trace = source_mtlmesh.postprocess_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((10, 3), dtype=np.int32),
+        3,
+        verbose=False,
+        simplification_runner=runner,
+    )
+
+    assert [target for target, _ in calls] == [9, 3]
+    assert all(call[1]["thresh"] == 1e-8 for call in calls)
+    assert trace[1]["simplifier_route"] == "canonical_adjacency_step_loop"
+    assert trace[3]["simplifier_route"] == "canonical_adjacency_step_loop"
+
+
+def test_source_native_postprocess_builds_canonical_turing_runner(monkeypatch):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = array
+
+        def contiguous(self):
+            return self
+
+    class FakeTorch(types.ModuleType):
+        def from_numpy(self, array):
+            return FakeTensor(array)
+
+    class FakeMesh:
+        calls = []
+
+        def __init__(self):
+            self.num_faces = 10
+
+        def init(self, vertices, faces):
+            pass
+
+        def get_vertex_face_adjacency(self):
+            self.calls.append("adjacency")
+
+        def sort_vertex_face_adjacency(self):
+            self.calls.append("sort")
+
+        def simplify_step_turing(self, rsqrt_lut, *args):
+            self.calls.append(
+                ("step", rsqrt_lut.array.copy(), args)
+            )
+            self.num_faces = 6 if self.num_faces == 10 else 3
+            return 4, self.num_faces
+
+        def remove_duplicate_faces(self):
+            pass
+
+        def repair_non_manifold_edges(self):
+            pass
+
+        def remove_small_connected_components(self, min_area):
+            pass
+
+        def fill_holes(self, max_hole_perimeter):
+            pass
+
+        def unify_face_orientations(self):
+            pass
+
+        def read(self):
+            return (
+                np.zeros((4, 3), dtype=np.float32),
+                np.zeros((self.num_faces, 3), dtype=np.int32),
+            )
+
+    fake_torch = FakeTorch("torch")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        source_mtlmesh,
+        "_load_source_mesh_class",
+        lambda **kwargs: FakeMesh,
+    )
+    lut = np.arange(16, dtype=np.int8)
+
+    _, _, trace = source_mtlmesh.postprocess_source_native(
+        np.zeros((4, 3), dtype=np.float32),
+        np.zeros((10, 3), dtype=np.int32),
+        3,
+        verbose=False,
+        turing_rsqrt_delta_lut=lut,
+        turing_rsqrt_lut_sha256="b" * 64,
+    )
+
+    assert FakeMesh.calls[0:2] == ["adjacency", "sort"]
+    assert FakeMesh.calls[2][0] == "step"
+    np.testing.assert_array_equal(FakeMesh.calls[2][1], lut)
+    assert FakeMesh.calls[2][2] == (0.01, 0.001, 1e-08, False, True)
+    assert FakeMesh.calls[3:5] == ["adjacency", "sort"]
+    assert FakeMesh.calls[5][0] == "step"
+    np.testing.assert_array_equal(FakeMesh.calls[5][1], lut)
+    assert FakeMesh.calls[5][2] == (0.01, 0.001, 1e-08, False, True)
+    assert trace[1]["simplifier_route"] == (
+        "canonical-adjacency-turing-rsqrt-step-loop"
+    )
+    assert trace[1]["adjacency_order"] == (
+        "ascending-face-id-per-vertex"
+    )
+    assert trace[1]["rsqrt_lut_sha256"] == "b" * 64
+    assert trace[3]["simplifier_route"] == (
+        "canonical-adjacency-turing-rsqrt-step-loop"
+    )

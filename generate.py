@@ -315,6 +315,8 @@ def _cleanup_and_simplify_mesh(
     qem_backend="mlx",
     source_native_source_root=None,
     source_native_python=None,
+    source_native_turing_rsqrt_lut=None,
+    source_native_turing_rsqrt_lut_sha256=None,
     cleanup_mesh=None,
     fill_holes=None,
     simplify=None,
@@ -386,8 +388,25 @@ def _cleanup_and_simplify_mesh(
         if source_native_python is not None:
             source_native_kwargs["reference_python"] = source_native_python
         if source_native_postprocess is None:
+            if (
+                source_native_turing_rsqrt_lut is None
+                or source_native_turing_rsqrt_lut_sha256 is None
+            ):
+                raise ValueError(
+                    "production source-native postprocess requires the "
+                    "authenticated Turing rsqrt LUT"
+                )
             from trellmlx.source_mtlmesh import postprocess_source_native
-            return postprocess_source_native(vertices, faces, target_faces, **source_native_kwargs)
+            return postprocess_source_native(
+                vertices,
+                faces,
+                target_faces,
+                **source_native_kwargs,
+                turing_rsqrt_delta_lut=source_native_turing_rsqrt_lut,
+                turing_rsqrt_lut_sha256=(
+                    source_native_turing_rsqrt_lut_sha256
+                ),
+            )
         return source_native_postprocess(vertices, faces, target_faces, **source_native_kwargs)
 
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
@@ -1227,6 +1246,11 @@ def main():
             args.decoder_layernorm_backend
             == DECODER_CUDA_WELFORD_TURING_T4_BACKEND
         )
+        or (
+            args.reference_cleanup
+            and args.qem_simplify
+            and args.qem_backend == "source-native"
+        )
     )
     turing_lut = None
     turing_lut_sha256 = None
@@ -1236,7 +1260,7 @@ def main():
             or not args.expected_turing_rsqrt_lut_sha256
         ):
             parser.error(
-                "Turing LayerNorm backends require "
+                "Turing LayerNorm or source-native QEM backends require "
                 "--turing-rsqrt-lut and "
                 "--expected-turing-rsqrt-lut-sha256"
             )
@@ -1253,7 +1277,7 @@ def main():
     ):
         parser.error(
             "--turing-rsqrt-lut and its expected SHA256 require a "
-            "cuda-welford-turing-t4 LayerNorm consumer"
+            "cuda-welford-turing-t4 LayerNorm or source-native QEM consumer"
         )
 
     if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
@@ -1344,6 +1368,8 @@ def main():
                 qem_backend=args.qem_backend,
                 source_native_source_root=args.source_native_source_root,
                 source_native_python=args.source_native_python,
+                source_native_turing_rsqrt_lut=turing_lut,
+                source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
             )
             if args.save_checkpoints:
                 from trellmlx.checkpoint import save_checkpoint
@@ -2748,6 +2774,8 @@ def main():
         qem_backend=args.qem_backend,
         source_native_source_root=args.source_native_source_root,
         source_native_python=args.source_native_python,
+        source_native_turing_rsqrt_lut=turing_lut,
+        source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
     )
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint

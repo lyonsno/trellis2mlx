@@ -1,5 +1,6 @@
 """Generate.py mesh postprocess sequencing contracts."""
 
+import numpy as np
 import pytest
 
 
@@ -498,6 +499,64 @@ def test_postprocess_source_native_qem_backend_uses_combined_source_route_by_def
             "requested_target_faces": 200_000,
             "output_faces": 200_007,
         }
+    ]
+
+
+def test_postprocess_real_source_native_route_requires_canonical_turing_runner(
+    monkeypatch,
+):
+    import trellmlx.source_mtlmesh as source_mtlmesh
+    from generate import _cleanup_and_simplify_mesh
+
+    calls = []
+    rsqrt_lut = np.arange(16, dtype=np.int8)
+
+    def source_postprocess(v, faces, target_faces, **kwargs):
+        calls.append((target_faces, kwargs))
+        return (
+            v,
+            FaceBag(target_faces),
+            [
+                {
+                    "operation": "simplify_coarse_source_native_qem",
+                    "simplifier_route": (
+                        "canonical-adjacency-turing-rsqrt-step-loop"
+                    ),
+                    "rsqrt_lut_sha256": "a" * 64,
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        source_mtlmesh,
+        "postprocess_source_native",
+        source_postprocess,
+    )
+
+    _cleanup_and_simplify_mesh(
+        FaceBag(10),
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        qem_simplify=True,
+        qem_backend="source-native",
+        source_native_source_root="/expected/mtlmesh",
+        source_native_turing_rsqrt_lut=rsqrt_lut,
+        source_native_turing_rsqrt_lut_sha256="a" * 64,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [
+        (
+            200_000,
+            {
+                "verbose": True,
+                "expected_source_root": "/expected/mtlmesh",
+                "turing_rsqrt_delta_lut": rsqrt_lut,
+                "turing_rsqrt_lut_sha256": "a" * 64,
+            },
+        )
     ]
 
 

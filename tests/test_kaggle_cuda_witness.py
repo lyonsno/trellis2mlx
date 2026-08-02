@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -514,10 +515,11 @@ def test_prepare_packet_can_declare_json_and_nested_expected_outputs_without_npz
     assert f'\\\"{"4" * 64}\\\"' in runner
     assert 'if CONFIG["output_npz"]:' in runner
     assert '"--output-npz", CONFIG["output_npz"]' in runner
-    assert "selective_decode_report\\.json" in output_command[-1]
-    assert "meshes/switch\\-1\\.raw\\.ply" in output_command[-1]
-    assert "meshes/switch\\-1\\.filled\\.ply" in output_command[-1]
-    output_pattern = re.compile(output_command[-1])
+    file_pattern = output_command[output_command.index("--file-pattern") + 1]
+    assert "selective_decode_report\\.json" in file_pattern
+    assert "meshes/switch\\-1\\.raw\\.ply" in file_pattern
+    assert "meshes/switch\\-1\\.filled\\.ply" in file_pattern
+    output_pattern = re.compile(file_pattern)
     expected_names = (*packet.outputs, "kaggle_cuda_witness_receipt.json")
     for name in expected_names:
         assert output_pattern.search(name)
@@ -933,6 +935,8 @@ def test_build_commands_preserve_dataset_kernel_and_accelerator(tmp_path):
             "\\A(?:cuda_result\\.json|cuda_result\\.npz|"
             "kaggle_cuda_witness_receipt\\.json)\\Z"
         ),
+        "--page-size",
+        "100",
     ]
 
 
@@ -1021,6 +1025,192 @@ def test_run_command_treats_invalid_dataset_source_as_failed(tmp_path):
     assert report["status"] == "failed"
     assert report["failure_phase"] == "kernel_push"
     assert report["exit_code"] == 0
+
+
+def test_wait_for_published_dataset_manifest_rejects_stale_ready_version(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        prepare_packet,
+        wait_for_published_dataset_manifest,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/publication-barrier-inputs",
+            kernel_id="operator/publication-barrier-cuda",
+            title="Publication Barrier CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    expected_manifest = (
+        packet.dataset_dir / "witness-manifest.json"
+    ).read_bytes()
+    downloads = 0
+
+    def runner(cmd, capture_output, text, check):
+        nonlocal downloads
+        if cmd[:3] == ["kaggle", "datasets", "status"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"status": "ready", "current_version_number": 2}',
+                stderr="",
+            )
+        assert cmd[:3] == ["kaggle", "datasets", "download"]
+        downloads += 1
+        output_dir = tmp_path / cmd[cmd.index("-p") + 1]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "witness-manifest.json").write_bytes(
+            b"stale manifest\n" if downloads == 1 else expected_manifest
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = wait_for_published_dataset_manifest(
+        packet,
+        report_path=tmp_path / "publication.json",
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        scratch_root=tmp_path,
+    )
+
+    assert downloads == 2
+    assert report["status"] == "done"
+    assert report["remote_manifest_sha256"] == report[
+        "expected_manifest_sha256"
+    ]
+    assert report["stale_observations"] == 1
+    assert report["dataset_status"] == {
+        "status": "ready",
+        "current_version_number": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure_phase"),
+    [
+        ("malformed_status", "dataset_status"),
+        ("stale_manifest", "stale_manifest"),
+        ("missing_manifest", "manifest_download"),
+    ],
+)
+def test_wait_for_published_dataset_manifest_writes_bounded_failure_report(
+    tmp_path,
+    mode,
+    failure_phase,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        prepare_packet,
+        wait_for_published_dataset_manifest,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/publication-failure-inputs",
+            kernel_id="operator/publication-failure-cuda",
+            title="Publication Failure CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    report_path = tmp_path / "publication.json"
+
+    def runner(cmd, capture_output, text, check):
+        if cmd[:3] == ["kaggle", "datasets", "status"]:
+            stdout = (
+                "not json"
+                if mode == "malformed_status"
+                else '{"status": "ready"}'
+            )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=stdout,
+                stderr="",
+            )
+        output_dir = Path(cmd[cmd.index("-p") + 1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if mode == "stale_manifest":
+            (output_dir / "witness-manifest.json").write_text("stale\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = wait_for_published_dataset_manifest(
+        packet,
+        report_path=report_path,
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        scratch_root=tmp_path,
+        max_attempts=2,
+    )
+
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == failure_phase
+    assert report["attempts"] == 2
+    assert report["last_trustworthy_phase"] == "publication_observed"
+    assert json.loads(report_path.read_text()) == report
+
+
+def test_wait_for_published_dataset_manifest_writes_running_observation(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        prepare_packet,
+        wait_for_published_dataset_manifest,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/publication-running-inputs",
+            kernel_id="operator/publication-running-cuda",
+            title="Publication Running CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    report_path = tmp_path / "publication.json"
+
+    def runner(cmd, capture_output, text, check):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout='{"status": "creating"}',
+            stderr="",
+        )
+
+    def observe_and_stop(_seconds):
+        running = json.loads(report_path.read_text())
+        assert running["status"] == "running"
+        assert running["current_phase"] == "dataset_status"
+        assert running["attempts"] == 1
+        assert running["max_attempts"] is None
+        raise StopIteration
+
+    with pytest.raises(StopIteration):
+        wait_for_published_dataset_manifest(
+            packet,
+            report_path=report_path,
+            runner=runner,
+            sleeper=observe_and_stop,
+        )
 
 
 def test_run_command_writes_report_when_executable_is_missing(tmp_path):

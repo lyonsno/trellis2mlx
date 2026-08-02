@@ -12,6 +12,9 @@ import tempfile
 
 import numpy as np
 
+from trellmlx.canonical_cumesh import (
+    simplify_with_canonical_adjacency_step_loop,
+)
 from trellmlx.source_route_identity import (
     SourceRouteIdentityError,
     probe_cumesh_route_identity,
@@ -98,14 +101,28 @@ from trellmlx.source_mtlmesh import postprocess_source_native
 
 
 verbose = sys.argv[1] == "1"
-input_npz, output_npz, trace_json, target_faces_text, expected_root = sys.argv[2:7]
+(
+    input_npz,
+    output_npz,
+    trace_json,
+    target_faces_text,
+    expected_root,
+    rsqrt_lut_sha256,
+) = sys.argv[2:8]
 data = np.load(input_npz)
+rsqrt_lut = (
+    np.asarray(data["turing_rsqrt_delta_lut"], dtype=np.int8)
+    if "turing_rsqrt_delta_lut" in data
+    else None
+)
 vertices, faces, trace = postprocess_source_native(
     np.asarray(data["vertices"], dtype=np.float32),
     np.asarray(data["faces"], dtype=np.int32),
     int(target_faces_text),
     verbose=verbose,
     expected_source_root=expected_root or None,
+    turing_rsqrt_delta_lut=rsqrt_lut,
+    turing_rsqrt_lut_sha256=rsqrt_lut_sha256 or None,
 )
 np.savez_compressed(output_npz, vertices=vertices, faces=faces)
 Path(trace_json).write_text(json.dumps(trace, indent=2, sort_keys=True) + "\n")
@@ -391,6 +408,8 @@ def _run_source_native_postprocess_subprocess(
     reference_python: str | Path,
     verbose: bool,
     expected_source_root: str | Path | None,
+    turing_rsqrt_delta_lut: np.ndarray | None,
+    turing_rsqrt_lut_sha256: str | None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
@@ -406,11 +425,16 @@ def _run_source_native_postprocess_subprocess(
         input_npz = tmp_path / "input_mesh.npz"
         output_npz = tmp_path / "output_mesh.npz"
         trace_json = tmp_path / "operation_trace.json"
-        np.savez_compressed(
-            input_npz,
-            vertices=np.asarray(vertices, dtype=np.float32),
-            faces=np.asarray(faces, dtype=np.int32),
-        )
+        inputs = {
+            "vertices": np.asarray(vertices, dtype=np.float32),
+            "faces": np.asarray(faces, dtype=np.int32),
+        }
+        if turing_rsqrt_delta_lut is not None:
+            inputs["turing_rsqrt_delta_lut"] = np.asarray(
+                turing_rsqrt_delta_lut,
+                dtype=np.int8,
+            )
+        np.savez_compressed(input_npz, **inputs)
         cmd = [
             str(reference_python),
             "-c",
@@ -421,6 +445,7 @@ def _run_source_native_postprocess_subprocess(
             str(trace_json),
             str(int(target_faces)),
             str(expected_source_root or ""),
+            str(turing_rsqrt_lut_sha256 or ""),
         ]
         completed = subprocess.run(
             cmd,
@@ -694,12 +719,47 @@ def postprocess_source_native(
         None,
     ]
     | None = None,
+    simplification_runner: Callable[..., dict] | None = None,
+    turing_rsqrt_delta_lut: np.ndarray | None = None,
+    turing_rsqrt_lut_sha256: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Run source-native simplify/cleanup/orientation in one mesh object."""
-    if reference_python is not None:
-        if stage_callback is not None:
+    if (turing_rsqrt_delta_lut is None) != (
+        turing_rsqrt_lut_sha256 is None
+    ):
+        raise ValueError(
+            "canonical source-native simplification requires both the "
+            "Turing rsqrt LUT and its attested SHA256"
+        )
+    if simplification_runner is not None and turing_rsqrt_delta_lut is not None:
+        raise ValueError(
+            "explicit simplification_runner and Turing rsqrt LUT are "
+            "mutually exclusive"
+        )
+    normalized_rsqrt_lut = None
+    if turing_rsqrt_delta_lut is not None:
+        normalized_rsqrt_lut = np.ascontiguousarray(
+            np.asarray(turing_rsqrt_delta_lut)
+        )
+        if (
+            normalized_rsqrt_lut.dtype != np.int8
+            or normalized_rsqrt_lut.ndim != 1
+        ):
             raise ValueError(
-                "stage_callback requires direct source-native execution; "
+                "Turing rsqrt LUT must be a contiguous int8 vector"
+            )
+        if (
+            not isinstance(turing_rsqrt_lut_sha256, str)
+            or len(turing_rsqrt_lut_sha256) != 64
+        ):
+            raise ValueError(
+                "Turing rsqrt LUT SHA256 must be 64 characters"
+            )
+    if reference_python is not None:
+        if stage_callback is not None or simplification_runner is not None:
+            raise ValueError(
+                "stage_callback and simplification_runner require direct "
+                "source-native execution; "
                 "launch this function with the reference Python instead"
             )
         return _run_source_native_postprocess_subprocess(
@@ -709,6 +769,8 @@ def postprocess_source_native(
             reference_python=reference_python,
             verbose=verbose,
             expected_source_root=expected_source_root,
+            turing_rsqrt_delta_lut=normalized_rsqrt_lut,
+            turing_rsqrt_lut_sha256=turing_rsqrt_lut_sha256,
         )
 
     try:
@@ -725,6 +787,34 @@ def postprocess_source_native(
     faces_t = torch.from_numpy(np.asarray(faces, dtype=np.int32)).contiguous()
     mesh.init(verts_t, faces_t)
     trace: list[dict] = []
+
+    if normalized_rsqrt_lut is not None:
+        rsqrt_lut = torch.from_numpy(normalized_rsqrt_lut)
+
+        def canonical_turing_runner(
+            source_mesh,
+            requested_target,
+            **options,
+        ):
+            step_trace = simplify_with_canonical_adjacency_step_loop(
+                source_mesh,
+                int(requested_target),
+                lambda_edge_length=float(options["lambda_edge_length"]),
+                lambda_skinny=float(options["lambda_skinny"]),
+                thresh=float(options["thresh"]),
+                rsqrt_lut=rsqrt_lut,
+            )
+            return {
+                "simplifier_route": (
+                    "canonical-adjacency-turing-rsqrt-step-loop"
+                ),
+                "adjacency_order": "ascending-face-id-per-vertex",
+                "reuse_vertex_face_adjacency": True,
+                "rsqrt_lut_sha256": turing_rsqrt_lut_sha256,
+                "simplifier_step_trace": step_trace,
+            }
+
+        simplification_runner = canonical_turing_runner
 
     def emit_stage(
         operation: str,
@@ -764,7 +854,8 @@ def postprocess_source_native(
 
     coarse_target = int(target_faces) * 3
     input_faces = _mesh_face_count(mesh)
-    simplify_trace = _simplify_source_mesh(
+    run_simplification = simplification_runner or _simplify_source_mesh
+    simplify_trace = run_simplification(
         mesh,
         coarse_target,
         verbose=verbose,
@@ -814,7 +905,7 @@ def postprocess_source_native(
     })
 
     input_faces = _mesh_face_count(mesh)
-    simplify_trace = _simplify_source_mesh(
+    simplify_trace = run_simplification(
         mesh,
         int(target_faces),
         verbose=verbose,

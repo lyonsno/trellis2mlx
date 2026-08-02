@@ -1,0 +1,19 @@
+diff --git a/src/simplify.cu b/src/simplify.cu
+--- a/src/simplify.cu
++++ b/src/simplify.cu
+@@ -338,6 +338,7 @@ static __global__ void unpack_qems_kernel(
+ 
+ std::unordered_map<std::string, torch::Tensor> CuMesh::read_qem_cost_trace() {
+     this->get_vertex_face_adjacency();
++    this->sort_vertex_face_adjacency();
+     this->get_edges();
+     this->get_boundary_info();
+     get_qem(*this);
+@@ -370,6 +371,7 @@ std::unordered_map<std::string, torch::Tensor> CuMesh::read_qem_cost_trace() {
+ std::unordered_map<std::string, torch::Tensor>
+ CuMesh::read_qem_cost_component_trace() {
+     this->get_vertex_face_adjacency();
++    this->sort_vertex_face_adjacency();
+     this->get_edges();
+     this->get_boundary_info();
+     get_qem(*this);

@@ -54,12 +54,26 @@ BASE_INSTRUMENTATION_SCHEMA = "trellis2mlx.cumesh_qem_cost_instrumentation.v1"
 COMPONENT_INSTRUMENTATION_SCHEMA = (
     "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2"
 )
+CANONICAL_COMPONENT_INSTRUMENTATION_SCHEMA = (
+    "trellis2mlx.cumesh_canonical_qem_cost_component_instrumentation.v1"
+)
 BASE_GEOMETRY_ROUTE = "release-cumesh-qem-cost-trace-instrumented"
 COMPONENT_GEOMETRY_ROUTE = (
     "release-cumesh-qem-cost-component-trace-instrumented"
 )
+CANONICAL_COMPONENT_GEOMETRY_ROUTE = (
+    "release-cumesh-canonical-adjacency-qem-cost-component-"
+    "trace-instrumented"
+)
 INSTRUMENTED_FILES = (
     "cumesh/cumesh.py",
+    "src/cumesh.h",
+    "src/ext.cpp",
+    "src/simplify.cu",
+)
+CANONICAL_INSTRUMENTED_FILES = (
+    "cumesh/cumesh.py",
+    "src/connectivity.cu",
     "src/cumesh.h",
     "src/ext.cpp",
     "src/simplify.cu",
@@ -77,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--component-trace", action="store_true")
     parser.add_argument("--allow-masked-attribution", action="store_true")
+    parser.add_argument("--canonical-adjacency-patch", type=Path)
+    parser.add_argument("--expected-canonical-adjacency-patch-sha256")
+    parser.add_argument("--trace-adjacency-patch", type=Path)
+    parser.add_argument("--expected-trace-adjacency-patch-sha256")
     return parser
 
 
@@ -114,15 +132,64 @@ def _instrumentation_callback(
     expected_patch_sha256: str,
     *,
     component_trace: bool = False,
+    canonical_adjacency_patch: Path | None = None,
+    expected_canonical_adjacency_patch_sha256: str | None = None,
+    trace_adjacency_patch: Path | None = None,
+    expected_trace_adjacency_patch_sha256: str | None = None,
 ) -> Callable[[Path, dict[str, Any]], dict[str, Any]]:
     patch = Path(patch).resolve(strict=False)
+    canonical_mode = canonical_adjacency_patch is not None
+    patch_records = [
+        {
+            "role": "qem_component_trace",
+            "path": str(patch),
+            "sha256": expected_patch_sha256,
+        }
+    ]
+    if canonical_mode:
+        canonical_adjacency_patch = Path(
+            canonical_adjacency_patch
+        ).resolve(strict=False)
+        trace_adjacency_patch = Path(
+            trace_adjacency_patch
+        ).resolve(strict=False)
+        patch_records = [
+            {
+                "role": "canonical_adjacency",
+                "path": str(canonical_adjacency_patch),
+                "sha256": expected_canonical_adjacency_patch_sha256,
+            },
+            *patch_records,
+            {
+                "role": "trace_local_adjacency_sort",
+                "path": str(trace_adjacency_patch),
+                "sha256": expected_trace_adjacency_patch_sha256,
+            },
+        ]
 
     def apply(cumesh_root: Path, report: dict[str, Any]) -> dict[str, Any]:
-        _run(
-            ["git", "-C", str(cumesh_root), "apply", "--check", str(patch)],
-            report,
-        )
-        _run(["git", "-C", str(cumesh_root), "apply", str(patch)], report)
+        for record in patch_records:
+            _run(
+                [
+                    "git",
+                    "-C",
+                    str(cumesh_root),
+                    "apply",
+                    "--check",
+                    record["path"],
+                ],
+                report,
+            )
+            _run(
+                [
+                    "git",
+                    "-C",
+                    str(cumesh_root),
+                    "apply",
+                    record["path"],
+                ],
+                report,
+            )
         _run(["git", "-C", str(cumesh_root), "diff", "--check"], report)
         status = _run(
             [
@@ -138,22 +205,35 @@ def _instrumentation_callback(
         changed_files = sorted(
             line[3:] for line in status.splitlines() if len(line) >= 4
         )
-        if changed_files != sorted(INSTRUMENTED_FILES):
+        expected_files = (
+            CANONICAL_INSTRUMENTED_FILES
+            if canonical_mode
+            else INSTRUMENTED_FILES
+        )
+        if changed_files != sorted(expected_files):
             raise WitnessError(
                 "instrumentation changed unexpected CuMesh files: "
-                f"expected {sorted(INSTRUMENTED_FILES)}, got {changed_files}"
+                f"expected {sorted(expected_files)}, got {changed_files}"
             )
         return {
             "schema": (
-                COMPONENT_INSTRUMENTATION_SCHEMA
+                CANONICAL_COMPONENT_INSTRUMENTATION_SCHEMA
+                if canonical_mode
+                else COMPONENT_INSTRUMENTATION_SCHEMA
                 if component_trace
                 else BASE_INSTRUMENTATION_SCHEMA
             ),
             "patch_path": str(patch),
             "patch_sha256": expected_patch_sha256,
+            "patches": patch_records if canonical_mode else None,
             "changed_files": changed_files,
             "base_commit": CUMESH_COMMIT,
             "read_only_trace": True,
+            "adjacency_order": (
+                "ascending-face-id-per-vertex"
+                if canonical_mode
+                else "native"
+            ),
         }
 
     return apply
@@ -266,6 +346,10 @@ def run_witness(
     work_dir: Path,
     component_trace: bool = False,
     allow_masked_attribution: bool = False,
+    canonical_adjacency_patch: Path | None = None,
+    expected_canonical_adjacency_patch_sha256: str | None = None,
+    trace_adjacency_patch: Path | None = None,
+    expected_trace_adjacency_patch_sha256: str | None = None,
     runtime_factory: Callable[..., Any] | None = None,
     collector: Callable[[Any, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     | None = None,
@@ -273,11 +357,26 @@ def run_witness(
     started = time.perf_counter()
     input_ply = Path(input_ply)
     instrumentation_patch = Path(instrumentation_patch)
+    canonical_values = (
+        canonical_adjacency_patch,
+        expected_canonical_adjacency_patch_sha256,
+        trace_adjacency_patch,
+        expected_trace_adjacency_patch_sha256,
+    )
+    canonical_mode = any(value is not None for value in canonical_values)
+    if canonical_adjacency_patch is not None:
+        canonical_adjacency_patch = Path(canonical_adjacency_patch)
+    if trace_adjacency_patch is not None:
+        trace_adjacency_patch = Path(trace_adjacency_patch)
     output_npz = Path(output_npz)
     output_json = Path(output_json)
     work_dir = Path(work_dir)
     geometry_route = (
-        COMPONENT_GEOMETRY_ROUTE if component_trace else BASE_GEOMETRY_ROUTE
+        CANONICAL_COMPONENT_GEOMETRY_ROUTE
+        if canonical_mode
+        else COMPONENT_GEOMETRY_ROUTE
+        if component_trace
+        else BASE_GEOMETRY_ROUTE
     )
     report: dict[str, Any] = {
         "schema": (
@@ -301,6 +400,22 @@ def run_witness(
             "geometry_route": geometry_route,
             "target_faces": 1,
             "allow_masked_attribution": allow_masked_attribution,
+            "canonical_adjacency_patch": (
+                str(canonical_adjacency_patch)
+                if canonical_adjacency_patch is not None
+                else None
+            ),
+            "expected_canonical_adjacency_patch_sha256": (
+                expected_canonical_adjacency_patch_sha256
+            ),
+            "trace_adjacency_patch": (
+                str(trace_adjacency_patch)
+                if trace_adjacency_patch is not None
+                else None
+            ),
+            "expected_trace_adjacency_patch_sha256": (
+                expected_trace_adjacency_patch_sha256
+            ),
         },
         "effective_route": None,
         "input_mesh": None,
@@ -316,6 +431,14 @@ def run_witness(
     phase = "request_validation"
 
     try:
+        if canonical_mode and (
+            not all(value is not None for value in canonical_values)
+            or not component_trace
+        ):
+            raise WitnessError(
+                "canonical QEM route requires both additional patches, both "
+                "expected SHA256 values, and --component-trace"
+            )
         for left, right, message in (
             (input_ply, output_npz, "output NPZ aliases protected input PLY"),
             (input_ply, output_json, "output JSON aliases protected input PLY"),
@@ -325,6 +448,15 @@ def run_witness(
         ):
             if _same_path(left, right):
                 raise WitnessError(message)
+        for protected_patch in (
+            canonical_adjacency_patch,
+            trace_adjacency_patch,
+        ):
+            if protected_patch is not None and (
+                _same_path(protected_patch, output_npz)
+                or _same_path(protected_patch, output_json)
+            ):
+                raise WitnessError("output aliases canonical route patch")
         if output_npz.suffix != ".npz":
             raise WitnessError("--output-npz must end in .npz")
         if allow_masked_attribution and not component_trace:
@@ -339,6 +471,21 @@ def run_witness(
             raise WitnessError(
                 "--expected-patch-sha256 must be 64 lowercase hex characters"
             )
+        if canonical_mode:
+            for name, value in (
+                (
+                    "--expected-canonical-adjacency-patch-sha256",
+                    expected_canonical_adjacency_patch_sha256,
+                ),
+                (
+                    "--expected-trace-adjacency-patch-sha256",
+                    expected_trace_adjacency_patch_sha256,
+                ),
+            ):
+                if not HEX_SHA256.fullmatch(value):
+                    raise WitnessError(
+                        f"{name} must be 64 lowercase hex characters"
+                    )
 
         phase = "input_validation"
         actual_input_sha256 = sha256_file(input_ply)
@@ -372,6 +519,36 @@ def run_witness(
             "sha256": actual_patch_sha256,
             "size_bytes": instrumentation_patch.stat().st_size,
         }
+        if canonical_mode:
+            canonical_records = []
+            for role, path, expected_sha256 in (
+                (
+                    "canonical_adjacency",
+                    canonical_adjacency_patch,
+                    expected_canonical_adjacency_patch_sha256,
+                ),
+                (
+                    "trace_local_adjacency_sort",
+                    trace_adjacency_patch,
+                    expected_trace_adjacency_patch_sha256,
+                ),
+            ):
+                if not path.is_file():
+                    raise WitnessError(
+                        f"{role} patch does not exist: {path}"
+                    )
+                actual_sha256 = sha256_file(path)
+                if actual_sha256 != expected_sha256:
+                    raise WitnessError(f"{role} patch SHA256 mismatch")
+                canonical_records.append(
+                    {
+                        "role": role,
+                        "path": str(path),
+                        "sha256": actual_sha256,
+                        "size_bytes": path.stat().st_size,
+                    }
+                )
+            report["canonical_route_patches"] = canonical_records
         report["last_trustworthy_phase"] = "patch_validated"
         _write_report(output_json, report)
 
@@ -393,6 +570,14 @@ def run_witness(
                 instrumentation_patch,
                 expected_patch_sha256,
                 component_trace=component_trace,
+                canonical_adjacency_patch=canonical_adjacency_patch,
+                expected_canonical_adjacency_patch_sha256=(
+                    expected_canonical_adjacency_patch_sha256
+                ),
+                trace_adjacency_patch=trace_adjacency_patch,
+                expected_trace_adjacency_patch_sha256=(
+                    expected_trace_adjacency_patch_sha256
+                ),
             ),
         )
         _validate_effective_route(runtime.effective_route)
@@ -402,19 +587,59 @@ def run_witness(
         if instrumentation.get("patch_sha256") != expected_patch_sha256:
             raise WitnessError("effective instrumentation patch SHA256 mismatch")
         expected_instrumentation_schema = (
-            COMPONENT_INSTRUMENTATION_SCHEMA
+            CANONICAL_COMPONENT_INSTRUMENTATION_SCHEMA
+            if canonical_mode
+            else COMPONENT_INSTRUMENTATION_SCHEMA
             if component_trace
             else BASE_INSTRUMENTATION_SCHEMA
         )
         if instrumentation.get("schema") != expected_instrumentation_schema:
             raise WitnessError("effective instrumentation schema mismatch")
-        if instrumentation.get("changed_files") != list(INSTRUMENTED_FILES):
+        expected_files = (
+            CANONICAL_INSTRUMENTED_FILES
+            if canonical_mode
+            else INSTRUMENTED_FILES
+        )
+        if instrumentation.get("changed_files") != list(expected_files):
             raise WitnessError("effective instrumentation changed-file set mismatch")
+        if canonical_mode:
+            expected_patches = [
+                {
+                    "role": "canonical_adjacency",
+                    "path": str(
+                        canonical_adjacency_patch.resolve(strict=False)
+                    ),
+                    "sha256": expected_canonical_adjacency_patch_sha256,
+                },
+                {
+                    "role": "qem_component_trace",
+                    "path": str(
+                        instrumentation_patch.resolve(strict=False)
+                    ),
+                    "sha256": expected_patch_sha256,
+                },
+                {
+                    "role": "trace_local_adjacency_sort",
+                    "path": str(
+                        trace_adjacency_patch.resolve(strict=False)
+                    ),
+                    "sha256": expected_trace_adjacency_patch_sha256,
+                },
+            ]
+            if instrumentation.get("patches") != expected_patches:
+                raise WitnessError(
+                    "effective canonical instrumentation patch stack mismatch"
+                )
         report["effective_route"] = {
             **runtime.effective_route,
             "input_ply": str(input_ply),
             "input_sha256": actual_input_sha256,
             "geometry_route": geometry_route,
+            "adjacency_order": (
+                "ascending-face-id-per-vertex"
+                if canonical_mode
+                else "native"
+            ),
         }
         report["status"] = "running"
         report["last_trustworthy_phase"] = "runtime_validated"
@@ -541,6 +766,14 @@ def main() -> int:
         work_dir=args.work_dir,
         component_trace=args.component_trace,
         allow_masked_attribution=args.allow_masked_attribution,
+        canonical_adjacency_patch=args.canonical_adjacency_patch,
+        expected_canonical_adjacency_patch_sha256=(
+            args.expected_canonical_adjacency_patch_sha256
+        ),
+        trace_adjacency_patch=args.trace_adjacency_patch,
+        expected_trace_adjacency_patch_sha256=(
+            args.expected_trace_adjacency_patch_sha256
+        ),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

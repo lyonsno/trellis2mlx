@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-faces", type=int, required=True)
     parser.add_argument("--expected-source-root", type=Path, required=True)
     parser.add_argument("--expected-source-commit", required=True)
+    parser.add_argument("--expected-extension-sha256")
+    parser.add_argument("--expected-metallib-sha256")
     return parser
 
 
@@ -58,8 +60,12 @@ def run_witness(
     target_faces: int,
     expected_source_root: Path,
     expected_source_commit: str = EXPECTED_SOURCE_COMMIT,
+    expected_extension_sha256: str | None = None,
+    expected_metallib_sha256: str | None = None,
     identity_probe: Callable[[], dict[str, Any]] | None = None,
     postprocessor: Callable[..., tuple[np.ndarray, np.ndarray, list[dict]]] | None = None,
+    requested_route_overrides: dict[str, Any] | None = None,
+    effective_route_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     input_ply = Path(input_ply)
@@ -89,6 +95,8 @@ def run_witness(
             "target_faces": int(target_faces),
             "expected_source_root": str(expected_source_root),
             "expected_source_commit": expected_source_commit,
+            "expected_extension_sha256": expected_extension_sha256,
+            "expected_metallib_sha256": expected_metallib_sha256,
             "geometry_route": "metal-mtlmesh-standard-non-remesh",
         },
         "effective_route": None,
@@ -101,9 +109,44 @@ def run_witness(
             "not proof of parity with release CuMesh",
         ],
     }
+    requested_overrides = dict(requested_route_overrides or {})
+    effective_overrides = dict(effective_route_overrides or {})
+    protected_route_keys = {
+        "input_ply",
+        "expected_input_sha256",
+        "output_dir",
+        "target_faces",
+        "expected_source_root",
+        "expected_source_commit",
+        "expected_extension_sha256",
+        "expected_metallib_sha256",
+    }
+    forbidden_requested_overrides = sorted(
+        protected_route_keys & requested_overrides.keys()
+    )
+    forbidden_effective_overrides = sorted(
+        {
+            "git_root",
+            "git_commit",
+            "git_status_porcelain",
+            "extension",
+            "metallib",
+            "target_faces",
+        }
+        & effective_overrides.keys()
+    )
+    report["requested_route"].update(requested_overrides)
     phase = "request_validation"
 
     try:
+        if forbidden_requested_overrides or forbidden_effective_overrides:
+            raise WitnessError(
+                "route overrides cannot replace protected identity: "
+                + ", ".join(
+                    forbidden_requested_overrides
+                    + forbidden_effective_overrides
+                )
+            )
         if _same_path(requested_report_json, input_ply):
             raise WitnessError("report path aliases protected input")
         for operation, stage_path in stage_paths.items():
@@ -117,6 +160,19 @@ def run_witness(
             raise WitnessError(
                 "--expected-source-commit must be 40 lowercase hex characters"
             )
+        binary_hashes = (
+            expected_extension_sha256,
+            expected_metallib_sha256,
+        )
+        if any(value is not None for value in binary_hashes):
+            if not all(
+                isinstance(value, str) and HEX_SHA256.fullmatch(value)
+                for value in binary_hashes
+            ):
+                raise WitnessError(
+                    "both expected binary SHA256 values must be supplied as "
+                    "64 lowercase hex characters"
+                )
 
         phase = "input_validation"
         if not input_ply.is_file():
@@ -168,11 +224,49 @@ def run_witness(
             )
         if identity.get("has_MtlMesh") is not True:
             raise WitnessError("effective route does not expose cumesh.metal_backend.MtlMesh")
+        if expected_extension_sha256 is not None:
+            package_dir = expected_source_root / "cumesh"
+            extension_candidates = sorted(package_dir.glob("_C*.so"))
+            if len(extension_candidates) != 1:
+                raise WitnessError(
+                    "expected exactly one Metal extension under "
+                    f"{package_dir}, found {len(extension_candidates)}"
+                )
+            extension_path = extension_candidates[0]
+            metallib_path = package_dir / "cumesh.metallib"
+            if not metallib_path.is_file():
+                raise WitnessError(
+                    f"effective Metal metallib does not exist: {metallib_path}"
+                )
+            identity["extension"] = {
+                "path": str(extension_path),
+                "sha256": sha256_file(extension_path),
+            }
+            identity["metallib"] = {
+                "path": str(metallib_path),
+                "sha256": sha256_file(metallib_path),
+            }
         report["effective_route"] = {
             **identity,
             "geometry_route": "metal-mtlmesh-standard-non-remesh",
             "target_faces": int(target_faces),
+            **effective_overrides,
         }
+        if expected_extension_sha256 is not None:
+            actual_extension_sha256 = identity["extension"]["sha256"]
+            actual_metallib_sha256 = identity["metallib"]["sha256"]
+            if actual_extension_sha256 != expected_extension_sha256:
+                raise WitnessError(
+                    "effective extension SHA256 mismatch: "
+                    f"expected {expected_extension_sha256}, "
+                    f"got {actual_extension_sha256}"
+                )
+            if actual_metallib_sha256 != expected_metallib_sha256:
+                raise WitnessError(
+                    "effective metallib SHA256 mismatch: "
+                    f"expected {expected_metallib_sha256}, "
+                    f"got {actual_metallib_sha256}"
+                )
         report["status"] = "running"
         report["last_trustworthy_phase"] = "runtime_validated"
         _write_report(effective_report_json, report)
@@ -337,6 +431,8 @@ def main() -> int:
             target_faces=args.target_faces,
             expected_source_root=args.expected_source_root,
             expected_source_commit=args.expected_source_commit,
+            expected_extension_sha256=args.expected_extension_sha256,
+            expected_metallib_sha256=args.expected_metallib_sha256,
         )
     except Exception:
         return 1

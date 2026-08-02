@@ -1,0 +1,129 @@
+diff --git a/src/connectivity.cu b/src/connectivity.cu
+--- a/src/connectivity.cu
++++ b/src/connectivity.cu
+@@ -55,6 +55,27 @@ static __global__ void fill_neighbor_face_ids_kernel(
+ }
+ 
+ 
++static __global__ void sort_neighbor_face_ids_kernel(
++    int* neighbor_face_ids,
++    const int* neighbor_face_ids_offset,
++    const int V
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= V) return;
++    const int begin = neighbor_face_ids_offset[tid];
++    const int end = neighbor_face_ids_offset[tid + 1];
++    for (int i = begin + 1; i < end; ++i) {
++        const int value = neighbor_face_ids[i];
++        int j = i - 1;
++        while (j >= begin && neighbor_face_ids[j] > value) {
++            neighbor_face_ids[j + 1] = neighbor_face_ids[j];
++            --j;
++        }
++        neighbor_face_ids[j + 1] = value;
++    }
++}
++
++
+ void CuMesh::get_vertex_face_adjacency() {
+     size_t F = this->faces.size;
+     size_t V = this->vertices.size;
+@@ -88,6 +109,20 @@ void CuMesh::get_vertex_face_adjacency() {
+ }
+ 
+ 
++void CuMesh::sort_vertex_face_adjacency() {
++    const int V = this->vertices.size;
++    if (this->vert2face.is_empty() || this->vert2face_offset.is_empty()) {
++        throw std::runtime_error(
++            "sort_vertex_face_adjacency requires cached vertex-face adjacency"
++        );
++    }
++    sort_neighbor_face_ids_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
++        this->vert2face.ptr, this->vert2face_offset.ptr, V
++    );
++    CUDA_CHECK(cudaGetLastError());
++}
++
++
+ /**
+  * Expand edges for each triangle face
+  * 
+diff --git a/src/cumesh.h b/src/cumesh.h
+--- a/src/cumesh.h
++++ b/src/cumesh.h
+@@ -230,8 +230,10 @@ public:
+      * - vert2face_cnt
+      * - vert2face_offset
+      */
+     void get_vertex_face_adjacency();
+ 
++    void sort_vertex_face_adjacency();
++
+     /**
+      * Get the edges of the mesh.
+      * This function refreshes:
+@@ -452,7 +454,13 @@ public:
+      * @param threshold The threshold for edge collapse cost.
+      * @return A tuple of the number of vertices and the number of faces after simplification.
+      */
+-    std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
++    std::tuple<int, int> simplify_step(
++        float lambda_edge_length,
++        float lambda_skinny,
++        float threshold,
++        bool timing=false,
++        bool reuse_vertex_face_adjacency=false
++    );
+ 
+ 
+     // Atlasing functions
+diff --git a/src/ext.cpp b/src/ext.cpp
+--- a/src/ext.cpp
++++ b/src/ext.cpp
+@@ -38,6 +38,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("compute_face_normals", &cumesh::CuMesh::compute_face_normals)
+         .def("compute_vertex_normals", &cumesh::CuMesh::compute_vertex_normals)
+         .def("get_vertex_face_adjacency", &cumesh::CuMesh::get_vertex_face_adjacency)
++        .def("sort_vertex_face_adjacency", &cumesh::CuMesh::sort_vertex_face_adjacency)
+         .def("get_edges", &cumesh::CuMesh::get_edges)
+         .def("get_edge_face_adjacency", &cumesh::CuMesh::get_edge_face_adjacency)
+         .def("get_vertex_edge_adjacency", &cumesh::CuMesh::get_vertex_edge_adjacency)
+@@ -58,7 +59,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("remove_non_manifold_faces", &cumesh::CuMesh::remove_non_manifold_faces)
+         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
+         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
+-        .def("simplify_step", &cumesh::CuMesh::simplify_step)
++        .def("simplify_step", &cumesh::CuMesh::simplify_step,
++             py::arg("lambda_edge_length"), py::arg("lambda_skinny"),
++             py::arg("threshold"), py::arg("timing") = false,
++             py::arg("reuse_vertex_face_adjacency") = false)
+         .def("compute_charts", &cumesh::CuMesh::compute_charts)
+         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
+ 
+diff --git a/src/simplify.cu b/src/simplify.cu
+--- a/src/simplify.cu
++++ b/src/simplify.cu
+@@ -520,11 +520,19 @@ void collapse_edges(
+ }
+ 
+ 
+-std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing) {
++std::tuple<int, int> CuMesh::simplify_step(
++    float lambda_edge_length,
++    float lambda_skinny,
++    float threshold,
++    bool timing,
++    bool reuse_vertex_face_adjacency
++) {
+     std::chrono::high_resolution_clock::time_point start, end;
+ 
+     if (timing) start = std::chrono::high_resolution_clock::now();
+-    this->get_vertex_face_adjacency();
++    if (!reuse_vertex_face_adjacency) {
++        this->get_vertex_face_adjacency();
++    }
+     if (timing) {
+         CUDA_CHECK(cudaDeviceSynchronize());
+         end = std::chrono::high_resolution_clock::now();

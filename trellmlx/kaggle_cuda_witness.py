@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -255,6 +256,180 @@ def build_dataset_command(packet: KaggleCudaWitnessPacket, *, version: bool = Fa
     ]
 
 
+def build_dataset_status_command(packet: KaggleCudaWitnessPacket) -> list[str]:
+    return [
+        "kaggle",
+        "datasets",
+        "status",
+        packet.dataset_id,
+        "--format",
+        "json",
+    ]
+
+
+def build_dataset_manifest_download_command(
+    packet: KaggleCudaWitnessPacket,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        "kaggle",
+        "datasets",
+        "download",
+        packet.dataset_id,
+        "-f",
+        "witness-manifest.json",
+        "-p",
+        str(output_dir),
+        "-o",
+        "-q",
+    ]
+
+
+def wait_for_published_dataset_manifest(
+    packet: KaggleCudaWitnessPacket,
+    *,
+    report_path: Path,
+    runner: Runner = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+    poll_seconds: float = 2.0,
+    scratch_root: Path | None = None,
+    max_attempts: int | None = None,
+) -> dict[str, object]:
+    if max_attempts is not None and max_attempts <= 0:
+        raise ValueError("max_attempts must be positive when provided")
+    expected_path = packet.dataset_dir / "witness-manifest.json"
+    expected_sha256 = sha256_file(expected_path)
+    stale_observations = 0
+    attempts = 0
+    last_observation: dict[str, object] = {}
+    while True:
+        attempts += 1
+        status_command = build_dataset_status_command(packet)
+        try:
+            status_completed = runner(
+                status_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            status_completed = subprocess.CompletedProcess(
+                status_command,
+                1,
+                stdout="",
+                stderr=f"{type(exc).__name__}: {exc}",
+            )
+        last_observation = {
+            "status_command": status_command,
+            "status_exit_code": status_completed.returncode,
+            "status_stdout": status_completed.stdout,
+            "status_stderr": status_completed.stderr,
+        }
+        dataset_status: dict[str, object] | None = None
+        failure_phase = "dataset_status"
+        if status_completed.returncode == 0:
+            try:
+                decoded_status = json.loads(status_completed.stdout)
+                if isinstance(decoded_status, dict):
+                    dataset_status = decoded_status
+                else:
+                    last_observation["status_parse_error"] = (
+                        "dataset status JSON is not an object"
+                    )
+            except json.JSONDecodeError as exc:
+                last_observation["status_parse_error"] = str(exc)
+        if dataset_status and dataset_status.get("status") == "ready":
+            scratch_parent = (
+                None if scratch_root is None else str(Path(scratch_root))
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="kaggle-dataset-publication-",
+                dir=scratch_parent,
+            ) as temporary:
+                download_dir = Path(temporary)
+                download_command = build_dataset_manifest_download_command(
+                    packet,
+                    download_dir,
+                )
+                try:
+                    download_completed = runner(
+                        download_command,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                except OSError as exc:
+                    download_completed = subprocess.CompletedProcess(
+                        download_command,
+                        1,
+                        stdout="",
+                        stderr=f"{type(exc).__name__}: {exc}",
+                    )
+                remote_manifest = download_dir / "witness-manifest.json"
+                failure_phase = "manifest_download"
+                last_observation.update(
+                    {
+                        "download_command": download_command,
+                        "download_exit_code": download_completed.returncode,
+                        "download_stdout": download_completed.stdout,
+                        "download_stderr": download_completed.stderr,
+                        "dataset_status": dataset_status,
+                    }
+                )
+                if (
+                    download_completed.returncode == 0
+                    and remote_manifest.is_file()
+                ):
+                    remote_sha256 = sha256_file(remote_manifest)
+                    last_observation["remote_manifest_sha256"] = remote_sha256
+                    if remote_sha256 == expected_sha256:
+                        report = {
+                            "schema": (
+                                "trellis2mlx.kaggle_cuda_witness."
+                                "dataset_publication.v1"
+                            ),
+                            "status": "done",
+                            "failure_phase": None,
+                            "dataset_id": packet.dataset_id,
+                            "dataset_status": dataset_status,
+                            "attempts": attempts,
+                            "stale_observations": stale_observations,
+                            "expected_manifest_sha256": expected_sha256,
+                            "remote_manifest_sha256": remote_sha256,
+                        }
+                        _write_json(report_path, report)
+                        return report
+                    stale_observations += 1
+                    failure_phase = "stale_manifest"
+        observation_report = {
+            "schema": (
+                "trellis2mlx.kaggle_cuda_witness."
+                "dataset_publication.v1"
+            ),
+            "status": "running",
+            "failure_phase": None,
+            "current_phase": failure_phase,
+            "last_trustworthy_phase": "publication_observed",
+            "dataset_id": packet.dataset_id,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "stale_observations": stale_observations,
+            "expected_manifest_sha256": expected_sha256,
+            "last_observation": last_observation,
+        }
+        if max_attempts is not None and attempts >= max_attempts:
+            observation_report.update(
+                {
+                    "status": "failed",
+                    "failure_phase": failure_phase,
+                }
+            )
+            _write_json(report_path, observation_report)
+            return observation_report
+        _write_json(report_path, observation_report)
+        sleeper(poll_seconds)
+
+
 def build_kernel_push_command(packet: KaggleCudaWitnessPacket, *, timeout_seconds: int | None = None) -> list[str]:
     cmd = [
         "kaggle",
@@ -287,6 +462,8 @@ def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Pat
         "-o",
         "--file-pattern",
         file_pattern,
+        "--page-size",
+        "100",
     ]
 
 
@@ -586,6 +763,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         drive.add_argument("--report-dir", type=Path)
         if name == "kernel-push":
             drive.add_argument("--timeout-seconds", type=int)
+        if name == "dataset-version":
+            drive.add_argument("--publication-max-attempts", type=int)
         if name == "kernel-output":
             drive.add_argument("--output-dir", type=Path)
 
@@ -624,7 +803,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_cli_command(build_dataset_command(packet), "dataset_create", args)
     if args.command == "dataset-version":
         packet = load_prepared_packet(args.packet_dir)
-        return _run_cli_command(build_dataset_command(packet, version=True), "dataset_version", args)
+        report_dir = args.report_dir or Path(args.packet_dir) / "reports"
+        report_path = report_dir / "dataset_version.json"
+        report = run_command(
+            build_dataset_command(packet, version=True),
+            phase="dataset_version",
+            report_path=report_path,
+        )
+        if report["status"] == "done":
+            publication = wait_for_published_dataset_manifest(
+                packet,
+                report_path=report_dir / "dataset_publication.json",
+                max_attempts=args.publication_max_attempts,
+            )
+            report["publication"] = publication
+            if publication["status"] != "done":
+                report.update(
+                    {
+                        "status": "failed",
+                        "failure_phase": "dataset_publication",
+                        "exit_code": 1,
+                    }
+                )
+            _write_json(report_path, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["status"] == "done" else int(
+            report["exit_code"] or 1
+        )
     if args.command == "kernel-push":
         packet = load_prepared_packet(args.packet_dir)
         return _run_cli_command(

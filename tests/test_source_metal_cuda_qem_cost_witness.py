@@ -118,8 +118,16 @@ def _write_cuda_trace(
 def _write_component_cuda_trace(
     tmp_path: Path,
     input_sha256: str,
+    *,
+    canonical: bool = False,
+    masked: bool = False,
 ) -> tuple[Path, Path]:
     arrays = _component_cuda_arrays()
+    if masked:
+        arrays["component_edge_collapse_costs"][0] = np.nextafter(
+            arrays["component_edge_collapse_costs"][0],
+            np.float32(np.inf),
+        )
     npz = tmp_path / "cuda_qem_cost_components.npz"
     report = tmp_path / "cuda_qem_cost_components.json"
     np.savez(npz, **arrays)
@@ -130,16 +138,34 @@ def _write_component_cuda_trace(
                 "status": "done",
                 "primary_output_status": "validated",
                 "input_mesh": {"sha256": input_sha256},
-                "backend_self_consistency": {"bit_exact": True},
+                "backend_self_consistency": {
+                    "bit_exact": not masked,
+                    "bit_mismatch_count": 1 if masked else 0,
+                },
+                "component_attribution": {
+                    "global_admitted": not masked,
+                    "masked_admitted": masked,
+                    "rejected_edge_count": 1 if masked else 0,
+                    "mask_predicate": (
+                        "component_edge_collapse_costs bits equal "
+                        "edge_collapse_costs bits"
+                    ),
+                },
                 "effective_route": {
                     "geometry_route": (
-                        "release-cumesh-qem-cost-component-trace-instrumented"
+                        "release-cumesh-canonical-adjacency-qem-cost-component-"
+                        "trace-instrumented"
+                        if canonical
+                        else "release-cumesh-qem-cost-component-trace-instrumented"
                     ),
                     "cuda_available": True,
                     "cuda_device_name": "Tesla T4",
                     "cumesh_instrumentation": {
                         "schema": (
-                            "trellis2mlx.cumesh_qem_cost_component_"
+                            "trellis2mlx.cumesh_canonical_qem_cost_component_"
+                            "instrumentation.v1"
+                            if canonical
+                            else "trellis2mlx.cumesh_qem_cost_component_"
                             "instrumentation.v2"
                         ),
                         "patch_sha256": PATCH_SHA256,
@@ -396,6 +422,119 @@ def test_component_witness_compares_every_admitted_component(tmp_path):
     assert report["schema"].endswith(".v2")
     assert report["backend_self_consistency"]["metal"]["bit_exact"] is True
     assert set(report["comparison"]) == set(metal_arrays)
+
+
+def test_component_witness_accepts_authenticated_canonical_cuda_route(
+    tmp_path,
+):
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    input_ply = tmp_path / "input.ply"
+    _write_input(input_ply)
+    cuda_report, cuda_npz = _write_component_cuda_trace(
+        tmp_path,
+        sha256_file(input_ply),
+        canonical=True,
+    )
+    metal_arrays = {
+        name: array.copy()
+        for name, array in _component_cuda_arrays().items()
+        if name != "vert2face"
+    }
+    rsqrt_lut = _write_rsqrt_lut(tmp_path / "rsqrt.npz")
+
+    report = run_witness(
+        input_ply=input_ply,
+        cuda_report_json=cuda_report,
+        cuda_npz=cuda_npz,
+        output_npz=tmp_path / "metal_qem_cost_components.npz",
+        report_json=tmp_path / "comparison.json",
+        expected_input_sha256=sha256_file(input_ply),
+        expected_cuda_report_sha256=sha256_file(cuda_report),
+        expected_cuda_npz_sha256=sha256_file(cuda_npz),
+        expected_source_root=source_root,
+        expected_source_commit=SOURCE_COMMIT,
+        rsqrt_lut_npz=rsqrt_lut,
+        expected_rsqrt_lut_sha256=sha256_file(rsqrt_lut),
+        identity_probe=lambda: _identity(source_root),
+        runner=lambda *_args: (
+            metal_arrays,
+            {
+                "injected_readback_exact": True,
+                "segment_multisets_exact": True,
+                "qem_kernel": "turing-rsqrt-lut",
+            },
+        ),
+    )
+
+    assert report["cuda_trace"]["geometry_route"].startswith(
+        "release-cumesh-canonical-adjacency"
+    )
+    assert set(report["comparison"]) == set(metal_arrays)
+
+
+def test_component_witness_explicitly_masks_counted_backend_reconstructions(
+    tmp_path,
+):
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    input_ply = tmp_path / "input.ply"
+    _write_input(input_ply)
+    cuda_report, cuda_npz = _write_component_cuda_trace(
+        tmp_path,
+        sha256_file(input_ply),
+        canonical=True,
+        masked=True,
+    )
+    metal_arrays = {
+        name: array.copy()
+        for name, array in _component_cuda_arrays().items()
+        if name != "vert2face"
+    }
+    metal_arrays["component_edge_collapse_costs"][2] = np.nextafter(
+        metal_arrays["component_edge_collapse_costs"][2],
+        np.float32(np.inf),
+    )
+    rsqrt_lut = _write_rsqrt_lut(tmp_path / "rsqrt.npz")
+
+    report = run_witness(
+        input_ply=input_ply,
+        cuda_report_json=cuda_report,
+        cuda_npz=cuda_npz,
+        output_npz=tmp_path / "metal_qem_cost_components.npz",
+        report_json=tmp_path / "comparison.json",
+        expected_input_sha256=sha256_file(input_ply),
+        expected_cuda_report_sha256=sha256_file(cuda_report),
+        expected_cuda_npz_sha256=sha256_file(cuda_npz),
+        expected_source_root=source_root,
+        expected_source_commit=SOURCE_COMMIT,
+        rsqrt_lut_npz=rsqrt_lut,
+        expected_rsqrt_lut_sha256=sha256_file(rsqrt_lut),
+        allow_masked_attribution=True,
+        identity_probe=lambda: _identity(source_root),
+        runner=lambda *_args: (
+            metal_arrays,
+            {
+                "injected_readback_exact": True,
+                "segment_multisets_exact": True,
+                "qem_kernel": "turing-rsqrt-lut",
+            },
+        ),
+    )
+
+    assert report["component_attribution"] == {
+        "cuda_rejected_edge_count": 1,
+        "metal_rejected_edge_count": 1,
+        "mask_predicate": (
+            "component_edge_collapse_costs bits equal "
+            "edge_collapse_costs bits"
+        ),
+    }
+    assert report["backend_self_consistency"]["cuda"] == {
+        "bit_exact": False,
+        "bit_mismatch_count": 1,
+    }
+    assert report["primary_output_status"] == "validated"
 
 
 def test_component_witness_requires_authenticated_turing_rsqrt_route(tmp_path):

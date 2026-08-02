@@ -211,3 +211,50 @@ def test_local_metal_witness_rejects_input_hash_before_runtime(tmp_path):
     assert runtime_called is False
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["failure_phase"] == "input_validation"
+
+
+def test_local_metal_witness_rejects_stale_extension_before_postprocess(
+    tmp_path,
+):
+    module = _load_script(
+        "source_metal_mtlmesh_postprocess_witness_binary",
+        "scripts/source_metal_mtlmesh_postprocess_witness.py",
+    )
+    input_ply = tmp_path / "input.ply"
+    _write_input(module, input_ply)
+    source_root = tmp_path / "mtlmesh"
+    package_dir = source_root / "cumesh"
+    package_dir.mkdir(parents=True)
+    extension = package_dir / "_C.fixture.so"
+    metallib = package_dir / "cumesh.metallib"
+    extension.write_bytes(b"current extension")
+    metallib.write_bytes(b"current metallib")
+    postprocessor_called = False
+
+    def postprocessor(*args, **kwargs):
+        nonlocal postprocessor_called
+        postprocessor_called = True
+        raise AssertionError("stale binary route must fail before postprocess")
+
+    with pytest.raises(module.WitnessError, match="extension SHA256"):
+        module.run_witness(
+            input_ply=input_ply,
+            output_dir=tmp_path / "stages",
+            report_json=tmp_path / "report.json",
+            expected_input_sha256=module.sha256_file(input_ply),
+            target_faces=10,
+            expected_source_root=source_root,
+            expected_extension_sha256="0" * 64,
+            expected_metallib_sha256=module.sha256_file(metallib),
+            identity_probe=lambda: _identity(module, source_root),
+            postprocessor=postprocessor,
+        )
+
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert postprocessor_called is False
+    assert report["failure_phase"] == "runtime_validation"
+    assert report["requested_route"]["expected_extension_sha256"] == "0" * 64
+    assert report["effective_route"]["extension"]["path"] == str(extension)
+    assert report["effective_route"]["extension"]["sha256"] == (
+        module.sha256_file(extension)
+    )

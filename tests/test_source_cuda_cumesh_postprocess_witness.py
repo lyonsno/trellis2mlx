@@ -308,3 +308,38 @@ def test_done_report_requires_every_reopened_stage(tmp_path):
     assert report["failure_phase"] == "stage_validation"
     assert report["primary_output_status"] == "partial"
     assert len(report["stage_artifacts"]) == 1
+
+
+def test_requested_route_overrides_survive_runtime_failure(tmp_path):
+    from scripts.source_cuda_cumesh_postprocess_witness import run_witness
+
+    input_ply = tmp_path / "input.ply"
+    _write_test_ply(input_ply)
+    digest = hashlib.sha256(input_ply.read_bytes()).hexdigest()
+
+    def failing_runtime(*args, **kwargs):
+        raise RuntimeError("runtime unavailable")
+
+    with pytest.raises(RuntimeError, match="runtime unavailable"):
+        run_witness(
+            input_ply=input_ply,
+            output_dir=tmp_path / "outputs",
+            report_json=tmp_path / "report.json",
+            expected_input_sha256=digest,
+            target_faces=10,
+            work_dir=tmp_path / "work",
+            runtime_factory=failing_runtime,
+            requested_route_overrides={
+                "geometry_route": "canonical-adjacency",
+                "adjacency_order": "ascending-face-id-per-vertex",
+            },
+        )
+
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["failure_phase"] == "runtime_setup"
+    assert report["requested_route"]["geometry_route"] == (
+        "canonical-adjacency"
+    )
+    assert report["requested_route"]["adjacency_order"] == (
+        "ascending-face-id-per-vertex"
+    )

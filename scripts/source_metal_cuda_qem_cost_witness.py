@@ -33,11 +33,18 @@ CUDA_GEOMETRY_ROUTE = "release-cumesh-qem-cost-trace-instrumented"
 CUDA_COMPONENT_GEOMETRY_ROUTE = (
     "release-cumesh-qem-cost-component-trace-instrumented"
 )
+CUDA_CANONICAL_COMPONENT_GEOMETRY_ROUTE = (
+    "release-cumesh-canonical-adjacency-qem-cost-component-"
+    "trace-instrumented"
+)
 CUDA_INSTRUMENTATION_SCHEMA = (
     "trellis2mlx.cumesh_qem_cost_instrumentation.v1"
 )
 CUDA_COMPONENT_INSTRUMENTATION_SCHEMA = (
     "trellis2mlx.cumesh_qem_cost_component_instrumentation.v2"
+)
+CUDA_CANONICAL_COMPONENT_INSTRUMENTATION_SCHEMA = (
+    "trellis2mlx.cumesh_canonical_qem_cost_component_instrumentation.v1"
 )
 CUDA_ARRAY_DTYPES = {
     "vert2face": np.dtype(np.int32),
@@ -93,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-rsqrt-lut-sha256")
     parser.add_argument("--expected-metallib-sha256")
     parser.add_argument("--metal-math-profile")
+    parser.add_argument("--allow-masked-attribution", action="store_true")
     return parser
 
 
@@ -262,6 +270,7 @@ def _load_cuda_trace(
     expected_input_sha256: str,
     num_vertices: int,
     num_faces: int,
+    allow_masked_attribution: bool = False,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if sha256_file(report_json) != expected_report_sha256:
         raise WitnessError("CUDA QEM report SHA256 mismatch")
@@ -279,6 +288,7 @@ def _load_cuda_trace(
     if cuda_geometry_route not in {
         CUDA_GEOMETRY_ROUTE,
         CUDA_COMPONENT_GEOMETRY_ROUTE,
+        CUDA_CANONICAL_COMPONENT_GEOMETRY_ROUTE,
     }:
         raise WitnessError("CUDA QEM geometry route is not authenticated")
     if route.get("cuda_available") is not True:
@@ -286,9 +296,14 @@ def _load_cuda_trace(
     if route.get("cuda_device_name") != "Tesla T4":
         raise WitnessError("CUDA QEM route did not use the requested Tesla T4")
     instrumentation = route.get("cumesh_instrumentation") or {}
-    component_trace = cuda_geometry_route == CUDA_COMPONENT_GEOMETRY_ROUTE
+    component_trace = cuda_geometry_route in {
+        CUDA_COMPONENT_GEOMETRY_ROUTE,
+        CUDA_CANONICAL_COMPONENT_GEOMETRY_ROUTE,
+    }
     expected_instrumentation_schema = (
-        CUDA_COMPONENT_INSTRUMENTATION_SCHEMA
+        CUDA_CANONICAL_COMPONENT_INSTRUMENTATION_SCHEMA
+        if cuda_geometry_route == CUDA_CANONICAL_COMPONENT_GEOMETRY_ROUTE
+        else CUDA_COMPONENT_INSTRUMENTATION_SCHEMA
         if component_trace
         else CUDA_INSTRUMENTATION_SCHEMA
     )
@@ -346,11 +361,26 @@ def _load_cuda_trace(
     if component_trace:
         ordinary = arrays["edge_collapse_costs"].view(np.uint32)
         component = arrays["component_edge_collapse_costs"].view(np.uint32)
-        if not np.array_equal(ordinary, component):
+        mismatch_count = int(np.count_nonzero(ordinary != component))
+        self_consistency = report.get("backend_self_consistency") or {}
+        attribution = report.get("component_attribution") or {}
+        if mismatch_count and not allow_masked_attribution:
             raise WitnessError(
                 "CUDA component total differs from the ordinary edge-cost kernel"
             )
-        if report.get("backend_self_consistency", {}).get("bit_exact") is not True:
+        if mismatch_count:
+            if (
+                self_consistency.get("bit_exact") is not False
+                or self_consistency.get("bit_mismatch_count")
+                != mismatch_count
+                or attribution.get("masked_admitted") is not True
+                or attribution.get("rejected_edge_count")
+                != mismatch_count
+            ):
+                raise WitnessError(
+                    "CUDA masked component attribution count is not authenticated"
+                )
+        elif self_consistency.get("bit_exact") is not True:
             raise WitnessError(
                 "CUDA report does not attest component self-consistency"
             )
@@ -483,6 +513,7 @@ def run_witness(
     expected_rsqrt_lut_sha256: str | None = None,
     expected_metallib_sha256: str | None = None,
     metal_math_profile: str | None = None,
+    allow_masked_attribution: bool = False,
     identity_probe: Callable[[], dict[str, Any]] | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
@@ -536,6 +567,7 @@ def run_witness(
             "expected_rsqrt_lut_sha256": expected_rsqrt_lut_sha256,
             "expected_metallib_sha256": expected_metallib_sha256,
             "metal_math_profile": metal_math_profile,
+            "allow_masked_attribution": allow_masked_attribution,
         },
         "effective_route": None,
         "input_mesh": None,
@@ -545,6 +577,7 @@ def run_witness(
         "metal_arrays": None,
         "comparison": None,
         "backend_self_consistency": None,
+        "component_attribution": None,
         "output_npz": None,
         "elapsed_seconds": None,
     }
@@ -630,11 +663,13 @@ def run_witness(
             expected_input_sha256=actual_input_sha256,
             num_vertices=len(vertices),
             num_faces=len(faces),
+            allow_masked_attribution=allow_masked_attribution,
         )
         cuda_route = cuda_report["effective_route"]
-        component_trace = (
-            cuda_route["geometry_route"] == CUDA_COMPONENT_GEOMETRY_ROUTE
-        )
+        component_trace = cuda_route["geometry_route"] in {
+            CUDA_COMPONENT_GEOMETRY_ROUTE,
+            CUDA_CANONICAL_COMPONENT_GEOMETRY_ROUTE,
+        }
         if component_trace and rsqrt_lut_npz is None:
             raise WitnessError(
                 "cost-component comparison requires an authenticated Turing "
@@ -651,7 +686,9 @@ def run_witness(
             )
             report["requested_route"]["geometry_route"] = geometry_route
             report["backend_self_consistency"] = {
-                "cuda": {"bit_exact": True},
+                "cuda": dict(
+                    cuda_report.get("backend_self_consistency") or {}
+                ),
                 "metal": None,
             }
         report["cuda_trace"] = {
@@ -799,10 +836,24 @@ def run_witness(
                 "metal"
             ] = metal_self_consistency
             if not metal_self_consistency["bit_exact"]:
-                raise WitnessError(
-                    "Metal component total differs from the ordinary edge-cost "
-                    f"kernel at {mismatch_count} edges"
-                )
+                if not allow_masked_attribution:
+                    raise WitnessError(
+                        "Metal component total differs from the ordinary "
+                        f"edge-cost kernel at {mismatch_count} edges"
+                    )
+            cuda_attribution = (
+                cuda_report.get("component_attribution") or {}
+            )
+            report["component_attribution"] = {
+                "cuda_rejected_edge_count": int(
+                    cuda_attribution.get("rejected_edge_count", 0)
+                ),
+                "metal_rejected_edge_count": mismatch_count,
+                "mask_predicate": (
+                    "component_edge_collapse_costs bits equal "
+                    "edge_collapse_costs bits"
+                ),
+            }
         report["injection"] = injection
         report["metal_arrays"] = {
             name: {
@@ -881,6 +932,7 @@ def main() -> int:
         expected_rsqrt_lut_sha256=args.expected_rsqrt_lut_sha256,
         expected_metallib_sha256=args.expected_metallib_sha256,
         metal_math_profile=args.metal_math_profile,
+        allow_masked_attribution=args.allow_masked_attribution,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

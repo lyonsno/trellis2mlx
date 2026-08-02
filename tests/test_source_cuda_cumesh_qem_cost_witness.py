@@ -28,7 +28,22 @@ def _write_input(path: Path) -> None:
 def _runtime(
     patch_sha256: str,
     schema: str = "trellis2mlx.cumesh_qem_cost_instrumentation.v1",
+    *,
+    patches: list[dict[str, str]] | None = None,
+    changed_files: list[str] | None = None,
 ):
+    instrumentation = {
+        "schema": schema,
+        "patch_sha256": patch_sha256,
+        "changed_files": changed_files or [
+            "cumesh/cumesh.py",
+            "src/cumesh.h",
+            "src/ext.cpp",
+            "src/simplify.cu",
+        ],
+    }
+    if patches is not None:
+        instrumentation["patches"] = patches
     return SimpleNamespace(
         effective_route={
             "trellis_commit": "5565d240c4a494caaf9ece7a554542b76ffa36d3",
@@ -42,16 +57,7 @@ def _runtime(
             "cuda_device_name": "Tesla T4",
             "cuda_capability": [7, 5],
             "device_type": "cuda",
-            "cumesh_instrumentation": {
-                "schema": schema,
-                "patch_sha256": patch_sha256,
-                "changed_files": [
-                    "cumesh/cumesh.py",
-                    "src/cumesh.h",
-                    "src/ext.cpp",
-                    "src/simplify.cu",
-                ],
-            },
+            "cumesh_instrumentation": instrumentation,
         }
     )
 
@@ -214,6 +220,114 @@ def test_component_witness_records_self_consistent_arrays(tmp_path):
     )
     with np.load(output_npz, allow_pickle=False) as archive:
         assert set(archive.files) == set(_component_arrays())
+
+
+def test_component_witness_records_canonical_three_patch_route(tmp_path):
+    input_ply = tmp_path / "input.ply"
+    qem_patch = tmp_path / "qem.patch"
+    canonical_patch = tmp_path / "canonical.patch"
+    trace_sort_patch = tmp_path / "trace-sort.patch"
+    output_npz = tmp_path / "trace.npz"
+    output_json = tmp_path / "trace.json"
+    _write_input(input_ply)
+    for path, text in (
+        (qem_patch, "qem\n"),
+        (canonical_patch, "canonical\n"),
+        (trace_sort_patch, "trace sort\n"),
+    ):
+        path.write_text(text)
+    patches = [
+        {
+            "role": "canonical_adjacency",
+            "path": str(canonical_patch),
+            "sha256": sha256_file(canonical_patch),
+        },
+        {
+            "role": "qem_component_trace",
+            "path": str(qem_patch),
+            "sha256": sha256_file(qem_patch),
+        },
+        {
+            "role": "trace_local_adjacency_sort",
+            "path": str(trace_sort_patch),
+            "sha256": sha256_file(trace_sort_patch),
+        },
+    ]
+    changed_files = [
+        "cumesh/cumesh.py",
+        "src/connectivity.cu",
+        "src/cumesh.h",
+        "src/ext.cpp",
+        "src/simplify.cu",
+    ]
+
+    report = run_witness(
+        input_ply=input_ply,
+        instrumentation_patch=qem_patch,
+        output_npz=output_npz,
+        output_json=output_json,
+        expected_input_sha256=sha256_file(input_ply),
+        expected_patch_sha256=sha256_file(qem_patch),
+        work_dir=tmp_path / "build",
+        component_trace=True,
+        canonical_adjacency_patch=canonical_patch,
+        expected_canonical_adjacency_patch_sha256=sha256_file(
+            canonical_patch
+        ),
+        trace_adjacency_patch=trace_sort_patch,
+        expected_trace_adjacency_patch_sha256=sha256_file(
+            trace_sort_patch
+        ),
+        runtime_factory=lambda **kwargs: _runtime(
+            sha256_file(qem_patch),
+            (
+                "trellis2mlx.cumesh_canonical_qem_cost_component_"
+                "instrumentation.v1"
+            ),
+            patches=patches,
+            changed_files=changed_files,
+        ),
+        collector=lambda runtime, vertices, faces: _component_arrays(),
+    )
+
+    instrumentation = report["effective_route"]["cumesh_instrumentation"]
+    assert instrumentation["patches"] == patches
+    assert instrumentation["changed_files"] == changed_files
+    assert report["effective_route"]["geometry_route"] == (
+        "release-cumesh-canonical-adjacency-qem-cost-component-"
+        "trace-instrumented"
+    )
+    assert report["effective_route"]["adjacency_order"] == (
+        "ascending-face-id-per-vertex"
+    )
+
+
+def test_canonical_component_witness_rejects_partial_patch_identity(tmp_path):
+    input_ply = tmp_path / "input.ply"
+    qem_patch = tmp_path / "qem.patch"
+    canonical_patch = tmp_path / "canonical.patch"
+    _write_input(input_ply)
+    qem_patch.write_text("qem\n")
+    canonical_patch.write_text("canonical\n")
+
+    with pytest.raises(WitnessError, match="canonical QEM route requires"):
+        run_witness(
+            input_ply=input_ply,
+            instrumentation_patch=qem_patch,
+            output_npz=tmp_path / "trace.npz",
+            output_json=tmp_path / "trace.json",
+            expected_input_sha256=sha256_file(input_ply),
+            expected_patch_sha256=sha256_file(qem_patch),
+            work_dir=tmp_path / "build",
+            component_trace=True,
+            canonical_adjacency_patch=canonical_patch,
+            expected_canonical_adjacency_patch_sha256=sha256_file(
+                canonical_patch
+            ),
+            runtime_factory=lambda **kwargs: pytest.fail(
+                "runtime should not be created"
+            ),
+        )
 
 
 def test_component_witness_can_preserve_explicitly_masked_non_global_trace(
