@@ -900,7 +900,11 @@ def test_generate_exposes_shape_flow_step_capture():
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
-    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
 
     args = build_parser().parse_args(
         [
@@ -918,12 +922,31 @@ def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
             "512",
             "--shared-noise",
             "noise.npz",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
         ]
     )
 
     command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(args, command)["route"]
 
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_step"
+    assert command[command.index("--shape-flow-attention-backend") + 1] == (
+        "source-cuda-self"
+    )
+    assert command[
+        command.index("--shape-flow-attention-softmax-backend") + 1
+    ] == "source-cuda-turing"
+    assert command[
+        command.index("--shape-flow-attention-value-backend") + 1
+    ] == "source-cuda-sequential"
+    assert route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
+    )
 
 
 def test_generate_exposes_shape_flow_steps_capture():
@@ -2524,7 +2547,10 @@ def test_shape_flow_attention_selectors_are_trace_only(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match="shape-flow attention selectors require --stop-after-stage shape_flow_block_trace",
+        match=(
+            "shape-flow attention selectors require --stop-after-stage "
+            "shape_flow_step or shape_flow_block_trace"
+        ),
     ):
         _build_generate_command(args, tmp_path / "checkpoints")
 
@@ -2906,6 +2932,167 @@ def test_shape_flow_attention_matching_primary_completes_route_binding(
     ] == "manual"
 
 
+def test_shape_flow_attention_first_step_primary_rejects_effective_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_fallback_step(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_step.npz"
+        checkpoint.parent.mkdir(parents=True)
+        np.savez(
+            checkpoint,
+            sample_next=np.zeros((2, 4), dtype=np.float32),
+            shape_timestep_modulation_lut_json=np.array(""),
+            shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+            qk_norm_backend=np.array("source-cuda-warp32"),
+            rope_backend=np.array("mlx-real"),
+            shape_flow_attention_backend_requested=np.array("source-cuda-self"),
+            shape_flow_attention_backend_effective=np.array("fast"),
+            shape_flow_attention_softmax_backend_requested=np.array(
+                "source-cuda-turing"
+            ),
+            shape_flow_attention_softmax_backend_effective=np.array(
+                "fused-fast-attention"
+            ),
+            shape_flow_attention_value_backend_requested=np.array(
+                "source-cuda-sequential"
+            ),
+            shape_flow_attention_value_backend_effective=np.array(
+                "fused-fast-attention"
+            ),
+            shape_flow_gelu_backend_effective=np.array(
+                "source-cuda-bf16-table-formula-otherwise"
+            ),
+            shape_flow_gelu_table_bits_sha256_effective=np.array(
+                "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+            ),
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        write_fallback_step,
+    )
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+            "--qk-norm-backend",
+            "source-cuda-warp32",
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "bind_effective_route_identity"
+    assert report["primary_output_status"] == "invalid"
+    assert "effective shape-flow attention backend 'fast'" in report["error"]
+
+
+def test_shape_flow_attention_matching_first_step_primary_completes_route_binding(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_matching_step(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_step.npz"
+        checkpoint.parent.mkdir(parents=True)
+        np.savez(
+            checkpoint,
+            sample_next=np.zeros((2, 4), dtype=np.float32),
+            shape_timestep_modulation_lut_json=np.array(""),
+            shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+            qk_norm_backend=np.array("source-cuda-warp32"),
+            rope_backend=np.array("mlx-real"),
+            shape_flow_attention_backend_requested=np.array("source-cuda-self"),
+            shape_flow_attention_backend_effective=np.array(
+                "source-cuda-self-widths-1029-7697-fast-otherwise"
+            ),
+            shape_flow_attention_softmax_backend_requested=np.array(
+                "source-cuda-turing"
+            ),
+            shape_flow_attention_softmax_backend_effective=np.array(
+                "source-cuda-turing-widths-1029-7697-fast-otherwise"
+            ),
+            shape_flow_attention_value_backend_requested=np.array(
+                "source-cuda-sequential"
+            ),
+            shape_flow_attention_value_backend_effective=np.array(
+                "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+            ),
+            shape_flow_gelu_backend_effective=np.array(
+                "source-cuda-bf16-table-formula-otherwise"
+            ),
+            shape_flow_gelu_table_bits_sha256_effective=np.array(
+                "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+            ),
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        write_matching_step,
+    )
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+            "--qk-norm-backend",
+            "source-cuda-warp32",
+        ]
+    )
+
+    assert result == 0
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "done"
+    assert report["last_trustworthy_phase"] == "shape_flow_step_validated"
+    assert report["route_identity"]["route"][
+        "shape_flow_attention_backend_effective"
+    ] == "source-cuda-self-widths-1029-7697-fast-otherwise"
+
+
 def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path):
     import subprocess
     import sys
@@ -2934,7 +3121,7 @@ def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path)
     assert result.returncode == 2
     assert (
         "shape-flow attention selectors require "
-        "--stop-after-stage shape_flow_block_trace"
+        "--stop-after-stage shape_flow_step or shape_flow_block_trace"
     ) in result.stderr
 
 
@@ -2958,6 +3145,35 @@ def test_generate_shape_flow_attention_route_does_not_touch_non_trace_stages(
     assert (
         os.environ["TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"]
         == "stale-ignored"
+    )
+
+
+def test_generate_configures_shape_flow_attention_route_for_first_step(
+    monkeypatch,
+):
+    import argparse
+    import os
+
+    import generate
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul")
+    args = argparse.Namespace(
+        stop_after_stage="shape_flow_step",
+        shape_flow_attention_backend="source-cuda-self",
+        shape_flow_attention_softmax_backend="source-cuda-turing",
+        shape_flow_attention_value_backend="source-cuda-sequential",
+    )
+
+    route = generate._configure_shape_flow_attention_route(args)
+
+    assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "source-cuda-self"
+    assert route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
+    )
+    assert route["shape_flow_attention_softmax_backend_effective"] == (
+        "source-cuda-turing-widths-1029-7697-fast-otherwise"
     )
 
 
