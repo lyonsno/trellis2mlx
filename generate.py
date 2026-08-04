@@ -2513,6 +2513,7 @@ def main():
             guidance_rescale=np.array(SHAPE_SAMPLER["guidance_rescale"], dtype=np.float32),
             guidance_interval=np.array(SHAPE_SAMPLER["guidance_interval"], dtype=np.float32),
             rescale_t=np.array(SHAPE_SAMPLER["rescale_t"], dtype=np.float32),
+            sigma_min=np.array(1e-5, dtype=np.float32),
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_timestep_modulation_lut_json=np.array(
                 shape_timestep_modulation_lut_json

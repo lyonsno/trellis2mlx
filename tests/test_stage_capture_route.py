@@ -1625,6 +1625,97 @@ def _rewrite_npz_array(path, name, value):
     np.savez(path, **payload)
 
 
+def _write_valid_shape_flow_step_checkpoint(
+    path,
+    *,
+    steps=8,
+    tokens=2,
+    channels=4,
+    attention_backend_effective="source-cuda-self-widths-1029-7697-fast-otherwise",
+    attention_softmax_backend_effective=(
+        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+    ),
+    attention_value_backend_effective=(
+        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+    ),
+):
+    import numpy as np
+
+    noise = np.arange(tokens * channels, dtype=np.float32).reshape(
+        tokens, channels
+    ) / np.float32(100.0)
+    pred_final = np.zeros_like(noise)
+    schedule = np.linspace(1, 0, steps + 1, dtype=np.float64)
+    schedule = 3.0 * schedule / (1 + 2.0 * schedule)
+    t = np.float32(schedule[0])
+    t_prev = np.float32(schedule[1])
+    coords_3d = np.arange(tokens * 3, dtype=np.int32).reshape(tokens, 3)
+    coords = np.concatenate(
+        [np.zeros((tokens, 1), dtype=np.int32), coords_3d], axis=1
+    )
+    tensor = np.zeros_like(noise)
+    np.savez(
+        path,
+        noise=noise,
+        sample_feats=noise.copy(),
+        coords=coords,
+        coords_3d=coords_3d,
+        pred_pos=tensor,
+        pred_neg=tensor,
+        pred_cfg=tensor,
+        x0_pos=tensor,
+        x0_cfg=tensor,
+        std_pos=np.asarray(0.0, dtype=np.float32),
+        std_cfg=np.asarray(0.0, dtype=np.float32),
+        ratio_raw=np.asarray(0.0, dtype=np.float32),
+        std_ratio=np.asarray(0.0, dtype=np.float32),
+        ratio_effective=np.asarray(0.0, dtype=np.float32),
+        x0_rescaled=tensor,
+        x0_after_rescale=tensor,
+        pred_final=pred_final,
+        pred_v_feats=pred_final.copy(),
+        sample_next=noise.copy(),
+        t=np.asarray(t, dtype=np.float32),
+        t_prev=np.asarray(t_prev, dtype=np.float32),
+        steps=np.asarray(steps, dtype=np.int32),
+        guidance_strength=np.asarray(7.5, dtype=np.float32),
+        guidance_rescale=np.asarray(0.5, dtype=np.float32),
+        guidance_interval=np.asarray([0.6, 1.0], dtype=np.float32),
+        rescale_t=np.asarray(3.0, dtype=np.float32),
+        sigma_min=np.asarray(1e-5, dtype=np.float32),
+        shape_flow_block_injection_json=np.asarray(""),
+        shape_timestep_modulation_lut_json=np.asarray(""),
+        shape_flow_layernorm_backend=np.asarray("mlx-two-pass"),
+        qk_norm_backend=np.asarray("source-cuda-warp32"),
+        rope_backend=np.asarray("mlx-real"),
+        shape_flow_attention_backend_requested=np.asarray("source-cuda-self"),
+        shape_flow_attention_backend_effective=np.asarray(
+            attention_backend_effective
+        ),
+        shape_flow_attention_softmax_backend_requested=np.asarray(
+            "source-cuda-turing"
+        ),
+        shape_flow_attention_softmax_backend_effective=np.asarray(
+            attention_softmax_backend_effective
+        ),
+        shape_flow_attention_value_backend_requested=np.asarray(
+            "source-cuda-sequential"
+        ),
+        shape_flow_attention_value_backend_effective=np.asarray(
+            attention_value_backend_effective
+        ),
+        shape_flow_gelu_backend_effective=np.asarray(
+            "source-cuda-bf16-table-formula-otherwise"
+        ),
+        shape_flow_gelu_table_bits_sha256_effective=np.asarray(
+            "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+        ),
+        shape_flow_turing_rsqrt_lut_sha256=np.asarray(""),
+        shape_flow_turing_rsqrt_lut_content_sha256=np.asarray(""),
+        shape_flow_turing_rope_phase_lut_sha256=np.asarray(""),
+    )
+
+
 def test_shape_flow_steps_missing_effective_layernorm_backend_fails_loud(tmp_path):
     import numpy as np
     import pytest
@@ -2983,33 +3074,11 @@ def test_shape_flow_attention_first_step_primary_rejects_effective_fallback(
     def write_fallback_step(command, **kwargs):
         checkpoint = output_dir / "checkpoints" / "shape_flow_step.npz"
         checkpoint.parent.mkdir(parents=True)
-        np.savez(
+        _write_valid_shape_flow_step_checkpoint(
             checkpoint,
-            sample_next=np.zeros((2, 4), dtype=np.float32),
-            shape_timestep_modulation_lut_json=np.array(""),
-            shape_flow_layernorm_backend=np.array("mlx-two-pass"),
-            qk_norm_backend=np.array("source-cuda-warp32"),
-            rope_backend=np.array("mlx-real"),
-            shape_flow_attention_backend_requested=np.array("source-cuda-self"),
-            shape_flow_attention_backend_effective=np.array("fast"),
-            shape_flow_attention_softmax_backend_requested=np.array(
-                "source-cuda-turing"
-            ),
-            shape_flow_attention_softmax_backend_effective=np.array(
-                "fused-fast-attention"
-            ),
-            shape_flow_attention_value_backend_requested=np.array(
-                "source-cuda-sequential"
-            ),
-            shape_flow_attention_value_backend_effective=np.array(
-                "fused-fast-attention"
-            ),
-            shape_flow_gelu_backend_effective=np.array(
-                "source-cuda-bf16-table-formula-otherwise"
-            ),
-            shape_flow_gelu_table_bits_sha256_effective=np.array(
-                "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
-            ),
+            attention_backend_effective="fast",
+            attention_softmax_backend_effective="fused-fast-attention",
+            attention_value_backend_effective="fused-fast-attention",
         )
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
@@ -3039,12 +3108,12 @@ def test_shape_flow_attention_first_step_primary_rejects_effective_fallback(
     assert result == 2
     report = json.loads((output_dir / "run_report.json").read_text())
     assert report["status"] == "failed"
-    assert report["failure_phase"] == "bind_effective_route_identity"
+    assert report["failure_phase"] == "validate_primary_output"
     assert report["primary_output_status"] == "invalid"
     assert "effective shape-flow attention backend 'fast'" in report["error"]
 
 
-def test_shape_flow_attention_matching_first_step_primary_completes_route_binding(
+def test_shape_flow_attention_matching_metadata_cannot_validate_partial_first_step(
     tmp_path,
     monkeypatch,
 ):
@@ -3117,10 +3186,64 @@ def test_shape_flow_attention_matching_first_step_primary_completes_route_bindin
         ]
     )
 
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "validate_primary_output"
+    assert report["primary_output_status"] == "invalid"
+    assert "shape_flow_step missing required arrays" in report["error"]
+
+
+def test_shape_flow_attention_complete_first_step_primary_binds_route(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def write_complete_step(command, **kwargs):
+        checkpoint = output_dir / "checkpoints" / "shape_flow_step.npz"
+        checkpoint.parent.mkdir(parents=True)
+        _write_valid_shape_flow_step_checkpoint(checkpoint)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        write_complete_step,
+    )
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_step",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+            "--qk-norm-backend",
+            "source-cuda-warp32",
+        ]
+    )
+
     assert result == 0
     report = json.loads((output_dir / "run_report.json").read_text())
     assert report["status"] == "done"
     assert report["last_trustworthy_phase"] == "shape_flow_step_validated"
+    assert report["primary_output_validation"]["schema"] == (
+        "trellis2mlx.shape_flow_step_output.v1"
+    )
+    assert report["primary_output_validation"]["token_count"] == 2
     assert report["route_identity"]["route"][
         "shape_flow_attention_backend_effective"
     ] == "source-cuda-self-widths-1029-7697-fast-otherwise"

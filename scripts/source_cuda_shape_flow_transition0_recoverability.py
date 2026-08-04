@@ -66,6 +66,14 @@ SOURCE_MATRIX_COMPARISON_CLASS = (
 )
 SOURCE_EXTERNAL_ROUTE = "official-source-cuda-external-transition0-recoverability"
 SOURCE_EXTERNAL_COMPARISON_CLASS = "external-transition0-plus-source-cuda-suffix"
+SOURCE_DIRECT_ROUTE = "official-source-cuda-shape-flow-recurrence"
+SOURCE_DIRECT_COMPARISON_CLASS = "source-native-eight-step-recurrence"
+SOURCE_DIRECT_INPUT_DIGESTS = (
+    "MLX run report",
+    "MLX shape-flow steps",
+    "conditioning",
+    "source tar",
+)
 SOURCE_EXTERNAL_CANDIDATE_NAMES = {
     "external-cuda-welford-metal",
     "external-cuda-welford-turing-t4",
@@ -1121,6 +1129,12 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
                 or candidate_names[1] not in SOURCE_EXTERNAL_CANDIDATE_NAMES
             ):
                 raise ValueError("source recurrence external route identity is invalid")
+        elif route_name == SOURCE_DIRECT_ROUTE:
+            if (
+                route.get("comparison_class") != SOURCE_DIRECT_COMPARISON_CLASS
+                or candidate_names != ["source-native-control"]
+            ):
+                raise ValueError("source recurrence direct route identity is invalid")
         else:
             raise ValueError("source recurrence route identity is invalid")
         if metadata.get("sampler_name") != SOURCE_SAMPLER_NAME:
@@ -1138,7 +1152,11 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
         ):
             raise ValueError("source recurrence sampler parameters are invalid")
         expected_digests = metadata.get("inputs", {}).get("expected_digests")
-        required_input_digests = set(SOURCE_REQUIRED_INPUT_DIGESTS)
+        required_input_digests = (
+            set(SOURCE_DIRECT_INPUT_DIGESTS)
+            if route_name == SOURCE_DIRECT_ROUTE
+            else set(SOURCE_REQUIRED_INPUT_DIGESTS)
+        )
         if route_name == SOURCE_EXTERNAL_ROUTE:
             required_input_digests.update(
                 {"external transition report", "external transition step"}
@@ -1156,10 +1174,17 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
                     f"source recurrence input digest {name!r} is invalid"
                 )
         source_candidate = metadata.get("source_candidate", {})
+        expected_source_step_indices = (
+            list(range(STEPS))
+            if route_name == SOURCE_DIRECT_ROUTE
+            else list(range(1, STEPS))
+        )
         if (
             source_candidate.get("name") != "source-native-control"
-            or source_candidate.get("source_step_indices") != list(range(1, STEPS))
-            or source_candidate.get("source_step_count") != STEPS - 1
+            or source_candidate.get("source_step_indices")
+            != expected_source_step_indices
+            or source_candidate.get("source_step_count")
+            != len(expected_source_step_indices)
         ):
             raise ValueError("source recurrence candidate identity is incomplete")
 

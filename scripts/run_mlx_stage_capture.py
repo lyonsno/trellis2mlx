@@ -892,6 +892,27 @@ def main(argv: list[str] | None = None) -> int:
                     ] = primary_output_validation["sampler"][
                         "shape_flow_turing_rope_phase_lut_sha256"
                     ]
+            elif args.stop_after_stage == "shape_flow_step":
+                primary_output_validation = _validate_shape_flow_step_checkpoint(
+                    checkpoint_npz,
+                    expected_steps=args.steps,
+                    expected_route=route_identity["route"],
+                )
+                route_identity["route"]["shape_flow_step_output"] = (
+                    primary_output_validation
+                )
+                effective_backend = _bind_effective_shape_flow_layernorm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+                effective_qk_backend = _bind_effective_qk_norm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+                effective_rope_backend = _bind_effective_rope_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
             else:
                 effective_backend = _bind_effective_shape_flow_layernorm_backend(
                     route_identity,
@@ -922,6 +943,17 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     raise ValueError(
                         "shape_flow_steps modulation validation differs from "
+                        "the shared effective binding"
+                    )
+            elif args.stop_after_stage == "shape_flow_step":
+                if (
+                    primary_output_validation["sampler"][
+                        "shape_timestep_modulation_route"
+                    ]
+                    != modulation_binding["shape_timestep_modulation_route"]
+                ):
+                    raise ValueError(
+                        "shape_flow_step modulation validation differs from "
                         "the shared effective binding"
                     )
             else:
@@ -955,7 +987,7 @@ def main(argv: list[str] | None = None) -> int:
             status = "failed"
             failure_phase = (
                 "validate_primary_output"
-                if args.stop_after_stage == "shape_flow_steps"
+                if args.stop_after_stage in {"shape_flow_step", "shape_flow_steps"}
                 else "bind_effective_route_identity"
             )
             route_binding_error = str(exc)
@@ -1476,6 +1508,261 @@ def _checkpoint_turing_lut_sha256(
                     f"non-Turing backend {backend!r}"
                 )
     return None, None
+
+
+def _validate_shape_flow_step_checkpoint(
+    checkpoint_path: Path,
+    *,
+    expected_steps: int,
+    expected_route: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    required = {
+        "noise",
+        "sample_feats",
+        "coords",
+        "coords_3d",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+        "t",
+        "t_prev",
+        "steps",
+        "guidance_strength",
+        "guidance_rescale",
+        "guidance_interval",
+        "rescale_t",
+        "sigma_min",
+        "shape_flow_block_injection_json",
+        "shape_timestep_modulation_lut_json",
+        "shape_flow_layernorm_backend",
+        "qk_norm_backend",
+        "rope_backend",
+    }
+    tensor_names = (
+        "noise",
+        "sample_feats",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "pred_v_feats",
+        "sample_next",
+    )
+    scalar_tensor_names = (
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+    )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        missing = sorted(required.difference(checkpoint.files))
+        if missing:
+            raise ValueError(f"shape_flow_step missing required arrays: {missing}")
+
+        noise = np.asarray(checkpoint["noise"])
+        if noise.dtype != np.dtype(np.float32) or noise.ndim != 2:
+            raise ValueError(
+                "shape_flow_step noise must have shape [N,C] float32, "
+                f"got {noise.shape} {noise.dtype}"
+            )
+        sample_shape = noise.shape
+        for name in tensor_names:
+            array = np.asarray(checkpoint[name])
+            if array.dtype != np.dtype(np.float32):
+                raise ValueError(
+                    f"shape_flow_step {name} dtype must be float32, got {array.dtype}"
+                )
+            if array.shape != sample_shape:
+                raise ValueError(
+                    f"shape_flow_step {name} shape {array.shape} does not match "
+                    f"{sample_shape}"
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(f"shape_flow_step {name} contains non-finite values")
+        for name in scalar_tensor_names:
+            array = np.asarray(checkpoint[name])
+            if array.dtype != np.dtype(np.float32) or array.shape != ():
+                raise ValueError(f"shape_flow_step {name} must be a float32 scalar")
+            if not np.isfinite(array).all():
+                raise ValueError(f"shape_flow_step {name} contains non-finite values")
+
+        if not np.array_equal(noise, np.asarray(checkpoint["sample_feats"])):
+            raise ValueError("shape_flow_step noise and sample_feats differ")
+        if not np.array_equal(
+            np.asarray(checkpoint["pred_final"]),
+            np.asarray(checkpoint["pred_v_feats"]),
+        ):
+            raise ValueError("shape_flow_step pred_v_feats does not match pred_final")
+
+        coords = np.asarray(checkpoint["coords"])
+        coords_3d = np.asarray(checkpoint["coords_3d"])
+        if coords.dtype != np.dtype(np.int32) or coords_3d.dtype != np.dtype(np.int32):
+            raise ValueError(
+                "shape_flow_step coords/coords_3d dtype must both be int32, "
+                f"got {coords.dtype} and {coords_3d.dtype}"
+            )
+        if coords.shape != (sample_shape[0], 4) or coords_3d.shape != (
+            sample_shape[0],
+            3,
+        ):
+            raise ValueError(
+                "shape_flow_step coordinates do not match token count: "
+                f"coords={coords.shape}, coords_3d={coords_3d.shape}, "
+                f"N={sample_shape[0]}"
+            )
+        if not np.array_equal(coords[:, 1:], coords_3d):
+            raise ValueError("shape_flow_step coords and coords_3d disagree")
+
+        steps_array = np.asarray(checkpoint["steps"])
+        if steps_array.shape != () or steps_array.dtype != np.dtype(np.int32):
+            raise ValueError("shape_flow_step steps must be an int32 scalar")
+        steps = int(steps_array.item())
+        if steps != expected_steps:
+            raise ValueError(
+                f"shape_flow_step records {steps} steps, expected {expected_steps}"
+            )
+
+        expected_sampler_scalars = {
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.5,
+            "rescale_t": 3.0,
+            "sigma_min": 1e-5,
+        }
+        sampler_scalars: dict[str, float] = {}
+        for name, expected in expected_sampler_scalars.items():
+            array = np.asarray(checkpoint[name])
+            if array.shape != () or array.dtype != np.dtype(np.float32):
+                raise ValueError(f"shape_flow_step {name} must be a float32 scalar")
+            value = float(array.item())
+            if not np.isfinite(value) or not np.isclose(
+                value, expected, rtol=0.0, atol=1e-7
+            ):
+                raise ValueError(
+                    f"shape_flow_step {name}={value} does not match route value {expected}"
+                )
+            sampler_scalars[name] = value
+
+        guidance_interval = np.asarray(checkpoint["guidance_interval"])
+        if (
+            guidance_interval.shape != (2,)
+            or guidance_interval.dtype != np.dtype(np.float32)
+            or not np.isfinite(guidance_interval).all()
+            or not np.allclose(
+                guidance_interval,
+                np.asarray([0.6, 1.0], dtype=np.float32),
+                rtol=0.0,
+                atol=1e-7,
+            )
+        ):
+            raise ValueError(
+                "shape_flow_step guidance_interval must be finite route value [0.6, 1.0]"
+            )
+
+        injection_array = np.asarray(checkpoint["shape_flow_block_injection_json"])
+        if injection_array.shape != () or injection_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape_flow_step shape_flow_block_injection_json must be a string scalar"
+            )
+        injection_json = str(injection_array.item())
+        injection_identity = json.loads(injection_json) if injection_json else None
+        if injection_identity is not None and not isinstance(injection_identity, dict):
+            raise ValueError(
+                "shape_flow_step shape_flow_block_injection_json must decode to an object"
+            )
+        injection_route = _validate_shape_flow_injection_identity(
+            injection_identity,
+            expected_route=expected_route or {},
+        )
+
+        modulation_array = np.asarray(
+            checkpoint["shape_timestep_modulation_lut_json"]
+        )
+        if modulation_array.shape != () or modulation_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape_flow_step shape_timestep_modulation_lut_json must be a string scalar"
+            )
+        modulation_json = str(modulation_array.item())
+        modulation_identity = json.loads(modulation_json) if modulation_json else None
+        if modulation_identity is not None and not isinstance(
+            modulation_identity, dict
+        ):
+            raise ValueError(
+                "shape_flow_step shape_timestep_modulation_lut_json must decode to an object"
+            )
+        modulation_route = _validate_shape_timestep_modulation_identity(
+            modulation_identity,
+            expected_route=expected_route or {},
+        )
+
+        t_array = np.asarray(checkpoint["t"])
+        t_prev_array = np.asarray(checkpoint["t_prev"])
+        if (
+            t_array.shape != ()
+            or t_prev_array.shape != ()
+            or t_array.dtype != np.dtype(np.float32)
+            or t_prev_array.dtype != np.dtype(np.float32)
+        ):
+            raise ValueError("shape_flow_step t/t_prev must both be float32 scalars")
+        t = float(t_array.item())
+        t_prev = float(t_prev_array.item())
+        schedule = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)
+        rescale_t = sampler_scalars["rescale_t"]
+        schedule = rescale_t * schedule / (1 + (rescale_t - 1) * schedule)
+        expected_t = np.float32(schedule[0])
+        expected_t_prev = np.float32(schedule[1])
+        if t_array.item() != expected_t or t_prev_array.item() != expected_t_prev:
+            raise ValueError(
+                "shape_flow_step t/t_prev do not match the first rescaled route pair"
+            )
+        pred_final = np.asarray(checkpoint["pred_final"], dtype=np.float32)
+        expected_next = noise - np.float32(expected_t - expected_t_prev) * pred_final
+        sample_next = np.asarray(checkpoint["sample_next"], dtype=np.float32)
+        euler_residual = np.abs(
+            sample_next.astype(np.float64) - expected_next.astype(np.float64)
+        )
+        if not np.allclose(sample_next, expected_next, rtol=2e-5, atol=2e-5):
+            raise ValueError(
+                "shape_flow_step Euler transition is inconsistent; "
+                f"max_abs_residual={float(np.max(euler_residual))}"
+            )
+
+    return {
+        "schema": "trellis2mlx.shape_flow_step_output.v1",
+        "path": str(checkpoint_path),
+        "sha256": _sha256_file(checkpoint_path),
+        "size_bytes": checkpoint_path.stat().st_size,
+        "step_count": 1,
+        "configured_step_count": expected_steps,
+        "token_count": int(sample_shape[0]),
+        "channel_count": int(sample_shape[1]),
+        "euler_transition_max_abs_residual": float(np.max(euler_residual)),
+        "sampler": {
+            **sampler_scalars,
+            "guidance_interval": [float(value) for value in guidance_interval],
+            "shape_flow_block_injection_json": injection_json,
+            "shape_flow_block_injection_route": injection_route,
+            "shape_timestep_modulation_lut_json": modulation_json,
+            "shape_timestep_modulation_route": modulation_route,
+        },
+        "finite": True,
+    }
 
 
 def _validate_shape_flow_steps_checkpoint(

@@ -255,6 +255,43 @@ def test_source_recurrence_artifact_binds_route_arrays_and_exact_linkage(tmp_pat
     assert validate_source_recurrence_artifact(output)["all_arrays_bound"] is True
 
 
+def test_source_recurrence_artifact_admits_truthful_direct_source_route(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        SOURCE_DIRECT_COMPARISON_CLASS,
+        SOURCE_DIRECT_INPUT_DIGESTS,
+        SOURCE_DIRECT_ROUTE,
+        validate_source_recurrence_artifact,
+        write_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture()
+    report["effective_route"].update(
+        {
+            "route": SOURCE_DIRECT_ROUTE,
+            "comparison_class": SOURCE_DIRECT_COMPARISON_CLASS,
+            "candidate_names": ["source-native-control"],
+        }
+    )
+    report["inputs"]["expected_digests"] = {
+        name: "1" * 64 for name in SOURCE_DIRECT_INPUT_DIGESTS
+    }
+    report["candidates"] = [
+        {
+            "name": "source-native-control",
+            "source_step_indices": list(range(8)),
+            "source_step_count": 8,
+        }
+    ]
+
+    output = tmp_path / "direct-source-recurrence.npz"
+    receipt = write_source_recurrence_artifact(
+        output, arrays=arrays, report=report
+    )
+
+    assert receipt["validation"]["recurrence_exact"] is True
+    assert validate_source_recurrence_artifact(output)["step_count"] == 8
+
+
 def test_guided_prediction_captures_the_exact_source_postprocessing_chain():
     from scripts.source_cuda_shape_block29_basin_map import _guided_prediction
 
