@@ -930,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
             if args.stop_after_stage in {
                 "shape_flow_step",
+                "shape_flow_steps",
                 "shape_flow_block_trace",
             }:
                 _bind_effective_shape_flow_attention_route(
@@ -2000,11 +2001,13 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         or args.shape_flow_attention_value_backend
     ) and args.stop_after_stage not in {
         "shape_flow_step",
+        "shape_flow_steps",
         "shape_flow_block_trace",
     }:
         raise ValueError(
             "shape-flow attention selectors require "
-            "--stop-after-stage shape_flow_step or shape_flow_block_trace"
+            "--stop-after-stage shape_flow_step, shape_flow_steps, or "
+            "shape_flow_block_trace"
         )
     command = [
         sys.executable,
@@ -2117,6 +2120,7 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
     if args.stop_after_stage in {
         "shape_flow_step",
+        "shape_flow_steps",
         "shape_flow_block_trace",
     }:
         if args.shape_flow_attention_backend:

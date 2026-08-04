@@ -976,7 +976,11 @@ def test_generate_exposes_shape_flow_steps_capture():
 
 
 def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
-    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
 
     args = build_parser().parse_args(
         [
@@ -992,12 +996,25 @@ def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
             "8",
             "--resolution",
             "512",
+            "--shape-flow-attention-backend",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
         ]
     )
 
     command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(args, command)["route"]
 
     assert command[command.index("--stop-after-stage") + 1] == "shape_flow_steps"
+    assert command[command.index("--shape-flow-attention-backend") + 1] == (
+        "source-cuda-self"
+    )
+    assert route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
+    )
 
 
 def test_stage_capture_forwards_and_records_shape_flow_layernorm_backend(tmp_path):
@@ -1580,6 +1597,22 @@ def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channel
         qk_norm_backend=np.array("source-cuda-warp32"),
         rope_backend=np.array("mlx-real"),
         shape_flow_turing_rope_phase_lut_sha256=np.array(""),
+        shape_flow_attention_backend_requested=np.array("fast"),
+        shape_flow_attention_backend_effective=np.array("fast"),
+        shape_flow_attention_softmax_backend_requested=np.array("mlx-softmax"),
+        shape_flow_attention_softmax_backend_effective=np.array(
+            "fused-fast-attention"
+        ),
+        shape_flow_attention_value_backend_requested=np.array("mlx-matmul"),
+        shape_flow_attention_value_backend_effective=np.array(
+            "fused-fast-attention"
+        ),
+        shape_flow_gelu_backend_effective=np.array(
+            "source-cuda-bf16-table-formula-otherwise"
+        ),
+        shape_flow_gelu_table_bits_sha256_effective=np.array(
+            "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+        ),
     )
 
 
@@ -2527,7 +2560,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     ] == "source-cuda-sequential"
 
 
-def test_shape_flow_attention_selectors_are_trace_only(tmp_path):
+def test_shape_flow_attention_selectors_are_diagnostic_only(tmp_path):
     import pytest
 
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
@@ -2539,7 +2572,7 @@ def test_shape_flow_attention_selectors_are_trace_only(tmp_path):
             "--output-dir",
             str(tmp_path),
             "--stop-after-stage",
-            "shape_flow_steps",
+            "shape_slat",
             "--shape-flow-attention-backend",
             "manual",
         ]
@@ -2549,13 +2582,13 @@ def test_shape_flow_attention_selectors_are_trace_only(tmp_path):
         ValueError,
         match=(
             "shape-flow attention selectors require --stop-after-stage "
-            "shape_flow_step or shape_flow_block_trace"
+            "shape_flow_step, shape_flow_steps, or shape_flow_block_trace"
         ),
     ):
         _build_generate_command(args, tmp_path / "checkpoints")
 
 
-def test_shape_flow_attention_trace_preflight_preserves_stale_primary_as_untrusted(
+def test_shape_flow_attention_diagnostic_preflight_preserves_stale_primary_as_untrusted(
     tmp_path,
     monkeypatch,
 ):
@@ -2566,7 +2599,7 @@ def test_shape_flow_attention_trace_preflight_preserves_stale_primary_as_untrust
     image = tmp_path / "input.png"
     image.write_bytes(b"image")
     output_dir = tmp_path / "output"
-    stale = output_dir / "checkpoints" / "shape_flow_steps.npz"
+    stale = output_dir / "checkpoints" / "shape_slat.npz"
     stale.parent.mkdir(parents=True)
     stale.write_bytes(b"stale")
 
@@ -2585,7 +2618,7 @@ def test_shape_flow_attention_trace_preflight_preserves_stale_primary_as_untrust
             "--output-dir",
             str(output_dir),
             "--stop-after-stage",
-            "shape_flow_steps",
+            "shape_slat",
             "--shape-flow-attention-backend",
             "manual",
         ]
@@ -3093,7 +3126,7 @@ def test_shape_flow_attention_matching_first_step_primary_completes_route_bindin
     ] == "source-cuda-self-widths-1029-7697-fast-otherwise"
 
 
-def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path):
+def test_generate_rejects_shape_flow_attention_selectors_outside_diagnostics(tmp_path):
     import subprocess
     import sys
 
@@ -3110,7 +3143,7 @@ def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path)
             "--save-checkpoints",
             str(tmp_path / "checkpoints"),
             "--stop-after-stage",
-            "shape_flow_steps",
+            "shape_slat",
             "--shape-flow-attention-backend",
             "manual",
         ],
@@ -3121,7 +3154,8 @@ def test_generate_rejects_shape_flow_attention_selectors_outside_trace(tmp_path)
     assert result.returncode == 2
     assert (
         "shape-flow attention selectors require "
-        "--stop-after-stage shape_flow_step or shape_flow_block_trace"
+        "--stop-after-stage shape_flow_step, shape_flow_steps, or "
+        "shape_flow_block_trace"
     ) in result.stderr
 
 
@@ -3135,7 +3169,7 @@ def test_generate_shape_flow_attention_route_does_not_touch_non_trace_stages(
     monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
     monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "stale-ignored")
     args = argparse.Namespace(
-        stop_after_stage="shape_flow_steps",
+        stop_after_stage="shape_slat",
         shape_flow_attention_backend=None,
         shape_flow_attention_softmax_backend=None,
         shape_flow_attention_value_backend=None,

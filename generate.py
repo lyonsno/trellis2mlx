@@ -220,6 +220,7 @@ def _configure_shape_flow_attention_route(
 ) -> dict[str, str] | None:
     if args.stop_after_stage not in {
         "shape_flow_step",
+        "shape_flow_steps",
         "shape_flow_block_trace",
     }:
         return None
@@ -1240,11 +1241,13 @@ def main():
         or args.shape_flow_attention_value_backend
     ) and args.stop_after_stage not in {
         "shape_flow_step",
+        "shape_flow_steps",
         "shape_flow_block_trace",
     }:
         parser.error(
             "shape-flow attention selectors require "
-            "--stop-after-stage shape_flow_step or shape_flow_block_trace"
+            "--stop-after-stage shape_flow_step, shape_flow_steps, or "
+            "shape_flow_block_trace"
         )
     turing_rsqrt_required = (
         args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
@@ -2537,6 +2540,9 @@ def main():
     if args.save_checkpoints and args.stop_after_stage == "shape_flow_steps":
         from trellmlx.checkpoint import save_checkpoint
 
+        if shape_flow_attention_route is None:
+            raise RuntimeError("shape-flow attention route was not configured")
+
         def shape_stack_step(name: str) -> np.ndarray:
             return np.stack(
                 [np.array(step[name]).astype(np.float32, copy=False) for step in shape_step_captures],
@@ -2584,6 +2590,10 @@ def main():
             shape_timestep_modulation_lut_json=np.array(
                 shape_timestep_modulation_lut_json
             ),
+            **{
+                field: np.array(value)
+                for field, value in shape_flow_attention_route.items()
+            },
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
             rope_backend=np.array(get_rope_backend()),
