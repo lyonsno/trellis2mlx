@@ -1320,8 +1320,9 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
             expected: np.ndarray,
             *,
             atol: float,
+            rtol: float = 0.0,
         ) -> None:
-            if not np.allclose(actual, expected, rtol=0.0, atol=atol):
+            if not np.allclose(actual, expected, rtol=rtol, atol=atol):
                 max_abs = float(
                     np.max(
                         np.abs(
@@ -1374,8 +1375,15 @@ def validate_source_recurrence_artifact(path: Path) -> dict[str, Any]:
 
         std_pos = np.asarray(archive["std_pos"])
         std_cfg = np.asarray(archive["std_cfg"])
-        require_guidance_close("std_pos", std_pos, sparse_std(x0_pos), atol=1e-5)
-        require_guidance_close("std_cfg", std_cfg, sparse_std(x0_cfg), atol=1e-5)
+        # The source SparseTensor computes population variance as two float32
+        # segmented reductions. CUDA and NumPy can round those reductions
+        # differently before the cancellation in mean(x^2) - mean(x)^2.
+        require_guidance_close(
+            "std_pos", std_pos, sparse_std(x0_pos), atol=1e-6, rtol=1e-4
+        )
+        require_guidance_close(
+            "std_cfg", std_cfg, sparse_std(x0_cfg), atol=1e-6, rtol=1e-4
+        )
         expected_ratio = std_pos / std_cfg
         std_ratio = np.asarray(archive["std_ratio"])
         require_guidance_close(

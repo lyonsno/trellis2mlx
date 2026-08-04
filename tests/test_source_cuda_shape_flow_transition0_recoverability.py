@@ -60,7 +60,7 @@ def test_parser_accepts_separate_source_recurrence_output(tmp_path):
     assert args.source_recurrence_output == trace_path
 
 
-def _source_recurrence_fixture():
+def _source_recurrence_fixture(*, std_reduction_scale=np.float32(1.0)):
     from scripts.source_cuda_shape_flow_suffix_ladder import _schedule_pairs
     from scripts.source_cuda_shape_flow_transition0_recoverability import (
         build_source_recurrence_arrays,
@@ -108,8 +108,8 @@ def _source_recurrence_fixture():
                 mean2 = row_mean2.mean(axis=0, keepdims=True, dtype=np.float32)
                 return np.sqrt(mean2 - np.square(mean), dtype=np.float32)
 
-            std_pos = sparse_std(x0_pos)
-            std_cfg = sparse_std(x0_cfg)
+            std_pos = sparse_std(x0_pos) * std_reduction_scale
+            std_cfg = sparse_std(x0_cfg) * std_reduction_scale
             std_ratio = std_pos / std_cfg
             x0_rescaled = x0_cfg * std_ratio
             x0_after_rescale = (
@@ -253,6 +253,38 @@ def test_source_recurrence_artifact_binds_route_arrays_and_exact_linkage(tmp_pat
         ):
             assert archive[name].shape[0] == expected_active
     assert validate_source_recurrence_artifact(output)["all_arrays_bound"] is True
+
+
+def test_source_recurrence_artifact_accepts_float32_backend_reduction_drift(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        write_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture(
+        std_reduction_scale=np.float32(1.00008)
+    )
+    output = tmp_path / "source-recurrence.npz"
+
+    receipt = write_source_recurrence_artifact(
+        output, arrays=arrays, report=report
+    )
+
+    assert receipt["validation"]["all_arrays_bound"] is True
+
+
+def test_source_recurrence_artifact_rejects_material_std_reduction_drift(tmp_path):
+    from scripts.source_cuda_shape_flow_transition0_recoverability import (
+        write_source_recurrence_artifact,
+    )
+
+    arrays, report = _source_recurrence_fixture(
+        std_reduction_scale=np.float32(1.001)
+    )
+
+    with pytest.raises(ValueError, match="std_pos|std_cfg"):
+        write_source_recurrence_artifact(
+            tmp_path / "source-recurrence.npz", arrays=arrays, report=report
+        )
 
 
 def test_source_recurrence_artifact_admits_truthful_direct_source_route(tmp_path):
