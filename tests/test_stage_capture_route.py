@@ -1541,7 +1541,12 @@ def test_shape_flow_turing_rope_checkpoint_requires_effective_lut_hash(tmp_path)
 
 
 def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channels=4):
+    import json
     import numpy as np
+
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
 
     rescale_t = np.float32(3.0)
     schedule = np.linspace(1, 0, steps + 1, dtype=np.float64)
@@ -1595,6 +1600,18 @@ def _write_valid_shape_flow_steps_checkpoint(path, *, steps=3, tokens=2, channel
         sigma_min=np.array(1e-5, dtype=np.float32),
         shape_flow_block_injection_json=np.array(""),
         shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+        shape_flow_terminal_linear_json=np.array(
+            json.dumps(
+                shape_flow_terminal_linear_backend_identity(
+                    tokens,
+                    input_width=1536,
+                    output_width=channels,
+                    has_bias=True,
+                    source_cuda_terminal=False,
+                ),
+                sort_keys=True,
+            )
+        ),
         qk_norm_backend=np.array("source-cuda-warp32"),
         rope_backend=np.array("mlx-real"),
         shape_flow_turing_rope_phase_lut_sha256=np.array(""),
@@ -1640,7 +1657,12 @@ def _write_valid_shape_flow_step_checkpoint(
         "source-cuda-sequential-widths-1029-7697-fast-otherwise"
     ),
 ):
+    import json
     import numpy as np
+
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
 
     noise = np.arange(tokens * channels, dtype=np.float32).reshape(
         tokens, channels
@@ -1687,6 +1709,18 @@ def _write_valid_shape_flow_step_checkpoint(
         shape_flow_block_injection_json=np.asarray(""),
         shape_timestep_modulation_lut_json=np.asarray(""),
         shape_flow_layernorm_backend=np.asarray("mlx-two-pass"),
+        shape_flow_terminal_linear_json=np.asarray(
+            json.dumps(
+                shape_flow_terminal_linear_backend_identity(
+                    tokens,
+                    input_width=1536,
+                    output_width=channels,
+                    has_bias=True,
+                    source_cuda_terminal=False,
+                ),
+                sort_keys=True,
+            )
+        ),
         qk_norm_backend=np.asarray("source-cuda-warp32"),
         rope_backend=np.asarray("mlx-real"),
         shape_flow_attention_backend_requested=np.asarray("source-cuda-self"),
@@ -1739,6 +1773,74 @@ def test_shape_flow_steps_missing_effective_layernorm_backend_fails_loud(tmp_pat
             expected_steps=3,
             expected_route={
                 "shape_flow_layernorm_backend_requested": "cuda-welford-metal",
+            },
+        )
+
+
+def test_shape_flow_steps_missing_terminal_linear_identity_fails_loud(tmp_path):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    with np.load(checkpoint, allow_pickle=False) as loaded:
+        payload = {
+            key: np.asarray(loaded[key])
+            for key in loaded.files
+            if key != "shape_flow_terminal_linear_json"
+        }
+    np.savez(checkpoint, **payload)
+
+    with pytest.raises(
+        ValueError,
+        match="missing required arrays.*shape_flow_terminal_linear_json",
+    ):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "source-cuda-warp32",
+                "rope_backend_requested": "mlx-real",
+            },
+        )
+
+
+def test_shape_flow_steps_rejects_substituted_terminal_linear_identity(tmp_path):
+    import json
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_shape_flow_steps_checkpoint
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
+
+    checkpoint = tmp_path / "shape_flow_steps.npz"
+    _write_valid_shape_flow_steps_checkpoint(checkpoint)
+    substituted = shape_flow_terminal_linear_backend_identity(
+        6038,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=True,
+    )
+    _rewrite_npz_array(
+        checkpoint,
+        "shape_flow_terminal_linear_json",
+        np.asarray(json.dumps(substituted, sort_keys=True)),
+    )
+
+    with pytest.raises(ValueError, match="terminal-linear identity does not match"):
+        _validate_shape_flow_steps_checkpoint(
+            checkpoint,
+            expected_steps=3,
+            expected_route={
+                "shape_flow_layernorm_backend_requested": "mlx-two-pass",
+                "qk_norm_backend_requested": "source-cuda-warp32",
+                "rope_backend_requested": "mlx-real",
             },
         )
 
@@ -2169,6 +2271,11 @@ def test_shape_flow_steps_complete_checkpoint_is_route_bound(tmp_path, monkeypat
     assert report["primary_output_validation"]["step_count"] == 3
     assert report["primary_output_validation"]["token_count"] == 2
     assert route["route"]["shape_flow_steps_output"] == report["primary_output_validation"]
+    assert route["route"]["shape_flow_terminal_linear_identity_effective"] == (
+        report["primary_output_validation"]["sampler"][
+            "shape_flow_terminal_linear_identity"
+        ]
+    )
 
 
 def test_shape_flow_steps_rejects_sampler_inconsistent_final_transition(tmp_path):
@@ -2977,6 +3084,192 @@ def test_shape_flow_gelu_primary_identity_is_required_and_route_bound(tmp_path):
         _bind_effective_shape_flow_gelu_route(route_identity, checkpoint)
 
 
+def test_shape_flow_block_trace_rejects_effective_terminal_identity_without_output(
+    tmp_path,
+):
+    import json
+
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_terminal_linear_identity,
+    )
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
+
+    identity = shape_flow_terminal_linear_backend_identity(
+        2,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=False,
+    )
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        coords=np.zeros((2, 4), dtype=np.int32),
+        shape_flow_trace_selected_keys=np.asarray(["pos_block0_after_self"]),
+        shape_flow_terminal_linear_configured_json=np.asarray(
+            json.dumps(identity, sort_keys=True)
+        ),
+        shape_flow_terminal_linear_json=np.asarray(json.dumps(identity, sort_keys=True)),
+    )
+    route_identity = {"route": {}}
+
+    with pytest.raises(
+        ValueError,
+        match="claims an effective terminal-linear identity without a persisted final output",
+    ):
+        _bind_effective_shape_flow_terminal_linear_identity(
+            route_identity,
+            checkpoint,
+            effective_layernorm_backend="mlx-two-pass",
+        )
+
+
+def test_shape_flow_block_trace_binds_configured_terminal_identity_without_execution(
+    tmp_path,
+):
+    import json
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_terminal_linear_identity,
+    )
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
+
+    identity = shape_flow_terminal_linear_backend_identity(
+        2,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=False,
+    )
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        coords=np.zeros((2, 4), dtype=np.int32),
+        shape_flow_trace_selected_keys=np.asarray(["pos_block0_after_self"]),
+        shape_flow_terminal_linear_configured_json=np.asarray(
+            json.dumps(identity, sort_keys=True)
+        ),
+        shape_flow_terminal_linear_json=np.asarray(""),
+    )
+    route_identity = {"route": {}}
+
+    effective = _bind_effective_shape_flow_terminal_linear_identity(
+        route_identity,
+        checkpoint,
+        effective_layernorm_backend="mlx-two-pass",
+    )
+
+    assert effective is None
+    assert route_identity["route"][
+        "shape_flow_terminal_linear_identity_configured"
+    ] == identity
+    assert route_identity["route"][
+        "shape_flow_terminal_linear_identity_effective"
+    ] is None
+
+
+def test_shape_flow_block_trace_rejects_wrong_terminal_output_geometry(tmp_path):
+    import json
+
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_terminal_linear_identity,
+    )
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
+
+    identity = shape_flow_terminal_linear_backend_identity(
+        2,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=False,
+    )
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        coords=np.zeros((2, 4), dtype=np.int32),
+        pos_final_output=np.zeros((1, 2, 3), dtype=np.float32),
+        shape_flow_trace_selected_keys=np.asarray(["pos_final_output"]),
+        shape_flow_terminal_linear_configured_json=np.asarray(
+            json.dumps(identity, sort_keys=True)
+        ),
+        shape_flow_terminal_linear_json=np.asarray(json.dumps(identity, sort_keys=True)),
+    )
+    route_identity = {"route": {}}
+
+    with pytest.raises(
+        ValueError,
+        match=r"pos_final_output must have shape \[1,2,32\]",
+    ):
+        _bind_effective_shape_flow_terminal_linear_identity(
+            route_identity,
+            checkpoint,
+            effective_layernorm_backend="mlx-two-pass",
+        )
+
+
+def test_shape_flow_block_trace_binds_effective_terminal_identity_from_output(
+    tmp_path,
+):
+    import json
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_terminal_linear_identity,
+    )
+    from trellmlx.models.slat_flow import (
+        shape_flow_terminal_linear_backend_identity,
+    )
+
+    identity = shape_flow_terminal_linear_backend_identity(
+        2,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=False,
+    )
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        coords=np.zeros((2, 4), dtype=np.int32),
+        pos_final_output=np.zeros((1, 2, 32), dtype=np.float32),
+        shape_flow_trace_selected_keys=np.asarray(["pos_final_output"]),
+        shape_flow_terminal_linear_configured_json=np.asarray(
+            json.dumps(identity, sort_keys=True)
+        ),
+        shape_flow_terminal_linear_json=np.asarray(json.dumps(identity, sort_keys=True)),
+    )
+    route_identity = {"route": {}}
+
+    effective = _bind_effective_shape_flow_terminal_linear_identity(
+        route_identity,
+        checkpoint,
+        effective_layernorm_backend="mlx-two-pass",
+    )
+
+    assert effective == identity
+    assert route_identity["route"][
+        "shape_flow_terminal_linear_identity_configured"
+    ] == identity
+    assert route_identity["route"][
+        "shape_flow_terminal_linear_identity_effective"
+    ] == identity
+
+
 def test_shape_flow_attention_matching_primary_completes_route_binding(
     tmp_path,
     monkeypatch,
@@ -2995,11 +3288,29 @@ def test_shape_flow_attention_matching_primary_completes_route_binding(
     def write_matching_trace(command, **kwargs):
         checkpoint = output_dir / "checkpoints" / "shape_flow_block_trace.npz"
         checkpoint.parent.mkdir(parents=True)
+        from trellmlx.models.slat_flow import (
+            shape_flow_terminal_linear_backend_identity,
+        )
+
         np.savez(
             checkpoint,
-            pos_final_output=np.zeros((1, 2, 3), dtype=np.float32),
-            shape_flow_trace_selected_keys=np.array(["pos_final_output"]),
+            pos_block0_after_self=np.zeros((1, 2, 3), dtype=np.float32),
+            coords=np.zeros((2, 4), dtype=np.int32),
+            shape_flow_trace_selected_keys=np.array(["pos_block0_after_self"]),
             shape_flow_layernorm_backend=np.array("mlx-two-pass"),
+            shape_flow_terminal_linear_configured_json=np.array(
+                json.dumps(
+                    shape_flow_terminal_linear_backend_identity(
+                        2,
+                        input_width=1536,
+                        output_width=32,
+                        has_bias=True,
+                        source_cuda_terminal=False,
+                    ),
+                    sort_keys=True,
+                )
+            ),
+            shape_flow_terminal_linear_json=np.array(""),
             qk_norm_backend=np.array("source-cuda-warp32"),
             rope_backend=np.array("mlx-real"),
             shape_flow_attention_backend_requested=np.array("mlx-manual"),

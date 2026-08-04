@@ -40,6 +40,78 @@ from ..modules.attention import MultiHeadRMSNorm
 from ..modules.rope import build_sparse_rope_phases
 
 
+_SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS = (0, 308, 616, 924, 1232, 1536)
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = 6038
+_source_cuda_terminal_linear_kernel = None
+
+
+def shape_flow_terminal_linear_backend_identity(
+    row_count: int,
+    *,
+    input_width: int,
+    output_width: int,
+    has_bias: bool,
+    source_cuda_terminal: bool,
+) -> dict:
+    """Describe the effective terminal projection for the complete dispatch contract."""
+    geometry = {
+        "rows": row_count,
+        "input_width": input_width,
+        "output_width": output_width,
+        "has_bias": has_bias,
+    }
+    if (
+        source_cuda_terminal
+        and geometry
+        == {
+            "rows": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
+            "input_width": 1536,
+            "output_width": 32,
+            "has_bias": True,
+        }
+    ):
+        return {
+            "backend": "source-cuda-t4-volta-sgemm-32x128-tn-metal",
+            "algorithm": "five-contiguous-fp32-fma-partitions-with-bias-epilogue",
+            "experimental": True,
+            "cuda_source_kernel": "volta_sgemm_32x128_tn",
+            "authenticated_contract": {
+                "rows": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
+                "input_width": 1536,
+                "output_width": 32,
+                "input_dtype": "float32",
+                "weight_dtype": "float32",
+                "bias_dtype": "float32",
+                "output_dtype": "float32",
+                "partition_bounds": list(
+                    _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
+                ),
+                "cuda_device_anchor": "Tesla T4 sm_75",
+                "torch_anchor": "2.10.0+cu128",
+                "source_recurrence_sha256": (
+                    "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f"
+                ),
+                "cuda_prefix_ladder_sha256": (
+                    "b21bad4d52e8202efdeec5a87af4fa9b52edaa7d513bd57fddf393a6f80dd6cc"
+                ),
+            },
+        }
+    if source_cuda_terminal:
+        return {
+            "backend": "numpy-fp32-blas",
+            "algorithm": "numpy-matmul-then-bias",
+            "experimental": True,
+            "effective_contract": geometry,
+            "excluded_row_geometry": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
+        }
+    return {
+        "backend": "mlx-native-linear",
+        "algorithm": "mlx-nn-linear",
+        "experimental": True,
+        "effective_contract": geometry,
+    }
+
+
 def _shape_shared_modulation(
     t: mx.array,
     t_embedder: TimestepEmbedder,
@@ -57,11 +129,94 @@ def _shape_shared_modulation(
     )
 
 
+def _source_cuda_t4_terminal_linear(
+    x: mx.array,
+    linear: nn.Linear,
+) -> mx.array:
+    """Execute the observed T4 SGEMM reduction law for terminal projection."""
+    global _source_cuda_terminal_linear_kernel
+
+    if x.ndim != 2 or x.shape[1] != 1536:
+        raise ValueError("T4 terminal linear requires rank-2 width-1536 input")
+    if linear.weight.ndim != 2 or linear.weight.shape != (32, 1536):
+        raise ValueError("T4 terminal linear requires 32x1536 weight")
+    if linear.bias is None or linear.bias.shape != (32,):
+        raise ValueError("T4 terminal linear requires width-32 bias")
+
+    if _source_cuda_terminal_linear_kernel is None:
+        source = r"""
+                constexpr uint reduction = 1536;
+                constexpr uint columns = 32;
+                constexpr uint partition_bounds[6] = {
+                    0, 308, 616, 924, 1232, 1536
+                };
+
+                uint output_index = thread_position_in_grid.x;
+                uint output_count = row_count[0] * columns;
+                if (output_index >= output_count) {
+                    return;
+                }
+
+                uint row = output_index / columns;
+                uint column = output_index - row * columns;
+                uint input_offset = row * reduction;
+                uint weight_offset = column * reduction;
+                float accumulator = bias[column];
+
+                for (uint partition = 0; partition < 5; ++partition) {
+                    float partial = 0.0f;
+                    for (uint k = partition_bounds[partition];
+                         k < partition_bounds[partition + 1];
+                         ++k) {
+                        partial = metal::fma(
+                            inp[input_offset + k],
+                            weight[weight_offset + k],
+                            partial);
+                    }
+                    accumulator = accumulator + partial;
+                }
+                out[output_index] = accumulator;
+            """
+        _source_cuda_terminal_linear_kernel = mx.fast.metal_kernel(
+            name="shape_flow_source_cuda_t4_terminal_linear_fp32",
+            input_names=["inp", "weight", "bias", "row_count"],
+            output_names=["out"],
+            source=source,
+            ensure_row_contiguous=True,
+        )
+
+    rows = int(x.shape[0])
+    output_count = rows * 32
+    grid_size = ((output_count + 255) // 256) * 256
+    return _source_cuda_terminal_linear_kernel(
+        inputs=[
+            x.astype(mx.float32),
+            linear.weight.astype(mx.float32),
+            linear.bias.astype(mx.float32),
+            mx.array([rows], dtype=mx.uint32),
+        ],
+        grid=(grid_size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, 32)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def _source_cuda_terminal_linear(
     x: mx.array,
     linear: nn.Linear,
 ) -> mx.array:
-    """Use the FP32 BLAS schedule observed exact to source CUDA's out layer."""
+    """Dispatch only source-authenticated terminal projection schedules."""
+    if (
+        x.ndim == 2
+        and x.shape == (_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS, 1536)
+        and linear.weight.shape == (32, 1536)
+        and linear.bias is not None
+        and linear.bias.shape == (32,)
+    ):
+        return _source_cuda_t4_terminal_linear(x, linear)
+
+    # Preserve the pre-existing diagnostic path for non-production fixtures.
     x_np = np.array(x, dtype=np.float32)
     weight_np = np.array(linear.weight, dtype=np.float32)
     output = x_np @ weight_np.T
@@ -270,6 +425,23 @@ class SLatFlowModel(nn.Module):
         if source_cuda_terminal:
             return x, _source_cuda_terminal_linear(x, self.out_layer)
         return x, self.out_layer(x)
+
+    def terminal_linear_backend_identity(self, row_count: int) -> dict:
+        source_cuda_terminal = (
+            self.shape_flow_layernorm
+            and get_shape_flow_layernorm_backend()
+            in {
+                CUDA_WELFORD_METAL_BACKEND,
+                CUDA_WELFORD_TURING_T4_BACKEND,
+            }
+        )
+        return shape_flow_terminal_linear_backend_identity(
+            row_count,
+            input_width=int(self.out_layer.weight.shape[1]),
+            output_width=int(self.out_layer.weight.shape[0]),
+            has_bias=self.out_layer.bias is not None,
+            source_cuda_terminal=source_cuda_terminal,
+        )
 
     def _run_blocks_impl(self, x, mod, cond, rope_phases):
         """Pure forward pass through all blocks (no mx.eval)."""

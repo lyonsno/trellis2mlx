@@ -2409,6 +2409,10 @@ def main():
     t0 = time.perf_counter()
     shape_step_capture = {} if args.stop_after_stage == "shape_flow_step" else None
     shape_step_captures = [] if args.stop_after_stage == "shape_flow_steps" else None
+    shape_flow_terminal_linear_json = json.dumps(
+        lr_slat_flow.terminal_linear_backend_identity(N_lr),
+        sort_keys=True,
+    )
     if args.stop_after_stage == "shape_flow_block_trace":
         if shape_flow_attention_route is None:
             raise RuntimeError("shape-flow attention route was not configured")
@@ -2528,6 +2532,10 @@ def main():
         trace_payload, effective_trace_keys = _select_shape_flow_trace_payload(
             trace_payload, requested_trace_keys
         )
+        terminal_output_persisted = any(
+            key in trace_payload
+            for key in ("pos_final_output", "neg_final_output")
+        )
         save_checkpoint(
             args.save_checkpoints,
             "shape_flow_block_trace",
@@ -2568,6 +2576,14 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_timestep_modulation_lut_json=np.array(
                 shape_timestep_modulation_lut_json
+            ),
+            shape_flow_terminal_linear_configured_json=np.array(
+                shape_flow_terminal_linear_json
+            ),
+            shape_flow_terminal_linear_json=np.array(
+                shape_flow_terminal_linear_json
+                if terminal_output_persisted
+                else ""
             ),
             shape_flow_layernorm_backend=np.array(get_shape_flow_layernorm_backend()),
             qk_norm_backend=np.array(get_qk_norm_backend()),
@@ -2642,6 +2658,9 @@ def main():
             shape_timestep_modulation_lut_json=np.array(
                 shape_timestep_modulation_lut_json
             ),
+            shape_flow_terminal_linear_json=np.array(
+                shape_flow_terminal_linear_json
+            ),
             **{
                 field: np.array(value)
                 for field, value in shape_flow_attention_route.items()
@@ -2714,6 +2733,9 @@ def main():
             shape_flow_block_injection_json=np.array(shape_block_injection_json),
             shape_timestep_modulation_lut_json=np.array(
                 shape_timestep_modulation_lut_json
+            ),
+            shape_flow_terminal_linear_json=np.array(
+                shape_flow_terminal_linear_json
             ),
             **{
                 field: np.array(value)

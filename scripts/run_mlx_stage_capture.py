@@ -18,6 +18,9 @@ from trellmlx.source_cuda_gelu import (
     SOURCE_CUDA_BF16_GELU_TANH_BACKEND,
     SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256,
 )
+from trellmlx.models.slat_flow import (
+    shape_flow_terminal_linear_backend_identity,
+)
 
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
@@ -974,7 +977,24 @@ def main(argv: list[str] | None = None) -> int:
                     checkpoint_npz,
                 )
             )
+            terminal_linear_binding = (
+                _bind_effective_shape_flow_terminal_linear_identity(
+                    route_identity,
+                    checkpoint_npz,
+                    effective_layernorm_backend=effective_backend,
+                )
+            )
             if args.stop_after_stage == "shape_flow_steps":
+                if (
+                    primary_output_validation["sampler"][
+                        "shape_flow_terminal_linear_identity"
+                    ]
+                    != terminal_linear_binding
+                ):
+                    raise ValueError(
+                        "shape_flow_steps terminal-linear validation differs "
+                        "from the shared effective binding"
+                    )
                 if (
                     primary_output_validation["sampler"][
                         "shape_timestep_modulation_route"
@@ -988,6 +1008,16 @@ def main(argv: list[str] | None = None) -> int:
                         "the shared effective binding"
                     )
             elif args.stop_after_stage == "shape_flow_step":
+                if (
+                    primary_output_validation["sampler"][
+                        "shape_flow_terminal_linear_identity"
+                    ]
+                    != terminal_linear_binding
+                ):
+                    raise ValueError(
+                        "shape_flow_step terminal-linear validation differs "
+                        "from the shared effective binding"
+                    )
                 if (
                     primary_output_validation["sampler"][
                         "shape_timestep_modulation_route"
@@ -1282,6 +1312,152 @@ def _bind_effective_shape_flow_layernorm_backend(
             effective_turing_lut_content_sha256
         )
     return effective
+
+
+def _checkpoint_shape_flow_terminal_linear_identity(
+    checkpoint: Any,
+    *,
+    row_count: int,
+    output_width: int,
+    effective_layernorm_backend: str,
+    context: str,
+    key: str = "shape_flow_terminal_linear_json",
+) -> dict[str, Any]:
+    if key not in checkpoint:
+        raise ValueError(f"{context} missing required arrays: ['{key}']")
+    value = np.asarray(checkpoint[key])
+    if value.shape != () or value.dtype.kind not in {"U", "S"}:
+        raise ValueError(
+            f"{context} {key} must be a string scalar"
+        )
+    try:
+        identity = json.loads(str(value.item()))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{context} {key} is invalid JSON") from exc
+    if not isinstance(identity, dict):
+        raise ValueError(f"{context} {key} must decode to an object")
+
+    expected = shape_flow_terminal_linear_backend_identity(
+        row_count,
+        input_width=1536,
+        output_width=output_width,
+        has_bias=True,
+        source_cuda_terminal=effective_layernorm_backend
+        in {"cuda-welford-metal", TURING_T4_BACKEND},
+    )
+    if identity != expected:
+        raise ValueError(
+            f"{context} terminal-linear identity does not match the effective "
+            f"geometry and LayerNorm route: recorded={identity!r}, expected={expected!r}"
+        )
+    return identity
+
+
+def _bind_effective_shape_flow_terminal_linear_identity(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+    *,
+    effective_layernorm_backend: str,
+) -> dict[str, Any] | None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "noise" in checkpoint:
+            noise = np.asarray(checkpoint["noise"])
+            if noise.ndim != 2:
+                raise ValueError(
+                    "shape-flow checkpoint noise must be rank two to bind "
+                    "terminal-linear geometry"
+                )
+            row_count, output_width = map(int, noise.shape)
+            identity = _checkpoint_shape_flow_terminal_linear_identity(
+                checkpoint,
+                row_count=row_count,
+                output_width=output_width,
+                effective_layernorm_backend=effective_layernorm_backend,
+                context="shape-flow checkpoint",
+            )
+            route["shape_flow_terminal_linear_identity_effective"] = identity
+            return identity
+        elif "coords" in checkpoint:
+            coords = np.asarray(checkpoint["coords"])
+            if coords.ndim != 2 or coords.shape[1] != 4:
+                raise ValueError(
+                    "shape-flow trace coords must have shape [N,4] to bind "
+                    "terminal-linear geometry"
+                )
+            row_count = int(coords.shape[0])
+            output_width = 32
+        else:
+            raise ValueError(
+                "shape-flow checkpoint omits noise/coords terminal-linear "
+                "geometry evidence"
+            )
+        configured_identity = _checkpoint_shape_flow_terminal_linear_identity(
+            checkpoint,
+            row_count=row_count,
+            output_width=output_width,
+            effective_layernorm_backend=effective_layernorm_backend,
+            context="shape-flow block trace",
+            key="shape_flow_terminal_linear_configured_json",
+        )
+        route["shape_flow_terminal_linear_identity_configured"] = (
+            configured_identity
+        )
+
+        final_output_keys = [
+            key
+            for key in ("pos_final_output", "neg_final_output")
+            if key in checkpoint
+        ]
+        effective_value = np.asarray(
+            checkpoint["shape_flow_terminal_linear_json"]
+        ) if "shape_flow_terminal_linear_json" in checkpoint else None
+        if not final_output_keys:
+            if effective_value is None:
+                raise ValueError(
+                    "shape-flow block trace missing required arrays: "
+                    "['shape_flow_terminal_linear_json']"
+                )
+            if (
+                effective_value.shape != ()
+                or effective_value.dtype.kind not in {"U", "S"}
+            ):
+                raise ValueError(
+                    "shape-flow block trace shape_flow_terminal_linear_json "
+                    "must be a string scalar"
+                )
+            if str(effective_value.item()):
+                raise ValueError(
+                    "shape-flow block trace claims an effective terminal-linear "
+                    "identity without a persisted final output"
+                )
+            identity = None
+        else:
+            expected_shapes = {(row_count, output_width), (1, row_count, output_width)}
+            for key in final_output_keys:
+                output = np.asarray(checkpoint[key])
+                if output.shape not in expected_shapes:
+                    raise ValueError(
+                        f"shape-flow block trace {key} must have shape "
+                        f"[1,{row_count},{output_width}] or "
+                        f"[{row_count},{output_width}], got {output.shape}"
+                    )
+            identity = _checkpoint_shape_flow_terminal_linear_identity(
+                checkpoint,
+                row_count=row_count,
+                output_width=output_width,
+                effective_layernorm_backend=effective_layernorm_backend,
+                context="shape-flow block trace",
+            )
+            if identity != configured_identity:
+                raise ValueError(
+                    "shape-flow block trace effective terminal-linear identity "
+                    "does not match configured identity"
+                )
+    route["shape_flow_terminal_linear_identity_effective"] = identity
+    return identity
 
 
 def _bind_effective_shape_timestep_modulation_identity(
@@ -1675,6 +1851,7 @@ def _validate_shape_flow_step_checkpoint(
         "shape_flow_block_injection_json",
         "shape_timestep_modulation_lut_json",
         "shape_flow_layernorm_backend",
+        "shape_flow_terminal_linear_json",
         "qk_norm_backend",
         "rope_backend",
     }
@@ -1839,6 +2016,31 @@ def _validate_shape_flow_step_checkpoint(
             expected_route=expected_route or {},
         )
 
+        backend_array = np.asarray(checkpoint["shape_flow_layernorm_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "shape_flow_step shape_flow_layernorm_backend must be a string scalar"
+            )
+        effective_backend = str(backend_array.item())
+        requested_backend = (expected_route or {}).get(
+            "shape_flow_layernorm_backend_requested",
+            "mlx-two-pass",
+        )
+        if effective_backend != requested_backend:
+            raise ValueError(
+                f"shape_flow_step effective LayerNorm backend {effective_backend!r} "
+                f"does not match requested {requested_backend!r}"
+            )
+        terminal_linear_identity = (
+            _checkpoint_shape_flow_terminal_linear_identity(
+                checkpoint,
+                row_count=int(sample_shape[0]),
+                output_width=int(sample_shape[1]),
+                effective_layernorm_backend=effective_backend,
+                context="shape_flow_step",
+            )
+        )
+
         t_array = np.asarray(checkpoint["t"])
         t_prev_array = np.asarray(checkpoint["t_prev"])
         if (
@@ -1888,6 +2090,8 @@ def _validate_shape_flow_step_checkpoint(
             "shape_flow_block_injection_route": injection_route,
             "shape_timestep_modulation_lut_json": modulation_json,
             "shape_timestep_modulation_route": modulation_route,
+            "shape_flow_layernorm_backend": effective_backend,
+            "shape_flow_terminal_linear_identity": terminal_linear_identity,
         },
         "finite": True,
     }
@@ -1930,6 +2134,7 @@ def _validate_shape_flow_steps_checkpoint(
         "sigma_min",
         "shape_flow_block_injection_json",
         "shape_flow_layernorm_backend",
+        "shape_flow_terminal_linear_json",
         "qk_norm_backend",
         "rope_backend",
     }
@@ -2167,6 +2372,15 @@ def _validate_shape_flow_steps_checkpoint(
             expected_route=expected_route or {},
             context="shape_flow_steps",
         )
+        terminal_linear_identity = (
+            _checkpoint_shape_flow_terminal_linear_identity(
+                checkpoint,
+                row_count=int(step_shape[1]),
+                output_width=int(step_shape[2]),
+                effective_layernorm_backend=effective_backend,
+                context="shape_flow_steps",
+            )
+        )
         qk_backend_array = np.asarray(checkpoint["qk_norm_backend"])
         if (
             qk_backend_array.shape != ()
@@ -2254,6 +2468,7 @@ def _validate_shape_flow_steps_checkpoint(
             "shape_timestep_modulation_lut_json": modulation_json,
             "shape_timestep_modulation_route": modulation_route,
             "shape_flow_layernorm_backend": effective_backend,
+            "shape_flow_terminal_linear_identity": terminal_linear_identity,
             "qk_norm_backend": effective_qk_backend,
             "rope_backend": effective_rope_backend,
             "shape_flow_turing_rsqrt_lut_sha256": (
