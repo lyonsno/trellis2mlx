@@ -239,6 +239,71 @@ def _configure_shape_flow_attention_route(
     return _shape_flow_attention_route_from_env()
 
 
+def _load_shape_flow_trace_sample(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    expected_coords: np.ndarray,
+    expected_steps: int,
+    step_index: int,
+    rescale_t: float,
+) -> tuple[np.ndarray, float, dict[str, object]]:
+    path = Path(path)
+    actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "shape flow trace sample SHA256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    if step_index < 0 or step_index >= expected_steps:
+        raise ValueError(
+            f"shape flow trace sample step must be in [0, {expected_steps - 1}]"
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        required = {"coords", "sample_in", "t"}
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(
+                f"shape flow trace sample is missing arrays: {missing}"
+            )
+        coords = np.asarray(archive["coords"])
+        sample_in = np.asarray(archive["sample_in"])
+        t = np.asarray(archive["t"])
+    expected_coords = np.asarray(expected_coords)
+    if coords.dtype != np.int32 or not np.array_equal(coords, expected_coords):
+        raise ValueError(
+            "shape flow trace sample coordinates do not exactly match support"
+        )
+    expected_shape = (expected_steps, expected_coords.shape[0], 32)
+    if sample_in.dtype != np.float32 or sample_in.shape != expected_shape:
+        raise ValueError(
+            "shape flow trace sample sample_in must be "
+            f"float32{expected_shape}, got {sample_in.dtype}{sample_in.shape}"
+        )
+    if not np.isfinite(sample_in).all():
+        raise ValueError("shape flow trace sample contains non-finite state")
+    expected_t = np.linspace(1, 0, expected_steps + 1, dtype=np.float64)[:-1]
+    expected_t = (
+        rescale_t * expected_t / (1 + (rescale_t - 1) * expected_t)
+    ).astype(np.float32)
+    if t.dtype != np.float32 or t.shape != (expected_steps,) or not np.array_equal(
+        t, expected_t
+    ):
+        raise ValueError("shape flow trace sample schedule does not match requested route")
+    selected = sample_in[step_index].copy()
+    return selected, float(t[step_index]), {
+        "schema": "trellis2mlx.shape_flow_trace_sample.v1",
+        "path": str(path),
+        "artifact_sha256": actual_sha256,
+        "coords_sha256": hashlib.sha256(coords.tobytes()).hexdigest(),
+        "sample_in_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        "step_index": step_index,
+        "t": float(t[step_index]),
+        "steps": expected_steps,
+        "rescale_t": float(rescale_t),
+    }
+
+
 def _filter_shape_flow_trace_payload(
     payload: dict[str, np.ndarray], selected_keys: list[str]
 ) -> dict[str, np.ndarray]:
@@ -1108,6 +1173,18 @@ def main():
     parser.add_argument("--shape-flow-noise-sample", metavar="NPZ",
                         help="Diagnostic: replay exact shape SLat first-step noise from an NPZ "
                              "containing coords plus noise or sample_feats.")
+    parser.add_argument(
+        "--shape-flow-trace-sample",
+        metavar="NPZ",
+        help=(
+            "Diagnostic: replay the exact sample_in state for "
+            "--shape-flow-trace-step-index from a bound shape-flow recurrence NPZ."
+        ),
+    )
+    parser.add_argument(
+        "--expected-shape-flow-trace-sample-sha256",
+        help="Require --shape-flow-trace-sample to match this exact SHA256.",
+    )
     parser.add_argument("--shape-timestep-modulation-lut", metavar="NPZ",
                         help="Diagnostic: replay authenticated source-CUDA shared AdaLN modulation.")
     parser.add_argument("--shape-timestep-modulation-report", metavar="JSON",
@@ -1207,6 +1284,20 @@ def main():
         )
     if (args.shape_flow_block_injection_trace or args.shape_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with shape-flow block injection")
+    trace_sample_args = (
+        args.shape_flow_trace_sample,
+        args.expected_shape_flow_trace_sample_sha256,
+    )
+    if any(trace_sample_args) and not all(trace_sample_args):
+        parser.error(
+            "--shape-flow-trace-sample and "
+            "--expected-shape-flow-trace-sample-sha256 are required together"
+        )
+    if all(trace_sample_args) and args.stop_after_stage != "shape_flow_block_trace":
+        parser.error(
+            "--shape-flow-trace-sample is only valid with "
+            "--stop-after-stage shape_flow_block_trace"
+        )
     modulation_lut_args = (
         args.shape_timestep_modulation_lut,
         args.shape_timestep_modulation_report,
@@ -2342,7 +2433,24 @@ def main():
             )
             return float(t_seq[shape_trace_step_index])
 
-        if shape_trace_step_index == 0:
+        shape_flow_trace_sample_identity = None
+        shape_flow_trace_sample_replay = None
+        if args.shape_flow_trace_sample:
+            (
+                shape_trace_sample_np,
+                shape_trace_t,
+                shape_flow_trace_sample_identity,
+            ) = _load_shape_flow_trace_sample(
+                args.shape_flow_trace_sample,
+                expected_sha256=args.expected_shape_flow_trace_sample_sha256,
+                expected_coords=lr_coords_4d,
+                expected_steps=n_steps,
+                step_index=shape_trace_step_index,
+                rescale_t=SHAPE_SAMPLER["rescale_t"],
+            )
+            shape_flow_trace_sample_replay = shape_trace_sample_np
+            shape_trace_sample = mx.array(shape_trace_sample_np).astype(mx.float32)
+        elif shape_trace_step_index == 0:
             shape_trace_sample = lr_noise
             shape_trace_t = shape_schedule_trace_t()
         else:
@@ -2430,6 +2538,22 @@ def main():
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
             shape_flow_trace_requested_keys=np.array(requested_trace_keys, dtype=str),
             shape_flow_trace_selected_keys=np.array(effective_trace_keys, dtype=str),
+            shape_flow_trace_sample_identity_json=np.array(
+                json.dumps(shape_flow_trace_sample_identity, sort_keys=True)
+                if shape_flow_trace_sample_identity is not None
+                else ""
+            ),
+            **(
+                {
+                    "shape_flow_trace_sample_replay": (
+                        shape_flow_trace_sample_replay.astype(
+                            np.float32, copy=False
+                        )
+                    )
+                }
+                if shape_flow_trace_sample_replay is not None
+                else {}
+            ),
             **{
                 field: np.array(value)
                 for field, value in shape_flow_attention_route.items()

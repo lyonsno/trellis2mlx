@@ -24,6 +24,7 @@ SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TURING_T4_BACKEND = "cuda-welford-turing-t4"
 TURING_T4_ROPE_BACKEND = "cuda-polar-turing-t4"
+SHAPE_FLOW_RESCALE_T = 3.0
 DEFAULT_ROPE_BACKEND = "mlx-real"
 SUPPORTED_ROPE_BACKENDS = (
     DEFAULT_ROPE_BACKEND,
@@ -73,6 +74,7 @@ INPUT_PATH_FIELDS = (
     "sparse_flow_block_injection_manifest",
     "sparse_flow_layernorm_correction_report",
     "shape_flow_noise_sample",
+    "shape_flow_trace_sample",
     "turing_rsqrt_lut",
     "turing_rope_phase_lut",
     "shape_flow_block_injection_trace",
@@ -80,6 +82,10 @@ INPUT_PATH_FIELDS = (
     "shape_timestep_modulation_lut",
     "shape_timestep_modulation_report",
 )
+
+
+class ShapeFlowTraceSampleRouteError(ValueError):
+    pass
 
 
 def _parse_sparse_flow_trace_keys(value: str | None) -> list[str]:
@@ -223,6 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turing-rsqrt-lut")
     parser.add_argument("--expected-turing-rsqrt-lut-sha256")
     parser.add_argument("--shape-flow-noise-sample")
+    parser.add_argument("--shape-flow-trace-sample")
+    parser.add_argument("--expected-shape-flow-trace-sample-sha256")
     parser.add_argument("--shape-timestep-modulation-lut")
     parser.add_argument("--shape-timestep-modulation-report")
     parser.add_argument("--expected-shape-timestep-modulation-lut-sha256")
@@ -305,6 +313,7 @@ def build_route_identity(
     timestep_modulation_identity = (
         _validate_shape_timestep_modulation_route_args(args)
     )
+    trace_sample_identity = _validate_shape_flow_trace_sample_route_args(args)
     if repo_identity is None:
         repo_identity = _read_repo_identity(args.expected_repo_commit)
     attention_backend_requested = os.environ.get(
@@ -551,6 +560,16 @@ def build_route_identity(
                 _sha256_file(args.shape_flow_noise_sample)
                 if args.shape_flow_noise_sample else None
             ),
+            "shape_flow_trace_sample_path": trace_sample_identity["path"],
+            "shape_flow_trace_sample_sha256_requested": trace_sample_identity[
+                "sha256_requested"
+            ],
+            "shape_flow_trace_sample_sha256_effective": trace_sample_identity[
+                "sha256_effective"
+            ],
+            "shape_flow_trace_sample_identity_requested": trace_sample_identity[
+                "identity"
+            ],
             "shape_timestep_modulation_lut_path": (
                 timestep_modulation_identity["npz_path"]
             ),
@@ -644,7 +663,11 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
                 "status": "failed",
-                "failure_phase": "preflight_shape_flow_attention_route",
+                "failure_phase": (
+                    "preflight_shape_flow_trace_sample_route"
+                    if isinstance(exc, ShapeFlowTraceSampleRouteError)
+                    else "preflight_shape_flow_attention_route"
+                ),
                 "last_trustworthy_phase": "requested_route_parsed",
                 "primary_output_status": (
                     "preexisting_untrusted_preserved"
@@ -745,6 +768,25 @@ def main(argv: list[str] | None = None) -> int:
                 "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
                 "status": "failed",
                 "failure_phase": "preflight_shape_timestep_modulation_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
+    try:
+        _validate_shape_flow_trace_sample_route_args(args)
+    except (OSError, ValueError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_shape_flow_trace_sample_route",
                 "last_trustworthy_phase": "requested_route_parsed",
                 "primary_output_status": "not_started",
                 "requested_inputs": requested_inputs,
@@ -960,6 +1002,9 @@ def main(argv: list[str] | None = None) -> int:
                 primary_output_validation = modulation_binding
             if args.stop_after_stage == "shape_flow_block_trace":
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
+                _bind_effective_shape_flow_trace_sample_identity(
+                    route_identity, checkpoint_npz
+                )
             if args.stop_after_stage in {
                 "shape_flow_step",
                 "shape_flow_steps",
@@ -1103,6 +1148,89 @@ def _bind_effective_shape_flow_trace_keys(
     if selection == "explicit" and effective_keys != requested:
         raise ValueError("shape-flow effective selected keys differ from the explicit request")
     route["shape_flow_trace_keys"] = effective_keys
+
+
+def _bind_effective_shape_flow_trace_sample_identity(
+    route_identity: dict[str, Any], checkpoint_path: Path
+) -> None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    expected_sha256 = route.get("shape_flow_trace_sample_sha256_effective")
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        key = "shape_flow_trace_sample_identity_json"
+        if key not in checkpoint:
+            if expected_sha256 is None:
+                route["shape_flow_trace_sample_identity_effective"] = None
+                return
+            raise ValueError("shape-flow trace omits trace-sample identity metadata")
+        value = np.asarray(checkpoint[key])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError("shape-flow trace-sample identity must be a string scalar")
+        raw_identity = str(value.item())
+
+    if expected_sha256 is None:
+        if raw_identity:
+            raise ValueError("shape-flow trace unexpectedly used a recurrence sample")
+        route["shape_flow_trace_sample_identity_effective"] = None
+        return
+    if not raw_identity:
+        raise ValueError("shape-flow trace did not bind the requested recurrence sample")
+    try:
+        identity = json.loads(raw_identity)
+    except json.JSONDecodeError as exc:
+        raise ValueError("shape-flow trace-sample identity is invalid JSON") from exc
+    if not isinstance(identity, dict):
+        raise ValueError("shape-flow trace-sample identity must decode to an object")
+    expected_identity = route.get("shape_flow_trace_sample_identity_requested")
+    if not isinstance(expected_identity, dict) or identity != expected_identity:
+        raise ValueError(
+            "shape-flow trace-sample primary identity differs from the requested identity"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        required = {
+            "shape_flow_trace_sample_replay",
+            "coords",
+            "shape_flow_trace_step_index",
+            "t",
+            "steps",
+            "rescale_t",
+        }
+        missing = sorted(required - set(checkpoint.files))
+        if missing:
+            raise ValueError(
+                f"shape-flow trace-sample primary omits replay evidence: {missing}"
+            )
+        replay = np.asarray(checkpoint["shape_flow_trace_sample_replay"])
+        coords = np.asarray(checkpoint["coords"])
+        step_index = np.asarray(checkpoint["shape_flow_trace_step_index"])
+        t = np.asarray(checkpoint["t"])
+        steps = np.asarray(checkpoint["steps"])
+        rescale_t = np.asarray(checkpoint["rescale_t"])
+    if replay.dtype != np.float32 or replay.ndim != 2 or replay.shape[1] != 32:
+        raise ValueError("shape-flow trace-sample replay must be float32[N,32]")
+    if not np.isfinite(replay).all():
+        raise ValueError("shape-flow trace-sample replay contains non-finite values")
+    if hashlib.sha256(replay.tobytes()).hexdigest() != identity["sample_in_sha256"]:
+        raise ValueError("shape-flow trace-sample replay hash differs from requested state")
+    if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+        raise ValueError("shape-flow trace-sample support must be int32[N,4]")
+    if coords.shape[0] != replay.shape[0]:
+        raise ValueError("shape-flow trace-sample replay and support row counts differ")
+    if hashlib.sha256(coords.tobytes()).hexdigest() != identity["coords_sha256"]:
+        raise ValueError("shape-flow trace-sample support hash differs from requested support")
+    scalar_checks = (
+        (step_index, np.int32, identity["step_index"], "step index"),
+        (t, np.float32, np.float32(1000.0 * identity["t"]).item(), "timestep"),
+        (steps, np.int32, identity["steps"], "step count"),
+        (rescale_t, np.float32, np.float32(identity["rescale_t"]).item(), "rescale_t"),
+    )
+    for value, dtype, expected, label in scalar_checks:
+        if value.shape != () or value.dtype != dtype or value.item() != expected:
+            raise ValueError(
+                f"shape-flow trace-sample primary {label} differs from requested route"
+            )
+    route["shape_flow_trace_sample_identity_effective"] = identity
 
 
 def _bind_effective_shape_flow_layernorm_backend(
@@ -2282,6 +2410,20 @@ def _validate_shape_flow_injection_identity(
 
 
 def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> list[str]:
+    trace_sample_args = (
+        args.shape_flow_trace_sample,
+        args.expected_shape_flow_trace_sample_sha256,
+    )
+    if any(trace_sample_args) and not all(trace_sample_args):
+        raise ShapeFlowTraceSampleRouteError(
+            "--shape-flow-trace-sample and "
+            "--expected-shape-flow-trace-sample-sha256 are required together"
+        )
+    if all(trace_sample_args) and args.stop_after_stage != "shape_flow_block_trace":
+        raise ShapeFlowTraceSampleRouteError(
+            "--shape-flow-trace-sample is only valid with "
+            "--stop-after-stage shape_flow_block_trace"
+        )
     if (
         args.shape_flow_attention_backend
         or args.shape_flow_attention_softmax_backend
@@ -2405,6 +2547,15 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         ])
         if args.shape_flow_trace_keys:
             command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
+        if args.shape_flow_trace_sample:
+            command.extend(
+                [
+                    "--shape-flow-trace-sample",
+                    str(Path(args.shape_flow_trace_sample)),
+                    "--expected-shape-flow-trace-sample-sha256",
+                    args.expected_shape_flow_trace_sample_sha256,
+                ]
+            )
     if args.stop_after_stage in {
         "shape_flow_step",
         "shape_flow_steps",
@@ -2515,6 +2666,98 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             str(Path(args.shape_flow_block_injection_manifest)),
         ])
     return command
+
+
+def _validate_shape_flow_trace_sample_route_args(
+    args: argparse.Namespace,
+) -> dict[str, object | None]:
+    path = args.shape_flow_trace_sample
+    expected = args.expected_shape_flow_trace_sample_sha256
+    if not path and not expected:
+        return {
+            "path": None,
+            "sha256_requested": None,
+            "sha256_effective": None,
+            "identity": None,
+        }
+    if not path or not expected:
+        raise ShapeFlowTraceSampleRouteError(
+            "--shape-flow-trace-sample and "
+            "--expected-shape-flow-trace-sample-sha256 are required together"
+        )
+    if args.stop_after_stage != "shape_flow_block_trace":
+        raise ShapeFlowTraceSampleRouteError(
+            "--shape-flow-trace-sample is only valid with "
+            "--stop-after-stage shape_flow_block_trace"
+        )
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        raise ShapeFlowTraceSampleRouteError(
+            "--expected-shape-flow-trace-sample-sha256 must be 64 lowercase hex characters"
+        )
+    effective = _sha256_file(path)
+    if effective != expected:
+        raise ShapeFlowTraceSampleRouteError(
+            "shape-flow trace sample SHA256 mismatch: "
+            f"expected {expected}, got {effective}"
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        required = {"coords", "sample_in", "t"}
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ShapeFlowTraceSampleRouteError(
+                f"shape-flow trace sample is missing arrays: {missing}"
+            )
+        coords = np.asarray(archive["coords"])
+        sample_in = np.asarray(archive["sample_in"])
+        t = np.asarray(archive["t"])
+    if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+        raise ShapeFlowTraceSampleRouteError(
+            "shape-flow trace sample support must be int32[N,4]"
+        )
+    expected_sample_shape = (args.steps, coords.shape[0], 32)
+    if sample_in.dtype != np.float32 or sample_in.shape != expected_sample_shape:
+        raise ShapeFlowTraceSampleRouteError(
+            "shape-flow trace sample sample_in must be "
+            f"float32{expected_sample_shape}, got {sample_in.dtype}{sample_in.shape}"
+        )
+    if not np.isfinite(sample_in).all():
+        raise ShapeFlowTraceSampleRouteError(
+            "shape-flow trace sample contains non-finite state"
+        )
+    if args.shape_flow_trace_step_index < 0 or args.shape_flow_trace_step_index >= args.steps:
+        raise ShapeFlowTraceSampleRouteError(
+            f"shape-flow trace sample step must be in [0, {args.steps - 1}]"
+        )
+    expected_t = np.linspace(1, 0, args.steps + 1, dtype=np.float64)[:-1]
+    expected_t = (
+        SHAPE_FLOW_RESCALE_T
+        * expected_t
+        / (1 + (SHAPE_FLOW_RESCALE_T - 1) * expected_t)
+    ).astype(np.float32)
+    if t.dtype != np.float32 or t.shape != (args.steps,) or not np.array_equal(
+        t, expected_t
+    ):
+        raise ShapeFlowTraceSampleRouteError(
+            "shape-flow trace sample schedule does not match requested route"
+        )
+    selected = sample_in[args.shape_flow_trace_step_index]
+    identity = {
+        "schema": "trellis2mlx.shape_flow_trace_sample.v1",
+        "path": str(Path(path)),
+        "artifact_sha256": effective,
+        "coords_sha256": hashlib.sha256(coords.tobytes()).hexdigest(),
+        "sample_in_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        "step_index": args.shape_flow_trace_step_index,
+        "t": float(t[args.shape_flow_trace_step_index]),
+        "steps": args.steps,
+        "rescale_t": SHAPE_FLOW_RESCALE_T,
+    }
+    return {
+        "path": str(Path(path)),
+        "sha256_requested": expected,
+        "sha256_effective": effective,
+        "identity": identity,
+    }
 
 
 def _validate_shape_timestep_modulation_route_args(

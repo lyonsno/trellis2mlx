@@ -152,6 +152,7 @@ def test_stage_capture_reports_repo_identity_read_failure_before_generate(
     tmp_path,
     monkeypatch,
 ):
+    import hashlib
     import json
     import subprocess
 
@@ -3368,6 +3369,275 @@ def test_stage_capture_route_identity_records_shape_flow_trace_indices(tmp_path)
     assert route_identity["route"]["shape_flow_trace_step_index"] == 4
     assert route_identity["route"]["shape_flow_noise_sample_path"] == str(noise_path)
     assert route_identity["route"]["shape_flow_noise_sample_sha256"] is not None
+
+
+def test_shape_flow_trace_sample_selects_exact_bound_recurrence_state(tmp_path):
+    import hashlib
+
+    import numpy as np
+    import generate
+
+    coords = np.asarray([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    sample_in = np.arange(8 * 2 * 32, dtype=np.float32).reshape(8, 2, 32)
+    t = np.linspace(1, 0, 9, dtype=np.float64)[:-1]
+    t = (3.0 * t / (1.0 + 2.0 * t)).astype(np.float32)
+    path = tmp_path / "source_steps.npz"
+    np.savez(path, coords=coords, sample_in=sample_in, t=t)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    selected, selected_t, identity = generate._load_shape_flow_trace_sample(
+        path,
+        expected_sha256=digest,
+        expected_coords=coords,
+        expected_steps=8,
+        step_index=5,
+        rescale_t=3.0,
+    )
+
+    assert np.array_equal(selected, sample_in[5])
+    assert selected_t == float(t[5])
+    assert identity["artifact_sha256"] == digest
+    assert identity["sample_in_sha256"] == hashlib.sha256(
+        sample_in[5].tobytes()
+    ).hexdigest()
+    assert identity["step_index"] == 5
+
+
+def test_shape_flow_trace_sample_rejects_digest_and_schedule_substitution(tmp_path):
+    import hashlib
+
+    import numpy as np
+    import pytest
+    import generate
+
+    coords = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    sample_in = np.zeros((8, 1, 32), dtype=np.float32)
+    t = np.linspace(1, 0, 9, dtype=np.float64)[:-1]
+    t = (3.0 * t / (1.0 + 2.0 * t)).astype(np.float32)
+    path = tmp_path / "source_steps.npz"
+    np.savez(path, coords=coords, sample_in=sample_in, t=t)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        generate._load_shape_flow_trace_sample(
+            path,
+            expected_sha256="0" * 64,
+            expected_coords=coords,
+            expected_steps=8,
+            step_index=5,
+            rescale_t=3.0,
+        )
+
+    with np.load(path, allow_pickle=False) as archive:
+        broken_t = np.asarray(archive["t"]).copy()
+    broken_t[5] += np.float32(0.01)
+    np.savez(path, coords=coords, sample_in=sample_in, t=broken_t)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="schedule"):
+        generate._load_shape_flow_trace_sample(
+            path,
+            expected_sha256=digest,
+            expected_coords=coords,
+            expected_steps=8,
+            step_index=5,
+            rescale_t=3.0,
+        )
+
+
+def test_stage_capture_forwards_and_binds_shape_flow_trace_sample(tmp_path):
+    import hashlib
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    trace_sample = tmp_path / "source_steps.npz"
+    coords = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    sample_in = np.zeros((8, 1, 32), dtype=np.float32)
+    t = np.linspace(1, 0, 9, dtype=np.float64)[:-1]
+    t = (3.0 * t / (1.0 + 2.0 * t)).astype(np.float32)
+    np.savez(trace_sample, coords=coords, sample_in=sample_in, t=t)
+    digest = hashlib.sha256(trace_sample.read_bytes()).hexdigest()
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--shape-flow-trace-step-index",
+            "5",
+            "--shape-flow-trace-sample",
+            str(trace_sample),
+            "--expected-shape-flow-trace-sample-sha256",
+            digest,
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--shape-flow-trace-sample") + 1] == str(
+        trace_sample
+    )
+    assert command[
+        command.index("--expected-shape-flow-trace-sample-sha256") + 1
+    ] == digest
+    assert route_identity["route"]["shape_flow_trace_sample_path"] == str(
+        trace_sample
+    )
+    assert route_identity["route"]["shape_flow_trace_sample_sha256_effective"] == digest
+    requested_identity = route_identity["route"][
+        "shape_flow_trace_sample_identity_requested"
+    ]
+    assert requested_identity["sample_in_sha256"] == hashlib.sha256(
+        sample_in[5].tobytes()
+    ).hexdigest()
+    assert requested_identity["coords_sha256"] == hashlib.sha256(
+        coords.tobytes()
+    ).hexdigest()
+    assert requested_identity["t"] == float(t[5])
+
+
+def test_shape_flow_trace_sample_primary_binding_rejects_missing_and_substitution(
+    tmp_path,
+):
+    import hashlib
+    import json
+
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_trace_sample_identity,
+    )
+
+    coords = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    replayed = np.zeros((1, 32), dtype=np.float32)
+    expected_identity = {
+        "schema": "trellis2mlx.shape_flow_trace_sample.v1",
+        "path": "/tmp/source_steps.npz",
+        "artifact_sha256": "a" * 64,
+        "coords_sha256": hashlib.sha256(coords.tobytes()).hexdigest(),
+        "sample_in_sha256": hashlib.sha256(replayed.tobytes()).hexdigest(),
+        "step_index": 5,
+        "t": 0.6428571343421936,
+        "steps": 8,
+        "rescale_t": 3.0,
+    }
+    route_identity = {
+        "route": {
+            "shape_flow_trace_sample_sha256_effective": "a" * 64,
+            "shape_flow_trace_step_index": 5,
+            "shape_flow_trace_sample_identity_requested": expected_identity,
+        }
+    }
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(checkpoint, shape_flow_trace_sample_identity_json=np.array(""))
+    with pytest.raises(ValueError, match="did not bind"):
+        _bind_effective_shape_flow_trace_sample_identity(route_identity, checkpoint)
+
+    skeletal = {
+        "schema": "trellis2mlx.shape_flow_trace_sample.v1",
+        "artifact_sha256": "a" * 64,
+        "step_index": 5,
+    }
+    np.savez(
+        checkpoint,
+        shape_flow_trace_sample_identity_json=np.array(
+            json.dumps(skeletal, sort_keys=True)
+        ),
+    )
+    with pytest.raises(ValueError, match="differs from the requested identity"):
+        _bind_effective_shape_flow_trace_sample_identity(route_identity, checkpoint)
+
+    np.savez(
+        checkpoint,
+        shape_flow_trace_sample_identity_json=np.array(
+            json.dumps(expected_identity, sort_keys=True)
+        ),
+        shape_flow_trace_sample_replay=replayed,
+        coords=coords,
+        shape_flow_trace_step_index=np.array(5, dtype=np.int32),
+        t=np.array(1000.0 * expected_identity["t"], dtype=np.float32),
+        steps=np.array(8, dtype=np.int32),
+        rescale_t=np.array(3.0, dtype=np.float32),
+    )
+    _bind_effective_shape_flow_trace_sample_identity(route_identity, checkpoint)
+    assert route_identity["route"][
+        "shape_flow_trace_sample_identity_effective"
+    ] == expected_identity
+
+
+def test_shape_flow_trace_sample_digest_failure_writes_durable_report(tmp_path):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    trace_sample = tmp_path / "source_steps.npz"
+    trace_sample.write_bytes(b"source recurrence")
+    output_dir = tmp_path / "output"
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-flow-trace-step-index",
+            "5",
+            "--shape-flow-trace-sample",
+            str(trace_sample),
+            "--expected-shape-flow-trace-sample-sha256",
+            "0" * 64,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_shape_flow_trace_sample_route"
+    assert report["last_trustworthy_phase"] == "requested_route_parsed"
+    assert report["primary_output_status"] == "not_started"
+    assert "SHA256 mismatch" in report["error"]
+
+
+def test_shape_flow_trace_sample_pair_failure_uses_trace_sample_failure_phase(
+    tmp_path,
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-flow-trace-sample",
+            str(tmp_path / "missing.npz"),
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["failure_phase"] == "preflight_shape_flow_trace_sample_route"
 
 
 def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
