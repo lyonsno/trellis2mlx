@@ -1,8 +1,10 @@
+import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -2684,6 +2686,8 @@ def test_postcond_decode_runner_defaults_mesh_override_input():
     assert args.output_mesh_state is None
     assert args.output_shape_slat is None
     assert args.output_shape_flow_step is None
+    assert args.sparse_flow_noise_sample is None
+    assert args.sparse_flow_noise_sample_sha256 is None
     assert args.shape_flow_noise_sample is None
 
 
@@ -2891,6 +2895,239 @@ def test_load_shape_flow_noise_sample_accepts_exact_coords(tmp_path):
 
     np.testing.assert_array_equal(loaded, noise)
     assert key == "noise"
+
+
+def test_load_sparse_flow_noise_sample_accepts_exact_source_noise(tmp_path):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        load_sparse_flow_noise_sample,
+        sha256_file,
+    )
+
+    sample = tmp_path / "source_mps_sparse_flow_steps.npz"
+    noise = np.arange(1 * 8 * 16 * 16 * 16, dtype=np.float32).reshape(1, 8, 16, 16, 16)
+    np.savez(sample, noise=noise, sample_in=np.zeros((8, 1, 8, 16, 16, 16), dtype=np.float32))
+
+    loaded, key = load_sparse_flow_noise_sample(
+        sample,
+        expected_shape=(1, 8, 16, 16, 16),
+        expected_sha256=sha256_file(sample),
+    )
+
+    np.testing.assert_array_equal(loaded, noise)
+    assert loaded.dtype == np.float32
+    assert key == "noise"
+
+
+def test_load_sparse_flow_noise_sample_rejects_same_shape_substitution(tmp_path):
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        load_sparse_flow_noise_sample,
+        sha256_file,
+    )
+
+    intended = tmp_path / "source_mps_sparse_flow_steps.npz"
+    replacement = tmp_path / "replacement_sparse_flow_steps.npz"
+    shape = (1, 8, 16, 16, 16)
+    np.savez(intended, noise=np.zeros(shape, dtype=np.float32))
+    np.savez(replacement, noise=np.ones(shape, dtype=np.float32))
+
+    with pytest.raises(ValueError, match="digest mismatch"):
+        load_sparse_flow_noise_sample(
+            replacement,
+            expected_shape=shape,
+            expected_sha256=sha256_file(intended),
+        )
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected_sha256", "message"),
+    [
+        ("noise.npz", None, "required"),
+        (None, "a" * 64, "provided together"),
+        ("noise.npz", "A" * 64, "canonical lowercase"),
+    ],
+)
+def test_validate_sparse_flow_noise_request_requires_paired_canonical_identity(
+    sample,
+    expected_sha256,
+    message,
+):
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        validate_sparse_flow_noise_request,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        validate_sparse_flow_noise_request(
+            Path(sample) if sample is not None else None,
+            expected_sha256,
+        )
+
+
+def test_main_preserves_sparse_noise_request_when_expected_hash_is_missing(tmp_path):
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    noise = tmp_path / "noise.npz"
+    np.savez(noise, noise=np.zeros((1, 8, 16, 16, 16), dtype=np.float32))
+    report = tmp_path / "report.json"
+
+    result = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(tmp_path / "summary.npz"),
+            "--sparse-flow-noise-sample",
+            str(noise),
+        ]
+    )
+
+    payload = json.loads(report.read_text())
+    assert result == 1
+    assert payload["status"] == "failed"
+    assert payload["failure_phase"] == "validate_args"
+    assert payload["sparse_flow_noise_sample"] == {
+        "path": str(noise),
+        "expected_sha256": None,
+        "sha256": None,
+        "noise_key": None,
+        "noise_shape": None,
+        "noise_dtype": None,
+        "sampling_route": "official-source-sparse-flow-from-admitted-noise",
+    }
+
+
+@pytest.mark.parametrize(
+    ("noise", "message"),
+    [
+        (np.zeros((1, 8, 8, 8, 8), dtype=np.float32), "shape"),
+        (np.zeros((1, 8, 16, 16, 16), dtype=np.float64), "float32"),
+        (
+            np.full((1, 8, 16, 16, 16), np.nan, dtype=np.float32),
+            "non-finite",
+        ),
+    ],
+)
+def test_load_sparse_flow_noise_sample_rejects_unfaithful_input(
+    tmp_path,
+    noise,
+    message,
+):
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        load_sparse_flow_noise_sample,
+        sha256_file,
+    )
+
+    sample = tmp_path / "bad_sparse_noise.npz"
+    np.savez(sample, noise=noise)
+
+    with pytest.raises(ValueError, match=message):
+        load_sparse_flow_noise_sample(
+            sample,
+            expected_shape=(1, 8, 16, 16, 16),
+            expected_sha256=sha256_file(sample),
+        )
+
+
+def test_sample_sparse_structure_with_noise_uses_admitted_tensor_without_randn():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import sample_sparse_structure_with_noise
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = np.asarray(array)
+
+        @property
+        def shape(self):
+            return self.array.shape
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def cpu(self):
+            return self
+
+        def int(self):
+            return FakeTensor(self.array.astype(np.int32))
+
+        def __gt__(self, other):
+            return FakeTensor(self.array > other)
+
+        def __getitem__(self, key):
+            return FakeTensor(self.array[key])
+
+    class FakeTorch:
+        @staticmethod
+        def from_numpy(array):
+            return FakeTensor(np.array(array, copy=True))
+
+        @staticmethod
+        def argwhere(tensor):
+            return FakeTensor(np.argwhere(tensor.array))
+
+    class Movable:
+        def __init__(self):
+            self.moves = []
+
+        def to(self, device):
+            self.moves.append(("to", device))
+            return self
+
+        def cpu(self):
+            self.moves.append(("cpu", None))
+            return self
+
+    flow_model = Movable()
+    flow_model.resolution = 16
+    flow_model.in_channels = 8
+    decoder = Movable()
+    decoded = np.zeros((1, 1, 32, 32, 32), dtype=np.float32)
+    decoded[0, 0, 2, 3, 4] = 1.0
+    decoder.__class__.__call__ = lambda self, latent: FakeTensor(decoded)
+    seen = {}
+
+    class Sampler:
+        def sample(self, model, noise, **kwargs):
+            seen["model"] = model
+            seen["noise"] = noise.array.copy()
+            seen["kwargs"] = kwargs
+            return SimpleNamespace(samples=FakeTensor(np.zeros((1, 8, 16, 16, 16), dtype=np.float32)))
+
+    pipeline = SimpleNamespace(
+        models={
+            "sparse_structure_flow_model": flow_model,
+            "sparse_structure_decoder": decoder,
+        },
+        sparse_structure_sampler=Sampler(),
+        sparse_structure_sampler_params={"guidance_strength": 7.5},
+        low_vram=True,
+        device="cuda",
+    )
+    noise = np.arange(1 * 8 * 16 * 16 * 16, dtype=np.float32).reshape(1, 8, 16, 16, 16)
+
+    coords = sample_sparse_structure_with_noise(
+        pipeline,
+        {"cond": "positive", "neg_cond": "negative"},
+        32,
+        1,
+        {"steps": 8},
+        noise,
+        torch_module=FakeTorch,
+    )
+
+    np.testing.assert_array_equal(seen["noise"], noise)
+    assert seen["model"] is flow_model
+    assert seen["kwargs"]["steps"] == 8
+    assert seen["kwargs"]["guidance_strength"] == 7.5
+    assert seen["kwargs"]["verbose"] is True
+    np.testing.assert_array_equal(coords.array, np.array([[0, 2, 3, 4]], dtype=np.int32))
+    assert flow_model.moves == [("to", "cuda"), ("cpu", None)]
+    assert decoder.moves == [("to", "cuda"), ("cpu", None)]
 
 
 def test_load_shape_flow_noise_sample_rejects_coord_order_mismatch(tmp_path):

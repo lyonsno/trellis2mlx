@@ -273,6 +273,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-shape-slat", type=Path)
     parser.add_argument("--output-shape-flow-step", type=Path)
     parser.add_argument(
+        "--sparse-flow-noise-sample",
+        type=Path,
+        help=(
+            "Optional NPZ containing the exact float32 dense sparse-flow "
+            "noise tensor under key 'noise'. The tensor must match the "
+            "official source model's [B,C,D,H,W] input shape."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-flow-noise-sample-sha256",
+        help="Required canonical SHA256 for --sparse-flow-noise-sample.",
+    )
+    parser.add_argument(
         "--shape-flow-noise-sample",
         type=Path,
         help=(
@@ -520,6 +533,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.shape_flow_noise_sample is not None
             else None
         )
+        sparse_flow_noise_sample_path = (
+            Path(args.sparse_flow_noise_sample)
+            if args.sparse_flow_noise_sample is not None
+            else None
+        )
+        sparse_flow_noise_sample_sha256 = args.sparse_flow_noise_sample_sha256
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         output_ply.parent.mkdir(parents=True, exist_ok=True)
@@ -533,6 +552,36 @@ def main(argv: list[str] | None = None) -> int:
         phase = "validate_args"
         if args.steps <= 0:
             raise ValueError("--steps must be positive")
+        if (
+            sparse_flow_noise_sample_path is not None
+            or sparse_flow_noise_sample_sha256 is not None
+        ):
+            report["sparse_flow_noise_sample"] = {
+                "path": (
+                    str(sparse_flow_noise_sample_path)
+                    if sparse_flow_noise_sample_path is not None
+                    else None
+                ),
+                "expected_sha256": sparse_flow_noise_sample_sha256,
+                "sha256": None,
+                "noise_key": None,
+                "noise_shape": None,
+                "noise_dtype": None,
+                "sampling_route": "official-source-sparse-flow-from-admitted-noise",
+            }
+        validate_sparse_flow_noise_request(
+            sparse_flow_noise_sample_path,
+            sparse_flow_noise_sample_sha256,
+        )
+        if sparse_flow_noise_sample_path is not None:
+            actual_sparse_noise_sha256 = sha256_file(sparse_flow_noise_sample_path)
+            report["sparse_flow_noise_sample"]["sha256"] = actual_sparse_noise_sha256
+            if actual_sparse_noise_sha256 != sparse_flow_noise_sample_sha256:
+                raise ValueError(
+                    "sparse-flow noise digest mismatch: "
+                    f"expected={sparse_flow_noise_sample_sha256}, "
+                    f"actual={actual_sparse_noise_sha256}"
+                )
         model_names = required_model_names(args.pipeline_type)
         if args.pipeline_type != "512" and args.conditioning_1024 is None:
             raise ValueError(f"--conditioning-1024 is required for pipeline_type={args.pipeline_type}")
@@ -655,12 +704,42 @@ def main(argv: list[str] | None = None) -> int:
         shape_flow_noise_key = None
 
         stage_started = time.perf_counter()
-        coords = pipeline.sample_sparse_structure(
-            cond_512,
-            32,
-            1,
-            {"steps": args.steps},
-        )
+        if sparse_flow_noise_sample_path is None:
+            coords = pipeline.sample_sparse_structure(
+                cond_512,
+                32,
+                1,
+                {"steps": args.steps},
+            )
+        else:
+            sparse_flow_model = pipeline.models["sparse_structure_flow_model"]
+            expected_sparse_noise_shape = (
+                1,
+                int(sparse_flow_model.in_channels),
+                int(sparse_flow_model.resolution),
+                int(sparse_flow_model.resolution),
+                int(sparse_flow_model.resolution),
+            )
+            sparse_flow_noise_sample, sparse_flow_noise_key = load_sparse_flow_noise_sample(
+                sparse_flow_noise_sample_path,
+                expected_shape=expected_sparse_noise_shape,
+                expected_sha256=sparse_flow_noise_sample_sha256,
+            )
+            report["sparse_flow_noise_sample"].update(
+                {
+                    "noise_key": sparse_flow_noise_key,
+                    "noise_shape": [int(v) for v in sparse_flow_noise_sample.shape],
+                    "noise_dtype": str(sparse_flow_noise_sample.dtype),
+                }
+            )
+            coords = sample_sparse_structure_with_noise(
+                pipeline,
+                cond_512,
+                32,
+                1,
+                {"steps": args.steps},
+                sparse_flow_noise_sample,
+            )
         sync_cuda(torch)
         stage_timings["sample_sparse_structure_elapsed_seconds"] = elapsed(stage_started)
         report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
@@ -3634,6 +3713,112 @@ def capture_source_shape_flow_first_step(
         "guidance_interval": np.asarray(guidance_interval, dtype=np.float32),
         "rescale_t": np.asarray(rescale_t, dtype=np.float32),
     }
+
+
+def validate_sparse_flow_noise_request(
+    path: Path | None,
+    expected_sha256: str | None,
+) -> None:
+    if path is not None and expected_sha256 is None:
+        raise ValueError(
+            "--sparse-flow-noise-sample-sha256 is required with "
+            "--sparse-flow-noise-sample"
+        )
+    if path is None and expected_sha256 is not None:
+        raise ValueError(
+            "--sparse-flow-noise-sample and "
+            "--sparse-flow-noise-sample-sha256 must be provided together"
+        )
+    if expected_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError(
+            "sparse-flow noise expected SHA256 must be canonical lowercase hex"
+        )
+
+
+def load_sparse_flow_noise_sample(
+    path: Path,
+    *,
+    expected_shape: tuple[int, int, int, int, int],
+    expected_sha256: str,
+) -> tuple[np.ndarray, str]:
+    path = Path(path)
+    validate_sparse_flow_noise_request(path, expected_sha256)
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "sparse-flow noise digest mismatch: "
+            f"expected={expected_sha256}, actual={actual_sha256}"
+        )
+    with np.load(path, allow_pickle=False) as data:
+        if "noise" not in data.files:
+            raise ValueError(f"sparse-flow noise sample {path} is missing required 'noise' array")
+        noise = np.asarray(data["noise"])
+
+    if noise.dtype != np.float32:
+        raise ValueError(f"sparse-flow noise must be float32, got {noise.dtype}")
+    if noise.shape != expected_shape:
+        raise ValueError(
+            f"sparse-flow noise shape must be {expected_shape}, got {noise.shape}"
+        )
+    if not np.isfinite(noise).all():
+        raise ValueError("sparse-flow noise contains non-finite values")
+    return np.ascontiguousarray(noise), "noise"
+
+
+def sample_sparse_structure_with_noise(
+    pipeline: Any,
+    cond: dict[str, Any],
+    resolution: int,
+    num_samples: int,
+    sampler_params: dict[str, Any],
+    noise_feats: np.ndarray,
+    *,
+    torch_module: Any | None = None,
+) -> Any:
+    torch = torch_module if torch_module is not None else __import__("torch")
+    flow_model = pipeline.models["sparse_structure_flow_model"]
+    expected_shape = (
+        int(num_samples),
+        int(flow_model.in_channels),
+        int(flow_model.resolution),
+        int(flow_model.resolution),
+        int(flow_model.resolution),
+    )
+    noise_array = np.asarray(noise_feats)
+    if noise_array.dtype != np.float32 or noise_array.shape != expected_shape:
+        raise ValueError(
+            "admitted sparse-flow noise must be float32 with shape "
+            f"{expected_shape}, got {noise_array.dtype} {noise_array.shape}"
+        )
+    noise = torch.from_numpy(np.ascontiguousarray(noise_array)).to(pipeline.device)
+    effective_sampler_params = {
+        **pipeline.sparse_structure_sampler_params,
+        **sampler_params,
+    }
+
+    if pipeline.low_vram:
+        flow_model.to(pipeline.device)
+    latent = pipeline.sparse_structure_sampler.sample(
+        flow_model,
+        noise,
+        **cond,
+        **effective_sampler_params,
+        verbose=True,
+        tqdm_desc="Sampling sparse structure",
+    ).samples
+    if pipeline.low_vram:
+        flow_model.cpu()
+
+    decoder = pipeline.models["sparse_structure_decoder"]
+    if pipeline.low_vram:
+        decoder.to(pipeline.device)
+    decoded = decoder(latent) > 0
+    if pipeline.low_vram:
+        decoder.cpu()
+    if resolution != decoded.shape[2]:
+        ratio = decoded.shape[2] // resolution
+        decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+    return torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
 
 def load_shape_flow_noise_sample(path: Path, expected_coords: np.ndarray) -> tuple[np.ndarray, str]:

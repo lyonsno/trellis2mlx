@@ -50,6 +50,8 @@ class KaggleCudaWitnessPacket:
     output_shape_flow_step: str | None = None
     expected_outputs: tuple[str, ...] = ()
     shape_flow_noise_sample: str | None = None
+    sparse_flow_noise_sample: str | None = None
+    sparse_flow_noise_sample_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -92,6 +94,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
 
     _validate_refs(packet)
     file_sources = _validate_inputs(packet)
+    _validate_sparse_flow_noise_input(packet, file_sources)
     if packet.output_dir.exists():
         shutil.rmtree(packet.output_dir)
     packet.dataset_dir.mkdir(parents=True)
@@ -116,6 +119,8 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "entrypoint_args": list(packet.entrypoint_args),
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+            "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
+            "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
         },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
@@ -223,6 +228,8 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         output_shape_flow_step=output_shape_flow_step,
         expected_outputs=expected_outputs,
         shape_flow_noise_sample=input_roles.get("shape_flow_noise_sample"),
+        sparse_flow_noise_sample=input_roles.get("sparse_flow_noise_sample"),
+        sparse_flow_noise_sample_sha256=input_roles.get("sparse_flow_noise_sample_sha256"),
     )
     _validate_refs(packet)
     return packet
@@ -657,6 +664,7 @@ def validate_downloaded_outputs(
                 f"downloaded output digest differs from receipt for {name}"
             )
         records[name] = record
+    _validate_sparse_flow_noise_report(packet, output_dir)
     receipt_size = receipt_path.stat().st_size
     if receipt_size == 0:
         raise WitnessPacketError(f"blank downloaded output: {receipt_path}")
@@ -665,6 +673,31 @@ def validate_downloaded_outputs(
         "sha256": sha256_file(receipt_path),
     }
     return records
+
+
+def _validate_sparse_flow_noise_report(
+    packet: KaggleCudaWitnessPacket,
+    output_dir: Path,
+) -> None:
+    if packet.sparse_flow_noise_sample is None:
+        return
+    report_path = output_dir / _canonical_output_name(packet.output_json)
+    report = json.loads(report_path.read_text())
+    identity = report.get("sparse_flow_noise_sample")
+    expected_identity = {
+        "path": packet.sparse_flow_noise_sample,
+        "expected_sha256": packet.sparse_flow_noise_sample_sha256,
+        "sha256": packet.sparse_flow_noise_sample_sha256,
+        "sampling_route": "official-source-sparse-flow-from-admitted-noise",
+    }
+    if not isinstance(identity, dict) or any(
+        identity.get(field) != expected
+        for field, expected in expected_identity.items()
+    ):
+        raise WitnessPacketError(
+            "downloaded report sparse-flow noise identity mismatch or missing: "
+            f"expected={expected_identity!r}, actual={identity!r}"
+        )
 
 
 def _validate_ply_output(path: Path) -> None:
@@ -756,6 +789,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
     )
     prepare.add_argument("--shape-flow-noise-sample")
+    prepare.add_argument("--sparse-flow-noise-sample")
+    prepare.add_argument("--sparse-flow-noise-sample-sha256")
 
     for name in ("dataset-create", "dataset-version", "kernel-push", "kernel-status", "kernel-output", "print-commands"):
         drive = subparsers.add_parser(name)
@@ -790,6 +825,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_shape_flow_step=args.output_shape_flow_step,
                 expected_outputs=tuple(args.expected_outputs),
                 shape_flow_noise_sample=args.shape_flow_noise_sample,
+                sparse_flow_noise_sample=args.sparse_flow_noise_sample,
+                sparse_flow_noise_sample_sha256=args.sparse_flow_noise_sample_sha256,
             )
         )
         print(json.dumps(_prepared_summary(packet), indent=2, sort_keys=True))
@@ -885,6 +922,11 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "entrypoint_args": list(packet.entrypoint_args),
+        "input_roles": {
+            "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+            "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
+            "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+        },
         "outputs": list(packet.outputs),
         "dataset_dir": str(packet.dataset_dir),
         "kernel_dir": str(packet.kernel_dir),
@@ -915,6 +957,23 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         raise WitnessPacketError("entrypoint must be one of the staged inputs")
     if packet.shape_flow_noise_sample is not None and packet.shape_flow_noise_sample not in packet.inputs:
         raise WitnessPacketError("shape_flow_noise_sample must be one of the staged inputs")
+    if packet.sparse_flow_noise_sample is not None and packet.sparse_flow_noise_sample not in packet.inputs:
+        raise WitnessPacketError("sparse_flow_noise_sample must be one of the staged inputs")
+    if packet.sparse_flow_noise_sample is not None and packet.sparse_flow_noise_sample_sha256 is None:
+        raise WitnessPacketError(
+            "sparse_flow_noise_sample requires an expected SHA256"
+        )
+    if packet.sparse_flow_noise_sample is None and packet.sparse_flow_noise_sample_sha256 is not None:
+        raise WitnessPacketError(
+            "sparse_flow_noise_sample and its expected SHA256 must be provided together"
+        )
+    if (
+        packet.sparse_flow_noise_sample_sha256 is not None
+        and re.fullmatch(r"[0-9a-f]{64}", packet.sparse_flow_noise_sample_sha256) is None
+    ):
+        raise WitnessPacketError(
+            "sparse_flow_noise_sample expected SHA256 must be canonical lowercase hex"
+        )
     canonical_outputs = tuple(_canonical_output_name(output) for output in packet.outputs)
     if len(set(canonical_outputs)) != len(canonical_outputs):
         raise WitnessPacketError("declared outputs must be canonically unique")
@@ -945,6 +1004,22 @@ def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
             raise WitnessPacketError(f"missing input: {relative_name}")
         sources[relative_name] = source
     return sources
+
+
+def _validate_sparse_flow_noise_input(
+    packet: KaggleCudaWitnessPacket,
+    sources: dict[str, Path],
+) -> None:
+    if packet.sparse_flow_noise_sample is None:
+        return
+    source = sources[packet.sparse_flow_noise_sample]
+    actual_sha256 = sha256_file(source)
+    if actual_sha256 != packet.sparse_flow_noise_sample_sha256:
+        raise WitnessPacketError(
+            "sparse_flow_noise_sample digest mismatch: "
+            f"expected={packet.sparse_flow_noise_sample_sha256}, "
+            f"actual={actual_sha256}"
+        )
 
 
 def _dataset_metadata(
@@ -998,6 +1073,8 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "output_shape_slat": packet.output_shape_slat,
         "output_shape_flow_step": packet.output_shape_flow_step,
         "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+        "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
+        "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
         "manifest_sha256": sha256_file(manifest_path),
         "manifest_identity": _manifest_identity(packet),
         "source_identity": {
@@ -1203,6 +1280,9 @@ def main() -> int:
         command += ["--output-shape-flow-step", CONFIG["output_shape_flow_step"]]
     if CONFIG["shape_flow_noise_sample"]:
         command += ["--shape-flow-noise-sample", CONFIG["shape_flow_noise_sample"]]
+    if CONFIG["sparse_flow_noise_sample"]:
+        command += ["--sparse-flow-noise-sample", CONFIG["sparse_flow_noise_sample"]]
+        command += ["--sparse-flow-noise-sample-sha256", CONFIG["sparse_flow_noise_sample_sha256"]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     extra = {{
         "effective_dataset_dir": str(dataset_dir),
@@ -1266,6 +1346,11 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "title": packet.title,
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
+        "input_roles": {
+            "shape_flow_noise_sample": packet.shape_flow_noise_sample,
+            "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
+            "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+        },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "outputs": list(packet.outputs),

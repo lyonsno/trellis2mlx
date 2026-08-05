@@ -705,6 +705,159 @@ def test_prepare_packet_can_declare_shape_flow_noise_sample(tmp_path):
     assert 'command += ["--shape-flow-noise-sample", CONFIG["shape_flow_noise_sample"]]' in runner
 
 
+def test_prepare_packet_binds_sparse_flow_noise_role_and_expected_digest(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        _prepared_summary,
+        load_prepared_packet,
+        prepare_packet,
+        sha256_file,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    sparse_noise = capsule / "source_mps_sparse_flow_steps.npz"
+    np.savez(sparse_noise, noise=np.zeros((1, 8, 16, 16, 16), dtype=np.float32))
+    expected_sha256 = sha256_file(sparse_noise)
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/sparse-noise-inputs",
+            kernel_id="operator/sparse-noise-cuda",
+            title="Sparse Noise CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py", sparse_noise.name),
+            sparse_flow_noise_sample=sparse_noise.name,
+            sparse_flow_noise_sample_sha256=expected_sha256,
+        )
+    )
+
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    loaded = load_prepared_packet(packet.output_dir)
+
+    assert manifest["input_roles"]["sparse_flow_noise_sample"] == sparse_noise.name
+    assert manifest["input_roles"]["sparse_flow_noise_sample_sha256"] == expected_sha256
+    assert loaded.sparse_flow_noise_sample == sparse_noise.name
+    assert loaded.sparse_flow_noise_sample_sha256 == expected_sha256
+    assert _prepared_summary(packet)["input_roles"] == manifest["input_roles"]
+    assert '\\"sparse_flow_noise_sample\\": \\"source_mps_sparse_flow_steps.npz\\"' in runner
+    assert f'\\"sparse_flow_noise_sample_sha256\\": \\"{expected_sha256}\\"' in runner
+    assert 'command += ["--sparse-flow-noise-sample", CONFIG["sparse_flow_noise_sample"]]' in runner
+    assert (
+        'command += ["--sparse-flow-noise-sample-sha256", '
+        'CONFIG["sparse_flow_noise_sample_sha256"]]'
+    ) in runner
+
+
+@pytest.mark.parametrize(
+    ("include_input", "expected_sha256", "message"),
+    [
+        (False, "a" * 64, "staged inputs"),
+        (True, None, "expected SHA256"),
+        (True, "A" * 64, "canonical lowercase"),
+    ],
+)
+def test_prepare_packet_rejects_unbound_sparse_flow_noise_role(
+    tmp_path,
+    include_input,
+    expected_sha256,
+    message,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    (capsule / "noise.npz").write_bytes(b"noise")
+    inputs = ("cuda_probe.py", "noise.npz") if include_input else ("cuda_probe.py",)
+
+    with pytest.raises(WitnessPacketError, match=message):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/unbound-noise-inputs",
+                kernel_id="operator/unbound-noise-cuda",
+                title="Unbound Noise CUDA",
+                entrypoint="cuda_probe.py",
+                inputs=inputs,
+                sparse_flow_noise_sample="noise.npz",
+                sparse_flow_noise_sample_sha256=expected_sha256,
+            )
+        )
+
+    assert not (tmp_path / "packet").exists()
+
+
+def test_validate_downloaded_outputs_rejects_missing_sparse_noise_report_identity(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+        sha256_file,
+        validate_downloaded_outputs,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "probe.py").write_text("print('probe')\n")
+    noise = capsule / "noise.npz"
+    np.savez(noise, noise=np.zeros((1, 8, 16, 16, 16), dtype=np.float32))
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/noise-output-inputs",
+            kernel_id="operator/noise-output-cuda",
+            title="Noise Output CUDA",
+            entrypoint="probe.py",
+            inputs=("probe.py", "noise.npz"),
+            sparse_flow_noise_sample="noise.npz",
+            sparse_flow_noise_sample_sha256=sha256_file(noise),
+        )
+    )
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    (output_dir / "cuda_result.json").write_text('{"status": "done"}\n')
+    np.savez(output_dir / "cuda_result.npz", witness=np.asarray([1]))
+    _write_success_receipt(packet, output_dir)
+
+    with pytest.raises(WitnessPacketError, match="sparse-flow noise identity"):
+        validate_downloaded_outputs(packet, output_dir)
+
+    expected_sha256 = packet.sparse_flow_noise_sample_sha256
+    (output_dir / "cuda_result.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "sparse_flow_noise_sample": {
+                    "path": "noise.npz",
+                    "expected_sha256": expected_sha256,
+                    "sha256": expected_sha256,
+                    "noise_key": "noise",
+                    "noise_shape": [1, 8, 16, 16, 16],
+                    "noise_dtype": "float32",
+                    "sampling_route": "official-source-sparse-flow-from-admitted-noise",
+                },
+            }
+        )
+        + "\n"
+    )
+    _write_success_receipt(packet, output_dir)
+
+    records = validate_downloaded_outputs(packet, output_dir)
+    assert records["cuda_result.json"]["sha256"] == sha256_file(
+        output_dir / "cuda_result.json"
+    )
+
 def test_prepare_packet_rejects_missing_input_before_metadata(tmp_path):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError, prepare_packet
 
