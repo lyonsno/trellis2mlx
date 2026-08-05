@@ -983,6 +983,576 @@ def _write_shape_slat_suffix_fixture(tmp_path):
     return grid, report
 
 
+def _write_source_shape_flow_steps_fixture(tmp_path):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    sample_next = np.arange(8 * 2 * 32, dtype=np.float32).reshape(8, 2, 32)
+    arrays = {
+        "coords": coords,
+        "sample_next": sample_next,
+    }
+    array_manifest = {
+        name: {
+            "dtype": str(values.dtype),
+            "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+            "shape": list(values.shape),
+        }
+        for name, values in arrays.items()
+    }
+    effective_route = {
+        "route": "official-source-cuda-shape-flow-recurrence",
+        "device_type": "cuda",
+        "cuda_device": "Tesla T4",
+        "attention_backend": "sdpa",
+        "conv_backend": "none",
+        "model_ref": (
+            "microsoft/TRELLIS.2-4B/ckpts/"
+            "slat_flow_img2shape_dit_1_3B_512_bf16"
+        ),
+        "rescale_t": 3.0,
+        "candidate_names": ["source-native-control"],
+        "steps": 8,
+        "one_model_load": True,
+        "comparison_class": "source-native-eight-step-recurrence",
+    }
+    metadata = {
+        "schema": (
+            "trellis2mlx.source_cuda_shape_flow_transition0_recoverability.v1."
+            "source_recurrence.v2"
+        ),
+        "artifact_status": "computed_pending_external_report",
+        "external_report_required": True,
+        "effective_route": effective_route,
+        "arrays": array_manifest,
+        "source_candidate": {
+            "name": "source-native-control",
+            "source_step_count": 8,
+            "source_step_indices": list(range(8)),
+        },
+    }
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    primary = Path(tmp_path) / "source-steps.npz"
+    np.savez(primary, **arrays)
+    primary_sha256 = hashlib.sha256(primary.read_bytes()).hexdigest()
+    report = Path(tmp_path) / "source-steps.json"
+    report.write_text(
+        json.dumps(
+            {
+                "schema": "trellis2mlx.source_cuda_shape_flow_steps.v1",
+                "status": "done",
+                "last_trustworthy_phase": "source_recurrence",
+                "effective_route": effective_route,
+                "candidates": [metadata["source_candidate"]],
+                "primary_output": {
+                    "path": primary.name,
+                    "sha256": primary_sha256,
+                    "size_bytes": primary.stat().st_size,
+                    "validation": {
+                        "all_arrays_bound": True,
+                        "recurrence_exact": True,
+                        "step_count": 8,
+                        "token_count": 2,
+                        "channel_count": 32,
+                    },
+                },
+                "timing": {
+                    "source_steps_completed": 8,
+                    "source_steps_requested": 8,
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return primary, report
+
+
+def _rewrite_source_shape_flow_route_self_consistently(
+    primary,
+    report,
+    **route_updates,
+):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    payload = json.loads(report.read_text())
+    payload["effective_route"].update(route_updates)
+    with np.load(primary, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    metadata = json.loads(str(arrays["metadata_json"].item()))
+    metadata["effective_route"].update(route_updates)
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(primary, **arrays)
+    payload["primary_output"].update(
+        {
+            "sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            "size_bytes": primary.stat().st_size,
+        }
+    )
+    report.write_text(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _source_shape_flow_endpoint_decode_args(tmp_path, primary, report):
+    import hashlib
+
+    return [
+        "--output-json",
+        str(tmp_path / "decode-report.json"),
+        "--source-shape-flow-steps",
+        str(primary),
+        "--source-shape-flow-steps-report",
+        str(report),
+        "--source-shape-flow-steps-sha256",
+        hashlib.sha256(primary.read_bytes()).hexdigest(),
+        "--source-shape-flow-steps-report-sha256",
+        hashlib.sha256(report.read_bytes()).hexdigest(),
+        "--output-dir",
+        str(tmp_path / "meshes"),
+        "--no-download",
+    ]
+
+
+def test_source_shape_flow_terminal_decode_preflight_binds_exact_endpoint(tmp_path):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    rc = main(
+        _source_shape_flow_endpoint_decode_args(tmp_path, primary, source_report)
+    )
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    with np.load(primary, allow_pickle=False) as archive:
+        terminal = np.asarray(archive["sample_next"][-1])
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["selected_point_names"] == ["source-terminal"]
+    assert report["source_shape_slat_route"]["route"] == (
+        "official-source-cuda-shape-flow-recurrence-terminal"
+    )
+    assert report["source_shape_slat_route"]["model_ref"] == (
+        "microsoft/TRELLIS.2-4B/ckpts/"
+        "slat_flow_img2shape_dit_1_3B_512_bf16"
+    )
+    assert report["source_shape_slat_route"]["rescale_t"] == 3.0
+    assert report["source_shape_slat_route"]["candidate_names"] == [
+        "source-native-control"
+    ]
+    assert report["selected_points"] == [
+        {
+            "coordinate_key": "source-terminal",
+            "output_key": "sample_next[-1]",
+            "sha256": hashlib.sha256(terminal.tobytes()).hexdigest(),
+            "shape": [2, 32],
+            "source_step_index": 7,
+            "normalization_status": "deferred_to_bound_source_pipeline_config",
+        }
+    ]
+    assert report["source_shape_slat_primary"]["sha256"] == hashlib.sha256(
+        primary.read_bytes()
+    ).hexdigest()
+    assert report["effective_route"]["route"] == (
+        "official-source-cuda-shape-slat-decoder"
+    )
+
+
+def test_source_shape_flow_terminal_decode_requires_bound_digests_before_cleanup(
+    tmp_path,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    args = _source_shape_flow_endpoint_decode_args(tmp_path, primary, source_report)
+    del args[args.index("--source-shape-flow-steps-sha256") : args.index("--output-dir")]
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "source-terminal.raw.ply"
+    stale.write_bytes(b"stale")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "expected report and NPZ SHA256 values are required" in report["error"]
+    assert stale.read_bytes() == b"stale"
+
+
+def test_source_shape_flow_terminal_decode_rejects_substitute_before_cleanup(
+    tmp_path,
+):
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    args = _source_shape_flow_endpoint_decode_args(tmp_path, primary, source_report)
+    with np.load(primary, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    arrays["sample_next"] = arrays["sample_next"].copy()
+    arrays["sample_next"][-1, 0, 0] += np.float32(1.0)
+    np.savez(primary, **arrays)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "source-terminal.raw.ply"
+    stale.write_bytes(b"stale")
+
+    rc = main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert "expected source shape-flow primary digest mismatch" in report["error"]
+    assert stale.read_bytes() == b"stale"
+
+
+@pytest.mark.parametrize("failure", ["metadata", "incomplete", "nonfinite"])
+def test_source_shape_flow_terminal_decode_rejects_invalid_recurrence(
+    tmp_path,
+    failure,
+):
+    import hashlib
+    import json
+
+    import numpy as np
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    with np.load(primary, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    metadata = json.loads(str(arrays["metadata_json"].item()))
+    if failure == "metadata":
+        arrays["metadata_json"] = np.asarray("{not-json")
+    elif failure == "incomplete":
+        arrays["sample_next"] = arrays["sample_next"][:-1]
+    else:
+        arrays["sample_next"] = arrays["sample_next"].copy()
+        arrays["sample_next"][-1, 0, 0] = np.nan
+    if failure != "metadata":
+        metadata["arrays"]["sample_next"] = {
+            "dtype": str(arrays["sample_next"].dtype),
+            "sha256": hashlib.sha256(
+                arrays["sample_next"].tobytes()
+            ).hexdigest(),
+            "shape": list(arrays["sample_next"].shape),
+        }
+        arrays["metadata_json"] = np.asarray(
+            json.dumps(metadata, sort_keys=True)
+        )
+    np.savez(primary, **arrays)
+    payload = json.loads(source_report.read_text())
+    payload["primary_output"]["sha256"] = hashlib.sha256(
+        primary.read_bytes()
+    ).hexdigest()
+    payload["primary_output"]["size_bytes"] = primary.stat().st_size
+    source_report.write_text(json.dumps(payload, sort_keys=True) + "\n")
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "source-terminal.raw.ply"
+    stale.write_bytes(b"stale source decoder evidence")
+
+    rc = main(
+        _source_shape_flow_endpoint_decode_args(tmp_path, primary, source_report)
+    )
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "input_validation"
+    if failure != "metadata":
+        expected = (
+            "exactly 8 steps" if failure == "incomplete" else "non-finite"
+        )
+        assert expected in report["error"]
+    assert stale.read_bytes() == b"stale source decoder evidence"
+
+
+@pytest.mark.parametrize(
+    ("route_update", "expected_field"),
+    [
+        ({"model_ref": "microsoft/TRELLIS.2-4B/ckpts/not-the-model"}, "model_ref"),
+        ({"rescale_t": 1.0}, "rescale_t"),
+        ({"candidate_names": ["different-source-control"]}, "candidate_names"),
+    ],
+)
+def test_source_shape_flow_terminal_decode_rejects_route_substitution_before_cleanup(
+    tmp_path,
+    route_update,
+    expected_field,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    _rewrite_source_shape_flow_route_self_consistently(
+        primary,
+        source_report,
+        **route_update,
+    )
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / "source-terminal.raw.ply"
+    stale.write_bytes(b"stale source decoder evidence")
+
+    rc = main(
+        _source_shape_flow_endpoint_decode_args(tmp_path, primary, source_report)
+    )
+
+    decode_report = json.loads((tmp_path / "decode-report.json").read_text())
+    assert rc == 1
+    assert decode_report["failure_phase"] == "input_validation"
+    assert f"route mismatch for {expected_field}" in decode_report["error"]
+    assert stale.read_bytes() == b"stale source decoder evidence"
+
+
+def test_source_shape_flow_level0_trace_binds_denormalized_decoder_input(
+    tmp_path,
+    monkeypatch,
+):
+    import contextlib
+    import hashlib
+    import json
+    import sys
+    import types
+
+    import numpy as np
+
+    import scripts.source_cuda_postcond_full_decode_timing as runner
+    from scripts import decoder_level0_trace_contract as trace_hash_contract
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    with np.load(primary, allow_pickle=False) as archive:
+        coords = np.asarray(archive["coords"])
+        normalized_endpoint = np.asarray(archive["sample_next"][-1])
+    mean = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
+    std = np.linspace(0.5, 2.0, 32, dtype=np.float32)
+    denormalized = normalized_endpoint * std[None] + mean[None]
+    config_path = tmp_path / "pipeline.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "args": {
+                    "models": {
+                        "shape_slat_decoder": "ckpts/shape-decoder",
+                    },
+                    "shape_slat_normalization": {
+                        "mean": mean.tolist(),
+                        "std": std.tolist(),
+                    },
+                }
+            }
+        )
+        + "\n"
+    )
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+            self.device = "cuda"
+
+        def __array__(self, dtype=None):
+            return np.asarray(self.values, dtype=dtype)
+
+        def to(self, *_args, **_kwargs):
+            return self
+
+        def __getitem__(self, item):
+            return FakeTensor(self.values[item])
+
+        def __mul__(self, other):
+            return FakeTensor(self.values * np.asarray(other))
+
+        def __add__(self, other):
+            return FakeTensor(self.values + np.asarray(other))
+
+    class FakeParameter:
+        def numel(self):
+            return 7
+
+    class FakeDecoder:
+        def __init__(self):
+            self.training = True
+            self.low_vram = False
+
+        def set_resolution(self, resolution):
+            self.resolution = resolution
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def to(self, _device):
+            return self
+
+        def parameters(self):
+            return [FakeParameter()]
+
+    decoder = FakeDecoder()
+    source_models = types.ModuleType("trellis2.models")
+    source_models.from_pretrained = lambda _model_ref: decoder
+    sparse_module = types.ModuleType("trellis2.modules.sparse")
+    sparse_module.SparseTensor = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    sparse_module.config = types.SimpleNamespace(ATTN="sdpa", CONV="none")
+    modules_package = types.ModuleType("trellis2.modules")
+    modules_package.sparse = sparse_module
+    trellis2_package = types.ModuleType("trellis2")
+    trellis2_package.models = source_models
+    trellis2_package.modules = modules_package
+
+    torch_module = types.ModuleType("torch")
+    torch_module.__version__ = "test-cuda"
+    torch_module.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_name=lambda _index: "Tesla T4",
+        synchronize=lambda: None,
+    )
+    torch_module.device = lambda value: value
+    torch_module.set_grad_enabled = lambda _enabled: None
+    torch_module.from_numpy = FakeTensor
+    torch_module.tensor = lambda values: FakeTensor(
+        np.asarray(values, dtype=np.float32)
+    )
+    torch_module.no_grad = contextlib.nullcontext
+    hub_module = types.ModuleType("huggingface_hub")
+    hub_module.hf_hub_download = lambda _repo, _path: str(config_path)
+
+    for name, module in {
+        "torch": torch_module,
+        "huggingface_hub": hub_module,
+        "trellis2": trellis2_package,
+        "trellis2.models": source_models,
+        "trellis2.modules": modules_package,
+        "trellis2.modules.sparse": sparse_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(runner, "extract_source", lambda *_args: tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "install_mesh_override",
+        lambda *_args: {"status": "installed"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "capture_source_decoder_level0_trace",
+        lambda effective_decoder, _shape_slat: {}
+        if effective_decoder is decoder
+        else (_ for _ in ()).throw(AssertionError("wrong decoder")),
+    )
+
+    def write_trace(path, _arrays, **_kwargs):
+        path.write_bytes(b"authenticated mock trace")
+        return {"reopened_exact": True}
+
+    fake_contract = types.SimpleNamespace(
+        write_decoder_level0_trace_npz=write_trace,
+        decoder_trace_input_sha256=(
+            trace_hash_contract.decoder_trace_input_sha256
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "load_decoder_level0_trace_contract",
+        lambda: fake_contract,
+    )
+
+    args = _source_shape_flow_endpoint_decode_args(
+        tmp_path,
+        primary,
+        source_report,
+    )
+    args.remove("--no-download")
+    args.append("--decoder-level0-trace")
+
+    rc = runner.main(args)
+
+    report = json.loads((tmp_path / "decode-report.json").read_text())
+    expected_hash = trace_hash_contract.decoder_trace_input_sha256(
+        denormalized,
+        coords,
+    )
+    normalized_hash = trace_hash_contract.decoder_trace_input_sha256(
+        normalized_endpoint,
+        coords,
+    )
+    assert rc == 0
+    assert report["status"] == "done"
+    assert report["source_endpoint_normalization"][
+        "normalized_endpoint_sha256"
+    ] == hashlib.sha256(normalized_endpoint.tobytes()).hexdigest()
+    assert report["source_endpoint_normalization"][
+        "decoder_input_sha256"
+    ] == hashlib.sha256(denormalized.tobytes()).hexdigest()
+    assert report["decoder_trace_artifacts"][0][
+        "input_tensor_sha256"
+    ] == expected_hash
+    assert expected_hash != normalized_hash
+
+
+@pytest.mark.parametrize(
+    ("mode_args", "output_name"),
+    [
+        ([], "source-terminal.raw.ply"),
+        (["--decoder-state-only"], "source-terminal.decoder-state.npz"),
+        (
+            ["--decoder-level0-trace"],
+            "source-terminal.decoder-level0-trace.npz",
+        ),
+    ],
+)
+def test_source_shape_flow_terminal_output_collision_preserves_stale_evidence(
+    tmp_path,
+    mode_args,
+    output_name,
+):
+    import json
+
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    primary, source_report = _write_source_shape_flow_steps_fixture(tmp_path)
+    output_dir = tmp_path / "meshes"
+    output_dir.mkdir()
+    stale = output_dir / output_name
+    stale.write_bytes(b"stale source decoder evidence")
+    args = _source_shape_flow_endpoint_decode_args(
+        tmp_path,
+        primary,
+        source_report,
+    )
+    args[args.index("--output-json") + 1] = str(stale)
+    args.extend(mode_args)
+
+    rc = main(args)
+
+    fallback = stale.with_name(
+        f"{stale.name}.selective-decode-failure.json"
+    )
+    report = json.loads(fallback.read_text())
+    assert rc == 1
+    assert report["failure_phase"] == "request_validation"
+    assert report["requested_output_json"] == str(stale)
+    assert report["effective_output_json"] == str(fallback)
+    assert "collides with an expected" in report["error"]
+    assert report["mesh_artifacts"] == []
+    assert report["decoder_state_artifacts"] == []
+    assert report["decoder_trace_artifacts"] == []
+    assert stale.read_bytes() == b"stale source decoder evidence"
+
+
 def _rewrite_shape_slat_suffix_fixture_self_consistently(grid, report):
     import hashlib
     import json

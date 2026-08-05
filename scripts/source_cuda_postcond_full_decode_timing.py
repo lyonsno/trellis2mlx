@@ -313,6 +313,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-shape-flow-steps",
+        type=Path,
+        help=(
+            "Official source-CUDA eight-step shape-flow recurrence whose "
+            "terminal sample will be decoded."
+        ),
+    )
+    parser.add_argument(
+        "--source-shape-flow-steps-report",
+        type=Path,
+        help="Authoritative external report bound to --source-shape-flow-steps.",
+    )
+    parser.add_argument(
+        "--source-shape-flow-steps-sha256",
+        help="Expected SHA256 of --source-shape-flow-steps.",
+    )
+    parser.add_argument(
+        "--source-shape-flow-steps-report-sha256",
+        help="Expected SHA256 of --source-shape-flow-steps-report.",
+    )
+    parser.add_argument(
         "--shape-slat-point",
         action="append",
         default=[],
@@ -452,6 +473,8 @@ def main(argv: list[str] | None = None) -> int:
         (
             args.shape_slat_grid is not None,
             args.shape_slat_grid_report is not None,
+            args.source_shape_flow_steps is not None,
+            args.source_shape_flow_steps_report is not None,
             bool(args.shape_slat_point),
             args.output_dir is not None,
             args.no_download,
@@ -845,6 +868,21 @@ SHAPE_SLAT_SUFFIX_ROUTE = {
     "one_model_load": True,
     "comparison_class": "exact-mlx-prefix-plus-source-cuda-suffix",
 }
+SOURCE_SHAPE_FLOW_STEPS_ROUTE = {
+    "route": "official-source-cuda-shape-flow-recurrence",
+    "device_type": "cuda",
+    "attention_backend": "sdpa",
+    "conv_backend": "none",
+    "model_ref": (
+        "microsoft/TRELLIS.2-4B/ckpts/"
+        "slat_flow_img2shape_dit_1_3B_512_bf16"
+    ),
+    "rescale_t": 3.0,
+    "candidate_names": ["source-native-control"],
+    "steps": 8,
+    "one_model_load": True,
+    "comparison_class": "source-native-eight-step-recurrence",
+}
 
 
 def _resolved_path(path: Path) -> Path:
@@ -1148,6 +1186,175 @@ def _load_selected_shape_slat_inputs(
     return coords, selected_arrays, selected_rows
 
 
+def _validate_source_shape_flow_steps_route(
+    source_report: dict[str, Any],
+) -> dict[str, Any]:
+    if source_report.get("schema") != "trellis2mlx.source_cuda_shape_flow_steps.v1":
+        raise ValueError("unsupported source shape-flow steps report schema")
+    if source_report.get("status") != "done":
+        raise ValueError("source shape-flow steps report is not done")
+    if source_report.get("last_trustworthy_phase") != "source_recurrence":
+        raise ValueError("source shape-flow steps report did not finish recurrence")
+    route = source_report.get("effective_route")
+    if not isinstance(route, dict):
+        raise ValueError("source shape-flow steps report is missing effective_route")
+    expected_route_fields = set(SOURCE_SHAPE_FLOW_STEPS_ROUTE) | {"cuda_device"}
+    if set(route) != expected_route_fields:
+        raise ValueError(
+            "source shape-flow route fields differ from the exact contract: "
+            f"expected={sorted(expected_route_fields)!r}, "
+            f"got={sorted(route)!r}"
+        )
+    for key, expected in SOURCE_SHAPE_FLOW_STEPS_ROUTE.items():
+        if route.get(key) != expected:
+            raise ValueError(
+                f"source shape-flow route mismatch for {key}: "
+                f"expected {expected!r}, got {route.get(key)!r}"
+            )
+    if not isinstance(route.get("cuda_device"), str) or not route["cuda_device"].strip():
+        raise ValueError("source shape-flow route is missing cuda_device")
+    candidates = source_report.get("candidates")
+    expected_candidate = {
+        "name": "source-native-control",
+        "source_step_count": 8,
+        "source_step_indices": list(range(8)),
+    }
+    if candidates != [expected_candidate]:
+        raise ValueError("source shape-flow report does not bind the full source control")
+    timing = source_report.get("timing")
+    if not isinstance(timing, dict):
+        raise ValueError("source shape-flow report is missing timing")
+    for key in ("source_steps_completed", "source_steps_requested"):
+        if timing.get(key) != 8:
+            raise ValueError(f"source shape-flow {key} must be 8")
+    primary = source_report.get("primary_output")
+    validation = primary.get("validation") if isinstance(primary, dict) else None
+    if not isinstance(validation, dict):
+        raise ValueError("source shape-flow report is missing primary validation")
+    expected_validation = {
+        "all_arrays_bound": True,
+        "recurrence_exact": True,
+        "step_count": 8,
+        "channel_count": 32,
+    }
+    for key, expected in expected_validation.items():
+        if validation.get(key) != expected:
+            raise ValueError(
+                f"source shape-flow primary validation mismatch for {key}"
+            )
+    token_count = validation.get("token_count")
+    if not isinstance(token_count, int) or token_count <= 0:
+        raise ValueError("source shape-flow token_count must be positive")
+    return {
+        "source_schema": source_report["schema"],
+        "route": "official-source-cuda-shape-flow-recurrence-terminal",
+        **{
+            key: route[key]
+            for key in (*SOURCE_SHAPE_FLOW_STEPS_ROUTE, "cuda_device")
+            if key != "route"
+        },
+    }
+
+
+def _load_source_shape_flow_terminal(
+    steps_path: Path,
+    source_report: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict[str, Any]]]:
+    primary = source_report.get("primary_output")
+    if not isinstance(primary, dict):
+        raise ValueError("source shape-flow report is missing primary_output")
+    actual_sha256 = sha256_file(steps_path)
+    if primary.get("sha256") != actual_sha256:
+        raise ValueError(
+            "source shape-flow primary digest mismatch: "
+            f"report={primary.get('sha256')!r}, actual={actual_sha256!r}"
+        )
+    if primary.get("size_bytes") != steps_path.stat().st_size:
+        raise ValueError("source shape-flow primary size mismatch")
+
+    with np.load(steps_path, allow_pickle=False) as archive:
+        if "metadata_json" not in archive.files:
+            raise ValueError("source shape-flow primary is missing metadata_json")
+        raw_metadata = np.asarray(archive["metadata_json"])
+        if raw_metadata.shape != () or raw_metadata.dtype.kind not in {"U", "S"}:
+            raise ValueError("source shape-flow metadata_json must be a string scalar")
+        try:
+            metadata = json.loads(str(raw_metadata.item()))
+        except json.JSONDecodeError as exc:
+            raise ValueError("source shape-flow metadata_json is invalid JSON") from exc
+        if metadata.get("schema") != (
+            "trellis2mlx.source_cuda_shape_flow_transition0_recoverability.v1."
+            "source_recurrence.v2"
+        ):
+            raise ValueError("source shape-flow artifact metadata schema is invalid")
+        if metadata.get("artifact_status") != "computed_pending_external_report":
+            raise ValueError("source shape-flow artifact metadata status is invalid")
+        if metadata.get("external_report_required") is not True:
+            raise ValueError("source shape-flow artifact must require external report")
+        if metadata.get("effective_route") != source_report.get("effective_route"):
+            raise ValueError("source shape-flow artifact route differs from report")
+        if metadata.get("source_candidate") != source_report.get("candidates", [None])[0]:
+            raise ValueError("source shape-flow artifact candidate differs from report")
+        manifest = metadata.get("arrays")
+        if not isinstance(manifest, dict):
+            raise ValueError("source shape-flow artifact is missing array manifest")
+        expected_names = set(archive.files) - {"metadata_json"}
+        if set(manifest) != expected_names:
+            raise ValueError("source shape-flow array manifest is not complete")
+        arrays: dict[str, np.ndarray] = {}
+        for name in sorted(expected_names):
+            values = np.asarray(archive[name])
+            row = manifest.get(name)
+            if not isinstance(row, dict):
+                raise ValueError(f"source shape-flow manifest row {name!r} is invalid")
+            identity = {
+                "dtype": str(values.dtype),
+                "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+                "shape": [int(value) for value in values.shape],
+            }
+            if row != identity:
+                raise ValueError(f"source shape-flow array {name!r} identity mismatch")
+            arrays[name] = values
+        coords = arrays.get("coords")
+        sample_next = arrays.get("sample_next")
+        if coords is None or coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+            raise ValueError("source shape-flow coords must be int32 [N, 4]")
+        if (
+            sample_next is None
+            or sample_next.dtype != np.float32
+            or sample_next.shape != (8, coords.shape[0], 32)
+        ):
+            raise ValueError(
+                "source shape-flow sample_next must contain exactly 8 steps "
+                "with shape [8, N, 32]"
+            )
+        if not np.isfinite(sample_next).all():
+            raise ValueError("source shape-flow sample_next contains non-finite values")
+        sample_in = arrays.get("sample_in")
+        if sample_in is not None:
+            if sample_in.shape != sample_next.shape or sample_in.dtype != np.float32:
+                raise ValueError("source shape-flow sample_in shape or dtype mismatch")
+            if not np.array_equal(sample_in[1:], sample_next[:-1]):
+                raise ValueError("source shape-flow recurrence is not exact")
+        terminal = np.ascontiguousarray(sample_next[-1])
+        coords = np.ascontiguousarray(coords)
+    terminal_sha256 = hashlib.sha256(terminal.tobytes()).hexdigest()
+    return (
+        coords,
+        {"source-terminal": terminal},
+        [
+            {
+                "coordinate_key": "source-terminal",
+                "output_key": "sample_next[-1]",
+                "sha256": terminal_sha256,
+                "shape": [int(value) for value in terminal.shape],
+                "source_step_index": 7,
+                "normalization_status": "deferred_to_bound_source_pipeline_config",
+            }
+        ],
+    )
+
+
 def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     decoder_state_only = bool(args.decoder_state_only)
@@ -1182,9 +1389,31 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         else "official-source-cuda-shape-slat-decoder"
     )
     requested_output_json = Path(args.output_json)
-    grid_path = Path(args.shape_slat_grid) if args.shape_slat_grid is not None else None
+    source_endpoint_values = (
+        args.source_shape_flow_steps,
+        args.source_shape_flow_steps_report,
+        args.source_shape_flow_steps_sha256,
+        args.source_shape_flow_steps_report_sha256,
+    )
+    source_endpoint_mode = any(value is not None for value in source_endpoint_values)
+    grid_values = (
+        args.shape_slat_grid,
+        args.shape_slat_grid_report,
+        args.shape_slat_grid_sha256,
+        args.shape_slat_grid_report_sha256,
+    )
+    grid_mode = any(value is not None for value in grid_values)
+    grid_path = (
+        Path(args.source_shape_flow_steps)
+        if source_endpoint_mode and args.source_shape_flow_steps is not None
+        else Path(args.shape_slat_grid)
+        if args.shape_slat_grid is not None
+        else None
+    )
     source_report_path = (
-        Path(args.shape_slat_grid_report)
+        Path(args.source_shape_flow_steps_report)
+        if source_endpoint_mode and args.source_shape_flow_steps_report is not None
+        else Path(args.shape_slat_grid_report)
         if args.shape_slat_grid_report is not None
         else None
     )
@@ -1244,8 +1473,21 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             "no_download": bool(args.no_download),
         },
         "requested_source_shape_slat_identity": {
-            "report_sha256": args.shape_slat_grid_report_sha256,
-            "primary_sha256": args.shape_slat_grid_sha256,
+            "report_sha256": (
+                args.source_shape_flow_steps_report_sha256
+                if source_endpoint_mode
+                else args.shape_slat_grid_report_sha256
+            ),
+            "primary_sha256": (
+                args.source_shape_flow_steps_sha256
+                if source_endpoint_mode
+                else args.shape_slat_grid_sha256
+            ),
+            "input_kind": (
+                "official-source-cuda-shape-flow-terminal"
+                if source_endpoint_mode
+                else "admitted-shape-slat-grid"
+            ),
         },
         "mesh_artifacts": [],
         "decoder_state_artifacts": [],
@@ -1264,6 +1506,17 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
     try:
         if collision:
             raise ValueError("--output-json collides with protected input")
+        if source_endpoint_mode and grid_mode:
+            raise ValueError(
+                "source shape-flow steps and shape-SLat grid inputs are mutually exclusive"
+            )
+        if source_endpoint_mode and not all(
+            value is not None for value in source_endpoint_values[:2]
+        ):
+            raise ValueError(
+                "--source-shape-flow-steps and "
+                "--source-shape-flow-steps-report are required together"
+            )
         if sum(
             (
                 decoder_state_only,
@@ -1291,10 +1544,21 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             raise ValueError("--shape-slat-grid-report is required for selective decode")
         if args.output_dir is None:
             raise ValueError("--output-dir is required for selective decode")
-        point_names = list(args.shape_slat_point)
+        requested_point_names = list(args.shape_slat_point)
+        if source_endpoint_mode and requested_point_names:
+            raise ValueError(
+                "--shape-slat-point is not accepted with source shape-flow steps"
+            )
+        point_names = (
+            ["source-terminal"] if source_endpoint_mode else requested_point_names
+        )
         if not point_names:
             raise ValueError("at least one --shape-slat-point is required")
-        invalid_names = [name for name in point_names if not SHAPE_SLAT_POINT_RE.fullmatch(name)]
+        invalid_names = [
+            name
+            for name in point_names
+            if name != "source-terminal" and not SHAPE_SLAT_POINT_RE.fullmatch(name)
+        ]
         if invalid_names:
             raise ValueError(f"invalid --shape-slat-point values: {invalid_names!r}")
         if len(set(point_names)) != len(point_names):
@@ -1337,6 +1601,21 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 for point_name in point_names
                 for variant in ("raw", "filled")
             ]
+        expected_output_kind = (
+            "decoder-level2-norm2-trace"
+            if decoder_level2_norm2_trace
+            else "decoder-level2-subdiv-trace"
+            if decoder_level2_subdiv_trace
+            else "decoder-level2-block0-trace"
+            if decoder_level2_block0_trace
+            else "decoder-level1-trace"
+            if decoder_level1_trace
+            else "decoder-level0-trace"
+            if decoder_level0_trace
+            else "decoder-state"
+            if decoder_state_only
+            else "mesh"
+        )
         protected_output_collisions = sorted(
             str(path)
             for path in expected_paths
@@ -1357,22 +1636,42 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 protected_paths + tuple(expected_paths),
             )
             report["effective_output_json"] = str(output_json)
+        if expected_output_collision and source_endpoint_mode:
+            raise ValueError(
+                "--output-json collides with an expected "
+                f"{expected_output_kind} output"
+            )
 
-        expected_grid_sha256 = args.shape_slat_grid_sha256
-        expected_report_sha256 = args.shape_slat_grid_report_sha256
+        expected_grid_sha256 = (
+            args.source_shape_flow_steps_sha256
+            if source_endpoint_mode
+            else args.shape_slat_grid_sha256
+        )
+        expected_report_sha256 = (
+            args.source_shape_flow_steps_report_sha256
+            if source_endpoint_mode
+            else args.shape_slat_grid_report_sha256
+        )
         suffix_selection = any(name.startswith("switch-") for name in point_names)
-        if suffix_selection and not (
+        if (suffix_selection or source_endpoint_mode) and not (
             expected_grid_sha256 and expected_report_sha256
         ):
             raise ValueError(
                 "expected report and NPZ SHA256 values are required for "
+                "source endpoint decode"
+                if source_endpoint_mode
+                else "expected report and NPZ SHA256 values are required for "
                 "suffix selective decode"
             )
         if bool(expected_grid_sha256) != bool(expected_report_sha256):
-            raise ValueError(
-                "--shape-slat-grid-sha256 and "
-                "--shape-slat-grid-report-sha256 must be provided together"
+            paired_flags = (
+                "--source-shape-flow-steps-sha256 and "
+                "--source-shape-flow-steps-report-sha256"
+                if source_endpoint_mode
+                else "--shape-slat-grid-sha256 and "
+                "--shape-slat-grid-report-sha256"
             )
+            raise ValueError(f"{paired_flags} must be provided together")
         if expected_grid_sha256 and expected_report_sha256:
             for label, expected in (
                 ("primary", expected_grid_sha256),
@@ -1385,17 +1684,37 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     )
             actual_report_sha256 = sha256_file(source_report_path)
             if actual_report_sha256 != expected_report_sha256:
+                label = (
+                    "source shape-flow report"
+                    if source_endpoint_mode
+                    else "source shape-SLat report"
+                )
                 raise ValueError(
-                    "expected source shape-SLat report digest mismatch: "
+                    f"expected {label} digest mismatch: "
                     f"expected={expected_report_sha256}, "
                     f"actual={actual_report_sha256}"
                 )
             actual_grid_sha256 = sha256_file(grid_path)
             if actual_grid_sha256 != expected_grid_sha256:
+                label = (
+                    "source shape-flow primary"
+                    if source_endpoint_mode
+                    else "source shape-SLat primary"
+                )
                 raise ValueError(
-                    "expected source shape-SLat primary digest mismatch: "
+                    f"expected {label} digest mismatch: "
                     f"expected={expected_grid_sha256}, actual={actual_grid_sha256}"
                 )
+
+        if source_endpoint_mode:
+            phase = "input_validation"
+            source_report = json.loads(source_report_path.read_text())
+            source_shape_slat_route = _validate_source_shape_flow_steps_route(
+                source_report
+            )
+            coords, selected_arrays, selected_rows = (
+                _load_source_shape_flow_terminal(grid_path, source_report)
+            )
 
         output_dir.mkdir(parents=True, exist_ok=True)
         for path in expected_paths:
@@ -1445,33 +1764,24 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                 for variant in ("raw", "filled")
             ]
         if expected_output_collision:
-            output_kind = (
-                "decoder-level2-norm2-trace"
-                if decoder_level2_norm2_trace
-                else "decoder-level2-subdiv-trace"
-                if decoder_level2_subdiv_trace
-                else "decoder-level2-block0-trace"
-                if decoder_level2_block0_trace
-                else "decoder-level1-trace"
-                if decoder_level1_trace
-                else "decoder-level0-trace"
-                if decoder_level0_trace
-                else "decoder-state"
-                if decoder_state_only
-                else "mesh"
-            )
             raise ValueError(
-                f"--output-json collides with an expected {output_kind} output"
+                "--output-json collides with an expected "
+                f"{expected_output_kind} output"
             )
 
         phase = "input_validation"
-        source_report = json.loads(source_report_path.read_text())
-        source_shape_slat_route = _validate_source_shape_slat_route(source_report)
-        coords, selected_arrays, selected_rows = _load_selected_shape_slat_inputs(
-            grid_path,
-            source_report,
-            point_names,
-        )
+        if not source_endpoint_mode:
+            source_report = json.loads(source_report_path.read_text())
+            source_shape_slat_route = _validate_source_shape_slat_route(
+                source_report
+            )
+            coords, selected_arrays, selected_rows = (
+                _load_selected_shape_slat_inputs(
+                    grid_path,
+                    source_report,
+                    point_names,
+                )
+            )
         source_shape_slat_report = {
             "path": str(source_report_path),
             "sha256": sha256_file(source_report_path),
@@ -1605,6 +1915,22 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
             args.model_repo,
             pipeline_args["models"]["shape_slat_decoder"],
         )
+        if source_endpoint_mode:
+            normalization = pipeline_args.get("shape_slat_normalization")
+            if not isinstance(normalization, dict):
+                raise ValueError("source pipeline config is missing shape normalization")
+            mean_values = np.asarray(normalization.get("mean"), dtype=np.float32)
+            std_values = np.asarray(normalization.get("std"), dtype=np.float32)
+            if mean_values.shape != (32,) or std_values.shape != (32,):
+                raise ValueError("source pipeline shape normalization must have 32 channels")
+            if not np.isfinite(mean_values).all() or not np.isfinite(std_values).all():
+                raise ValueError("source pipeline shape normalization is non-finite")
+            report["source_endpoint_normalization"] = {
+                "backend": "official-source-torch-cuda",
+                "pipeline_config_path": str(pipeline_config_path),
+                "mean_sha256": hashlib.sha256(mean_values.tobytes()).hexdigest(),
+                "std_sha256": hashlib.sha256(std_values.tobytes()).hexdigest(),
+            }
         report["phase_timings"][phase] = elapsed(phase_started)
 
         phase = "load_shape_decoder"
@@ -1647,7 +1973,34 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
         }
         for point_name in point_names:
             point_started = time.perf_counter()
-            feats_tensor = torch.from_numpy(selected_arrays[point_name].copy()).to(device=device)
+            decoder_input = selected_arrays[point_name]
+            feats_tensor = torch.from_numpy(decoder_input.copy()).to(device=device)
+            if source_endpoint_mode:
+                std_tensor = torch.tensor(
+                    pipeline_args["shape_slat_normalization"]["std"]
+                )[None].to(feats_tensor.device)
+                mean_tensor = torch.tensor(
+                    pipeline_args["shape_slat_normalization"]["mean"]
+                )[None].to(feats_tensor.device)
+                feats_tensor = feats_tensor * std_tensor + mean_tensor
+                sync_cuda(torch)
+                decoder_input = tensor_to_numpy(feats_tensor).astype(
+                    np.float32,
+                    copy=False,
+                )
+                report["source_endpoint_normalization"].update(
+                    {
+                        "normalized_endpoint_sha256": hashlib.sha256(
+                            selected_arrays[point_name].tobytes()
+                        ).hexdigest(),
+                        "decoder_input_sha256": hashlib.sha256(
+                            decoder_input.tobytes()
+                        ).hexdigest(),
+                        "decoder_input_shape": [
+                            int(value) for value in decoder_input.shape
+                        ],
+                    }
+                )
             shape_slat = SparseTensor(feats=feats_tensor, coords=coords_tensor)
             if decoder_trace_mode:
                 trace_contract = (
@@ -1804,7 +2157,7 @@ def run_shape_slat_grid_decode(args: argparse.Namespace) -> int:
                     )
                     input_tensor_sha256 = (
                         trace_contract.decoder_trace_input_sha256(
-                            selected_arrays[point_name],
+                            decoder_input,
                             coords,
                         )
                     )
