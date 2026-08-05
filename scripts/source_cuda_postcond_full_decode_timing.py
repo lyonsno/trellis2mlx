@@ -49,6 +49,11 @@ MODEL_NAMES_BY_PIPELINE_TYPE = {
     ),
 }
 
+SPARSE_STRUCTURE_MODEL_NAMES = (
+    "sparse_structure_decoder",
+    "sparse_structure_flow_model",
+)
+
 
 def load_decoder_level0_trace_contract():
     if not __package__:
@@ -272,6 +277,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-mesh-state", type=Path)
     parser.add_argument("--output-shape-slat", type=Path)
     parser.add_argument("--output-shape-flow-step", type=Path)
+    parser.add_argument("--output-sparse-flow-steps", type=Path)
+    parser.add_argument(
+        "--stop-after-sparse-structure",
+        action="store_true",
+        help=(
+            "Capture the official sparse-flow recurrence, decode its sparse "
+            "support, write --output-sparse-flow-steps, and stop before shape "
+            "flow, texture flow, and mesh decode."
+        ),
+    )
     parser.add_argument(
         "--sparse-flow-noise-sample",
         type=Path,
@@ -513,19 +528,35 @@ def main(argv: list[str] | None = None) -> int:
             "not GLB export timing unless export_glb_elapsed_seconds is present",
         ],
     }
+    if args.stop_after_sparse_structure:
+        report["requested_backend"] = (
+            "official TRELLIS.2 source sparse-flow recurrence and decoded "
+            "sparse support on CUDA"
+        )
+        report["forbidden_inferences"].extend(
+            [
+                "not shape-flow, texture-flow, mesh, winding, or GLB evidence",
+                "not proof of full-pipeline parity",
+            ]
+        )
     phase = "setup"
 
     try:
         output_json = Path(args.output_json)
-        if args.output_npz is None:
+        if args.output_npz is None and not args.stop_after_sparse_structure:
             raise ValueError("--output-npz is required for full post-conditioning decode")
-        output_npz = Path(args.output_npz)
+        output_npz = Path(args.output_npz) if args.output_npz is not None else None
         output_ply = Path(args.output_ply)
         output_mesh_state = Path(args.output_mesh_state) if args.output_mesh_state is not None else None
         output_shape_slat = Path(args.output_shape_slat) if args.output_shape_slat is not None else None
         output_shape_flow_step = (
             Path(args.output_shape_flow_step)
             if args.output_shape_flow_step is not None
+            else None
+        )
+        output_sparse_flow_steps = (
+            Path(args.output_sparse_flow_steps)
+            if args.output_sparse_flow_steps is not None
             else None
         )
         shape_flow_noise_sample_path = (
@@ -540,18 +571,48 @@ def main(argv: list[str] | None = None) -> int:
         )
         sparse_flow_noise_sample_sha256 = args.sparse_flow_noise_sample_sha256
         output_json.parent.mkdir(parents=True, exist_ok=True)
-        output_npz.parent.mkdir(parents=True, exist_ok=True)
-        output_ply.parent.mkdir(parents=True, exist_ok=True)
+        if output_npz is not None:
+            output_npz.parent.mkdir(parents=True, exist_ok=True)
+        if not args.stop_after_sparse_structure:
+            output_ply.parent.mkdir(parents=True, exist_ok=True)
         if output_mesh_state is not None:
             output_mesh_state.parent.mkdir(parents=True, exist_ok=True)
         if output_shape_slat is not None:
             output_shape_slat.parent.mkdir(parents=True, exist_ok=True)
         if output_shape_flow_step is not None:
             output_shape_flow_step.parent.mkdir(parents=True, exist_ok=True)
+        if output_sparse_flow_steps is not None:
+            output_sparse_flow_steps.parent.mkdir(parents=True, exist_ok=True)
 
         phase = "validate_args"
         if args.steps <= 0:
             raise ValueError("--steps must be positive")
+        if args.stop_after_sparse_structure:
+            if output_sparse_flow_steps is None:
+                raise ValueError(
+                    "--output-sparse-flow-steps is required with "
+                    "--stop-after-sparse-structure"
+                )
+            if sparse_flow_noise_sample_path is None:
+                raise ValueError(
+                    "--stop-after-sparse-structure requires exact sparse-flow noise "
+                    "and its expected SHA256"
+                )
+            if args.steps != 8:
+                raise ValueError(
+                    "the source-CUDA sparse-flow recurrence witness requires "
+                    "--steps 8"
+                )
+            if args.pipeline_type != "512":
+                raise ValueError(
+                    "the source-CUDA sparse-flow recurrence witness requires "
+                    "--pipeline-type 512"
+                )
+        elif output_sparse_flow_steps is not None:
+            raise ValueError(
+                "--output-sparse-flow-steps requires "
+                "--stop-after-sparse-structure"
+            )
         if (
             sparse_flow_noise_sample_path is not None
             or sparse_flow_noise_sample_sha256 is not None
@@ -582,7 +643,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"expected={sparse_flow_noise_sample_sha256}, "
                     f"actual={actual_sparse_noise_sha256}"
                 )
-        model_names = required_model_names(args.pipeline_type)
+        if output_sparse_flow_steps is not None:
+            protected_inputs = (
+                output_json,
+                Path(args.conditioning),
+                Path(args.source_tar),
+                Path(args.mesh_override),
+                sparse_flow_noise_sample_path,
+            )
+            if any(
+                candidate is not None
+                and output_sparse_flow_steps.resolve(strict=False)
+                == Path(candidate).resolve(strict=False)
+                for candidate in protected_inputs
+            ):
+                raise ValueError(
+                    "--output-sparse-flow-steps must not replace an input or report"
+                )
+        model_names = (
+            SPARSE_STRUCTURE_MODEL_NAMES
+            if args.stop_after_sparse_structure
+            else required_model_names(args.pipeline_type)
+        )
         if args.pipeline_type != "512" and args.conditioning_1024 is None:
             raise ValueError(f"--conditioning-1024 is required for pipeline_type={args.pipeline_type}")
         report["required_model_names"] = list(model_names)
@@ -590,6 +672,13 @@ def main(argv: list[str] | None = None) -> int:
             args.sparse_conv_backend,
             args.sparse_attn_backend,
         )
+
+        if args.stop_after_sparse_structure:
+            assert output_sparse_flow_steps is not None
+            output_sparse_flow_steps.unlink(missing_ok=True)
+            report["requested_sparse_flow_steps_output"] = str(
+                output_sparse_flow_steps
+            )
 
         phase = "extract_source"
         phase_started = time.perf_counter()
@@ -694,12 +783,17 @@ def main(argv: list[str] | None = None) -> int:
         }
         report["phase_timings"][phase] = elapsed(phase_started)
 
-        phase = "post_conditioning_decode"
+        phase = (
+            "sparse_structure_capture"
+            if args.stop_after_sparse_structure
+            else "post_conditioning_decode"
+        )
         decode_started = time.perf_counter()
         torch.manual_seed(args.seed)
         report["stage_timings"] = {}
         stage_timings = report["stage_timings"]
         shape_flow_step_payload = None
+        sparse_flow_steps_payload = None
         shape_flow_noise_sample = None
         shape_flow_noise_key = None
 
@@ -732,6 +826,8 @@ def main(argv: list[str] | None = None) -> int:
                     "noise_dtype": str(sparse_flow_noise_sample.dtype),
                 }
             )
+            if output_sparse_flow_steps is not None:
+                sparse_flow_steps_payload = {}
             coords = sample_sparse_structure_with_noise(
                 pipeline,
                 cond_512,
@@ -739,10 +835,50 @@ def main(argv: list[str] | None = None) -> int:
                 1,
                 {"steps": args.steps},
                 sparse_flow_noise_sample,
+                capture_steps=sparse_flow_steps_payload,
             )
         sync_cuda(torch)
         stage_timings["sample_sparse_structure_elapsed_seconds"] = elapsed(stage_started)
         report["post_conditioning_partial_elapsed_seconds"] = elapsed(decode_started)
+
+        if args.stop_after_sparse_structure:
+            assert output_sparse_flow_steps is not None
+            assert sparse_flow_steps_payload is not None
+            phase = "write_sparse_flow_steps"
+            report["sparse_coords_count"] = int(coords.shape[0])
+            artifact = write_source_sparse_flow_steps_npz(
+                output_sparse_flow_steps,
+                sparse_flow_steps_payload,
+                tensor_to_numpy(coords).astype(np.int32, copy=False),
+            )
+            report["sparse_flow_steps_artifact"] = artifact
+            report["primary_output"] = artifact
+            report["effective_route"] = {
+                "route": "official-source-cuda-sparse-flow-recurrence-from-exact-noise",
+                "device_type": "cuda",
+                "cuda_device": report["cuda_device"],
+                "attention_backend": report["sparse_attention_backend"],
+                "conv_backend": report["sparse_conv_backend"],
+                "steps": int(args.steps),
+                "one_sparse_model_load": True,
+                "comparison_class": "exact-common-noise-and-source-conditioning",
+                "sampler_execution": "official FlowEuler sampler sample/sample_once",
+                "capture_method": "temporary observer hooks restored after sampling",
+            }
+            report.update(
+                {
+                    "status": "done",
+                    "failure_phase": None,
+                    "elapsed_seconds": elapsed(started),
+                    "post_conditioning_sparse_structure_elapsed_seconds": elapsed(
+                        decode_started
+                    ),
+                }
+            )
+            output_json.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n"
+            )
+            return 0
 
         if args.pipeline_type == "512":
             if output_shape_flow_step is not None:
@@ -878,6 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
                 normalization=pipeline_args["shape_slat_normalization"],
             )
 
+        assert output_npz is not None
         np.savez(
             output_npz,
             sparse_coords_count=np.asarray(report["sparse_coords_count"], dtype=np.int64),
@@ -3774,6 +3911,7 @@ def sample_sparse_structure_with_noise(
     noise_feats: np.ndarray,
     *,
     torch_module: Any | None = None,
+    capture_steps: dict[str, np.ndarray] | None = None,
 ) -> Any:
     torch = torch_module if torch_module is not None else __import__("torch")
     flow_model = pipeline.models["sparse_structure_flow_model"]
@@ -3798,27 +3936,430 @@ def sample_sparse_structure_with_noise(
 
     if pipeline.low_vram:
         flow_model.to(pipeline.device)
-    latent = pipeline.sparse_structure_sampler.sample(
-        flow_model,
-        noise,
-        **cond,
-        **effective_sampler_params,
-        verbose=True,
-        tqdm_desc="Sampling sparse structure",
-    ).samples
-    if pipeline.low_vram:
-        flow_model.cpu()
+    try:
+        if capture_steps is None:
+            latent = pipeline.sparse_structure_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **effective_sampler_params,
+                verbose=True,
+                tqdm_desc="Sampling sparse structure",
+            ).samples
+        else:
+            latent, captured = _sample_sparse_flow_with_official_observer(
+                pipeline.sparse_structure_sampler,
+                flow_model,
+                noise,
+                cond,
+                effective_sampler_params,
+            )
+            capture_steps.update(captured)
+    finally:
+        if pipeline.low_vram:
+            flow_model.cpu()
 
     decoder = pipeline.models["sparse_structure_decoder"]
     if pipeline.low_vram:
         decoder.to(pipeline.device)
-    decoded = decoder(latent) > 0
-    if pipeline.low_vram:
-        decoder.cpu()
+    try:
+        decoded = decoder(latent) > 0
+    finally:
+        if pipeline.low_vram:
+            decoder.cpu()
     if resolution != decoded.shape[2]:
         ratio = decoded.shape[2] // resolution
         decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
     return torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+
+
+def _sample_sparse_flow_with_official_observer(
+    sampler: Any,
+    flow_model: Any,
+    noise: Any,
+    cond: dict[str, Any],
+    sampler_params: dict[str, Any],
+) -> tuple[Any, dict[str, np.ndarray]]:
+    """Observe the official sampler without replacing its recurrence."""
+
+    original_inference = sampler._inference_model
+    original_sample_once = sampler.sample_once
+    inference_records: list[dict[str, Any]] = []
+    step_records: list[dict[str, Any]] = []
+    sentinel = object()
+    prior_inference = sampler.__dict__.get("_inference_model", sentinel)
+    prior_sample_once = sampler.__dict__.get("sample_once", sentinel)
+
+    guidance_strength = float(sampler_params.get("guidance_strength", 1.0))
+    guidance_rescale = float(sampler_params.get("guidance_rescale", 0.0))
+    guidance_interval = tuple(
+        float(value) for value in sampler_params.get("guidance_interval", (0.0, 1.0))
+    )
+    if len(guidance_interval) != 2:
+        raise ValueError(
+            f"guidance_interval must contain exactly two values, got {guidance_interval!r}"
+        )
+    steps = int(sampler_params.get("steps", 50))
+    rescale_t = float(sampler_params.get("rescale_t", 1.0))
+
+    def observed_inference(model, sample, t, cond=None, **kwargs):
+        model_outputs: list[Any] = []
+
+        def observed_model(*args, **model_kwargs):
+            output = model(*args, **model_kwargs)
+            model_outputs.append(output)
+            return output
+
+        pred_final = original_inference(
+            observed_model,
+            sample,
+            t,
+            cond,
+            **kwargs,
+        )
+        active = (
+            guidance_strength != 1.0
+            and guidance_interval[0] <= float(t) <= guidance_interval[1]
+        )
+        if not model_outputs:
+            raise RuntimeError("official sampler inference produced no observed model output")
+        if active and guidance_strength not in (0.0, 1.0):
+            if len(model_outputs) != 2:
+                raise RuntimeError(
+                    "guided official sampler step must execute exactly two model branches"
+                )
+            pred_pos, pred_neg = model_outputs
+        elif active and guidance_strength == 0.0:
+            if len(model_outputs) != 1:
+                raise RuntimeError(
+                    "zero-strength official sampler step must execute one model branch"
+                )
+            pred_pos = pred_neg = model_outputs[0]
+        else:
+            if len(model_outputs) != 1:
+                raise RuntimeError(
+                    "unguided official sampler step must execute exactly one model branch"
+                )
+            pred_pos = pred_neg = model_outputs[0]
+
+        inference_records.append(
+            {
+                "sample_in": sample,
+                "pred_pos": pred_pos,
+                "pred_neg": pred_neg,
+                "pred_final": pred_final,
+                "t": float(t),
+                "apply_guidance": active,
+            }
+        )
+        return pred_final
+
+    def observed_sample_once(model, sample, t, t_prev, cond=None, **kwargs):
+        before = len(inference_records)
+        output = original_sample_once(
+            model,
+            sample,
+            t,
+            t_prev,
+            cond,
+            **kwargs,
+        )
+        if len(inference_records) != before + 1:
+            raise RuntimeError(
+                "official sampler step did not produce exactly one observed inference"
+            )
+        record = inference_records[-1]
+        record["sample_next"] = output.pred_x_prev
+        record["t_prev"] = float(t_prev)
+        step_records.append(record)
+        return output
+
+    sampler._inference_model = observed_inference
+    sampler.sample_once = observed_sample_once
+    try:
+        sampled = sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **sampler_params,
+            verbose=True,
+            tqdm_desc="Sampling sparse structure",
+        )
+    finally:
+        if prior_inference is sentinel:
+            delattr(sampler, "_inference_model")
+        else:
+            sampler._inference_model = prior_inference
+        if prior_sample_once is sentinel:
+            delattr(sampler, "sample_once")
+        else:
+            sampler.sample_once = prior_sample_once
+
+    if len(step_records) != steps:
+        raise RuntimeError(
+            f"official sampler observer captured {len(step_records)} of {steps} steps"
+        )
+
+    # Derive explanatory CFG/x0 fields only after the official recurrence has
+    # completed so diagnostic arithmetic cannot perturb its execution order.
+    for record in step_records:
+        if record["apply_guidance"] and guidance_strength not in (0.0, 1.0):
+            pred_cfg = (
+                guidance_strength * record["pred_pos"]
+                + (1 - guidance_strength) * record["pred_neg"]
+            )
+        else:
+            pred_cfg = record["pred_pos"]
+        x0_pos = sampler._pred_to_xstart(
+            record["sample_in"], record["t"], record["pred_pos"]
+        )
+        x0_cfg = sampler._pred_to_xstart(
+            record["sample_in"], record["t"], pred_cfg
+        )
+        reduce_dims = list(range(1, x0_pos.ndim))
+        std_pos = x0_pos.std(dim=reduce_dims, keepdim=True)
+        std_cfg = x0_cfg.std(dim=reduce_dims, keepdim=True)
+        ratio_raw = std_pos / std_cfg
+        x0_rescaled = x0_cfg * ratio_raw
+        if record["apply_guidance"] and guidance_rescale > 0:
+            x0_after_rescale = (
+                guidance_rescale * x0_rescaled
+                + (1 - guidance_rescale) * x0_cfg
+            )
+            ratio_effective = ratio_raw
+        else:
+            x0_after_rescale = x0_cfg
+            ratio_effective = std_pos * 0 + 1
+        record.update(
+            {
+                "pred_cfg": pred_cfg,
+                "x0_pos": x0_pos,
+                "x0_cfg": x0_cfg,
+                "std_pos": std_pos,
+                "std_cfg": std_cfg,
+                "ratio_raw": ratio_raw,
+                "std_ratio": ratio_raw,
+                "ratio_effective": ratio_effective,
+                "x0_rescaled": x0_rescaled,
+                "x0_after_rescale": x0_after_rescale,
+            }
+        )
+
+    tensor_fields = (
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "sample_next",
+    )
+    payload = {
+        name: np.stack(
+            [
+                tensor_to_numpy(record[name]).astype(np.float32, copy=False)
+                for record in step_records
+            ],
+            axis=0,
+        )
+        for name in tensor_fields
+    }
+    payload.update(
+        {
+            "noise": tensor_to_numpy(noise).astype(np.float32, copy=False),
+            "t": np.asarray(
+                [record["t"] for record in step_records], dtype=np.float32
+            ),
+            "t_prev": np.asarray(
+                [record["t_prev"] for record in step_records], dtype=np.float32
+            ),
+            "t_tensor": np.asarray(
+                [1000 * record["t"] for record in step_records], dtype=np.float32
+            ),
+            "steps": np.asarray(steps, dtype=np.int32),
+            "guidance_strength": np.asarray(guidance_strength, dtype=np.float32),
+            "guidance_rescale": np.asarray(guidance_rescale, dtype=np.float32),
+            "guidance_interval": np.asarray(guidance_interval, dtype=np.float32),
+            "rescale_t": np.asarray(rescale_t, dtype=np.float32),
+            "sigma_min": np.asarray(sampler.sigma_min, dtype=np.float32),
+            "apply_guidance": np.asarray(
+                [record["apply_guidance"] for record in step_records],
+                dtype=np.bool_,
+            ),
+        }
+    )
+    return sampled.samples, payload
+
+
+def write_source_sparse_flow_steps_npz(
+    path: Path,
+    payload: dict[str, Any],
+    decoded_coords: np.ndarray,
+) -> dict[str, Any]:
+    tensor_fields = (
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "x0_rescaled",
+        "x0_after_rescale",
+        "pred_final",
+        "sample_next",
+    )
+    statistic_fields = (
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+    )
+    schedule_fields = ("t", "t_prev", "t_tensor", "apply_guidance")
+    scalar_fields = (
+        "steps",
+        "guidance_strength",
+        "guidance_rescale",
+        "guidance_interval",
+        "rescale_t",
+        "sigma_min",
+    )
+    required = {"noise", *tensor_fields, *statistic_fields, *schedule_fields, *scalar_fields}
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"sparse flow steps payload missing keys: {missing}")
+
+    arrays = {name: np.asarray(payload[name]) for name in sorted(required)}
+    steps = int(arrays["steps"].item())
+    if steps != 8:
+        raise ValueError(f"source sparse-flow witness requires exactly 8 steps, got {steps}")
+    noise = arrays["noise"]
+    if noise.dtype != np.float32 or noise.ndim != 5:
+        raise ValueError(
+            "source sparse-flow noise must be float32 with shape [B,C,D,H,W]"
+        )
+    if not np.isfinite(noise).all():
+        raise ValueError("source sparse-flow noise contains non-finite values")
+    expected_tensor_shape = (steps, *noise.shape)
+    for name in tensor_fields:
+        value = arrays[name]
+        if value.dtype != np.float32 or value.shape != expected_tensor_shape:
+            raise ValueError(
+                f"sparse flow {name} must be float32 with shape "
+                f"{expected_tensor_shape}, got {value.dtype} {value.shape}"
+            )
+        if not np.isfinite(value).all():
+            raise ValueError(f"sparse flow {name} contains non-finite values")
+    for name in statistic_fields:
+        value = arrays[name]
+        if value.dtype != np.float32 or value.shape[0] != steps:
+            raise ValueError(
+                f"sparse flow {name} must be float32 with {steps} leading steps"
+            )
+        if not np.isfinite(value).all():
+            raise ValueError(f"sparse flow {name} contains non-finite values")
+    for name in schedule_fields:
+        value = arrays[name]
+        if value.shape != (steps,):
+            raise ValueError(f"sparse flow {name} must have shape ({steps},)")
+        expected_dtype = np.bool_ if name == "apply_guidance" else np.float32
+        if value.dtype != expected_dtype:
+            raise ValueError(
+                f"sparse flow {name} must have dtype {np.dtype(expected_dtype)}"
+            )
+        if value.dtype != np.bool_ and not np.isfinite(value).all():
+            raise ValueError(f"sparse flow {name} contains non-finite values")
+    scalar_contracts = {
+        "steps": (np.int32, ()),
+        "guidance_strength": (np.float32, ()),
+        "guidance_rescale": (np.float32, ()),
+        "guidance_interval": (np.float32, (2,)),
+        "rescale_t": (np.float32, ()),
+        "sigma_min": (np.float32, ()),
+    }
+    for name, (expected_dtype, expected_shape) in scalar_contracts.items():
+        value = arrays[name]
+        if value.dtype != expected_dtype or value.shape != expected_shape:
+            raise ValueError(
+                f"sparse flow {name} must be {np.dtype(expected_dtype)} with "
+                f"shape {expected_shape}, got {value.dtype} {value.shape}"
+            )
+        if value.dtype != np.int32 and not np.isfinite(value).all():
+            raise ValueError(f"sparse flow {name} contains non-finite values")
+    if not np.array_equal(arrays["sample_in"][0], noise):
+        raise ValueError("sparse flow initial sample does not equal admitted noise")
+    if not np.array_equal(arrays["sample_in"][1:], arrays["sample_next"][:-1]):
+        raise ValueError(
+            "sparse flow recurrence sample_in[step+1] != sample_next[step]"
+        )
+
+    coords = np.asarray(decoded_coords)
+    if coords.dtype != np.int32 or coords.ndim != 2 or coords.shape[1] != 4:
+        raise ValueError(
+            "decoded sparse support must be int32 with shape [N,4], got "
+            f"{coords.dtype} {coords.shape}"
+        )
+    arrays["decoded_coords"] = np.ascontiguousarray(coords)
+    arrays["decoded_coords_3d"] = np.ascontiguousarray(coords[:, 1:])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}.",
+        suffix=".npz",
+        dir=path.parent,
+        delete=False,
+    ) as handle:
+        temporary_path = Path(handle.name)
+    try:
+        np.savez(
+            temporary_path,
+            **{
+                name: np.ascontiguousarray(value)
+                for name, value in sorted(arrays.items())
+            },
+        )
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    return {
+        "artifact_scope": "source_cuda_sparse_flow_steps",
+        "format": "sparse_flow_steps_npz",
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "step_count": steps,
+        "support_count": int(coords.shape[0]),
+        "official_sampler_fields": [
+            "sample_in",
+            "pred_pos",
+            "pred_neg",
+            "pred_final",
+            "sample_next",
+        ],
+        "reconstructed_diagnostic_fields": [
+            "pred_cfg",
+            "x0_pos",
+            "x0_cfg",
+            "std_pos",
+            "std_cfg",
+            "ratio_raw",
+            "std_ratio",
+            "ratio_effective",
+            "x0_rescaled",
+            "x0_after_rescale",
+        ],
+        "recurrence_exact": True,
+        "initial_noise_exact": True,
+    }
 
 
 def load_shape_flow_noise_sample(path: Path, expected_coords: np.ndarray) -> tuple[np.ndarray, str]:

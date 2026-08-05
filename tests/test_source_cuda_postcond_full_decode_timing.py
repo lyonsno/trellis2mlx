@@ -3130,6 +3130,371 @@ def test_sample_sparse_structure_with_noise_uses_admitted_tensor_without_randn()
     assert decoder.moves == [("to", "cuda"), ("cpu", None)]
 
 
+def test_sample_sparse_structure_capture_observes_official_sampler_and_restores_hooks():
+    from types import SimpleNamespace
+
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        sample_sparse_structure_with_noise,
+    )
+
+    class Tensor:
+        def __init__(self, array):
+            self.array = np.asarray(array, dtype=np.float32)
+
+        def __array__(self, dtype=None):
+            return np.asarray(self.array, dtype=dtype)
+
+        @property
+        def shape(self):
+            return self.array.shape
+
+        @property
+        def ndim(self):
+            return self.array.ndim
+
+        @property
+        def device(self):
+            return "cuda"
+
+        def detach(self):
+            return self
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def cpu(self):
+            return self
+
+        def int(self):
+            return Tensor(self.array.astype(np.int32))
+
+        def std(self, dim, keepdim):
+            return Tensor(
+                np.std(self.array, axis=tuple(dim), ddof=1, keepdims=keepdim)
+            )
+
+        def __getitem__(self, key):
+            return Tensor(self.array[key])
+
+        def __gt__(self, other):
+            return Tensor(self.array > other)
+
+        def __add__(self, other):
+            return Tensor(self.array + np.asarray(other))
+
+        def __radd__(self, other):
+            return Tensor(np.asarray(other) + self.array)
+
+        def __sub__(self, other):
+            return Tensor(self.array - np.asarray(other))
+
+        def __rsub__(self, other):
+            return Tensor(np.asarray(other) - self.array)
+
+        def __mul__(self, other):
+            return Tensor(self.array * np.asarray(other))
+
+        def __rmul__(self, other):
+            return Tensor(np.asarray(other) * self.array)
+
+        def __truediv__(self, other):
+            return Tensor(self.array / np.asarray(other))
+
+    class FakeTorch:
+        @staticmethod
+        def from_numpy(array):
+            return Tensor(np.array(array, copy=True))
+
+        @staticmethod
+        def argwhere(tensor):
+            return Tensor(np.argwhere(tensor.array))
+
+    class FlowModel:
+        resolution = 1
+        in_channels = 2
+
+        def __init__(self):
+            self.moves = []
+
+        def __call__(self, sample, t_tensor, cond):
+            value = 0.25 if cond == "positive" else -0.125
+            return Tensor(np.full(sample.shape, value, dtype=np.float32))
+
+        def to(self, device):
+            self.moves.append(("to", device))
+
+        def cpu(self):
+            self.moves.append(("cpu", None))
+
+    class Sampler:
+        sigma_min = 1e-5
+
+        def _pred_to_xstart(self, sample, t, pred):
+            return (1 - self.sigma_min) * sample - (
+                self.sigma_min + (1 - self.sigma_min) * t
+            ) * pred
+
+        def _xstart_to_pred(self, sample, t, x0):
+            return ((1 - self.sigma_min) * sample - x0) / (
+                self.sigma_min + (1 - self.sigma_min) * t
+            )
+
+        def _inference_model(
+            self,
+            model,
+            sample,
+            t,
+            cond,
+            neg_cond,
+            guidance_strength,
+            guidance_rescale,
+            guidance_interval,
+        ):
+            pred_pos = model(sample, t, cond)
+            if guidance_interval[0] <= t <= guidance_interval[1]:
+                pred_neg = model(sample, t, neg_cond)
+                pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+                x0_pos = self._pred_to_xstart(sample, t, pred_pos)
+                x0_cfg = self._pred_to_xstart(sample, t, pred)
+                ratio = x0_pos.std(list(range(1, x0_pos.ndim)), True) / x0_cfg.std(
+                    list(range(1, x0_cfg.ndim)), True
+                )
+                x0 = guidance_rescale * x0_cfg * ratio + (1 - guidance_rescale) * x0_cfg
+                pred = self._xstart_to_pred(sample, t, x0)
+                return pred
+            return pred_pos
+
+        def sample_once(self, model, sample, t, t_prev, cond, **kwargs):
+            pred = self._inference_model(model, sample, t, cond=cond, **kwargs)
+            return SimpleNamespace(
+                pred_x_prev=sample - (t - t_prev) * pred,
+                pred_x_0=self._pred_to_xstart(sample, t, pred),
+            )
+
+        def sample(
+            self,
+            model,
+            noise,
+            cond,
+            steps,
+            rescale_t,
+            verbose=True,
+            tqdm_desc="Sampling",
+            **kwargs,
+        ):
+            sample = noise
+            t_seq = np.linspace(1, 0, steps + 1)
+            t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+            for index in range(steps):
+                sample = self.sample_once(
+                    model,
+                    sample,
+                    float(t_seq[index]),
+                    float(t_seq[index + 1]),
+                    cond,
+                    **kwargs,
+                ).pred_x_prev
+            return SimpleNamespace(samples=sample)
+
+    class Decoder:
+        def __call__(self, latent):
+            return Tensor(np.array([[[[[1.0]]]]], dtype=np.float32))
+
+        def to(self, device):
+            return self
+
+        def cpu(self):
+            return self
+
+    flow_model = FlowModel()
+    sampler = Sampler()
+    pipeline = SimpleNamespace(
+        models={
+            "sparse_structure_flow_model": flow_model,
+            "sparse_structure_decoder": Decoder(),
+        },
+        sparse_structure_sampler=sampler,
+        sparse_structure_sampler_params={
+            "steps": 2,
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.7,
+            "guidance_interval": (0.6, 1.0),
+            "rescale_t": 5.0,
+        },
+        low_vram=True,
+        device="cuda",
+    )
+    capture = {}
+    noise = np.array([[[[[1.0]]], [[[2.0]]]]], dtype=np.float32)
+
+    coords = sample_sparse_structure_with_noise(
+        pipeline,
+        {"cond": "positive", "neg_cond": "negative"},
+        1,
+        1,
+        {"steps": 2},
+        noise,
+        torch_module=FakeTorch,
+        capture_steps=capture,
+    )
+
+    assert "_inference_model" not in sampler.__dict__
+    assert "sample_once" not in sampler.__dict__
+    assert capture["sample_in"].shape == (2, 1, 2, 1, 1, 1)
+    assert capture["pred_pos"].shape == capture["sample_in"].shape
+    assert capture["pred_neg"].shape == capture["sample_in"].shape
+    assert capture["pred_final"].shape == capture["sample_in"].shape
+    np.testing.assert_array_equal(capture["noise"], noise)
+    np.testing.assert_array_equal(capture["sample_in"][1:], capture["sample_next"][:-1])
+    np.testing.assert_array_equal(coords.array, np.array([[0, 0, 0, 0]], dtype=np.float32))
+
+
+def _source_sparse_flow_steps_payload(*, steps=8, break_recurrence=False):
+    shape = (steps, 1, 2, 1, 1, 1)
+    sample_in = np.empty(shape, dtype=np.float32)
+    sample_next = np.empty(shape, dtype=np.float32)
+    pred_final = np.full(shape, np.float32(0.25), dtype=np.float32)
+    t = np.linspace(1.0, 0.2, steps, dtype=np.float32)
+    t_prev = t - np.float32(0.05)
+    sample_in[0] = np.array([[[[[1.0]]], [[[2.0]]]]], dtype=np.float32)
+    for index in range(steps):
+        sample_next[index] = (
+            sample_in[index]
+            - np.float32(t[index] - t_prev[index]) * pred_final[index]
+        )
+        if index + 1 < steps:
+            sample_in[index + 1] = sample_next[index]
+    if break_recurrence and steps > 1:
+        sample_in[1, 0, 0, 0, 0, 0] += np.float32(1.0)
+    ones = np.ones((steps, 1, 1, 1, 1, 1), dtype=np.float32)
+    return {
+        "noise": sample_in[0].copy(),
+        "sample_in": sample_in,
+        "pred_pos": pred_final.copy(),
+        "pred_neg": pred_final.copy(),
+        "pred_cfg": pred_final.copy(),
+        "x0_pos": pred_final.copy(),
+        "x0_cfg": pred_final.copy(),
+        "std_pos": ones.copy(),
+        "std_cfg": ones.copy(),
+        "ratio_raw": ones.copy(),
+        "std_ratio": ones.copy(),
+        "ratio_effective": ones.copy(),
+        "x0_rescaled": pred_final.copy(),
+        "x0_after_rescale": pred_final.copy(),
+        "pred_final": pred_final,
+        "sample_next": sample_next,
+        "t": t,
+        "t_prev": t_prev,
+        "t_tensor": 1000 * t,
+        "steps": np.asarray(steps, dtype=np.int32),
+        "guidance_strength": np.asarray(7.5, dtype=np.float32),
+        "guidance_rescale": np.asarray(0.7, dtype=np.float32),
+        "guidance_interval": np.asarray([0.6, 1.0], dtype=np.float32),
+        "rescale_t": np.asarray(5.0, dtype=np.float32),
+        "sigma_min": np.asarray(1e-5, dtype=np.float32),
+        "apply_guidance": np.ones(steps, dtype=np.bool_),
+    }
+
+
+def test_write_source_sparse_flow_steps_npz_binds_recurrence_and_support(tmp_path):
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        write_source_sparse_flow_steps_npz,
+    )
+
+    output = tmp_path / "source_cuda_sparse_flow_steps.npz"
+    payload = _source_sparse_flow_steps_payload()
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+
+    artifact = write_source_sparse_flow_steps_npz(output, payload, coords)
+
+    assert artifact["artifact_scope"] == "source_cuda_sparse_flow_steps"
+    assert artifact["format"] == "sparse_flow_steps_npz"
+    assert artifact["step_count"] == 8
+    assert artifact["support_count"] == 2
+    assert artifact["official_sampler_fields"] == [
+        "sample_in",
+        "pred_pos",
+        "pred_neg",
+        "pred_final",
+        "sample_next",
+    ]
+    assert artifact["reconstructed_diagnostic_fields"] == [
+        "pred_cfg",
+        "x0_pos",
+        "x0_cfg",
+        "std_pos",
+        "std_cfg",
+        "ratio_raw",
+        "std_ratio",
+        "ratio_effective",
+        "x0_rescaled",
+        "x0_after_rescale",
+    ]
+    with np.load(output, allow_pickle=False) as archive:
+        assert set(payload) <= set(archive.files)
+        np.testing.assert_array_equal(archive["decoded_coords"], coords)
+        np.testing.assert_array_equal(archive["decoded_coords_3d"], coords[:, 1:])
+        np.testing.assert_array_equal(archive["sample_in"][1:], archive["sample_next"][:-1])
+        np.testing.assert_array_equal(archive["sample_in"][0], archive["noise"])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("step_count", "exactly 8 steps"),
+        ("recurrence", "recurrence"),
+        ("nonfinite", "non-finite"),
+    ],
+)
+def test_write_source_sparse_flow_steps_npz_rejects_false_closure(
+    tmp_path,
+    mutation,
+    message,
+):
+    from scripts.source_cuda_postcond_full_decode_timing import (
+        write_source_sparse_flow_steps_npz,
+    )
+
+    payload = _source_sparse_flow_steps_payload(
+        steps=7 if mutation == "step_count" else 8,
+        break_recurrence=mutation == "recurrence",
+    )
+    if mutation == "nonfinite":
+        payload["pred_final"] = payload["pred_final"].copy()
+        payload["pred_final"][0, 0, 0, 0, 0, 0] = np.nan
+
+    with pytest.raises(ValueError, match=message):
+        write_source_sparse_flow_steps_npz(
+            tmp_path / "invalid.npz",
+            payload,
+            np.array([[0, 1, 2, 3]], dtype=np.int32),
+        )
+
+    assert not (tmp_path / "invalid.npz").exists()
+
+
+def test_sparse_structure_stop_route_requires_exact_noise_before_source_extract(tmp_path):
+    from scripts.source_cuda_postcond_full_decode_timing import main
+
+    report = tmp_path / "report.json"
+    result = main(
+        [
+            "--output-json",
+            str(report),
+            "--output-sparse-flow-steps",
+            str(tmp_path / "steps.npz"),
+            "--stop-after-sparse-structure",
+        ]
+    )
+
+    payload = json.loads(report.read_text())
+    assert result == 1
+    assert payload["failure_phase"] == "validate_args"
+    assert "exact sparse-flow noise" in payload["error"]
+    assert not (tmp_path / "steps.npz").exists()
+
+
 def test_load_shape_flow_noise_sample_rejects_coord_order_mismatch(tmp_path):
     import numpy as np
 
