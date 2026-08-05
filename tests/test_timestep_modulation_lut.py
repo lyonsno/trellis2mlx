@@ -450,7 +450,7 @@ def test_stage_capture_rejects_missing_or_substituted_effective_modulation(
     ("stop_after_stage", "no_cascade", "message"),
     [
         ("shape_flow_steps", False, "requires --no-cascade"),
-        ("shape_slat", True, "only valid for shape-flow diagnostic stops"),
+        ("sparse_coords", True, "requires a shape-flow or downstream consumer"),
     ],
 )
 def test_stage_capture_rejects_timestep_modulation_outside_bounded_route(

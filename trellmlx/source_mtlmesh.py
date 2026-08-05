@@ -107,8 +107,9 @@ verbose = sys.argv[1] == "1"
     trace_json,
     target_faces_text,
     expected_root,
+    expected_commit,
     rsqrt_lut_sha256,
-) = sys.argv[2:8]
+) = sys.argv[2:9]
 data = np.load(input_npz)
 rsqrt_lut = (
     np.asarray(data["turing_rsqrt_delta_lut"], dtype=np.int8)
@@ -121,6 +122,7 @@ vertices, faces, trace = postprocess_source_native(
     int(target_faces_text),
     verbose=verbose,
     expected_source_root=expected_root or None,
+    expected_source_commit=expected_commit or None,
     turing_rsqrt_delta_lut=rsqrt_lut,
     turing_rsqrt_lut_sha256=rsqrt_lut_sha256 or None,
 )
@@ -408,6 +410,7 @@ def _run_source_native_postprocess_subprocess(
     reference_python: str | Path,
     verbose: bool,
     expected_source_root: str | Path | None,
+    expected_source_commit: str | None,
     turing_rsqrt_delta_lut: np.ndarray | None,
     turing_rsqrt_lut_sha256: str | None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
@@ -445,6 +448,7 @@ def _run_source_native_postprocess_subprocess(
             str(trace_json),
             str(int(target_faces)),
             str(expected_source_root or ""),
+            str(expected_source_commit or ""),
             str(turing_rsqrt_lut_sha256 or ""),
         ]
         completed = subprocess.run(
@@ -479,7 +483,12 @@ def _run_source_native_postprocess_subprocess(
         )
 
 
-def _load_source_mesh_class(*, expected_source_root: str | Path | None = None):
+def _load_source_mesh_class(
+    *,
+    expected_source_root: str | Path | None = None,
+    expected_source_commit: str | None = None,
+    require_clean: bool = False,
+):
     try:
         cumesh = importlib.import_module("cumesh")
     except ImportError as exc:
@@ -494,6 +503,8 @@ def _load_source_mesh_class(*, expected_source_root: str | Path | None = None):
             validate_source_route_identity(
                 probe_cumesh_route_identity(),
                 expected_root=expected_source_root,
+                expected_commit=expected_source_commit,
+                require_clean=require_clean,
             )
         except SourceRouteIdentityError as exc:
             raise RuntimeError(f"qem_backend='source-native' rejected route: {exc}") from exc
@@ -516,6 +527,8 @@ def _load_source_mesh_class(*, expected_source_root: str | Path | None = None):
         validate_source_route_identity(
             probe_cumesh_route_identity(),
             expected_root=expected_source_root,
+            expected_commit=expected_source_commit,
+            require_clean=require_clean,
         )
     except SourceRouteIdentityError as exc:
         raise RuntimeError(f"qem_backend='source-native' rejected route: {exc}") from exc
@@ -713,6 +726,7 @@ def postprocess_source_native(
     lambda_skinny: float = 1e-3,
     thresh: float = 1e-8,
     expected_source_root: str | Path | None = None,
+    expected_source_commit: str | None = None,
     reference_python: str | Path | None = None,
     stage_callback: Callable[
         [str, int, int, dict, np.ndarray, np.ndarray],
@@ -769,6 +783,7 @@ def postprocess_source_native(
             reference_python=reference_python,
             verbose=verbose,
             expected_source_root=expected_source_root,
+            expected_source_commit=expected_source_commit,
             turing_rsqrt_delta_lut=normalized_rsqrt_lut,
             turing_rsqrt_lut_sha256=turing_rsqrt_lut_sha256,
         )
@@ -781,7 +796,11 @@ def postprocess_source_native(
             "mtlmesh/cumesh backend"
         ) from exc
 
-    mesh_cls = _load_source_mesh_class(expected_source_root=expected_source_root)
+    mesh_cls = _load_source_mesh_class(
+        expected_source_root=expected_source_root,
+        expected_source_commit=expected_source_commit,
+        require_clean=expected_source_commit is not None,
+    )
     mesh = mesh_cls()
     verts_t = torch.from_numpy(np.asarray(vertices, dtype=np.float32)).contiguous()
     faces_t = torch.from_numpy(np.asarray(faces, dtype=np.int32)).contiguous()

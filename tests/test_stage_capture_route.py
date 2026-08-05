@@ -2759,9 +2759,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     ] == "source-cuda-sequential"
 
 
-def test_shape_flow_attention_selectors_are_diagnostic_only(tmp_path):
-    import pytest
-
+def test_shape_flow_attention_selectors_compose_into_final_glb_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 
     args = build_parser().parse_args(
@@ -2771,23 +2769,47 @@ def test_shape_flow_attention_selectors_are_diagnostic_only(tmp_path):
             "--output-dir",
             str(tmp_path),
             "--stop-after-stage",
-            "shape_slat",
+            "final_glb",
             "--shape-flow-attention-backend",
-            "manual",
+            "source-cuda-self",
+            "--shape-flow-attention-softmax-backend",
+            "source-cuda-turing",
+            "--shape-flow-attention-value-backend",
+            "source-cuda-sequential",
+            "--reference-cleanup",
+            "--qem-simplify",
+            "--qem-backend",
+            "source-native",
+            "--source-native-source-root",
+            "/tmp/mtlmesh",
+            "--source-native-python",
+            "/tmp/python",
+            "--expected-source-native-commit",
+            "c" * 40,
         ]
     )
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            "shape-flow attention selectors require --stop-after-stage "
-            "shape_flow_step, shape_flow_steps, or shape_flow_block_trace"
-        ),
-    ):
-        _build_generate_command(args, tmp_path / "checkpoints")
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    assert command[command.index("--stop-after-stage") + 1] == "final_glb"
+    assert command[command.index("--shape-flow-attention-backend") + 1] == (
+        "source-cuda-self"
+    )
+    assert command[command.index("--shape-flow-attention-softmax-backend") + 1] == (
+        "source-cuda-turing"
+    )
+    assert command[command.index("--shape-flow-attention-value-backend") + 1] == (
+        "source-cuda-sequential"
+    )
+    assert "--reference-cleanup" in command
+    assert "--qem-simplify" in command
+    assert command[command.index("--qem-backend") + 1] == "source-native"
+    assert command[command.index("--source-native-source-root") + 1] == "/tmp/mtlmesh"
+    assert command[command.index("--source-native-python") + 1] == "/tmp/python"
+    assert command[command.index("--expected-source-native-commit") + 1] == "c" * 40
 
 
-def test_shape_flow_attention_diagnostic_preflight_preserves_stale_primary_as_untrusted(
+def test_shape_flow_attention_pre_shape_preflight_preserves_stale_primary_as_untrusted(
     tmp_path,
     monkeypatch,
 ):
@@ -2798,12 +2820,12 @@ def test_shape_flow_attention_diagnostic_preflight_preserves_stale_primary_as_un
     image = tmp_path / "input.png"
     image.write_bytes(b"image")
     output_dir = tmp_path / "output"
-    stale = output_dir / "checkpoints" / "shape_slat.npz"
+    stale = output_dir / "checkpoints" / "sparse_coords.npz"
     stale.parent.mkdir(parents=True)
     stale.write_bytes(b"stale")
 
     def unexpected_generate(*args, **kwargs):
-        raise AssertionError("invalid trace-only selectors must not launch generation")
+        raise AssertionError("pre-shape attention selectors must not launch generation")
 
     monkeypatch.setattr(
         "scripts.run_mlx_stage_capture.subprocess.run",
@@ -2817,7 +2839,7 @@ def test_shape_flow_attention_diagnostic_preflight_preserves_stale_primary_as_un
             "--output-dir",
             str(output_dir),
             "--stop-after-stage",
-            "shape_slat",
+            "sparse_coords",
             "--shape-flow-attention-backend",
             "manual",
         ]
@@ -2830,6 +2852,129 @@ def test_shape_flow_attention_diagnostic_preflight_preserves_stale_primary_as_un
     assert report["failure_phase"] == "preflight_shape_flow_attention_route"
     assert report["last_trustworthy_phase"] == "requested_route_parsed"
     assert report["primary_output_status"] == "preexisting_untrusted_preserved"
+
+
+def test_source_native_finalizer_preflight_rejects_missing_runtime_paths(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("missing source-native runtime must not launch generation")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        unexpected_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "final_glb",
+            "--reference-cleanup",
+            "--qem-simplify",
+            "--qem-backend",
+            "source-native",
+            "--source-native-source-root",
+            str(tmp_path / "missing-source"),
+            "--source-native-python",
+            str(tmp_path / "missing-python"),
+            "--expected-source-native-commit",
+            "c" * 40,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "preflight_source_native_postprocess_route"
+    assert report["primary_output_status"] == "not_started"
+    assert "source-native source root" in report["error"]
+    assert not (output_dir / "route_identity.json").exists()
+
+
+def test_final_glb_main_rejects_stale_artifact_with_malformed_new_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import subprocess
+
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    stale_glb = output_dir / "output.glb"
+    stale_glb.write_bytes(b"glTF" + b"\x02\x00\x00\x00" + b"\x0c\x00\x00\x00")
+    clean_identity = {
+        "commit_requested": None,
+        "commit_effective": "a" * 40,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda _requested: clean_identity,
+    )
+
+    def malformed_generate(command, **_kwargs):
+        checkpoint = output_dir / "checkpoints" / "final_glb.npz"
+        checkpoint.parent.mkdir(parents=True)
+        np.savez(checkpoint, unrelated=np.array(1))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        malformed_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "final_glb",
+        ]
+    )
+
+    assert result == 2
+    assert stale_glb.exists()
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "validate_primary_output"
+    assert report["primary_output_status"] == "invalid"
+    assert "checkpoint is missing arrays" in report["error"]
+
+
+def test_shape_attention_route_is_restored_before_texture_model_construction():
+    import inspect
+
+    import generate
+
+    source = inspect.getsource(generate.main)
+    restore_index = source.index(
+        "texture_attention_route = _restore_attention_route_env("
+    )
+    texture_model_index = source.index("tex_flow = SLatFlowModel.for_texture()")
+
+    assert restore_index < texture_model_index
 
 
 def test_shape_flow_fast_attention_records_manual_subroutes_as_ineffective(
@@ -3561,37 +3706,398 @@ def test_shape_flow_attention_complete_first_step_primary_binds_route(
     ] == "source-cuda-self-widths-1029-7697-fast-otherwise"
 
 
-def test_generate_rejects_shape_flow_attention_selectors_outside_diagnostics(tmp_path):
+def test_generate_scopes_shape_attention_and_restores_texture_route(monkeypatch):
+    import argparse
+    import os
+
+    import generate
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul")
+    args = argparse.Namespace(
+        stop_after_stage="final_glb",
+        shape_flow_attention_backend="source-cuda-self",
+        shape_flow_attention_softmax_backend="source-cuda-turing",
+        shape_flow_attention_value_backend="source-cuda-sequential",
+    )
+
+    baseline = generate._capture_attention_route_env()
+    shape_route = generate._configure_shape_flow_attention_route(args)
+    texture_route = generate._restore_attention_route_env(baseline)
+
+    assert shape_route["shape_flow_attention_backend_effective"] == (
+        "source-cuda-self-widths-1029-7697-fast-otherwise"
+    )
+    assert texture_route["shape_flow_attention_backend_effective"] == "fast"
+    assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "fast"
+    assert os.environ["TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND"] == "mlx-softmax"
+    assert os.environ["TRELLIS2MLX_ATTENTION_VALUE_BACKEND"] == "mlx-matmul"
+
+
+def test_generate_final_glb_records_default_shape_route_without_selectors(monkeypatch):
+    import argparse
+
+    import generate
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul")
+    args = argparse.Namespace(
+        stop_after_stage="final_glb",
+        shape_flow_attention_backend=None,
+        shape_flow_attention_softmax_backend=None,
+        shape_flow_attention_value_backend=None,
+    )
+
+    route = generate._configure_shape_flow_attention_route(args)
+
+    assert route == generate._shape_flow_attention_route_from_env()
+
+
+def _write_final_glb_checkpoint(path, output_path, *, shape_route, texture_route, postprocess_route):
+    import hashlib
+    import json
+    import numpy as np
+
+    payload = output_path.read_bytes()
+    np.savez(
+        path,
+        output_path=np.asarray(str(output_path)),
+        output_sha256=np.asarray(hashlib.sha256(payload).hexdigest()),
+        output_size_bytes=np.asarray(len(payload), dtype=np.int64),
+        shape_flow_attention_route_json=np.asarray(
+            json.dumps(shape_route, sort_keys=True)
+        ),
+        texture_attention_route_json=np.asarray(
+            json.dumps(texture_route, sort_keys=True)
+        ),
+        postprocess_route_json=np.asarray(
+            json.dumps(postprocess_route, sort_keys=True)
+        ),
+    )
+
+
+def _final_glb_expected_route():
+    return {
+        "shape_flow_attention_backend_requested": "source-cuda-self",
+        "shape_flow_attention_backend_effective": (
+            "source-cuda-self-widths-1029-7697-fast-otherwise"
+        ),
+        "shape_flow_attention_softmax_backend_requested": "source-cuda-turing",
+        "shape_flow_attention_softmax_backend_effective": (
+            "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        ),
+        "shape_flow_attention_value_backend_requested": "source-cuda-sequential",
+        "shape_flow_attention_value_backend_effective": (
+            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+        ),
+        "shape_flow_gelu_backend_effective": (
+            "source-cuda-bf16-table-formula-otherwise"
+        ),
+        "shape_flow_gelu_table_bits_sha256_effective": (
+            "bbd19b8d372bacd98eeb75c66f5078ea44837a5e25034d1fb738c45e93f434e3"
+        ),
+        "attention_backend_requested": "fast",
+        "attention_backend": "fast",
+        "attention_softmax_backend_requested": "mlx-softmax",
+        "attention_softmax_backend_effective": "fused-fast-attention",
+        "attention_value_backend_requested": "mlx-matmul",
+        "attention_value_backend_effective": "fused-fast-attention",
+        "reference_cleanup": True,
+        "qem_simplify": True,
+        "qem_backend": "source-native",
+        "source_native_source_root": "/tmp/mtlmesh",
+        "source_native_python": "/tmp/python",
+        "expected_source_native_commit": "c" * 40,
+        "uv_method": "auto",
+    }
+
+
+def _final_glb_checkpoint_routes(expected):
+    shape = {
+        key: expected[key]
+        for key in (
+            "shape_flow_attention_backend_requested",
+            "shape_flow_attention_backend_effective",
+            "shape_flow_attention_softmax_backend_requested",
+            "shape_flow_attention_softmax_backend_effective",
+            "shape_flow_attention_value_backend_requested",
+            "shape_flow_attention_value_backend_effective",
+            "shape_flow_gelu_backend_effective",
+            "shape_flow_gelu_table_bits_sha256_effective",
+        )
+    }
+    texture = {
+        "shape_flow_attention_backend_requested": expected[
+            "attention_backend_requested"
+        ],
+        "shape_flow_attention_backend_effective": expected["attention_backend"],
+        "shape_flow_attention_softmax_backend_requested": expected[
+            "attention_softmax_backend_requested"
+        ],
+        "shape_flow_attention_softmax_backend_effective": expected[
+            "attention_softmax_backend_effective"
+        ],
+        "shape_flow_attention_value_backend_requested": expected[
+            "attention_value_backend_requested"
+        ],
+        "shape_flow_attention_value_backend_effective": expected[
+            "attention_value_backend_effective"
+        ],
+        "shape_flow_gelu_backend_effective": expected[
+            "shape_flow_gelu_backend_effective"
+        ],
+        "shape_flow_gelu_table_bits_sha256_effective": expected[
+            "shape_flow_gelu_table_bits_sha256_effective"
+        ],
+    }
+    postprocess = {
+        key: expected[key]
+        for key in (
+            "reference_cleanup",
+            "qem_simplify",
+            "qem_backend",
+            "source_native_source_root",
+            "source_native_python",
+            "expected_source_native_commit",
+            "uv_method",
+        )
+    }
+    return shape, texture, postprocess
+
+
+def test_final_glb_validator_rejects_blank_primary(tmp_path):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    output.write_bytes(b"")
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        postprocess_route=postprocess,
+    )
+
+    with pytest.raises(ValueError, match="GLB header"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
+
+
+def test_final_glb_validator_rejects_texture_route_leakage(tmp_path):
+    import numpy as np
+    import pytest
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    texture["shape_flow_attention_backend_requested"] = "source-cuda-self"
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        postprocess_route=postprocess,
+    )
+
+    with pytest.raises(ValueError, match="texture attention route"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
+
+
+def test_final_glb_validator_accepts_bound_reopenable_artifact(tmp_path):
+    import numpy as np
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        postprocess_route=postprocess,
+    )
+
+    validation = _validate_final_glb_checkpoint(
+        checkpoint,
+        expected_output_path=output,
+        expected_route=expected,
+    )
+
+    assert validation["reopenable_glb"] is True
+    assert validation["mesh_count"] == 1
+    assert validation["output_size_bytes"] == output.stat().st_size
+
+
+def test_final_glb_validator_accepts_routes_shaped_by_generate(monkeypatch, tmp_path):
+    import numpy as np
+    import trimesh
+
+    import generate
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    expected = _final_glb_expected_route()
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "source-cuda-self")
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "source-cuda-turing"
+    )
+    monkeypatch.setenv(
+        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "source-cuda-sequential"
+    )
+    shape_route = generate._shape_flow_attention_route_from_env()
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax")
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul")
+    texture_route = generate._shape_flow_attention_route_from_env()
+    _, _, postprocess = _final_glb_checkpoint_routes(expected)
+    checkpoint = tmp_path / "final_glb.npz"
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape_route,
+        texture_route=texture_route,
+        postprocess_route=postprocess,
+    )
+
+    validation = _validate_final_glb_checkpoint(
+        checkpoint,
+        expected_output_path=output,
+        expected_route=expected,
+    )
+
+    assert validation["shape_flow_attention_route"] == shape_route
+    assert validation["texture_attention_route"] == texture_route
+
+
+def test_source_native_dependency_movement_invalidates_written_primary(
+    tmp_path,
+    monkeypatch,
+):
+    import json
     import subprocess
     import sys
 
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import main
+
     image = tmp_path / "input.png"
     image.write_bytes(b"image")
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(GENERATE_SOURCE),
-            "--image",
-            str(image),
-            "--output",
-            str(tmp_path / "output.glb"),
-            "--save-checkpoints",
-            str(tmp_path / "checkpoints"),
-            "--stop-after-stage",
-            "shape_slat",
-            "--shape-flow-attention-backend",
-            "manual",
-        ],
-        text=True,
-        capture_output=True,
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    output_dir = tmp_path / "output"
+    expected_commit = "c" * 40
+    clean_repo = {
+        "commit_requested": None,
+        "commit_effective": "a" * 40,
+        "dirty": False,
+        "status_porcelain": "",
+    }
+    source_preflight = {
+        "git_root": str(source_root),
+        "git_commit": expected_commit,
+        "git_dirty": False,
+        "git_status_porcelain": "",
+    }
+    source_postflight = {
+        **source_preflight,
+        "git_commit": "d" * 40,
+    }
+    source_identities = iter((source_preflight, source_postflight))
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_repo_identity",
+        lambda _requested: clean_repo,
+    )
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._read_source_native_dependency_identity",
+        lambda _args: next(source_identities),
+    )
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture._validate_turing_rsqrt_route_args",
+        lambda _args: {
+            "path": None,
+            "sha256_requested": None,
+            "sha256_effective": None,
+            "content_sha256_effective": None,
+        },
     )
 
-    assert result.returncode == 2
-    assert (
-        "shape-flow attention selectors require "
-        "--stop-after-stage shape_flow_step, shape_flow_steps, or "
-        "shape_flow_block_trace"
-    ) in result.stderr
+    def successful_generate(command, **_kwargs):
+        checkpoint = output_dir / "checkpoints" / "final_glb.npz"
+        checkpoint.parent.mkdir(parents=True)
+        np.savez(checkpoint, unrelated=np.array(1))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(
+        "scripts.run_mlx_stage_capture.subprocess.run",
+        successful_generate,
+    )
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "final_glb",
+            "--reference-cleanup",
+            "--qem-simplify",
+            "--qem-backend",
+            "source-native",
+            "--source-native-source-root",
+            str(source_root),
+            "--source-native-python",
+            sys.executable,
+            "--expected-source-native-commit",
+            expected_commit,
+        ]
+    )
+
+    assert result == 2
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "postflight_source_native_identity"
+    assert report["primary_output_status"] == "invalid"
+    assert report["source_native_identity_preflight"] == source_preflight
+    assert report["source_native_identity_postflight"] == source_postflight
 
 
 def test_generate_shape_flow_attention_route_does_not_touch_non_trace_stages(

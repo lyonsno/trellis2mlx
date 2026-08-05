@@ -215,14 +215,47 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     }
 
 
+_ATTENTION_ROUTE_ENV_KEYS = (
+    "TRELLIS2MLX_ATTENTION_BACKEND",
+    "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+    "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+)
+
+
+def _capture_attention_route_env() -> dict[str, str | None]:
+    return {key: os.environ.get(key) for key in _ATTENTION_ROUTE_ENV_KEYS}
+
+
+def _restore_attention_route_env(
+    snapshot: dict[str, str | None],
+) -> dict[str, str]:
+    if set(snapshot) != set(_ATTENTION_ROUTE_ENV_KEYS):
+        raise ValueError("attention route snapshot has unexpected keys")
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    return _shape_flow_attention_route_from_env()
+
+
 def _configure_shape_flow_attention_route(
     args: argparse.Namespace,
 ) -> dict[str, str] | None:
-    if args.stop_after_stage not in {
+    diagnostic_stop = args.stop_after_stage in {
         "shape_flow_step",
         "shape_flow_steps",
         "shape_flow_block_trace",
-    }:
+        "final_glb",
+    }
+    selectors_requested = any(
+        (
+            args.shape_flow_attention_backend,
+            args.shape_flow_attention_softmax_backend,
+            args.shape_flow_attention_value_backend,
+        )
+    )
+    if not diagnostic_stop and not selectors_requested:
         return None
     if args.shape_flow_attention_backend:
         os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] = (
@@ -384,6 +417,7 @@ def _cleanup_and_simplify_mesh(
     qem_backend="mlx",
     source_native_source_root=None,
     source_native_python=None,
+    expected_source_native_commit=None,
     source_native_turing_rsqrt_lut=None,
     source_native_turing_rsqrt_lut_sha256=None,
     cleanup_mesh=None,
@@ -456,6 +490,10 @@ def _cleanup_and_simplify_mesh(
             source_native_kwargs["expected_source_root"] = source_native_source_root
         if source_native_python is not None:
             source_native_kwargs["reference_python"] = source_native_python
+        if expected_source_native_commit is not None:
+            source_native_kwargs["expected_source_commit"] = (
+                expected_source_native_commit
+            )
         if source_native_postprocess is None:
             if (
                 source_native_turing_rsqrt_lut is None
@@ -958,6 +996,13 @@ def main():
     parser.add_argument("--source-native-python",
                         help="Python executable that can import the expected mtlmesh/cumesh and torch "
                              "for --qem-backend source-native.")
+    parser.add_argument(
+        "--expected-source-native-commit",
+        help=(
+            "Require the source-native mtlmesh/cumesh checkout to resolve to "
+            "this clean commit."
+        ),
+    )
     parser.add_argument("--save-checkpoints", metavar="DIR",
                         help="Save intermediate representations to DIR for replay")
     parser.add_argument(
@@ -977,6 +1022,7 @@ def main():
             "mesh_raw",
             "mesh_clean",
             "mesh_uv",
+            "final_glb",
         ],
         default=None,
         help="Stop after writing the named checkpoint stage. Requires --save-checkpoints.",
@@ -1315,14 +1361,17 @@ def main():
         parser.error(
             "source-CUDA shape timestep modulation replay requires --no-cascade"
         )
-    if all(modulation_lut_args) and args.stop_after_stage not in {
-        "shape_flow_step",
-        "shape_flow_steps",
-        "shape_flow_block_trace",
+    if all(modulation_lut_args) and args.stop_after_stage in {
+        "conditioning",
+        "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_steps",
+        "sparse_flow_block_trace",
+        "sparse_internals",
     }:
         parser.error(
-            "source-CUDA shape timestep modulation replay is only valid for "
-            "shape-flow diagnostic stops"
+            "source-CUDA shape timestep modulation replay requires a shape-flow "
+            "or downstream consumer"
         )
     if args.stop_after_stage == "shape_flow_block_trace" and not args.no_cascade:
         parser.error("--stop-after-stage shape_flow_block_trace requires --no-cascade")
@@ -1330,15 +1379,17 @@ def main():
         args.shape_flow_attention_backend
         or args.shape_flow_attention_softmax_backend
         or args.shape_flow_attention_value_backend
-    ) and args.stop_after_stage not in {
-        "shape_flow_step",
-        "shape_flow_steps",
-        "shape_flow_block_trace",
+    ) and args.stop_after_stage in {
+        "conditioning",
+        "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_steps",
+        "sparse_flow_block_trace",
+        "sparse_internals",
     }:
         parser.error(
-            "shape-flow attention selectors require "
-            "--stop-after-stage shape_flow_step, shape_flow_steps, or "
-            "shape_flow_block_trace"
+            "shape-flow attention selectors require a shape-flow or downstream "
+            "consumer"
         )
     turing_rsqrt_required = (
         args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
@@ -1468,6 +1519,7 @@ def main():
                 qem_backend=args.qem_backend,
                 source_native_source_root=args.source_native_source_root,
                 source_native_python=args.source_native_python,
+                expected_source_native_commit=args.expected_source_native_commit,
                 source_native_turing_rsqrt_lut=turing_lut,
                 source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
             )
@@ -2295,6 +2347,7 @@ def main():
 
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
+    attention_route_baseline = _capture_attention_route_env()
     shape_flow_attention_route = _configure_shape_flow_attention_route(args)
     from trellmlx.models.slat_flow import SLatFlowModel
 
@@ -2837,6 +2890,12 @@ def main():
         del hr_slat_flow
         gc.collect()
 
+    texture_attention_route = None
+    if shape_flow_attention_route is not None:
+        texture_attention_route = _restore_attention_route_env(
+            attention_route_baseline
+        )
+
     # Keep hr_slat — needed for texture conditioning
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
@@ -2848,6 +2907,12 @@ def main():
             coords_3d=hr_coords_3d.astype(np.int32, copy=False),
             mesh_grid_size=hr_resolution,
             cascade=not args.no_cascade,
+            shape_flow_attention_route_json=np.array(
+                json.dumps(shape_flow_attention_route or {}, sort_keys=True)
+            ),
+            texture_attention_route_json=np.array(
+                json.dumps(texture_attention_route or {}, sort_keys=True)
+            ),
         )
         if args.stop_after_stage == "shape_slat":
             print("  Stop after stage: shape_slat", flush=True)
@@ -2943,6 +3008,7 @@ def main():
         qem_backend=args.qem_backend,
         source_native_source_root=args.source_native_source_root,
         source_native_python=args.source_native_python,
+        expected_source_native_commit=args.expected_source_native_commit,
         source_native_turing_rsqrt_lut=turing_lut,
         source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
     )
@@ -3039,10 +3105,6 @@ def main():
             next_stage="texture_bake",
             output_path=args.output,
         )
-        if args.stop_after_stage == "mesh_uv":
-            print("  Stop after stage: mesh_uv", flush=True)
-            return
-
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
     from trellmlx.texture_bake import uv_unwrap, uv_unwrap_cube, bake_texture
@@ -3069,6 +3131,9 @@ def main():
             next_stage="texture_bake",
             output_path=args.output,
         )
+        if args.stop_after_stage == "mesh_uv":
+            print("  Stop after stage: mesh_uv", flush=True)
+            return
 
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(
@@ -3115,6 +3180,44 @@ def main():
         )
         textured_mesh.export(args.output)
         print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
+        if args.save_checkpoints:
+            from trellmlx.checkpoint import save_checkpoint
+
+            output_path = Path(args.output)
+            postprocess_route = {
+                "reference_cleanup": bool(args.reference_cleanup),
+                "qem_simplify": bool(args.qem_simplify),
+                "qem_backend": args.qem_backend,
+                "source_native_source_root": args.source_native_source_root,
+                "source_native_python": args.source_native_python,
+                "expected_source_native_commit": (
+                    args.expected_source_native_commit
+                ),
+                "uv_method": args.uv_method,
+            }
+            save_checkpoint(
+                args.save_checkpoints,
+                "final_glb",
+                output_path=np.array(str(output_path)),
+                output_sha256=np.array(
+                    hashlib.sha256(output_path.read_bytes()).hexdigest()
+                ),
+                output_size_bytes=np.array(
+                    output_path.stat().st_size, dtype=np.int64
+                ),
+                shape_flow_attention_route_json=np.array(
+                    json.dumps(shape_flow_attention_route or {}, sort_keys=True)
+                ),
+                texture_attention_route_json=np.array(
+                    json.dumps(texture_attention_route or {}, sort_keys=True)
+                ),
+                postprocess_route_json=np.array(
+                    json.dumps(postprocess_route, sort_keys=True)
+                ),
+            )
+        if args.stop_after_stage == "final_glb":
+            print("  Stop after stage: final_glb", flush=True)
+            return
     else:
         print("  WARNING: Empty mesh!", flush=True)
 

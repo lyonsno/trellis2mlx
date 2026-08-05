@@ -66,6 +66,67 @@ def test_source_route_identity_rejects_wrong_root_even_without_hunyuan_marker():
         )
 
 
+def test_source_route_identity_rejects_wrong_commit(tmp_path):
+    from trellmlx.source_route_identity import SourceRouteIdentityError, validate_source_route_identity
+
+    identity = {
+        "status": "available",
+        "git_root": str(tmp_path),
+        "git_commit": "a" * 40,
+        "git_dirty": False,
+        "git_status_porcelain": "",
+    }
+
+    with pytest.raises(SourceRouteIdentityError, match="commit does not match"):
+        validate_source_route_identity(
+            identity,
+            expected_root=tmp_path,
+            expected_commit="b" * 40,
+            require_clean=True,
+        )
+
+
+def test_source_route_identity_rejects_dirty_checkout(tmp_path):
+    from trellmlx.source_route_identity import SourceRouteIdentityError, validate_source_route_identity
+
+    identity = {
+        "status": "available",
+        "git_root": str(tmp_path),
+        "git_commit": "a" * 40,
+        "git_dirty": True,
+        "git_status_porcelain": " M cumesh/metal_backend.py",
+    }
+
+    with pytest.raises(SourceRouteIdentityError, match="checkout is dirty"):
+        validate_source_route_identity(
+            identity,
+            expected_root=tmp_path,
+            expected_commit="a" * 40,
+            require_clean=True,
+        )
+
+
+def test_source_route_identity_rejects_unavailable_cleanliness(tmp_path):
+    from trellmlx.source_route_identity import SourceRouteIdentityError, validate_source_route_identity
+
+    identity = {
+        "status": "available",
+        "git_root": str(tmp_path),
+        "git_commit": "a" * 40,
+        "git_dirty": False,
+        "git_status_porcelain": None,
+        "git_status_available": False,
+    }
+
+    with pytest.raises(SourceRouteIdentityError, match="cleanliness is unavailable"):
+        validate_source_route_identity(
+            identity,
+            expected_root=tmp_path,
+            expected_commit="a" * 40,
+            require_clean=True,
+        )
+
+
 def test_source_native_loader_rejects_hunyuan_import_route(monkeypatch):
     import trellmlx.source_mtlmesh as source_mtlmesh
 

@@ -69,6 +69,30 @@ def _git_output(root: str | None, *args: str) -> str | None:
     return value or None
 
 
+def _git_status_porcelain(root: str | None) -> str | None:
+    if not root:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                root,
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.rstrip("\n")
+
+
 def _first_remote_url(root: str | None) -> str | None:
     if not root:
         return None
@@ -110,13 +134,17 @@ def probe_cumesh_route_identity() -> dict[str, Any]:
     else:
         metal_backend_file = inspect.getfile(metal_backend)
         git_root = _find_git_root(metal_backend_file)
+        git_status_porcelain = _git_status_porcelain(git_root)
         identity.update({
             "metal_backend_file": metal_backend_file,
             "has_MtlMesh": hasattr(metal_backend, "MtlMesh"),
             "git_root": git_root,
             "git_remote": _first_remote_url(git_root),
             "git_commit": _git_output(git_root, "rev-parse", "HEAD"),
+            "git_status_porcelain": git_status_porcelain,
+            "git_status_available": git_status_porcelain is not None,
         })
+        identity["git_dirty"] = bool(identity["git_status_porcelain"])
     return identity
 
 
@@ -124,6 +152,8 @@ def validate_source_route_identity(
     identity: dict[str, Any],
     *,
     expected_root: str | Path | None = None,
+    expected_commit: str | None = None,
+    require_clean: bool = False,
     forbidden_markers: tuple[str, ...] = DEFAULT_FORBIDDEN_SOURCE_MARKERS,
 ) -> dict[str, Any]:
     """Validate that a source-native backend did not resolve to a proxy route."""
@@ -172,6 +202,31 @@ def validate_source_route_identity(
             )
     else:
         validated["source_root_match"] = None
+
+    validated["expected_source_commit"] = expected_commit
+    if expected_commit is not None:
+        effective_commit = validated.get("git_commit")
+        validated["source_commit_match"] = effective_commit == expected_commit
+        if not validated["source_commit_match"]:
+            raise SourceRouteIdentityError(
+                "mtlmesh/cumesh commit does not match expected source commit: "
+                f"{effective_commit} != {expected_commit}",
+                validated,
+            )
+    else:
+        validated["source_commit_match"] = None
+
+    validated["source_clean_required"] = require_clean
+    if require_clean and validated.get("git_status_available") is False:
+        raise SourceRouteIdentityError(
+            "mtlmesh/cumesh source checkout cleanliness is unavailable",
+            validated,
+        )
+    if require_clean and validated.get("git_dirty"):
+        raise SourceRouteIdentityError(
+            "mtlmesh/cumesh source checkout is dirty",
+            validated,
+        )
 
     validated["forbidden_source_route"] = False
     return validated

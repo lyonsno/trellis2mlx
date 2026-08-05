@@ -141,10 +141,10 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
 
     def fake_run(cmd, *, capture_output, text, check, env):
         calls.append((cmd, env))
-        input_npz = Path(cmd[-6])
-        output_npz = Path(cmd[-5])
-        trace_json = Path(cmd[-4])
-        target_faces = int(cmd[-3])
+        input_npz = Path(cmd[-7])
+        output_npz = Path(cmd[-6])
+        trace_json = Path(cmd[-5])
+        target_faces = int(cmd[-4])
         data = np.load(input_npz)
         np.savez_compressed(
             output_npz,
@@ -169,6 +169,7 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
         verbose=False,
         reference_python="/ref/python",
         expected_source_root="/ref/mtlmesh",
+        expected_source_commit="d" * 40,
     )
 
     assert out_vertices.shape == (3, 3)
@@ -176,7 +177,7 @@ def test_source_native_postprocess_can_run_in_reference_python_subprocess(monkey
     assert trace == [{"operation": "source_full"}]
     cmd, env = calls[0]
     assert cmd[0] == "/ref/python"
-    assert cmd[-3:] == ["1", "/ref/mtlmesh", ""]
+    assert cmd[-4:] == ["1", "/ref/mtlmesh", "d" * 40, ""]
     assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"]
 
 
@@ -189,9 +190,9 @@ def test_source_native_postprocess_carries_turing_lut_through_subprocess(
     lut = np.arange(16, dtype=np.int8)
 
     def fake_run(cmd, *, capture_output, text, check, env):
-        input_npz = Path(cmd[-6])
-        output_npz = Path(cmd[-5])
-        trace_json = Path(cmd[-4])
+        input_npz = Path(cmd[-7])
+        output_npz = Path(cmd[-6])
+        trace_json = Path(cmd[-5])
         data = np.load(input_npz)
         observed["lut"] = np.asarray(
             data["turing_rsqrt_delta_lut"],

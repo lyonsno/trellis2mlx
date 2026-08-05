@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -129,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mesh_raw",
             "mesh_clean",
             "mesh_uv",
+            "final_glb",
         ],
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -147,6 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--no-rembg", action="store_true")
+    parser.add_argument("--reference-cleanup", action="store_true")
+    parser.add_argument("--qem-simplify", action="store_true")
+    parser.add_argument("--qem-backend", choices=["mlx", "source-native"], default="mlx")
+    parser.add_argument("--source-native-source-root")
+    parser.add_argument("--source-native-python")
+    parser.add_argument("--expected-source-native-commit")
+    parser.add_argument("--uv-method", choices=["auto", "lscm", "xatlas", "cube"], default="auto")
     parser.add_argument("--conditioning-sample")
     parser.add_argument("--shape-slat-sample")
     parser.add_argument("--shape-slat-support-sample")
@@ -306,6 +315,7 @@ def build_route_identity(
     command: list[str],
     *,
     repo_identity: dict[str, Any] | None = None,
+    source_native_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     image_path = str(Path(args.image))
     output_dir = str(Path(args.output_dir))
@@ -533,6 +543,16 @@ def build_route_identity(
             "turing_rsqrt_lut_content_sha256_effective": (
                 turing_lut_identity["content_sha256_effective"]
             ),
+            "reference_cleanup": args.reference_cleanup,
+            "qem_simplify": args.qem_simplify,
+            "qem_backend": args.qem_backend,
+            "source_native_source_root": args.source_native_source_root,
+            "source_native_python": args.source_native_python,
+            "expected_source_native_commit": (
+                args.expected_source_native_commit
+            ),
+            "source_native_identity_preflight": source_native_identity,
+            "uv_method": args.uv_method,
             "shape_flow_block_injection_trace_path": (
                 str(Path(args.shape_flow_block_injection_trace))
                 if args.shape_flow_block_injection_trace else None
@@ -620,6 +640,7 @@ def build_route_identity(
                 "mesh_raw",
                 "mesh_clean",
                 "mesh_uv",
+                "final_glb",
             )
         },
         "output_dir": output_dir,
@@ -722,6 +743,27 @@ def main(argv: list[str] | None = None) -> int:
     requested_inputs, invalid_inputs = _preflight_input_paths(args)
     turing_lut_identity = _describe_turing_rsqrt_route_args(args)
     turing_rope_lut_identity = _describe_turing_rope_route_args(args)
+    try:
+        _validate_source_native_postprocess_route_args(args)
+        source_native_identity = _read_source_native_dependency_identity(args)
+    except (OSError, ValueError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_source_native_postprocess_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "error": str(exc),
+                "source_native_identity": getattr(exc, "identity", None),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
     try:
         _validate_turing_rsqrt_route_args(args)
     except (OSError, ValueError) as exc:
@@ -844,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         args,
         command,
         repo_identity=repo_identity,
+        source_native_identity=source_native_identity,
     )
     _write_json(output_dir / "route_identity.json", route_identity)
     _write_json(
@@ -876,6 +919,9 @@ def main(argv: list[str] | None = None) -> int:
     repo_identity_postflight = None
     repo_identity_postflight_error = None
     postflight_repo_invalid = False
+    source_native_identity_postflight = None
+    source_native_identity_postflight_error = None
+    postflight_source_native_invalid = False
     if result.returncode == 0:
         try:
             repo_identity_postflight = _read_repo_identity(args.expected_repo_commit)
@@ -894,10 +940,31 @@ def main(argv: list[str] | None = None) -> int:
         route_identity["route"]["repo_identity_postflight_error"] = (
             repo_identity_postflight_error
         )
+        if source_native_identity is not None:
+            try:
+                source_native_identity_postflight = (
+                    _read_source_native_dependency_identity(args)
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                source_native_identity_postflight_error = str(exc)
+                postflight_source_native_invalid = True
+            else:
+                postflight_source_native_invalid = (
+                    source_native_identity_postflight != source_native_identity
+                )
+            route_identity["route"]["source_native_identity_postflight"] = (
+                source_native_identity_postflight
+            )
+            route_identity["route"][
+                "source_native_identity_postflight_error"
+            ] = source_native_identity_postflight_error
 
     status = (
         "done"
-        if result.returncode == 0 and output_written and not postflight_repo_invalid
+        if result.returncode == 0
+        and output_written
+        and not postflight_repo_invalid
+        and not postflight_source_native_invalid
         else "failed"
     )
     failure_phase = None
@@ -909,6 +976,23 @@ def main(argv: list[str] | None = None) -> int:
         failure_phase = "missing_primary_output"
     elif postflight_repo_invalid:
         failure_phase = "postflight_repo_identity"
+    elif postflight_source_native_invalid:
+        failure_phase = "postflight_source_native_identity"
+    elif args.stop_after_stage == "final_glb":
+        try:
+            primary_output_validation = _validate_final_glb_checkpoint(
+                checkpoint_npz,
+                expected_output_path=Path(args.output_dir) / "output.glb",
+                expected_route=route_identity["route"],
+            )
+            route_identity["route"]["final_glb_output"] = (
+                primary_output_validation
+            )
+            _write_json(output_dir / "route_identity.json", route_identity)
+        except (OSError, ValueError) as exc:
+            status = "failed"
+            failure_phase = "validate_primary_output"
+            route_binding_error = str(exc)
     elif args.stop_after_stage in {
         "shape_flow_step",
         "shape_flow_steps",
@@ -1082,6 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
                     "shape_flow_step",
                     "shape_flow_steps",
                     "shape_flow_block_trace",
+                    "final_glb",
                 }
                 else f"{args.stop_after_stage}_saved"
                 if status == "done" and output_written
@@ -1094,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                     "bind_effective_route_identity",
                     "validate_primary_output",
                     "postflight_repo_identity",
+                    "postflight_source_native_identity",
                 }
                 else "written"
                 if output_written
@@ -1103,6 +1189,13 @@ def main(argv: list[str] | None = None) -> int:
             "repo_identity_preflight": repo_identity,
             "repo_identity_postflight": repo_identity_postflight,
             "repo_identity_postflight_error": repo_identity_postflight_error,
+            "source_native_identity_preflight": source_native_identity,
+            "source_native_identity_postflight": (
+                source_native_identity_postflight
+            ),
+            "source_native_identity_postflight_error": (
+                source_native_identity_postflight_error
+            ),
             "failure_phase": failure_phase,
             "error": route_binding_error,
             "exit_code": result.returncode,
@@ -1113,6 +1206,135 @@ def main(argv: list[str] | None = None) -> int:
     if result.returncode != 0:
         return result.returncode
     return 0 if status == "done" else 2
+
+
+def _validate_final_glb_checkpoint(
+    checkpoint_path: Path,
+    *,
+    expected_output_path: Path,
+    expected_route: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "output_path",
+        "output_sha256",
+        "output_size_bytes",
+        "shape_flow_attention_route_json",
+        "texture_attention_route_json",
+        "postprocess_route_json",
+    }
+    with np.load(checkpoint_path, allow_pickle=False) as archive:
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(f"final_glb checkpoint is missing arrays: {missing}")
+
+        def scalar(name: str) -> Any:
+            value = np.asarray(archive[name])
+            if value.shape != ():
+                raise ValueError(f"final_glb {name} must be scalar")
+            return value.item()
+
+        recorded_output_path = Path(str(scalar("output_path")))
+        recorded_sha256 = str(scalar("output_sha256"))
+        recorded_size = int(scalar("output_size_bytes"))
+        try:
+            shape_route = json.loads(str(scalar("shape_flow_attention_route_json")))
+            texture_route = json.loads(str(scalar("texture_attention_route_json")))
+            postprocess_route = json.loads(str(scalar("postprocess_route_json")))
+        except json.JSONDecodeError as exc:
+            raise ValueError("final_glb route identity contains invalid JSON") from exc
+
+    expected_output_path = expected_output_path.resolve()
+    if recorded_output_path.resolve() != expected_output_path:
+        raise ValueError(
+            "final_glb output path differs from requested output: "
+            f"{recorded_output_path} != {expected_output_path}"
+        )
+    if not expected_output_path.is_file():
+        raise ValueError("final_glb output file is missing")
+    payload = expected_output_path.read_bytes()
+    effective_sha256 = hashlib.sha256(payload).hexdigest()
+    if recorded_sha256 != effective_sha256:
+        raise ValueError("final_glb output SHA256 differs from checkpoint")
+    if recorded_size != len(payload):
+        raise ValueError("final_glb output size differs from checkpoint")
+    if len(payload) < 20 or payload[:4] != b"glTF":
+        raise ValueError("final_glb GLB header is missing or truncated")
+    version = int.from_bytes(payload[4:8], "little")
+    declared_size = int.from_bytes(payload[8:12], "little")
+    if version != 2 or declared_size != len(payload):
+        raise ValueError("final_glb GLB header version or length is invalid")
+
+    shape_fields = (
+        SHAPE_FLOW_ATTENTION_ROUTE_FIELDS + SHAPE_FLOW_GELU_ROUTE_FIELDS
+    )
+    expected_shape_route = {
+        field: expected_route[field] for field in shape_fields
+    }
+    if shape_route != expected_shape_route:
+        raise ValueError("final_glb shape attention route differs from requested route")
+    expected_texture_route = {
+        "shape_flow_attention_backend_requested": expected_route[
+            "attention_backend_requested"
+        ],
+        "shape_flow_attention_backend_effective": expected_route[
+            "attention_backend"
+        ],
+        "shape_flow_attention_softmax_backend_requested": expected_route[
+            "attention_softmax_backend_requested"
+        ],
+        "shape_flow_attention_softmax_backend_effective": expected_route[
+            "attention_softmax_backend_effective"
+        ],
+        "shape_flow_attention_value_backend_requested": expected_route[
+            "attention_value_backend_requested"
+        ],
+        "shape_flow_attention_value_backend_effective": expected_route[
+            "attention_value_backend_effective"
+        ],
+        "shape_flow_gelu_backend_effective": expected_route[
+            "shape_flow_gelu_backend_effective"
+        ],
+        "shape_flow_gelu_table_bits_sha256_effective": expected_route[
+            "shape_flow_gelu_table_bits_sha256_effective"
+        ],
+    }
+    if texture_route != expected_texture_route:
+        raise ValueError("final_glb texture attention route leaked or changed")
+    postprocess_fields = (
+        "reference_cleanup",
+        "qem_simplify",
+        "qem_backend",
+        "source_native_source_root",
+        "source_native_python",
+        "expected_source_native_commit",
+        "uv_method",
+    )
+    expected_postprocess_route = {
+        field: expected_route.get(field) for field in postprocess_fields
+    }
+    if postprocess_route != expected_postprocess_route:
+        raise ValueError("final_glb postprocess route differs from requested route")
+
+    import trimesh
+
+    try:
+        scene = trimesh.load(expected_output_path, force="scene", process=False)
+    except Exception as exc:
+        raise ValueError(f"final_glb could not be reopened: {exc}") from exc
+    mesh_count = len(scene.geometry)
+    if mesh_count == 0:
+        raise ValueError("final_glb reopened without mesh geometry")
+    return {
+        "schema": "trellis2mlx.final_glb_output.v1",
+        "path": str(expected_output_path),
+        "sha256": effective_sha256,
+        "output_size_bytes": len(payload),
+        "reopenable_glb": True,
+        "mesh_count": mesh_count,
+        "shape_flow_attention_route": shape_route,
+        "texture_attention_route": texture_route,
+        "postprocess_route": postprocess_route,
+    }
 
 
 def _preflight_input_paths(args: argparse.Namespace) -> tuple[dict[str, str | None], list[dict[str, str]]]:
@@ -2643,15 +2865,17 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         args.shape_flow_attention_backend
         or args.shape_flow_attention_softmax_backend
         or args.shape_flow_attention_value_backend
-    ) and args.stop_after_stage not in {
-        "shape_flow_step",
-        "shape_flow_steps",
-        "shape_flow_block_trace",
+    ) and args.stop_after_stage in {
+        "conditioning",
+        "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_steps",
+        "sparse_flow_block_trace",
+        "sparse_internals",
     }:
         raise ValueError(
-            "shape-flow attention selectors require "
-            "--stop-after-stage shape_flow_step, shape_flow_steps, or "
-            "shape_flow_block_trace"
+            "shape-flow attention selectors require a shape-flow or downstream "
+            "consumer"
         )
     command = [
         sys.executable,
@@ -2680,6 +2904,25 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--no-cascade")
     if args.no_rembg:
         command.append("--no-rembg")
+    if args.reference_cleanup:
+        command.append("--reference-cleanup")
+    if args.qem_simplify:
+        command.append("--qem-simplify")
+    command.extend(["--qem-backend", args.qem_backend])
+    if args.source_native_source_root:
+        command.extend(
+            ["--source-native-source-root", args.source_native_source_root]
+        )
+    if args.source_native_python:
+        command.extend(["--source-native-python", args.source_native_python])
+    if args.expected_source_native_commit:
+        command.extend(
+            [
+                "--expected-source-native-commit",
+                args.expected_source_native_commit,
+            ]
+        )
+    command.extend(["--uv-method", args.uv_method])
     if args.conditioning_sample:
         command.extend(["--conditioning-sample", str(Path(args.conditioning_sample))])
     if args.shape_slat_sample:
@@ -2771,32 +3014,27 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
                     args.expected_shape_flow_trace_sample_sha256,
                 ]
             )
-    if args.stop_after_stage in {
-        "shape_flow_step",
-        "shape_flow_steps",
-        "shape_flow_block_trace",
-    }:
-        if args.shape_flow_attention_backend:
-            command.extend(
-                [
-                    "--shape-flow-attention-backend",
-                    args.shape_flow_attention_backend,
-                ]
-            )
-        if args.shape_flow_attention_softmax_backend:
-            command.extend(
-                [
-                    "--shape-flow-attention-softmax-backend",
-                    args.shape_flow_attention_softmax_backend,
-                ]
-            )
-        if args.shape_flow_attention_value_backend:
-            command.extend(
-                [
-                    "--shape-flow-attention-value-backend",
-                    args.shape_flow_attention_value_backend,
-                ]
-            )
+    if args.shape_flow_attention_backend:
+        command.extend(
+            [
+                "--shape-flow-attention-backend",
+                args.shape_flow_attention_backend,
+            ]
+        )
+    if args.shape_flow_attention_softmax_backend:
+        command.extend(
+            [
+                "--shape-flow-attention-softmax-backend",
+                args.shape_flow_attention_softmax_backend,
+            ]
+        )
+    if args.shape_flow_attention_value_backend:
+        command.extend(
+            [
+                "--shape-flow-attention-value-backend",
+                args.shape_flow_attention_value_backend,
+            ]
+        )
     command.extend([
         "--shape-flow-layernorm-backend",
         args.shape_flow_layernorm_backend,
@@ -3006,14 +3244,17 @@ def _validate_shape_timestep_modulation_route_args(
         raise ValueError(
             "source-CUDA shape timestep modulation replay requires --no-cascade"
         )
-    if args.stop_after_stage not in {
-        "shape_flow_step",
-        "shape_flow_steps",
-        "shape_flow_block_trace",
+    if args.stop_after_stage in {
+        "conditioning",
+        "sparse_coords",
+        "sparse_flow_step",
+        "sparse_flow_steps",
+        "sparse_flow_block_trace",
+        "sparse_internals",
     }:
         raise ValueError(
-            "source-CUDA shape timestep modulation replay is only valid for "
-            "shape-flow diagnostic stops"
+            "source-CUDA shape timestep modulation replay requires a shape-flow "
+            "or downstream consumer"
         )
 
     from trellmlx.timestep_modulation_lut import (
@@ -3059,7 +3300,14 @@ def _validate_turing_rsqrt_route_args(
     expected = getattr(
         args, "expected_turing_rsqrt_lut_sha256", None
     )
-    if args.shape_flow_layernorm_backend == TURING_T4_BACKEND:
+    if (
+        args.shape_flow_layernorm_backend == TURING_T4_BACKEND
+        or (
+            args.reference_cleanup
+            and args.qem_simplify
+            and args.qem_backend == "source-native"
+        )
+    ):
         if not path or not expected:
             raise ValueError(
                 f"{TURING_T4_BACKEND} requires --turing-rsqrt-lut and "
@@ -3081,7 +3329,7 @@ def _validate_turing_rsqrt_route_args(
     if path or expected:
         raise ValueError(
             "Turing rsqrt LUT arguments only apply to "
-            f"{TURING_T4_BACKEND}"
+            f"{TURING_T4_BACKEND} or source-native QEM"
         )
     return {
         "path": None,
@@ -3089,6 +3337,110 @@ def _validate_turing_rsqrt_route_args(
         "sha256_effective": None,
         "content_sha256_effective": None,
     }
+
+
+def _validate_source_native_postprocess_route_args(
+    args: argparse.Namespace,
+) -> None:
+    if not (args.qem_simplify and args.qem_backend == "source-native"):
+        return
+    if not args.source_native_source_root:
+        raise ValueError(
+            "source-native QEM requires --source-native-source-root"
+        )
+    source_root = Path(args.source_native_source_root)
+    if not source_root.is_dir():
+        raise ValueError(
+            f"source-native source root is not a directory: {source_root}"
+        )
+    if not args.source_native_python:
+        raise ValueError("source-native QEM requires --source-native-python")
+    python_path = Path(args.source_native_python)
+    if not python_path.is_file():
+        raise ValueError(
+            f"source-native Python is not a file: {python_path}"
+        )
+    if not os.access(python_path, os.X_OK):
+        raise ValueError(
+            f"source-native Python is not executable: {python_path}"
+        )
+    expected_commit = args.expected_source_native_commit
+    if not expected_commit:
+        raise ValueError(
+            "source-native QEM requires --expected-source-native-commit"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise ValueError(
+            "--expected-source-native-commit must be a lowercase 40-hex commit"
+        )
+
+
+def _read_source_native_dependency_identity(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    if not (args.qem_simplify and args.qem_backend == "source-native"):
+        return None
+    probe_code = r'''
+import json
+import sys
+from trellmlx.source_route_identity import (
+    SourceRouteIdentityError,
+    probe_cumesh_route_identity,
+    validate_source_route_identity,
+)
+
+try:
+    identity = validate_source_route_identity(
+        probe_cumesh_route_identity(),
+        expected_root=sys.argv[1],
+        expected_commit=sys.argv[2],
+        require_clean=True,
+    )
+except SourceRouteIdentityError as exc:
+    print(json.dumps({"error": str(exc), "identity": exc.identity}, sort_keys=True))
+    raise SystemExit(2)
+print(json.dumps(identity, sort_keys=True))
+'''
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(REPO_ROOT)
+        if not existing_pythonpath
+        else str(REPO_ROOT) + os.pathsep + existing_pythonpath
+    )
+    completed = subprocess.run(
+        [
+            args.source_native_python,
+            "-c",
+            probe_code,
+            args.source_native_source_root,
+            args.expected_source_native_commit,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    payload_text = completed.stdout.strip()
+    if completed.returncode != 0:
+        detail = payload_text or completed.stderr.strip() or "no subprocess output"
+        raise ValueError(
+            "source-native dependency identity probe failed in "
+            f"{args.source_native_python}: {detail}"
+        )
+    try:
+        identity = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "source-native dependency identity probe returned invalid JSON"
+        ) from exc
+    if identity.get("status") != "available":
+        raise ValueError(
+            "source-native dependency identity probe did not resolve an "
+            "available cumesh route"
+        )
+    return identity
 
 
 def _describe_turing_rsqrt_route_args(
