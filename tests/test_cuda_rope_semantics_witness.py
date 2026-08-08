@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -139,6 +140,147 @@ def test_rope_witness_rejects_case_input_that_requires_bfloat16_rounding(
         ValueError, match="case_input must be exactly BF16-representable"
     ):
         _load_witness(path)
+
+
+def test_rope_witness_explicit_phase_mode_requires_bound_case_phases(
+    tmp_path,
+):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(path)
+
+    with pytest.raises(
+        ValueError,
+        match="explicit phase mode requires case_phase_pairs",
+    ):
+        _load_witness(path, phase_mode="explicit")
+
+
+def test_rope_witness_explicit_phase_mode_validates_case_phase_shape(
+    tmp_path,
+):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(
+        path,
+        case_phase_pairs=np.ones((2, 2), dtype=np.float32),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="case_phase_pairs must match case_input shape",
+    ):
+        _load_witness(path, phase_mode="explicit")
+
+
+def test_rope_witness_accepts_source_runtime_cpu_generated_phases(tmp_path):
+    from scripts.cuda_rope_semantics_witness import _load_witness
+
+    path = tmp_path / "witness.npz"
+    _write_rope_witness(path)
+
+    arrays = _load_witness(path, phase_mode="cpu-generated")
+
+    assert "case_phase_pairs" not in arrays
+
+
+def test_rope_witness_result_preserves_precast_cuda_product(tmp_path):
+    from scripts.cuda_rope_semantics_witness import _write_result
+
+    output = tmp_path / "result.npz"
+    arrays = {
+        "coordinate_values": np.arange(64, dtype=np.int32),
+        "frequencies": np.linspace(1.0, 0.01, 21, dtype=np.float32),
+        "case_coordinate_index": np.asarray([1], dtype=np.int32),
+        "case_frequency_index": np.asarray([2], dtype=np.int32),
+        "expected_case_output": np.asarray([[1.0, 2.0]], dtype=np.float32),
+    }
+    precast = np.asarray([[1.001, 2.002]], dtype=np.float32)
+
+    _write_result(
+        output,
+        phase_pairs=np.zeros((64, 21, 2), dtype=np.float32),
+        case_phase_pairs=np.asarray([[0.5, 0.25]], dtype=np.float32),
+        case_output=np.asarray([[1.0, 2.0]], dtype=np.float32),
+        case_output_float32_precast=precast,
+        arrays=arrays,
+    )
+
+    with np.load(output, allow_pickle=False) as result:
+        assert np.array_equal(result["case_output_float32_precast"], precast)
+
+
+def test_rope_witness_preserves_diagnostic_output_on_self_auth_failure(
+    monkeypatch, tmp_path
+):
+    from scripts import cuda_rope_semantics_witness as witness
+
+    witness_path = tmp_path / "witness.npz"
+    witness_path.write_bytes(b"bound witness")
+    digest = hashlib.sha256(witness_path.read_bytes()).hexdigest()
+    output_json = tmp_path / "result.json"
+    output_npz = tmp_path / "result.npz"
+    arrays = {
+        "coordinate_values": np.arange(64, dtype=np.int32),
+        "frequencies": np.linspace(1.0, 0.01, 21, dtype=np.float32),
+        "case_coordinate_index": np.asarray([1], dtype=np.int32),
+        "case_frequency_index": np.asarray([2], dtype=np.int32),
+        "expected_case_output": np.asarray([[1.0, 2.0]], dtype=np.float32),
+    }
+    fake_torch = SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    monkeypatch.setattr(witness, "_load_witness", lambda *_args, **_kwargs: arrays)
+    monkeypatch.setattr(
+        witness,
+        "_run_cuda",
+        lambda *_args, **_kwargs: (
+            np.zeros((64, 21, 2), dtype=np.float32),
+            np.asarray([[0.5, 0.25]], dtype=np.float32),
+            np.asarray([[1.001, 2.002]], dtype=np.float32),
+            np.asarray([[1.0, 2.0]], dtype=np.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        witness,
+        "analyze_cuda_results",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("CUDA RoPE cases do not reproduce source outputs")
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cuda_rope_semantics_witness.py",
+            "--witness",
+            str(witness_path),
+            "--expected-witness-sha256",
+            digest,
+            "--phase-mode",
+            "cpu-generated",
+            "--output-json",
+            str(output_json),
+            "--output-npz",
+            str(output_npz),
+        ],
+    )
+
+    assert witness.main() == 1
+
+    report = json.loads(output_json.read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "cuda_self_authentication"
+    assert report["primary_output"]["exists"] is True
+    assert report["primary_output"]["authority"] == "diagnostic-only"
+    with np.load(output_npz, allow_pickle=False) as result:
+        assert "case_output_float32_precast" in result.files
 
 
 def test_rope_witness_failure_removes_stale_primary_and_writes_report(

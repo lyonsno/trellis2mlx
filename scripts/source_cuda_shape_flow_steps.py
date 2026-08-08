@@ -25,6 +25,7 @@ try:
         _load_conditioning,
         _run_suffix,
         _sha256,
+        _validate_expected_modulation_identity,
         _validate_file,
         load_mlx_trajectory,
     )
@@ -49,6 +50,7 @@ except ImportError:
         _load_conditioning,
         _run_suffix,
         _sha256,
+        _validate_expected_modulation_identity,
         _validate_file,
         load_mlx_trajectory,
     )
@@ -103,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mlx-shape-flow-steps-sha256", required=True)
     parser.add_argument("--mlx-run-report", required=True, type=Path)
     parser.add_argument("--mlx-run-report-sha256", required=True)
+    parser.add_argument(
+        "--mlx-timestep-modulation-route",
+        choices=("default", "source-cuda-lut"),
+    )
+    parser.add_argument("--expected-modulation-lut-sha256")
+    parser.add_argument("--expected-modulation-report-sha256")
+    parser.add_argument("--expected-modulation-source-checkpoint-sha256")
     parser.add_argument("--conditioning", required=True, type=Path)
     parser.add_argument("--conditioning-sha256", required=True)
     parser.add_argument("--source-tar", required=True, type=Path)
@@ -120,6 +129,17 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     phase = "arguments_parsed"
     last_trustworthy_phase: str | None = phase
+    expected_modulation_identity = (
+        {
+            "npz_sha256_effective": args.expected_modulation_lut_sha256,
+            "report_sha256_effective": args.expected_modulation_report_sha256,
+            "source_checkpoint_sha256_effective": (
+                args.expected_modulation_source_checkpoint_sha256
+            ),
+        }
+        if args.mlx_timestep_modulation_route == "source-cuda-lut"
+        else None
+    )
     input_paths = {
         "MLX shape-flow steps": args.mlx_shape_flow_steps,
         "MLX run report": args.mlx_run_report,
@@ -137,6 +157,10 @@ def main(argv: list[str] | None = None) -> int:
             "steps": STEPS,
             "attention_backend": args.sparse_attn_backend,
             "conv_backend": args.sparse_conv_backend,
+            "mlx_timestep_modulation_route": (
+                args.mlx_timestep_modulation_route
+            ),
+            "expected_modulation_identity": expected_modulation_identity,
         },
         "effective_route": "not-established",
         "primary_output_status": "missing",
@@ -156,6 +180,29 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "output JSON collides with protected paths: " + ", ".join(collisions)
             )
+        if args.mlx_timestep_modulation_route not in {
+            "default",
+            "source-cuda-lut",
+        }:
+            raise ValueError(
+                "--mlx-timestep-modulation-route must explicitly select "
+                "default or source-cuda-lut"
+            )
+        if (
+            args.mlx_timestep_modulation_route == "default"
+            and any(
+                value is not None
+                for value in (
+                    args.expected_modulation_lut_sha256,
+                    args.expected_modulation_report_sha256,
+                    args.expected_modulation_source_checkpoint_sha256,
+                )
+            )
+        ):
+            raise ValueError(
+                "expected modulation SHA256 values require source-cuda-lut mode"
+            )
+        _validate_expected_modulation_identity(expected_modulation_identity)
         expected_digests = {
             "MLX shape-flow steps": _validate_sha256(
                 args.mlx_shape_flow_steps_sha256,
@@ -201,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
             args.mlx_shape_flow_steps,
             args.mlx_run_report,
             args.conditioning,
-            expected_modulation_identity=None,
+            expected_modulation_identity=expected_modulation_identity,
         )
         cond_np, neg_cond_np = _load_conditioning(args.conditioning)
         report["inputs"] = {
@@ -348,6 +395,12 @@ def main(argv: list[str] | None = None) -> int:
             "model_ref": model_ref,
             "candidate_names": ["source-native-control"],
             "comparison_class": SOURCE_DIRECT_COMPARISON_CLASS,
+            "mlx_timestep_modulation_route": (
+                args.mlx_timestep_modulation_route
+            ),
+            "mlx_timestep_modulation_identity": (
+                mlx_identity["shape_timestep_modulation_identity"]
+            ),
         }
         report.update(
             {

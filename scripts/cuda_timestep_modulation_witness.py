@@ -22,16 +22,28 @@ PROJECTION_BATCH_MODES = (
     "independent-singletons",
 )
 EXPECTED_STEP_INDICES = tuple(range(8))
-EXPECTED_TIMESTEP_FLOAT32_BITS = (
-    0x447A0000,
-    0x446EA2E9,
-    0x44610000,
-    0x44505555,
-    0x443B8000,
-    0x4420B6DB,
-    0x43FA0000,
-    0x43960000,
-)
+SCHEDULE_TIMESTEP_FLOAT32_BITS = {
+    "shape-slat-rescale-3": (
+        0x447A0000,
+        0x446EA2E9,
+        0x44610000,
+        0x44505555,
+        0x443B8000,
+        0x4420B6DB,
+        0x43FA0000,
+        0x43960000,
+    ),
+    "sparse-structure-rescale-5": (
+        0x447A0000,
+        0x44730E39,
+        0x446A6000,
+        0x445F36DB,
+        0x44505555,
+        0x443B8000,
+        0x441C4000,
+        0x43D05555,
+    ),
+}
 STAGES = (
     "embedding",
     "linear0",
@@ -117,13 +129,15 @@ def validate_schedule(
     *,
     step_indices: np.ndarray,
     timesteps: np.ndarray,
+    schedule_profile: str = "shape-slat-rescale-3",
 ) -> dict[str, Any]:
     step_indices = np.asarray(step_indices)
     timesteps = np.asarray(timesteps)
     expected_steps = np.asarray(EXPECTED_STEP_INDICES, dtype=np.int32)
-    expected_bits = np.asarray(
-        EXPECTED_TIMESTEP_FLOAT32_BITS, dtype=np.uint32
-    )
+    if schedule_profile not in SCHEDULE_TIMESTEP_FLOAT32_BITS:
+        raise ValueError(f"unsupported schedule profile {schedule_profile!r}")
+    expected_timestep_bits = SCHEDULE_TIMESTEP_FLOAT32_BITS[schedule_profile]
+    expected_bits = np.asarray(expected_timestep_bits, dtype=np.uint32)
     if (
         step_indices.dtype != np.int32
         or step_indices.shape != expected_steps.shape
@@ -141,10 +155,12 @@ def validate_schedule(
             "candidate must use the canonical eight-step schedule timesteps"
         )
     return {
+        "profile_expected": schedule_profile,
+        "profile_effective": schedule_profile,
         "step_indices_expected": list(EXPECTED_STEP_INDICES),
         "step_indices_effective": step_indices.tolist(),
         "timestep_float32_bits_expected": [
-            f"0x{bits:08x}" for bits in EXPECTED_TIMESTEP_FLOAT32_BITS
+            f"0x{bits:08x}" for bits in expected_timestep_bits
         ],
         "timestep_float32_bits_effective": [
             f"0x{int(bits):08x}" for bits in timesteps.view(np.uint32)
@@ -340,13 +356,16 @@ def _load_weights(path: Path) -> tuple[dict[str, np.ndarray], str]:
 
 def _load_candidate(
     path: Path,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], str, str]:
+    *,
+    expected_schedule_profile: str = "shape-slat-rescale-3",
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], str, str, str]:
     with np.load(path, allow_pickle=False) as data:
         required = {
             "step_indices",
             "timestep_float32",
             "candidate_route",
             "projection_batch_mode",
+            "schedule_profile",
             *STAGES,
         }
         missing = sorted(required.difference(data.files))
@@ -361,7 +380,19 @@ def _load_candidate(
         projection_batch_mode = _scalar_text(
             data["projection_batch_mode"], name="projection_batch_mode"
         )
-    validate_schedule(step_indices=step_indices, timesteps=timesteps)
+        schedule_profile = _scalar_text(
+            data["schedule_profile"], name="schedule_profile"
+        )
+    if schedule_profile != expected_schedule_profile:
+        raise ValueError(
+            "candidate schedule profile mismatch: "
+            f"expected {expected_schedule_profile!r}, got {schedule_profile!r}"
+        )
+    validate_schedule(
+        step_indices=step_indices,
+        timesteps=timesteps,
+        schedule_profile=schedule_profile,
+    )
     # Reuse the full analysis validator against itself.
     analyze_modulation(
         step_indices=step_indices,
@@ -374,6 +405,7 @@ def _load_candidate(
         arrays,
         candidate_route,
         projection_batch_mode,
+        schedule_profile,
     )
 
 
@@ -384,11 +416,13 @@ def validate_written_primary(
     timesteps: np.ndarray,
     source_arrays: dict[str, np.ndarray],
     projection_batch_mode: str,
+    schedule_profile: str = "shape-slat-rescale-3",
 ) -> dict[str, str]:
     expected = {
         "step_indices": np.asarray(step_indices),
         "timestep_float32": np.asarray(timesteps),
         "projection_batch_mode": np.asarray(projection_batch_mode),
+        "schedule_profile": np.asarray(schedule_profile),
         **{
             f"source_{name}": np.asarray(value)
             for name, value in source_arrays.items()
@@ -523,6 +557,11 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         choices=PROJECTION_BATCH_MODES,
     )
+    parser.add_argument(
+        "--schedule-profile",
+        required=True,
+        choices=tuple(SCHEDULE_TIMESTEP_FLOAT32_BITS),
+    )
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-npz", required=True, type=Path)
     return parser
@@ -573,6 +612,7 @@ def main() -> int:
             "torch": EXPECTED_TORCH,
             "cuda_device": EXPECTED_DEVICE,
             "projection_batch_mode": args.projection_batch_mode,
+            "schedule_profile": args.schedule_profile,
         },
         "inputs": {
             "weights": str(args.weights),
@@ -584,6 +624,7 @@ def main() -> int:
             "candidate_sha256_requested": args.expected_candidate_sha256,
             "candidate_route_requested": args.expected_candidate_route,
             "projection_batch_mode_requested": args.projection_batch_mode,
+            "schedule_profile_requested": args.schedule_profile,
         },
     }
     try:
@@ -620,7 +661,11 @@ def main() -> int:
             candidate_arrays,
             candidate_route,
             candidate_projection_batch_mode,
-        ) = _load_candidate(args.candidate)
+            candidate_schedule_profile,
+        ) = _load_candidate(
+            args.candidate,
+            expected_schedule_profile=args.schedule_profile,
+        )
         validate_provenance(
             source_checkpoint_sha256=source_checkpoint_sha256,
             expected_source_checkpoint_sha256=(
@@ -636,6 +681,7 @@ def main() -> int:
         report["schedule_identity"] = validate_schedule(
             step_indices=step_indices,
             timesteps=timesteps,
+            schedule_profile=candidate_schedule_profile,
         )
         report["inputs"].update(
             {
@@ -646,6 +692,7 @@ def main() -> int:
                 "projection_batch_mode_effective": (
                     candidate_projection_batch_mode
                 ),
+                "schedule_profile_effective": candidate_schedule_profile,
             }
         )
         last_trustworthy_phase = phase
@@ -665,6 +712,7 @@ def main() -> int:
             "cuda_device": cuda_device,
             "device_type": "cuda",
             "projection_batch_mode": args.projection_batch_mode,
+            "schedule_profile": candidate_schedule_profile,
         }
         last_trustworthy_phase = phase
 
@@ -689,6 +737,7 @@ def main() -> int:
             step_indices=step_indices,
             timestep_float32=timesteps,
             projection_batch_mode=np.asarray(args.projection_batch_mode),
+            schedule_profile=np.asarray(candidate_schedule_profile),
             **{
                 f"source_{name}": np.ascontiguousarray(value)
                 for name, value in source_arrays.items()
@@ -703,6 +752,7 @@ def main() -> int:
             timesteps=timesteps,
             source_arrays=source_arrays,
             projection_batch_mode=args.projection_batch_mode,
+            schedule_profile=candidate_schedule_profile,
         )
         primary_sha256 = sha256_file(args.output_npz)
         report.update(

@@ -26,6 +26,122 @@ def test_generate_exposes_stage_capture_cli_contracts():
         assert f'"{stage}"' in source
 
 
+def test_stage_capture_forwards_and_records_sparse_attention_route(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--sparse-flow-attention-backend",
+            "source-cuda-math-turing-t4",
+        ]
+    )
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(
+        args,
+        command,
+        repo_identity={
+            "commit_requested": "a" * 40,
+            "commit_effective": "a" * 40,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )["route"]
+
+    index = command.index("--sparse-flow-attention-backend")
+    assert command[index + 1] == "source-cuda-math-turing-t4"
+    assert (
+        route["sparse_flow_attention_backend_requested"]
+        == "source-cuda-math-turing-t4"
+    )
+
+
+def test_stage_capture_forwards_and_records_sparse_terminal_linear_route(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    backend = "source-cuda-t4-volta-sgemm-32x128-tn-metal"
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_steps",
+            "--sparse-flow-terminal-linear-backend",
+            backend,
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(
+        args,
+        command,
+        repo_identity={
+            "commit_requested": "a" * 40,
+            "commit_effective": "a" * 40,
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )["route"]
+
+    index = command.index("--sparse-flow-terminal-linear-backend")
+    assert command[index + 1] == backend
+    assert route["sparse_flow_terminal_linear_backend_requested"] == backend
+    assert route["sparse_flow_terminal_linear_identity"]["backend"] == backend
+
+
+def test_stage_capture_sparse_attention_binding_rejects_fallback(tmp_path):
+    import json
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_attention_route,
+    )
+    from trellmlx.sparse_flow_attention import (
+        DEFAULT_BACKEND,
+        SOURCE_CUDA_MATH_TURING_T4_BACKEND,
+        configure_sparse_flow_attention_backend,
+        sparse_flow_attention_backend_identity,
+    )
+
+    configure_sparse_flow_attention_backend(DEFAULT_BACKEND)
+    checkpoint = tmp_path / "trace.npz"
+    np.savez(
+        checkpoint,
+        sparse_flow_attention_route_json=np.asarray(
+            json.dumps(sparse_flow_attention_backend_identity(), sort_keys=True)
+        ),
+    )
+    route_identity = {
+        "route": {
+            "sparse_flow_attention_backend_requested": (
+                SOURCE_CUDA_MATH_TURING_T4_BACKEND
+            )
+        }
+    }
+
+    with pytest.raises(ValueError, match="does not match requested"):
+        _bind_effective_sparse_flow_attention_route(
+            route_identity,
+            checkpoint,
+        )
+
+
 def test_generate_stage_capture_saves_requested_sparse_and_shape_artifacts():
     source = GENERATE_SOURCE.read_text()
 
@@ -946,7 +1062,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
         command.index("--shape-flow-attention-value-backend") + 1
     ] == "source-cuda-sequential"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
 
 
@@ -1014,7 +1130,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
         "source-cuda-self"
     )
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
 
 
@@ -1649,12 +1765,12 @@ def _write_valid_shape_flow_step_checkpoint(
     steps=8,
     tokens=2,
     channels=4,
-    attention_backend_effective="source-cuda-self-widths-1029-7697-fast-otherwise",
+    attention_backend_effective="source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise",
     attention_softmax_backend_effective=(
-        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
     ),
     attention_value_backend_effective=(
-        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
     ),
 ):
     import json
@@ -3057,13 +3173,13 @@ def test_shape_flow_source_cuda_self_route_records_width_scoped_effective_identi
     )
     assert route["shape_flow_attention_backend_requested"] == "source-cuda-self"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_value_backend_effective"] == (
-        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_gelu_backend_effective"] == (
         "source-cuda-bf16-table-formula-otherwise"
@@ -3091,13 +3207,13 @@ def test_generate_source_cuda_self_route_records_authenticated_widths(
     route = generate._shape_flow_attention_route_from_env()
 
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_value_backend_effective"] == (
-        "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_gelu_backend_effective"] == (
         "source-cuda-bf16-table-formula-otherwise"
@@ -3597,19 +3713,19 @@ def test_shape_flow_attention_matching_metadata_cannot_validate_partial_first_st
             rope_backend=np.array("mlx-real"),
             shape_flow_attention_backend_requested=np.array("source-cuda-self"),
             shape_flow_attention_backend_effective=np.array(
-                "source-cuda-self-widths-1029-7697-fast-otherwise"
+                "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_attention_softmax_backend_requested=np.array(
                 "source-cuda-turing"
             ),
             shape_flow_attention_softmax_backend_effective=np.array(
-                "source-cuda-turing-widths-1029-7697-fast-otherwise"
+                "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_attention_value_backend_requested=np.array(
                 "source-cuda-sequential"
             ),
             shape_flow_attention_value_backend_effective=np.array(
-                "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+                "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_gelu_backend_effective=np.array(
                 "source-cuda-bf16-table-formula-otherwise"
@@ -3703,7 +3819,7 @@ def test_shape_flow_attention_complete_first_step_primary_binds_route(
     assert report["primary_output_validation"]["token_count"] == 2
     assert report["route_identity"]["route"][
         "shape_flow_attention_backend_effective"
-    ] == "source-cuda-self-widths-1029-7697-fast-otherwise"
+    ] == "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
 
 
 def test_generate_scopes_shape_attention_and_restores_texture_route(monkeypatch):
@@ -3727,7 +3843,7 @@ def test_generate_scopes_shape_attention_and_restores_texture_route(monkeypatch)
     texture_route = generate._restore_attention_route_env(baseline)
 
     assert shape_route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert texture_route["shape_flow_attention_backend_effective"] == "fast"
     assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "fast"
@@ -3755,12 +3871,74 @@ def test_generate_final_glb_records_default_shape_route_without_selectors(monkey
     assert route == generate._shape_flow_attention_route_from_env()
 
 
-def _write_final_glb_checkpoint(path, output_path, *, shape_route, texture_route, postprocess_route):
+def _write_final_glb_checkpoint(
+    path,
+    output_path,
+    *,
+    shape_route,
+    texture_route,
+    decoder_route,
+    postprocess_route,
+    omit_sparse_key=None,
+    sparse_overrides=None,
+):
     import hashlib
     import json
     import numpy as np
 
     payload = output_path.read_bytes()
+    from trellmlx.models.sparse_structure_flow import (
+        sparse_flow_terminal_linear_backend_identity,
+    )
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
+    sparse_arrays = {
+        "sparse_flow_layernorm_backend": np.asarray("mlx-two-pass"),
+        "sparse_flow_turing_rsqrt_lut_sha256": np.asarray(""),
+        "sparse_flow_turing_rsqrt_lut_content_sha256": np.asarray(""),
+        "qk_norm_backend": np.asarray("source-cuda-warp32"),
+        "rope_backend": np.asarray("mlx-real"),
+        "sparse_flow_turing_rope_phase_lut_sha256": np.asarray(""),
+        "sparse_flow_rope_backend": np.asarray("inherit"),
+        "sparse_flow_rope_phase_lut_artifact_sha256_attested": np.asarray(""),
+        "sparse_flow_rope_phase_lut_content_sha256": np.asarray(""),
+        "sparse_flow_attention_route_json": np.asarray(
+            json.dumps(
+                {
+                    "backend": "inherit",
+                    "scope": "sparse-structure-flow",
+                    "algorithm": "inherited-global-attention-route",
+                    "experimental": False,
+                },
+                sort_keys=True,
+            )
+        ),
+        "sparse_flow_terminal_linear_json": np.asarray(
+            json.dumps(
+                sparse_flow_terminal_linear_backend_identity(
+                    4096,
+                    input_width=1536,
+                    output_width=8,
+                    has_bias=True,
+                ),
+                sort_keys=True,
+            )
+        ),
+        "sparse_flow_cfg_rescale_std_json": np.asarray(
+            json.dumps(
+                dense_cfg_rescale_std_backend_identity(
+                    (1, 8, 16, 16, 16),
+                    dtype="float32",
+                ),
+                sort_keys=True,
+            )
+        ),
+        "sparse_timestep_modulation_lut_json": np.asarray(""),
+    }
+    sparse_arrays.update(sparse_overrides or {})
+    if omit_sparse_key is not None:
+        sparse_arrays.pop(omit_sparse_key)
+
     np.savez(
         path,
         output_path=np.asarray(str(output_path)),
@@ -3772,25 +3950,55 @@ def _write_final_glb_checkpoint(path, output_path, *, shape_route, texture_route
         texture_attention_route_json=np.asarray(
             json.dumps(texture_route, sort_keys=True)
         ),
+        decoder_route_json=np.asarray(json.dumps(decoder_route, sort_keys=True)),
         postprocess_route_json=np.asarray(
             json.dumps(postprocess_route, sort_keys=True)
         ),
+        **sparse_arrays,
     )
 
 
 def _final_glb_expected_route():
+    from trellmlx.models.sparse_structure_flow import (
+        sparse_flow_terminal_linear_backend_identity,
+    )
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
     return {
+        "sparse_flow_attention_backend_requested": "inherit",
+        "sparse_flow_layernorm_backend_requested": "mlx-two-pass",
+        "sparse_flow_terminal_linear_backend_requested": "mlx-native-linear",
+        "sparse_flow_terminal_linear_identity": (
+            sparse_flow_terminal_linear_backend_identity(
+                4096,
+                input_width=1536,
+                output_width=8,
+                has_bias=True,
+            )
+        ),
+        "sparse_flow_cfg_rescale_std_identity": (
+            dense_cfg_rescale_std_backend_identity(
+                (1, 8, 16, 16, 16),
+                dtype="float32",
+            )
+        ),
+        "sparse_timestep_modulation_identity": None,
+        "qk_norm_backend_requested": "source-cuda-warp32",
+        "rope_backend_requested": "mlx-real",
+        "sparse_flow_rope_backend_requested": "inherit",
+        "sparse_flow_rope_phase_lut_sha256_effective": None,
+        "sparse_flow_rope_phase_lut_content_sha256_effective": None,
         "shape_flow_attention_backend_requested": "source-cuda-self",
         "shape_flow_attention_backend_effective": (
-            "source-cuda-self-widths-1029-7697-fast-otherwise"
+            "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_attention_softmax_backend_requested": "source-cuda-turing",
         "shape_flow_attention_softmax_backend_effective": (
-            "source-cuda-turing-widths-1029-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_attention_value_backend_requested": "source-cuda-sequential",
         "shape_flow_attention_value_backend_effective": (
-            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_gelu_backend_effective": (
             "source-cuda-bf16-table-formula-otherwise"
@@ -3804,6 +4012,12 @@ def _final_glb_expected_route():
         "attention_softmax_backend_effective": "fused-fast-attention",
         "attention_value_backend_requested": "mlx-matmul",
         "attention_value_backend_effective": "fused-fast-attention",
+        "decoder_linear_backend_requested": "turing_fda",
+        "decoder_sparse_conv_matmul_backend_requested": "turing_fda",
+        "decoder_layernorm_backend_requested": "cuda-welford-turing-t4",
+        "decoder_silu_backend_requested": "cuda-turing-t4-fp16-lut",
+        "decoder_silu_lut_sha256_effective": "e" * 64,
+        "turing_rsqrt_lut_sha256_effective": "d" * 64,
         "reference_cleanup": True,
         "qem_simplify": True,
         "qem_backend": "source-native",
@@ -3812,6 +4026,76 @@ def _final_glb_expected_route():
         "expected_source_native_commit": "c" * 40,
         "uv_method": "auto",
     }
+
+
+def test_final_glb_validator_rejects_missing_sparse_route_binding(tmp_path):
+    import numpy as np
+    import pytest
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        decoder_route=decoder,
+        postprocess_route=postprocess,
+        omit_sparse_key="sparse_flow_attention_route_json",
+    )
+
+    with pytest.raises(ValueError, match="sparse-flow attention route metadata"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
+
+
+def test_final_glb_validator_rejects_substituted_sparse_route_binding(tmp_path):
+    import numpy as np
+    import pytest
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        decoder_route=decoder,
+        postprocess_route=postprocess,
+        sparse_overrides={
+            "sparse_flow_layernorm_backend": np.asarray("cuda-welford-metal")
+        },
+    )
+
+    with pytest.raises(ValueError, match="effective LayerNorm backend"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
 
 
 def _final_glb_checkpoint_routes(expected):
@@ -3864,7 +4148,31 @@ def _final_glb_checkpoint_routes(expected):
             "uv_method",
         )
     }
-    return shape, texture, postprocess
+    decoder = {
+        "decoder_linear_backend": expected[
+            "decoder_linear_backend_requested"
+        ],
+        "sparse_conv_matmul_backend": expected[
+            "decoder_sparse_conv_matmul_backend_requested"
+        ],
+        "decoder_layernorm": {
+            "backend": expected["decoder_layernorm_backend_requested"],
+            "turing_rsqrt_lut_artifact_sha256_attested": expected[
+                "turing_rsqrt_lut_sha256_effective"
+            ],
+        },
+        "decoder_silu": {
+            "backend": expected["decoder_silu_backend_requested"],
+            "output_lut_artifact_sha256_attested": expected[
+                "decoder_silu_lut_sha256_effective"
+            ],
+            "output_lut_artifact_sha256_effective": expected[
+                "decoder_silu_lut_sha256_effective"
+            ],
+        },
+        "decoder_output_head_backend": "mlx-native-fp32",
+    }
+    return shape, texture, decoder, postprocess
 
 
 def test_final_glb_validator_rejects_blank_primary(tmp_path):
@@ -3876,12 +4184,13 @@ def test_final_glb_validator_rejects_blank_primary(tmp_path):
     output.write_bytes(b"")
     checkpoint = tmp_path / "final_glb.npz"
     expected = _final_glb_expected_route()
-    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
     _write_final_glb_checkpoint(
         checkpoint,
         output,
         shape_route=shape,
         texture_route=texture,
+        decoder_route=decoder,
         postprocess_route=postprocess,
     )
 
@@ -3908,17 +4217,52 @@ def test_final_glb_validator_rejects_texture_route_leakage(tmp_path):
     ).export(output)
     checkpoint = tmp_path / "final_glb.npz"
     expected = _final_glb_expected_route()
-    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
     texture["shape_flow_attention_backend_requested"] = "source-cuda-self"
     _write_final_glb_checkpoint(
         checkpoint,
         output,
         shape_route=shape,
         texture_route=texture,
+        decoder_route=decoder,
         postprocess_route=postprocess,
     )
 
     with pytest.raises(ValueError, match="texture attention route"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
+
+
+def test_final_glb_validator_rejects_decoder_route_leakage(tmp_path):
+    import numpy as np
+    import pytest
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
+    decoder["decoder_linear_backend"] = "native"
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        decoder_route=decoder,
+        postprocess_route=postprocess,
+    )
+
+    with pytest.raises(ValueError, match="decoder route"):
         _validate_final_glb_checkpoint(
             checkpoint,
             expected_output_path=output,
@@ -3940,12 +4284,13 @@ def test_final_glb_validator_accepts_bound_reopenable_artifact(tmp_path):
     ).export(output)
     checkpoint = tmp_path / "final_glb.npz"
     expected = _final_glb_expected_route()
-    shape, texture, postprocess = _final_glb_checkpoint_routes(expected)
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
     _write_final_glb_checkpoint(
         checkpoint,
         output,
         shape_route=shape,
         texture_route=texture,
+        decoder_route=decoder,
         postprocess_route=postprocess,
     )
 
@@ -3986,13 +4331,14 @@ def test_final_glb_validator_accepts_routes_shaped_by_generate(monkeypatch, tmp_
     monkeypatch.setenv("TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax")
     monkeypatch.setenv("TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul")
     texture_route = generate._shape_flow_attention_route_from_env()
-    _, _, postprocess = _final_glb_checkpoint_routes(expected)
+    _, _, decoder_route, postprocess = _final_glb_checkpoint_routes(expected)
     checkpoint = tmp_path / "final_glb.npz"
     _write_final_glb_checkpoint(
         checkpoint,
         output,
         shape_route=shape_route,
         texture_route=texture_route,
+        decoder_route=decoder_route,
         postprocess_route=postprocess,
     )
 
@@ -4145,10 +4491,10 @@ def test_generate_configures_shape_flow_attention_route_for_first_step(
 
     assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "source-cuda-self"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
     )
 
 
@@ -4484,6 +4830,204 @@ def test_stage_capture_wrapper_exposes_sparse_flow_block_trace_route(tmp_path):
     assert command[command.index("--stop-after-stage") + 1] == "sparse_flow_block_trace"
 
 
+def test_stage_capture_wrapper_forwards_sparse_flow_layernorm_backend(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "sparse_flow_block_trace",
+            "--sparse-flow-layernorm-backend",
+            "cuda-welford-metal",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route = build_route_identity(args, command)["route"]
+
+    assert command[command.index("--sparse-flow-layernorm-backend") + 1] == (
+        "cuda-welford-metal"
+    )
+    assert route["sparse_flow_layernorm_backend_requested"] == (
+        "cuda-welford-metal"
+    )
+
+
+def test_sparse_flow_layernorm_backend_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_layernorm_backend,
+    )
+
+    checkpoint = tmp_path / "sparse_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        sparse_flow_layernorm_backend=np.asarray("mlx-two-pass"),
+        sparse_flow_turing_rsqrt_lut_sha256=np.asarray(""),
+        sparse_flow_turing_rsqrt_lut_content_sha256=np.asarray(""),
+    )
+    route_identity = {
+        "route": {
+            "sparse_flow_layernorm_backend_requested": "cuda-welford-metal",
+            "turing_rsqrt_lut_sha256_requested": None,
+            "turing_rsqrt_lut_sha256_effective": None,
+            "turing_rsqrt_lut_content_sha256_effective": None,
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="sparse-flow effective LayerNorm backend.*does not match requested",
+    ):
+        _bind_effective_sparse_flow_layernorm_backend(route_identity, checkpoint)
+
+
+def test_sparse_flow_checkpoint_binds_qk_and_turing_rope_identity(tmp_path):
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_global_rope_backend,
+        _bind_effective_sparse_flow_qk_norm_backend,
+        _bind_effective_sparse_flow_rope_backend,
+    )
+
+    checkpoint = tmp_path / "sparse_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        qk_norm_backend=np.asarray("source-cuda-warp32"),
+        rope_backend=np.asarray("cuda-polar-turing-t4"),
+        sparse_flow_turing_rope_phase_lut_sha256=np.asarray("a" * 64),
+        sparse_flow_rope_backend=np.asarray(
+            "source-cpu-polar-torch-2.10"
+        ),
+        sparse_flow_rope_phase_lut_artifact_sha256_attested=np.asarray(
+            "b" * 64
+        ),
+        sparse_flow_rope_phase_lut_content_sha256=np.asarray("c" * 64),
+    )
+    route_identity = {
+        "route": {
+            "qk_norm_backend_requested": "source-cuda-warp32",
+            "rope_backend_requested": "cuda-polar-turing-t4",
+            "turing_rope_phase_lut_sha256_effective": "a" * 64,
+            "sparse_flow_rope_backend_requested": (
+                "source-cpu-polar-torch-2.10"
+            ),
+            "sparse_flow_rope_phase_lut_sha256_effective": "b" * 64,
+            "sparse_flow_rope_phase_lut_content_sha256_effective": "c" * 64,
+        }
+    }
+
+    assert (
+        _bind_effective_sparse_flow_qk_norm_backend(
+            route_identity,
+            checkpoint,
+        )
+        == "source-cuda-warp32"
+    )
+    assert (
+        _bind_effective_sparse_flow_global_rope_backend(
+            route_identity,
+            checkpoint,
+        )
+        == "cuda-polar-turing-t4"
+    )
+    assert route_identity["route"][
+        "sparse_flow_turing_rope_phase_lut_sha256_effective"
+    ] == "a" * 64
+    assert (
+        _bind_effective_sparse_flow_rope_backend(
+            route_identity,
+            checkpoint,
+        )
+        == "source-cpu-polar-torch-2.10"
+    )
+
+
+def test_sparse_flow_turing_rope_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_global_rope_backend,
+    )
+
+    checkpoint = tmp_path / "sparse_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        rope_backend=np.asarray("mlx-real"),
+        sparse_flow_turing_rope_phase_lut_sha256=np.asarray(""),
+    )
+    route_identity = {
+        "route": {
+            "rope_backend_requested": "cuda-polar-turing-t4",
+            "turing_rope_phase_lut_sha256_effective": "a" * 64,
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "sparse-flow checkpoint effective RoPE backend.*"
+            "does not match requested"
+        ),
+    ):
+        _bind_effective_sparse_flow_global_rope_backend(
+            route_identity, checkpoint
+        )
+
+
+def test_sparse_flow_source_cpu_rope_fallback_cannot_impersonate_requested_route(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_rope_backend,
+    )
+
+    checkpoint = tmp_path / "sparse_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        sparse_flow_rope_backend=np.asarray("inherit"),
+        sparse_flow_rope_phase_lut_artifact_sha256_attested=np.asarray(""),
+        sparse_flow_rope_phase_lut_content_sha256=np.asarray(""),
+    )
+    route_identity = {
+        "route": {
+            "sparse_flow_rope_backend_requested": (
+                "source-cpu-polar-torch-2.10"
+            ),
+            "sparse_flow_rope_phase_lut_sha256_effective": "b" * 64,
+            "sparse_flow_rope_phase_lut_content_sha256_effective": "c" * 64,
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "sparse-flow checkpoint effective sparse-flow RoPE backend.*"
+            "does not match requested"
+        ),
+    ):
+        _bind_effective_sparse_flow_rope_backend(route_identity, checkpoint)
+
+
 def test_stage_capture_wrapper_forwards_sparse_flow_trace_block_index(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser, build_route_identity
 
@@ -4774,6 +5318,115 @@ def test_stage_capture_wrapper_forwards_shape_slat_sample(tmp_path):
     assert command[command.index("--shape-slat-sample") + 1] == str(shape_slat_path)
     assert route_identity["route"]["shape_slat_sample_path"] == str(shape_slat_path)
     assert route_identity["route"]["shape_slat_sample_sha256"] is not None
+
+
+def test_stage_capture_wrapper_forwards_exact_decoder_route(tmp_path):
+    import hashlib
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+
+    silu_lut = tmp_path / "decoder_silu.npz"
+    bits = np.arange(1 << 16, dtype=np.uint16)
+    np.savez(silu_lut, input_bits=bits, output_bits=bits)
+    silu_sha256 = hashlib.sha256(silu_lut.read_bytes()).hexdigest()
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "final_glb",
+            "--decoder-linear-backend",
+            "turing_fda",
+            "--decoder-sparse-conv-matmul-backend",
+            "turing_fda",
+            "--decoder-layernorm-backend",
+            "cuda-welford-turing-t4",
+            "--decoder-silu-backend",
+            "cuda-turing-t4-fp16-lut",
+            "--decoder-silu-lut",
+            str(silu_lut),
+            "--expected-decoder-silu-lut-sha256",
+            silu_sha256,
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+
+    expected_pairs = {
+        "--decoder-linear-backend": "turing_fda",
+        "--decoder-sparse-conv-matmul-backend": "turing_fda",
+        "--decoder-layernorm-backend": "cuda-welford-turing-t4",
+        "--decoder-silu-backend": "cuda-turing-t4-fp16-lut",
+        "--decoder-silu-lut": str(silu_lut),
+        "--expected-decoder-silu-lut-sha256": silu_sha256,
+    }
+    for option, value in expected_pairs.items():
+        assert command[command.index(option) + 1] == value
+
+
+def test_stage_capture_rejects_malformed_exact_decoder_silu_before_launch(tmp_path):
+    import hashlib
+    import json
+
+    from scripts.run_mlx_stage_capture import main
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"image")
+    silu_lut = tmp_path / "decoder_silu.npz"
+    silu_lut.write_bytes(b"not-an-npz")
+    silu_sha256 = hashlib.sha256(silu_lut.read_bytes()).hexdigest()
+    output_dir = tmp_path / "output"
+
+    result = main(
+        [
+            "--image",
+            str(image),
+            "--output-dir",
+            str(output_dir),
+            "--stop-after-stage",
+            "final_glb",
+            "--decoder-silu-backend",
+            "cuda-turing-t4-fp16-lut",
+            "--decoder-silu-lut",
+            str(silu_lut),
+            "--expected-decoder-silu-lut-sha256",
+            silu_sha256,
+        ]
+    )
+
+    report = json.loads((output_dir / "run_report.json").read_text())
+    assert result == 2
+    assert report["failure_phase"] == "preflight_decoder_route"
+    assert report["primary_output_status"] == "not_started"
+    assert report["command"] is None
+
+
+def test_exact_decoder_layernorm_requires_turing_rsqrt_evidence(tmp_path):
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _validate_turing_rsqrt_route_args,
+        build_parser,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "final_glb",
+            "--decoder-layernorm-backend",
+            "cuda-welford-turing-t4",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires --turing-rsqrt-lut"):
+        _validate_turing_rsqrt_route_args(args)
 
 
 def test_stage_capture_wrapper_forwards_shape_slat_support_sample(tmp_path):

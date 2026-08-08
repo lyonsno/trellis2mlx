@@ -269,22 +269,7 @@ def apply_rope(x: mx.array, phases: mx.array) -> mx.array:
     x_pairs = x.reshape(T, H, half, 2)  # [T, H, D//2, 2]
 
     if _backend != MLX_REAL_BACKEND:
-        x_pairs = x_pairs.astype(mx.float32)
-        imaginary = mx.array(1j, dtype=mx.complex64)
-        x_complex = (
-            x_pairs[..., 0].astype(mx.complex64)
-            + imaginary * x_pairs[..., 1].astype(mx.complex64)
-        )
-        phase_complex = (
-            phases[..., 0].astype(mx.complex64)
-            + imaginary * phases[..., 1].astype(mx.complex64)
-        )
-        rotated = x_complex * phase_complex[:, None, :]
-        out = mx.stack(
-            [mx.real(rotated), mx.imag(rotated)],
-            axis=-1,
-        )
-        return out.reshape(T, H, D).astype(orig_dtype)
+        return apply_rope_source_complex(x, phases)
 
     # phases: [T, D//2, 2] → broadcast to [T, 1, D//2, 2]
     cos_p = phases[:, :, 0:1]  # [T, D//2, 1]
@@ -302,4 +287,23 @@ def apply_rope(x: mx.array, phases: mx.array) -> mx.array:
     out1 = x0 * sin_p + x1 * cos_p
 
     out = mx.concatenate([out0, out1], axis=-1)  # [T, H, D//2, 2]
+    return out.reshape(T, H, D).astype(orig_dtype)
+
+
+def apply_rope_source_complex(x: mx.array, phases: mx.array) -> mx.array:
+    """Apply the source complex64 multiply independent of global routing."""
+    orig_dtype = x.dtype
+    T, H, D = x.shape
+    x_pairs = x.reshape(T, H, D // 2, 2).astype(mx.float32)
+    imaginary = mx.array(1j, dtype=mx.complex64)
+    x_complex = (
+        x_pairs[..., 0].astype(mx.complex64)
+        + imaginary * x_pairs[..., 1].astype(mx.complex64)
+    )
+    phase_complex = (
+        phases[..., 0].astype(mx.complex64)
+        + imaginary * phases[..., 1].astype(mx.complex64)
+    )
+    rotated = x_complex * phase_complex[:, None, :]
+    out = mx.stack([mx.real(rotated), mx.imag(rotated)], axis=-1)
     return out.reshape(T, H, D).astype(orig_dtype)

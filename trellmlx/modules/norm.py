@@ -17,16 +17,19 @@ class LayerNorm32(nn.Module):
         eps: float = 1e-6,
         affine: bool = False,
         *,
+        sparse_flow_layernorm: bool = False,
         shape_flow_layernorm: bool = False,
         decoder_layernorm: bool = False,
     ):
         super().__init__()
-        if shape_flow_layernorm and decoder_layernorm:
+        if sum((sparse_flow_layernorm, shape_flow_layernorm, decoder_layernorm)) > 1:
             raise ValueError(
-                "LayerNorm32 cannot use shape-flow and decoder routes together"
+                "LayerNorm32 cannot use sparse-flow, shape-flow, and decoder "
+                "routes together"
             )
         self.eps = eps
         self.affine = affine
+        self.sparse_flow_layernorm = sparse_flow_layernorm
         self.shape_flow_layernorm = shape_flow_layernorm
         self.decoder_layernorm = decoder_layernorm
         if affine:
@@ -37,6 +40,12 @@ class LayerNorm32(nn.Module):
         orig_dtype = x.dtype
         weight = self.weight if self.affine else None
         bias = self.bias if self.affine else None
+        if self.sparse_flow_layernorm:
+            from ..sparse_flow_layernorm import layernorm_affine, layernorm_noaffine
+
+            if self.affine:
+                return layernorm_affine(x, weight, bias, self.eps).astype(orig_dtype)
+            return layernorm_noaffine(x, self.eps).astype(orig_dtype)
         if self.shape_flow_layernorm and self.affine:
             from ..shape_flow_layernorm import layernorm_affine
 

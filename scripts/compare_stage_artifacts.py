@@ -136,6 +136,7 @@ def _array_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]
         return summary
     diff = np.abs(reference.astype(np.float64) - candidate.astype(np.float64))
     summary.update(_diff_summary(diff))
+    summary["exact_match"] = bool(np.array_equal(reference, candidate))
     return summary
 
 
@@ -151,7 +152,7 @@ def _block_trace_delta(reference: Any, candidate: Any) -> dict[str, Any]:
         if _is_numeric_delta_dtype(ref_array.dtype) and _is_numeric_delta_dtype(
             cand_array.dtype
         ):
-            arrays[name] = _array_delta(ref_array, cand_array)
+            arrays[name] = _block_trace_array_delta(name, ref_array, cand_array)
         else:
             metadata[name] = _metadata_delta(ref_array, cand_array)
     return {
@@ -163,6 +164,26 @@ def _block_trace_delta(reference: Any, candidate: Any) -> dict[str, Any]:
         "arrays": arrays,
         "metadata": metadata,
     }
+
+
+def _block_trace_array_delta(
+    name: str,
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> dict[str, Any]:
+    if (
+        name.endswith(("_attention_raw", "_cross_attention_raw"))
+        and {reference.ndim, candidate.ndim} == {3, 4}
+        and reference.shape[:2] == candidate.shape[:2]
+        and reference.size == candidate.size
+    ):
+        candidate_recorded_shape = list(candidate.shape)
+        candidate = candidate.reshape(reference.shape)
+        summary = _array_delta(reference, candidate)
+        summary["candidate_recorded_shape"] = candidate_recorded_shape
+        summary["shape_normalization"] = "flattened-head-dimension-to-reference"
+        return summary
+    return _array_delta(reference, candidate)
 
 
 def _metadata_delta(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:

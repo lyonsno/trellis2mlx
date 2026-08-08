@@ -58,6 +58,33 @@ from trellmlx.shape_flow_layernorm import (
     get_shape_flow_turing_rsqrt_lut_artifact_sha256_attested,
     get_shape_flow_turing_rsqrt_lut_content_sha256,
 )
+from trellmlx.sparse_flow_layernorm import (
+    DEFAULT_BACKEND as DEFAULT_SPARSE_FLOW_LAYERNORM_BACKEND,
+    SUPPORTED_BACKENDS as SPARSE_FLOW_LAYERNORM_BACKENDS,
+    configure_sparse_flow_layernorm_backend,
+    get_sparse_flow_layernorm_backend,
+    get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested,
+    get_sparse_flow_turing_rsqrt_lut_content_sha256,
+)
+from trellmlx.sparse_flow_attention import (
+    DEFAULT_BACKEND as DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND,
+    SUPPORTED_BACKENDS as SPARSE_FLOW_ATTENTION_BACKENDS,
+    configure_sparse_flow_attention_backend,
+    sparse_flow_attention_backend_identity,
+)
+from trellmlx.sparse_flow_rope import (
+    DEFAULT_BACKEND as DEFAULT_SPARSE_FLOW_ROPE_BACKEND,
+    SOURCE_CPU_POLAR_TORCH_2_10_BACKEND,
+    SUPPORTED_BACKENDS as SPARSE_FLOW_ROPE_BACKENDS,
+    configure_sparse_flow_rope_backend,
+    get_sparse_flow_rope_backend,
+    get_sparse_flow_rope_phase_lut_artifact_sha256_attested,
+    get_sparse_flow_rope_phase_lut_content_sha256,
+)
+from trellmlx.models.sparse_structure_flow import (
+    DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+    SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS,
+)
 from trellmlx.source_cuda_gelu import (
     SOURCE_CUDA_BF16_GELU_TANH_BACKEND,
     SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256,
@@ -150,7 +177,7 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     elif backend_requested in {"fast", "mlx-fast"}:
         backend_effective = "fast"
     elif backend_requested == "source-cuda-self":
-        backend_effective = "source-cuda-self-widths-1029-7697-fast-otherwise"
+        backend_effective = "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     else:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
@@ -191,10 +218,10 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
                 "source-cuda-sequential value projection"
             )
         softmax_effective = (
-            "source-cuda-turing-widths-1029-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
         )
         value_effective = (
-            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
         )
     else:
         softmax_effective = "fused-fast-attention"
@@ -843,24 +870,48 @@ def _load_turing_rope_phase_lut(
     path: str | Path,
     expected_sha256: str,
 ) -> tuple[mx.array, str]:
+    return _load_rope_phase_lut(
+        path,
+        expected_sha256,
+        label="Turing RoPE",
+    )
+
+
+def _load_sparse_flow_rope_phase_lut(
+    path: str | Path,
+    expected_sha256: str,
+) -> tuple[mx.array, str]:
+    return _load_rope_phase_lut(
+        path,
+        expected_sha256,
+        label="sparse-flow source CPU RoPE",
+    )
+
+
+def _load_rope_phase_lut(
+    path: str | Path,
+    expected_sha256: str,
+    *,
+    label: str,
+) -> tuple[mx.array, str]:
     path = Path(path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != expected_sha256:
         raise ValueError(
-            "Turing RoPE phase LUT SHA256 mismatch: "
+            f"{label} phase LUT SHA256 mismatch: "
             f"expected {expected_sha256}, got {digest}"
         )
     with np.load(path, allow_pickle=False) as loaded:
         if "phase_pairs" not in loaded.files:
-            raise ValueError("Turing RoPE phase LUT NPZ omits phase_pairs")
+            raise ValueError(f"{label} phase LUT NPZ omits phase_pairs")
         phase_pairs = np.asarray(loaded["phase_pairs"])
     if phase_pairs.dtype != np.float32 or phase_pairs.shape != (64, 21, 2):
         raise ValueError(
-            "Turing RoPE phase LUT must be float32[64,21,2], "
+            f"{label} phase LUT must be float32[64,21,2], "
             f"got {phase_pairs.dtype}{phase_pairs.shape}"
         )
     if not np.isfinite(phase_pairs).all():
-        raise ValueError("Turing RoPE phase LUT contains non-finite values")
+        raise ValueError(f"{label} phase LUT contains non-finite values")
     return mx.array(phase_pairs), digest
 
 
@@ -945,6 +996,19 @@ def _configure_decoder_route(
             else "mlx-native-caller-dtype"
         ),
     }
+
+
+def _validate_sparse_layernorm_correction_route(parser, args) -> None:
+    if (
+        args.sparse_flow_layernorm_correction_report
+        and args.sparse_flow_layernorm_backend
+        != DEFAULT_SPARSE_FLOW_LAYERNORM_BACKEND
+    ):
+        parser.error(
+            "--sparse-flow-layernorm-correction-report is calibrated for "
+            f"{DEFAULT_SPARSE_FLOW_LAYERNORM_BACKEND} and cannot be combined "
+            "with a different --sparse-flow-layernorm-backend"
+        )
 
 
 def main():
@@ -1107,6 +1171,12 @@ def main():
                         help="Diagnostic: comma-separated final shape-flow block-trace payload keys "
                              "to save. Omit to save the full block trace.")
     parser.add_argument(
+        "--sparse-flow-attention-backend",
+        choices=SPARSE_FLOW_ATTENTION_BACKENDS,
+        default=DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND,
+        help="Sparse-structure flow attention execution backend.",
+    )
+    parser.add_argument(
         "--shape-flow-attention-backend",
         choices=[
             "fast",
@@ -1137,6 +1207,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--sparse-flow-layernorm-backend",
+        choices=SPARSE_FLOW_LAYERNORM_BACKENDS,
+        default=DEFAULT_SPARSE_FLOW_LAYERNORM_BACKEND,
+        help="Sparse-structure flow LayerNorm backend.",
+    )
+    parser.add_argument(
+        "--sparse-flow-terminal-linear-backend",
+        choices=SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS,
+        default=DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+        help="Sparse-structure flow terminal projection backend.",
+    )
+    parser.add_argument(
         "--shape-flow-layernorm-backend",
         choices=SHAPE_FLOW_LAYERNORM_BACKENDS,
         default=DEFAULT_SHAPE_FLOW_LAYERNORM_BACKEND,
@@ -1153,6 +1235,27 @@ def main():
         choices=SUPPORTED_ROPE_BACKENDS,
         default=MLX_REAL_BACKEND,
         help="RoPE phase-generation and rotation backend.",
+    )
+    parser.add_argument(
+        "--sparse-flow-rope-backend",
+        choices=SPARSE_FLOW_ROPE_BACKENDS,
+        default=DEFAULT_SPARSE_FLOW_ROPE_BACKEND,
+        help="Sparse-structure-flow-specific RoPE backend.",
+    )
+    parser.add_argument(
+        "--sparse-flow-rope-phase-lut",
+        metavar="NPZ",
+        help=(
+            "Required with source-cpu-polar-torch-2.10: NPZ containing the "
+            "authenticated source-runtime CPU torch.polar phase_pairs table."
+        ),
+    )
+    parser.add_argument(
+        "--expected-sparse-flow-rope-phase-lut-sha256",
+        help=(
+            "Require the sparse-flow source CPU RoPE phase LUT NPZ to match "
+            "this exact SHA256."
+        ),
     )
     parser.add_argument(
         "--turing-rope-phase-lut",
@@ -1230,6 +1333,18 @@ def main():
     parser.add_argument(
         "--expected-shape-flow-trace-sample-sha256",
         help="Require --shape-flow-trace-sample to match this exact SHA256.",
+    )
+    parser.add_argument("--sparse-timestep-modulation-lut", metavar="NPZ",
+                        help="Diagnostic: replay authenticated source-CUDA sparse shared AdaLN modulation.")
+    parser.add_argument("--sparse-timestep-modulation-report", metavar="JSON",
+                        help="Witness report authenticating --sparse-timestep-modulation-lut.")
+    parser.add_argument("--expected-sparse-timestep-modulation-lut-sha256",
+                        help="Require the sparse source-CUDA modulation NPZ to match this SHA256.")
+    parser.add_argument("--expected-sparse-timestep-modulation-report-sha256",
+                        help="Require the sparse source-CUDA modulation report to match this SHA256.")
+    parser.add_argument(
+        "--expected-sparse-timestep-modulation-source-checkpoint-sha256",
+        help="Require the sparse modulation witness to bind this source checkpoint SHA256.",
     )
     parser.add_argument("--shape-timestep-modulation-lut", metavar="NPZ",
                         help="Diagnostic: replay authenticated source-CUDA shared AdaLN modulation.")
@@ -1319,6 +1434,7 @@ def main():
             "--sparse-flow-layernorm-correction-report is mutually exclusive with "
             "sparse-flow block injection"
         )
+    _validate_sparse_layernorm_correction_route(parser, args)
     if (args.sparse_flow_block_injection_trace or args.sparse_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with sparse-flow block injection")
     if args.sparse_flow_layernorm_correction_report and args.compile:
@@ -1343,6 +1459,29 @@ def main():
         parser.error(
             "--shape-flow-trace-sample is only valid with "
             "--stop-after-stage shape_flow_block_trace"
+        )
+    sparse_modulation_lut_args = (
+        args.sparse_timestep_modulation_lut,
+        args.sparse_timestep_modulation_report,
+        args.expected_sparse_timestep_modulation_lut_sha256,
+        args.expected_sparse_timestep_modulation_report_sha256,
+        args.expected_sparse_timestep_modulation_source_checkpoint_sha256,
+    )
+    if any(sparse_modulation_lut_args) and not all(sparse_modulation_lut_args):
+        parser.error(
+            "source-CUDA sparse timestep modulation replay requires the LUT, "
+            "witness report, both expected artifact SHA256 values, and the "
+            "expected source checkpoint SHA256"
+        )
+    if all(sparse_modulation_lut_args) and args.stop_after_stage == "conditioning":
+        parser.error(
+            "source-CUDA sparse timestep modulation replay requires a sparse-flow "
+            "or downstream consumer"
+        )
+    if all(sparse_modulation_lut_args) and (args.shape_slat_sample or args.edit_target):
+        parser.error(
+            "source-CUDA sparse timestep modulation replay is incompatible with "
+            "shape-SLat replay and VS3D editing"
         )
     modulation_lut_args = (
         args.shape_timestep_modulation_lut,
@@ -1392,7 +1531,8 @@ def main():
             "consumer"
         )
     turing_rsqrt_required = (
-        args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
+        args.sparse_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
+        or args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND
         or (
             args.decoder_layernorm_backend
             == DECODER_CUDA_WELFORD_TURING_T4_BACKEND
@@ -1430,6 +1570,24 @@ def main():
             "--turing-rsqrt-lut and its expected SHA256 require a "
             "cuda-welford-turing-t4 LayerNorm or source-native QEM consumer"
         )
+
+    if args.sparse_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
+        try:
+            configure_sparse_flow_layernorm_backend(
+                args.sparse_flow_layernorm_backend,
+                turing_rsqrt_delta_lut=turing_lut,
+                turing_rsqrt_lut_artifact_sha256_attested=turing_lut_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    else:
+        configure_sparse_flow_layernorm_backend(
+            args.sparse_flow_layernorm_backend
+        )
+    configure_sparse_flow_attention_backend(
+        args.sparse_flow_attention_backend
+    )
+    sparse_flow_attention_route = sparse_flow_attention_backend_identity()
 
     if args.shape_flow_layernorm_backend == CUDA_WELFORD_TURING_T4_BACKEND:
         try:
@@ -1484,6 +1642,41 @@ def main():
                 f"to {CUDA_POLAR_TURING_T4_BACKEND}"
             )
         configure_rope_backend(args.rope_backend)
+    if args.sparse_flow_rope_backend == SOURCE_CPU_POLAR_TORCH_2_10_BACKEND:
+        if (
+            not args.sparse_flow_rope_phase_lut
+            or not args.expected_sparse_flow_rope_phase_lut_sha256
+        ):
+            parser.error(
+                f"--sparse-flow-rope-backend "
+                f"{SOURCE_CPU_POLAR_TORCH_2_10_BACKEND} requires "
+                "--sparse-flow-rope-phase-lut and "
+                "--expected-sparse-flow-rope-phase-lut-sha256"
+            )
+        try:
+            sparse_rope_lut, sparse_rope_lut_sha256 = (
+                _load_sparse_flow_rope_phase_lut(
+                    args.sparse_flow_rope_phase_lut,
+                    args.expected_sparse_flow_rope_phase_lut_sha256,
+                )
+            )
+            configure_sparse_flow_rope_backend(
+                args.sparse_flow_rope_backend,
+                phase_lut=sparse_rope_lut,
+                phase_lut_artifact_sha256_attested=sparse_rope_lut_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    else:
+        if (
+            args.sparse_flow_rope_phase_lut
+            or args.expected_sparse_flow_rope_phase_lut_sha256
+        ):
+            parser.error(
+                "--sparse-flow-rope-phase-lut and its expected SHA256 only "
+                f"apply to {SOURCE_CPU_POLAR_TORCH_2_10_BACKEND}"
+            )
+        configure_sparse_flow_rope_backend(args.sparse_flow_rope_backend)
     shared_noise = np.load(args.shared_noise) if args.shared_noise else None
 
     # === Resume from checkpoints ===
@@ -1781,7 +1974,9 @@ def main():
     from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
     from trellmlx.models.sparse_structure_decoder import SparseStructureDecoder
 
-    ss_flow = SparseStructureFlowModel()
+    ss_flow = SparseStructureFlowModel(
+        terminal_linear_backend=args.sparse_flow_terminal_linear_backend
+    )
     load_weights(ss_flow, HF_4B + "ss_flow_img_dit_1_3B_64_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(ss_flow, bits=args.quantize)
@@ -1790,11 +1985,52 @@ def main():
     ss_dec = SparseStructureDecoder()
     load_weights(ss_dec, HF_LARGE + "ss_dec_conv3d_16l8_fp16.safetensors", verbose=False)
 
+    sparse_timestep_modulation_lut = None
+    sparse_timestep_modulation_lut_json = ""
+    if args.sparse_timestep_modulation_lut:
+        from trellmlx.timestep_modulation_lut import (
+            load_source_cuda_timestep_modulation_lut,
+        )
+
+        sparse_timestep_modulation_lut = (
+            load_source_cuda_timestep_modulation_lut(
+                npz_path=args.sparse_timestep_modulation_lut,
+                report_path=args.sparse_timestep_modulation_report,
+                expected_npz_sha256=(
+                    args.expected_sparse_timestep_modulation_lut_sha256
+                ),
+                expected_report_sha256=(
+                    args.expected_sparse_timestep_modulation_report_sha256
+                ),
+                expected_source_checkpoint_sha256=(
+                    args.expected_sparse_timestep_modulation_source_checkpoint_sha256
+                ),
+                expected_schedule_profile="sparse-structure-rescale-5",
+            )
+        )
+        sparse_timestep_modulation_lut_json = json.dumps(
+            sparse_timestep_modulation_lut.report_identity(),
+            sort_keys=True,
+        )
+
     if shared_noise is not None:
         noise = mx.array(shared_noise["ss_noise"]).astype(mx.float32)
         print(f"  Shared sparse noise: {args.shared_noise} {noise.shape}", flush=True)
     else:
         noise = mx.random.normal((1, 8, 16, 16, 16)).astype(mx.float32)
+    sparse_flow_terminal_linear_json = json.dumps(
+        ss_flow.terminal_linear_backend_identity(int(np.prod(noise.shape[2:]))),
+        sort_keys=True,
+    )
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
+    sparse_flow_cfg_rescale_std_json = json.dumps(
+        dense_cfg_rescale_std_backend_identity(
+            tuple(int(value) for value in noise.shape),
+            dtype="float32",
+        ),
+        sort_keys=True,
+    )
     t0 = time.perf_counter()
 
     if vs3d_mode:
@@ -1965,6 +2201,7 @@ def main():
                     cross_kv_cache=pos_kv_cache,
                     sparse_block_injection=active_trace_injection("pos"),
                     sparse_block_injection_branch="pos",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 neg_trace = ss_flow.trace_projected_block_input(
                     neg_block_input,
@@ -1974,6 +2211,7 @@ def main():
                     cross_kv_cache=neg_kv_cache,
                     sparse_block_injection=active_trace_injection("neg"),
                     sparse_block_injection_branch="neg",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 trace_input_mode = "projected_block_input"
             elif args.sparse_flow_trace_sample:
@@ -2006,6 +2244,7 @@ def main():
                     cross_kv_cache=pos_kv_cache,
                     sparse_block_injection=active_trace_injection("pos"),
                     sparse_block_injection_branch="pos",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -2015,6 +2254,7 @@ def main():
                     cross_kv_cache=neg_kv_cache,
                     sparse_block_injection=active_trace_injection("neg"),
                     sparse_block_injection_branch="neg",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
             elif trace_step_index == 0:
                 trace_sample = noise
@@ -2028,6 +2268,7 @@ def main():
                     cross_kv_cache=pos_kv_cache,
                     sparse_block_injection=active_trace_injection("pos"),
                     sparse_block_injection_branch="pos",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -2037,6 +2278,7 @@ def main():
                     cross_kv_cache=neg_kv_cache,
                     sparse_block_injection=active_trace_injection("neg"),
                     sparse_block_injection_branch="neg",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
             else:
                 trace_steps = []
@@ -2048,6 +2290,7 @@ def main():
                     steps=n_steps,
                     verbose=False,
                     capture_steps=trace_steps,
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 if trace_step_index >= len(trace_steps):
                     raise ValueError(
@@ -2065,6 +2308,7 @@ def main():
                     cross_kv_cache=pos_kv_cache,
                     sparse_block_injection=active_trace_injection("pos"),
                     sparse_block_injection_branch="pos",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
                 neg_trace = ss_flow.trace_block(
                     trace_sample,
@@ -2074,6 +2318,7 @@ def main():
                     cross_kv_cache=neg_kv_cache,
                     sparse_block_injection=active_trace_injection("neg"),
                     sparse_block_injection_branch="neg",
+                    sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
                 )
             def trace_np(value):
                 return np.array(value.astype(mx.float32))[None].astype(np.float32, copy=False)
@@ -2106,6 +2351,39 @@ def main():
                 sparse_flow_trace_neg_block_input_key=np.array(neg_block_input_key),
                 sparse_flow_trace_uses_kv_cache=np.array(use_kv_cache, dtype=np.bool_),
                 sparse_flow_trace_selected_keys=np.array(selected_trace_keys, dtype=str),
+                sparse_flow_layernorm_backend=np.array(
+                    get_sparse_flow_layernorm_backend()
+                ),
+                sparse_flow_turing_rsqrt_lut_sha256=np.array(
+                    get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+                ),
+                sparse_flow_turing_rsqrt_lut_content_sha256=np.array(
+                    get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
+                ),
+                qk_norm_backend=np.array(get_qk_norm_backend()),
+                rope_backend=np.array(get_rope_backend()),
+                sparse_flow_turing_rope_phase_lut_sha256=np.array(
+                    get_turing_phase_lut_sha256() or ""
+                ),
+                sparse_flow_rope_backend=np.array(
+                    get_sparse_flow_rope_backend()
+                ),
+                sparse_flow_rope_phase_lut_artifact_sha256_attested=np.array(
+                    get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
+                    or ""
+                ),
+                sparse_flow_rope_phase_lut_content_sha256=np.array(
+                    get_sparse_flow_rope_phase_lut_content_sha256() or ""
+                ),
+                sparse_flow_attention_route_json=np.array(
+                    json.dumps(sparse_flow_attention_route, sort_keys=True)
+                ),
+                sparse_flow_terminal_linear_json=np.array(
+                    sparse_flow_terminal_linear_json
+                ),
+                sparse_timestep_modulation_lut_json=np.array(
+                    sparse_timestep_modulation_lut_json
+                ),
                 t=np.array(1000.0 * trace_t, dtype=np.float32),
                 steps=np.array(n_steps, dtype=np.int32),
                 rescale_t=np.array(5.0, dtype=np.float32),
@@ -2189,7 +2467,8 @@ def main():
                                 capture_steps=step_captures,
                                 stop_after_first_step=args.stop_after_stage == "sparse_flow_step",
                                 start_step_index=sparse_flow_start_step_index,
-                                sparse_block_injection=sparse_block_injection)
+                                sparse_block_injection=sparse_block_injection,
+                                sparse_timestep_modulation_lut=sparse_timestep_modulation_lut)
         mx.eval(z_s)
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
@@ -2227,6 +2506,40 @@ def main():
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
             sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
             sparse_flow_layernorm_correction_json=np.array(sparse_flow_layernorm_correction_json),
+            sparse_timestep_modulation_lut_json=np.array(
+                sparse_timestep_modulation_lut_json
+            ),
+            sparse_flow_layernorm_backend=np.array(get_sparse_flow_layernorm_backend()),
+            sparse_flow_turing_rsqrt_lut_sha256=np.array(
+                get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+            ),
+            sparse_flow_turing_rsqrt_lut_content_sha256=np.array(
+                get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
+            ),
+            qk_norm_backend=np.array(get_qk_norm_backend()),
+            rope_backend=np.array(get_rope_backend()),
+            sparse_flow_turing_rope_phase_lut_sha256=np.array(
+                get_turing_phase_lut_sha256() or ""
+            ),
+            sparse_flow_rope_backend=np.array(
+                get_sparse_flow_rope_backend()
+            ),
+            sparse_flow_rope_phase_lut_artifact_sha256_attested=np.array(
+                get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
+                or ""
+            ),
+            sparse_flow_rope_phase_lut_content_sha256=np.array(
+                get_sparse_flow_rope_phase_lut_content_sha256() or ""
+            ),
+            sparse_flow_attention_route_json=np.array(
+                json.dumps(sparse_flow_attention_route, sort_keys=True)
+            ),
+            sparse_flow_terminal_linear_json=np.array(
+                sparse_flow_terminal_linear_json
+            ),
+            sparse_flow_cfg_rescale_std_json=np.array(
+                sparse_flow_cfg_rescale_std_json
+            ),
         )
         print("  Stop after stage: sparse_flow_step", flush=True)
         return
@@ -2271,6 +2584,40 @@ def main():
             sparse_flow_start_step_index=np.array(sparse_flow_start_step_index, dtype=np.int32),
             sparse_flow_block_injection_json=np.array(sparse_block_injection_json),
             sparse_flow_layernorm_correction_json=np.array(sparse_flow_layernorm_correction_json),
+            sparse_timestep_modulation_lut_json=np.array(
+                sparse_timestep_modulation_lut_json
+            ),
+            sparse_flow_layernorm_backend=np.array(get_sparse_flow_layernorm_backend()),
+            sparse_flow_turing_rsqrt_lut_sha256=np.array(
+                get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested() or ""
+            ),
+            sparse_flow_turing_rsqrt_lut_content_sha256=np.array(
+                get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
+            ),
+            qk_norm_backend=np.array(get_qk_norm_backend()),
+            rope_backend=np.array(get_rope_backend()),
+            sparse_flow_turing_rope_phase_lut_sha256=np.array(
+                get_turing_phase_lut_sha256() or ""
+            ),
+            sparse_flow_rope_backend=np.array(
+                get_sparse_flow_rope_backend()
+            ),
+            sparse_flow_rope_phase_lut_artifact_sha256_attested=np.array(
+                get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
+                or ""
+            ),
+            sparse_flow_rope_phase_lut_content_sha256=np.array(
+                get_sparse_flow_rope_phase_lut_content_sha256() or ""
+            ),
+            sparse_flow_attention_route_json=np.array(
+                json.dumps(sparse_flow_attention_route, sort_keys=True)
+            ),
+            sparse_flow_terminal_linear_json=np.array(
+                sparse_flow_terminal_linear_json
+            ),
+            sparse_flow_cfg_rescale_std_json=np.array(
+                sparse_flow_cfg_rescale_std_json
+            ),
         )
         print("  Stop after stage: sparse_flow_steps", flush=True)
         return
@@ -2413,6 +2760,7 @@ def main():
                 expected_source_checkpoint_sha256=(
                     args.expected_shape_timestep_modulation_source_checkpoint_sha256
                 ),
+                expected_schedule_profile="shape-slat-rescale-3",
             )
         )
         shape_timestep_modulation_lut_json = json.dumps(
@@ -3208,8 +3556,48 @@ def main():
                 shape_flow_attention_route_json=np.array(
                     json.dumps(shape_flow_attention_route or {}, sort_keys=True)
                 ),
+                sparse_flow_layernorm_backend=np.array(
+                    get_sparse_flow_layernorm_backend()
+                ),
+                sparse_flow_turing_rsqrt_lut_sha256=np.array(
+                    get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested()
+                    or ""
+                ),
+                sparse_flow_turing_rsqrt_lut_content_sha256=np.array(
+                    get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
+                ),
+                qk_norm_backend=np.array(get_qk_norm_backend()),
+                rope_backend=np.array(get_rope_backend()),
+                sparse_flow_turing_rope_phase_lut_sha256=np.array(
+                    get_turing_phase_lut_sha256() or ""
+                ),
+                sparse_flow_rope_backend=np.array(
+                    get_sparse_flow_rope_backend()
+                ),
+                sparse_flow_rope_phase_lut_artifact_sha256_attested=np.array(
+                    get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
+                    or ""
+                ),
+                sparse_flow_rope_phase_lut_content_sha256=np.array(
+                    get_sparse_flow_rope_phase_lut_content_sha256() or ""
+                ),
+                sparse_flow_attention_route_json=np.array(
+                    json.dumps(sparse_flow_attention_route, sort_keys=True)
+                ),
+                sparse_flow_terminal_linear_json=np.array(
+                    sparse_flow_terminal_linear_json
+                ),
+                sparse_flow_cfg_rescale_std_json=np.array(
+                    sparse_flow_cfg_rescale_std_json
+                ),
+                sparse_timestep_modulation_lut_json=np.array(
+                    sparse_timestep_modulation_lut_json
+                ),
                 texture_attention_route_json=np.array(
                     json.dumps(texture_attention_route or {}, sort_keys=True)
+                ),
+                decoder_route_json=np.array(
+                    json.dumps(decoder_route, sort_keys=True)
                 ),
                 postprocess_route_json=np.array(
                     json.dumps(postprocess_route, sort_keys=True)

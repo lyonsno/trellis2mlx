@@ -22,12 +22,44 @@ from trellmlx.source_cuda_gelu import (
 from trellmlx.models.slat_flow import (
     shape_flow_terminal_linear_backend_identity,
 )
+from trellmlx.models.sparse_structure_flow import (
+    DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+    SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS,
+    sparse_flow_terminal_linear_backend_identity,
+)
+from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
 
 
 SCHEMA = "trellis2mlx.mlx_stage_capture_route.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TURING_T4_BACKEND = "cuda-welford-turing-t4"
+DEFAULT_DECODER_LINEAR_BACKEND = "native"
+SUPPORTED_DECODER_LINEAR_BACKENDS = ("native", "turing_fda")
+DEFAULT_DECODER_SPARSE_CONV_MATMUL_BACKEND = "native"
+SUPPORTED_DECODER_SPARSE_CONV_MATMUL_BACKENDS = ("native", "turing_fda")
+DEFAULT_DECODER_LAYERNORM_BACKEND = "mlx-fast-layer-norm"
+SUPPORTED_DECODER_LAYERNORM_BACKENDS = (
+    DEFAULT_DECODER_LAYERNORM_BACKEND,
+    TURING_T4_BACKEND,
+)
+DEFAULT_DECODER_SILU_BACKEND = "mlx-native"
+CUDA_TURING_T4_DECODER_SILU_BACKEND = "cuda-turing-t4-fp16-lut"
+SUPPORTED_DECODER_SILU_BACKENDS = (
+    DEFAULT_DECODER_SILU_BACKEND,
+    CUDA_TURING_T4_DECODER_SILU_BACKEND,
+)
+SUPPORTED_FLOW_LAYERNORM_BACKENDS = (
+    "mlx-two-pass",
+    "cuda-welford-metal",
+    TURING_T4_BACKEND,
+)
 TURING_T4_ROPE_BACKEND = "cuda-polar-turing-t4"
+DEFAULT_SPARSE_FLOW_ROPE_BACKEND = "inherit"
+SOURCE_CPU_POLAR_TORCH_2_10_BACKEND = "source-cpu-polar-torch-2.10"
+SUPPORTED_SPARSE_FLOW_ROPE_BACKENDS = (
+    DEFAULT_SPARSE_FLOW_ROPE_BACKEND,
+    SOURCE_CPU_POLAR_TORCH_2_10_BACKEND,
+)
 SHAPE_FLOW_RESCALE_T = 3.0
 DEFAULT_ROPE_BACKEND = "mlx-real"
 SUPPORTED_ROPE_BACKENDS = (
@@ -49,6 +81,14 @@ SUPPORTED_ATTENTION_BACKENDS = (
 )
 SUPPORTED_ATTENTION_SOFTMAX_BACKENDS = ("mlx-softmax", "source-cuda-turing")
 SUPPORTED_ATTENTION_VALUE_BACKENDS = ("mlx-matmul", "source-cuda-sequential")
+DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND = "inherit"
+SOURCE_CUDA_MATH_TURING_T4_ATTENTION_BACKEND = (
+    "source-cuda-math-turing-t4"
+)
+SUPPORTED_SPARSE_FLOW_ATTENTION_BACKENDS = (
+    DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND,
+    SOURCE_CUDA_MATH_TURING_T4_ATTENTION_BACKEND,
+)
 SHAPE_FLOW_ATTENTION_ROUTE_FIELDS = (
     "shape_flow_attention_backend_requested",
     "shape_flow_attention_backend_effective",
@@ -80,15 +120,23 @@ INPUT_PATH_FIELDS = (
     "shape_flow_noise_sample",
     "shape_flow_trace_sample",
     "turing_rsqrt_lut",
+    "decoder_silu_lut",
     "turing_rope_phase_lut",
+    "sparse_flow_rope_phase_lut",
     "shape_flow_block_injection_trace",
     "shape_flow_block_injection_manifest",
+    "sparse_timestep_modulation_lut",
+    "sparse_timestep_modulation_report",
     "shape_timestep_modulation_lut",
     "shape_timestep_modulation_report",
 )
 
 
 class ShapeFlowTraceSampleRouteError(ValueError):
+    pass
+
+
+class DecoderRouteError(ValueError):
     pass
 
 
@@ -206,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-keys")
     parser.add_argument(
+        "--sparse-flow-attention-backend",
+        choices=SUPPORTED_SPARSE_FLOW_ATTENTION_BACKENDS,
+        default=DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND,
+    )
+    parser.add_argument(
         "--shape-flow-attention-backend",
         choices=SUPPORTED_ATTENTION_BACKENDS,
     )
@@ -218,12 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_ATTENTION_VALUE_BACKENDS,
     )
     parser.add_argument(
+        "--sparse-flow-layernorm-backend",
+        choices=SUPPORTED_FLOW_LAYERNORM_BACKENDS,
+        default="mlx-two-pass",
+    )
+    parser.add_argument(
+        "--sparse-flow-terminal-linear-backend",
+        choices=SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS,
+        default=DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+    )
+    parser.add_argument(
         "--shape-flow-layernorm-backend",
-        choices=[
-            "mlx-two-pass",
-            "cuda-welford-metal",
-            TURING_T4_BACKEND,
-        ],
+        choices=SUPPORTED_FLOW_LAYERNORM_BACKENDS,
         default="mlx-two-pass",
     )
     parser.add_argument(
@@ -236,13 +295,51 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_ROPE_BACKENDS,
         default=DEFAULT_ROPE_BACKEND,
     )
+    parser.add_argument(
+        "--sparse-flow-rope-backend",
+        choices=SUPPORTED_SPARSE_FLOW_ROPE_BACKENDS,
+        default=DEFAULT_SPARSE_FLOW_ROPE_BACKEND,
+    )
+    parser.add_argument("--sparse-flow-rope-phase-lut")
+    parser.add_argument(
+        "--expected-sparse-flow-rope-phase-lut-sha256"
+    )
     parser.add_argument("--turing-rope-phase-lut")
     parser.add_argument("--expected-turing-rope-phase-lut-sha256")
     parser.add_argument("--turing-rsqrt-lut")
     parser.add_argument("--expected-turing-rsqrt-lut-sha256")
+    parser.add_argument(
+        "--decoder-linear-backend",
+        choices=SUPPORTED_DECODER_LINEAR_BACKENDS,
+        default=DEFAULT_DECODER_LINEAR_BACKEND,
+    )
+    parser.add_argument(
+        "--decoder-sparse-conv-matmul-backend",
+        choices=SUPPORTED_DECODER_SPARSE_CONV_MATMUL_BACKENDS,
+        default=DEFAULT_DECODER_SPARSE_CONV_MATMUL_BACKEND,
+    )
+    parser.add_argument(
+        "--decoder-layernorm-backend",
+        choices=SUPPORTED_DECODER_LAYERNORM_BACKENDS,
+        default=DEFAULT_DECODER_LAYERNORM_BACKEND,
+    )
+    parser.add_argument(
+        "--decoder-silu-backend",
+        choices=SUPPORTED_DECODER_SILU_BACKENDS,
+        default=DEFAULT_DECODER_SILU_BACKEND,
+    )
+    parser.add_argument("--decoder-silu-lut")
+    parser.add_argument("--expected-decoder-silu-lut-sha256")
     parser.add_argument("--shape-flow-noise-sample")
     parser.add_argument("--shape-flow-trace-sample")
     parser.add_argument("--expected-shape-flow-trace-sample-sha256")
+    parser.add_argument("--sparse-timestep-modulation-lut")
+    parser.add_argument("--sparse-timestep-modulation-report")
+    parser.add_argument("--expected-sparse-timestep-modulation-lut-sha256")
+    parser.add_argument("--expected-sparse-timestep-modulation-report-sha256")
+    parser.add_argument(
+        "--expected-sparse-timestep-modulation-source-checkpoint-sha256"
+    )
     parser.add_argument("--shape-timestep-modulation-lut")
     parser.add_argument("--shape-timestep-modulation-report")
     parser.add_argument("--expected-shape-timestep-modulation-lut-sha256")
@@ -321,8 +418,30 @@ def build_route_identity(
     output_dir = str(Path(args.output_dir))
     target_faces = _resolve_target_faces(args)
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
+    decoder_identity = _validate_decoder_route_args(args)
     turing_lut_identity = _validate_turing_rsqrt_route_args(args)
     turing_rope_lut_identity = _validate_turing_rope_route_args(args)
+    sparse_flow_rope_lut_identity = (
+        _validate_sparse_flow_rope_route_args(args)
+    )
+    sparse_timestep_modulation_identity = (
+        _validate_sparse_timestep_modulation_route_args(args)
+    )
+    sparse_terminal_linear_identity = sparse_flow_terminal_linear_backend_identity(
+        4096,
+        input_width=1536,
+        output_width=8,
+        has_bias=True,
+        backend=getattr(
+            args,
+            "sparse_flow_terminal_linear_backend",
+            DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+        ),
+    )
+    sparse_cfg_rescale_std_identity = dense_cfg_rescale_std_backend_identity(
+        (1, 8, 16, 16, 16),
+        dtype="float32",
+    )
     timestep_modulation_identity = (
         _validate_shape_timestep_modulation_route_args(args)
     )
@@ -378,10 +497,10 @@ def build_route_identity(
                 "source-cuda-sequential value projection"
             )
         shape_attention_softmax_effective = (
-            "source-cuda-turing-widths-1029-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
         )
         shape_attention_value_effective = (
-            "source-cuda-sequential-widths-1029-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
         )
     else:
         shape_attention_softmax_effective = "fused-fast-attention"
@@ -523,9 +642,39 @@ def build_route_identity(
             "shape_flow_gelu_table_bits_sha256_effective": (
                 SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256
             ),
+            "sparse_flow_layernorm_backend_requested": args.sparse_flow_layernorm_backend,
+            "sparse_flow_attention_backend_requested": (
+                args.sparse_flow_attention_backend
+            ),
+            "sparse_flow_terminal_linear_identity": (
+                sparse_terminal_linear_identity
+            ),
+            "sparse_flow_terminal_linear_backend_requested": getattr(
+                args,
+                "sparse_flow_terminal_linear_backend",
+                DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+            ),
+            "sparse_flow_cfg_rescale_std_identity": (
+                sparse_cfg_rescale_std_identity
+            ),
             "shape_flow_layernorm_backend_requested": args.shape_flow_layernorm_backend,
             "qk_norm_backend_requested": args.qk_norm_backend,
             "rope_backend_requested": args.rope_backend,
+            "sparse_flow_rope_backend_requested": (
+                args.sparse_flow_rope_backend
+            ),
+            "sparse_flow_rope_phase_lut_path": (
+                sparse_flow_rope_lut_identity["path"]
+            ),
+            "sparse_flow_rope_phase_lut_sha256_requested": (
+                sparse_flow_rope_lut_identity["sha256_requested"]
+            ),
+            "sparse_flow_rope_phase_lut_sha256_effective": (
+                sparse_flow_rope_lut_identity["sha256_effective"]
+            ),
+            "sparse_flow_rope_phase_lut_content_sha256_effective": (
+                sparse_flow_rope_lut_identity["content_sha256_effective"]
+            ),
             "turing_rope_phase_lut_path": turing_rope_lut_identity["path"],
             "turing_rope_phase_lut_sha256_requested": (
                 turing_rope_lut_identity["sha256_requested"]
@@ -543,6 +692,26 @@ def build_route_identity(
             "turing_rsqrt_lut_content_sha256_effective": (
                 turing_lut_identity["content_sha256_effective"]
             ),
+            "decoder_linear_backend_requested": (
+                args.decoder_linear_backend
+            ),
+            "decoder_sparse_conv_matmul_backend_requested": (
+                args.decoder_sparse_conv_matmul_backend
+            ),
+            "decoder_layernorm_backend_requested": (
+                args.decoder_layernorm_backend
+            ),
+            "decoder_silu_backend_requested": args.decoder_silu_backend,
+            "decoder_silu_lut_path": decoder_identity["path"],
+            "decoder_silu_lut_sha256_requested": decoder_identity[
+                "sha256_requested"
+            ],
+            "decoder_silu_lut_sha256_effective": decoder_identity[
+                "sha256_effective"
+            ],
+            "decoder_silu_lut_content_sha256_effective": decoder_identity[
+                "content_sha256_effective"
+            ],
             "reference_cleanup": args.reference_cleanup,
             "qem_simplify": args.qem_simplify,
             "qem_backend": args.qem_backend,
@@ -593,6 +762,30 @@ def build_route_identity(
             "shape_flow_trace_sample_identity_requested": trace_sample_identity[
                 "identity"
             ],
+            "sparse_timestep_modulation_lut_path": (
+                sparse_timestep_modulation_identity["npz_path"]
+            ),
+            "sparse_timestep_modulation_lut_sha256_requested": (
+                sparse_timestep_modulation_identity["npz_sha256_requested"]
+            ),
+            "sparse_timestep_modulation_lut_sha256_effective": (
+                sparse_timestep_modulation_identity["npz_sha256_effective"]
+            ),
+            "sparse_timestep_modulation_report_path": (
+                sparse_timestep_modulation_identity["report_path"]
+            ),
+            "sparse_timestep_modulation_report_sha256_requested": (
+                sparse_timestep_modulation_identity["report_sha256_requested"]
+            ),
+            "sparse_timestep_modulation_report_sha256_effective": (
+                sparse_timestep_modulation_identity["report_sha256_effective"]
+            ),
+            "sparse_timestep_modulation_source_checkpoint_sha256": (
+                sparse_timestep_modulation_identity["source_checkpoint_sha256"]
+            ),
+            "sparse_timestep_modulation_identity": (
+                sparse_timestep_modulation_identity["identity"]
+            ),
             "shape_timestep_modulation_lut_path": (
                 timestep_modulation_identity["npz_path"]
             ),
@@ -690,6 +883,8 @@ def main(argv: list[str] | None = None) -> int:
                 "failure_phase": (
                     "preflight_shape_flow_trace_sample_route"
                     if isinstance(exc, ShapeFlowTraceSampleRouteError)
+                    else "preflight_decoder_route"
+                    if isinstance(exc, DecoderRouteError)
                     else "preflight_shape_flow_attention_route"
                 ),
                 "last_trustworthy_phase": "requested_route_parsed",
@@ -743,6 +938,9 @@ def main(argv: list[str] | None = None) -> int:
     requested_inputs, invalid_inputs = _preflight_input_paths(args)
     turing_lut_identity = _describe_turing_rsqrt_route_args(args)
     turing_rope_lut_identity = _describe_turing_rope_route_args(args)
+    sparse_flow_rope_lut_identity = (
+        _describe_sparse_flow_rope_route_args(args)
+    )
     try:
         _validate_source_native_postprocess_route_args(args)
         source_native_identity = _read_source_native_dependency_identity(args)
@@ -798,6 +996,47 @@ def main(argv: list[str] | None = None) -> int:
                 "requested_inputs": requested_inputs,
                 "invalid_inputs": invalid_inputs,
                 "turing_rope_phase_lut_identity": turing_rope_lut_identity,
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
+    try:
+        _validate_sparse_flow_rope_route_args(args)
+    except (OSError, ValueError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_sparse_flow_rope_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
+                "sparse_flow_rope_phase_lut_identity": (
+                    sparse_flow_rope_lut_identity
+                ),
+                "error": str(exc),
+                "command": command,
+                "exit_code": 2,
+            },
+        )
+        return 2
+    try:
+        _validate_sparse_timestep_modulation_route_args(args)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _write_json(
+            output_dir / "run_report.json",
+            {
+                "schema": "trellis2mlx.mlx_stage_capture_run_report.v1",
+                "status": "failed",
+                "failure_phase": "preflight_sparse_timestep_modulation_route",
+                "last_trustworthy_phase": "requested_route_parsed",
+                "primary_output_status": "not_started",
+                "requested_inputs": requested_inputs,
+                "invalid_inputs": invalid_inputs,
                 "error": str(exc),
                 "command": command,
                 "exit_code": 2,
@@ -994,6 +1233,95 @@ def main(argv: list[str] | None = None) -> int:
             failure_phase = "validate_primary_output"
             route_binding_error = str(exc)
     elif args.stop_after_stage in {
+        "sparse_flow_step",
+        "sparse_flow_steps",
+        "sparse_flow_block_trace",
+    }:
+        try:
+            effective_backend = _bind_effective_sparse_flow_layernorm_backend(
+                route_identity,
+                checkpoint_npz,
+            )
+            route_identity["route"]["sparse_flow_layernorm_backend_effective"] = (
+                effective_backend
+            )
+            effective_qk_backend = (
+                _bind_effective_sparse_flow_qk_norm_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            effective_rope_backend = (
+                _bind_effective_sparse_flow_global_rope_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            effective_sparse_rope_backend = (
+                _bind_effective_sparse_flow_rope_backend(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            effective_sparse_attention_backend = (
+                _bind_effective_sparse_flow_attention_route(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            sparse_terminal_linear_binding = (
+                _bind_effective_sparse_flow_terminal_linear_identity(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            sparse_cfg_rescale_std_binding = None
+            if args.stop_after_stage != "sparse_flow_block_trace":
+                sparse_cfg_rescale_std_binding = (
+                    _bind_effective_sparse_flow_cfg_rescale_std_identity(
+                        route_identity,
+                        checkpoint_npz,
+                    )
+                )
+            sparse_modulation_binding = (
+                _bind_effective_sparse_timestep_modulation_identity(
+                    route_identity,
+                    checkpoint_npz,
+                )
+            )
+            route_identity["route"]["qk_norm_backend_effective"] = (
+                effective_qk_backend
+            )
+            route_identity["route"]["rope_backend_effective"] = (
+                effective_rope_backend
+            )
+            route_identity["route"][
+                "sparse_flow_rope_backend_effective"
+            ] = effective_sparse_rope_backend
+            primary_output_validation = {
+                "sparse_flow_layernorm_backend": effective_backend,
+                "qk_norm_backend": effective_qk_backend,
+                "rope_backend": effective_rope_backend,
+                "sparse_flow_rope_backend": effective_sparse_rope_backend,
+                "sparse_flow_attention_backend": (
+                    effective_sparse_attention_backend
+                ),
+                "sparse_flow_terminal_linear_identity": (
+                    sparse_terminal_linear_binding
+                ),
+                "sparse_flow_cfg_rescale_std_identity": (
+                    sparse_cfg_rescale_std_binding
+                ),
+                "sparse_timestep_modulation_binding": (
+                    sparse_modulation_binding
+                ),
+            }
+            _write_json(output_dir / "route_identity.json", route_identity)
+        except (OSError, ValueError) as exc:
+            status = "failed"
+            failure_phase = "bind_effective_route_identity"
+            route_binding_error = str(exc)
+    elif args.stop_after_stage in {
         "shape_flow_step",
         "shape_flow_steps",
         "shape_flow_block_trace",
@@ -1163,6 +1491,9 @@ def main(argv: list[str] | None = None) -> int:
                 if status == "done"
                 and args.stop_after_stage
                 in {
+                    "sparse_flow_step",
+                    "sparse_flow_steps",
+                    "sparse_flow_block_trace",
                     "shape_flow_step",
                     "shape_flow_steps",
                     "shape_flow_block_trace",
@@ -1220,6 +1551,7 @@ def _validate_final_glb_checkpoint(
         "output_size_bytes",
         "shape_flow_attention_route_json",
         "texture_attention_route_json",
+        "decoder_route_json",
         "postprocess_route_json",
     }
     with np.load(checkpoint_path, allow_pickle=False) as archive:
@@ -1239,6 +1571,7 @@ def _validate_final_glb_checkpoint(
         try:
             shape_route = json.loads(str(scalar("shape_flow_attention_route_json")))
             texture_route = json.loads(str(scalar("texture_attention_route_json")))
+            decoder_route = json.loads(str(scalar("decoder_route_json")))
             postprocess_route = json.loads(str(scalar("postprocess_route_json")))
         except json.JSONDecodeError as exc:
             raise ValueError("final_glb route identity contains invalid JSON") from exc
@@ -1263,6 +1596,46 @@ def _validate_final_glb_checkpoint(
     declared_size = int.from_bytes(payload[8:12], "little")
     if version != 2 or declared_size != len(payload):
         raise ValueError("final_glb GLB header version or length is invalid")
+
+    sparse_route_identity = {"route": dict(expected_route)}
+    sparse_layernorm = _bind_effective_sparse_flow_layernorm_backend(
+        sparse_route_identity,
+        checkpoint_path,
+    )
+    sparse_qk_norm = _bind_effective_sparse_flow_qk_norm_backend(
+        sparse_route_identity,
+        checkpoint_path,
+    )
+    sparse_global_rope = _bind_effective_sparse_flow_global_rope_backend(
+        sparse_route_identity,
+        checkpoint_path,
+    )
+    sparse_rope = _bind_effective_sparse_flow_rope_backend(
+        sparse_route_identity,
+        checkpoint_path,
+    )
+    sparse_attention = _bind_effective_sparse_flow_attention_route(
+        sparse_route_identity,
+        checkpoint_path,
+    )
+    sparse_terminal_linear = (
+        _bind_effective_sparse_flow_terminal_linear_identity(
+            sparse_route_identity,
+            checkpoint_path,
+        )
+    )
+    sparse_cfg_rescale_std = (
+        _bind_effective_sparse_flow_cfg_rescale_std_identity(
+            sparse_route_identity,
+            checkpoint_path,
+        )
+    )
+    sparse_timestep_modulation = (
+        _bind_effective_sparse_timestep_modulation_identity(
+            sparse_route_identity,
+            checkpoint_path,
+        )
+    )
 
     shape_fields = (
         SHAPE_FLOW_ATTENTION_ROUTE_FIELDS + SHAPE_FLOW_GELU_ROUTE_FIELDS
@@ -1300,6 +1673,50 @@ def _validate_final_glb_checkpoint(
     }
     if texture_route != expected_texture_route:
         raise ValueError("final_glb texture attention route leaked or changed")
+    expected_decoder_top_level = {
+        "decoder_linear_backend": expected_route[
+            "decoder_linear_backend_requested"
+        ],
+        "sparse_conv_matmul_backend": expected_route[
+            "decoder_sparse_conv_matmul_backend_requested"
+        ],
+        "decoder_output_head_backend": (
+            "mlx-native-fp32"
+            if expected_route["decoder_layernorm_backend_requested"]
+            == TURING_T4_BACKEND
+            else "mlx-native-caller-dtype"
+        ),
+    }
+    if any(
+        decoder_route.get(field) != value
+        for field, value in expected_decoder_top_level.items()
+    ):
+        raise ValueError("final_glb decoder route differs from requested route")
+    decoder_layernorm = decoder_route.get("decoder_layernorm")
+    if not isinstance(decoder_layernorm, dict) or decoder_layernorm.get(
+        "backend"
+    ) != expected_route["decoder_layernorm_backend_requested"]:
+        raise ValueError("final_glb decoder route differs from requested route")
+    if expected_route["decoder_layernorm_backend_requested"] == TURING_T4_BACKEND:
+        if decoder_layernorm.get(
+            "turing_rsqrt_lut_artifact_sha256_attested"
+        ) != expected_route["turing_rsqrt_lut_sha256_effective"]:
+            raise ValueError("final_glb decoder route differs from requested route")
+    decoder_silu = decoder_route.get("decoder_silu")
+    if not isinstance(decoder_silu, dict) or decoder_silu.get(
+        "backend"
+    ) != expected_route["decoder_silu_backend_requested"]:
+        raise ValueError("final_glb decoder route differs from requested route")
+    expected_silu_sha256 = expected_route[
+        "decoder_silu_lut_sha256_effective"
+    ]
+    if expected_silu_sha256 is not None and (
+        decoder_silu.get("output_lut_artifact_sha256_attested")
+        != expected_silu_sha256
+        or decoder_silu.get("output_lut_artifact_sha256_effective")
+        != expected_silu_sha256
+    ):
+        raise ValueError("final_glb decoder route differs from requested route")
     postprocess_fields = (
         "reference_cleanup",
         "qem_simplify",
@@ -1331,8 +1748,19 @@ def _validate_final_glb_checkpoint(
         "output_size_bytes": len(payload),
         "reopenable_glb": True,
         "mesh_count": mesh_count,
+        "sparse_flow_route": {
+            "layernorm_backend": sparse_layernorm,
+            "qk_norm_backend": sparse_qk_norm,
+            "global_rope_backend": sparse_global_rope,
+            "sparse_rope_backend": sparse_rope,
+            "attention_backend": sparse_attention,
+            "terminal_linear_identity": sparse_terminal_linear,
+            "cfg_rescale_std_identity": sparse_cfg_rescale_std,
+            "timestep_modulation_binding": sparse_timestep_modulation,
+        },
         "shape_flow_attention_route": shape_route,
         "texture_attention_route": texture_route,
+        "decoder_route": decoder_route,
         "postprocess_route": postprocess_route,
     }
 
@@ -1536,6 +1964,55 @@ def _bind_effective_shape_flow_layernorm_backend(
     return effective
 
 
+def _bind_effective_sparse_flow_layernorm_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("sparse_flow_layernorm_backend_requested")
+    if requested not in SUPPORTED_FLOW_LAYERNORM_BACKENDS:
+        raise ValueError(
+            "route identity has unsupported requested sparse-flow "
+            f"LayerNorm backend {requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "sparse_flow_layernorm_backend" not in checkpoint:
+            raise ValueError(
+                "sparse-flow checkpoint omits effective LayerNorm backend metadata"
+            )
+        backend_array = np.asarray(checkpoint["sparse_flow_layernorm_backend"])
+        if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "sparse-flow effective LayerNorm backend must be a string scalar"
+            )
+        effective = str(backend_array.item())
+        (
+            effective_turing_lut_sha256,
+            effective_turing_lut_content_sha256,
+        ) = _checkpoint_turing_lut_sha256(
+            checkpoint,
+            backend=effective,
+            expected_route=route,
+            context="sparse-flow checkpoint",
+            key_prefix="sparse_flow",
+        )
+    if effective != requested:
+        raise ValueError(
+            f"sparse-flow effective LayerNorm backend {effective!r} "
+            f"does not match requested {requested!r}"
+        )
+    if requested == TURING_T4_BACKEND:
+        route["sparse_flow_turing_rsqrt_lut_sha256_effective"] = (
+            effective_turing_lut_sha256
+        )
+        route["sparse_flow_turing_rsqrt_lut_content_sha256_effective"] = (
+            effective_turing_lut_content_sha256
+        )
+    return effective
+
+
 def _checkpoint_shape_flow_terminal_linear_identity(
     checkpoint: Any,
     *,
@@ -1682,6 +2159,55 @@ def _bind_effective_shape_flow_terminal_linear_identity(
     return identity
 
 
+def _bind_effective_sparse_timestep_modulation_identity(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    checkpoint_path = Path(checkpoint_path)
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        identity = None
+        identity_json = ""
+        if "sparse_timestep_modulation_lut_json" in checkpoint:
+            value = np.asarray(
+                checkpoint["sparse_timestep_modulation_lut_json"]
+            )
+            if value.shape != () or value.dtype.kind not in {"U", "S"}:
+                raise ValueError(
+                    "sparse-flow checkpoint timestep modulation identity "
+                    "must be a string scalar"
+                )
+            identity_json = str(value.item())
+            if identity_json:
+                try:
+                    identity = json.loads(identity_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "sparse-flow checkpoint timestep modulation identity "
+                        "is invalid JSON"
+                    ) from exc
+                if not isinstance(identity, dict):
+                    raise ValueError(
+                        "sparse-flow checkpoint timestep modulation identity "
+                        "must decode to an object"
+                    )
+    effective = _validate_sparse_timestep_modulation_identity(
+        identity,
+        expected_route=route,
+    )
+    route["sparse_timestep_modulation_identity_effective"] = effective
+    return {
+        "schema": "trellis2mlx.sparse_timestep_modulation_binding.v1",
+        "path": str(checkpoint_path),
+        "sha256": _sha256_file(checkpoint_path),
+        "size_bytes": checkpoint_path.stat().st_size,
+        "sparse_timestep_modulation_lut_json": identity_json,
+        "sparse_timestep_modulation_route": effective,
+    }
+
+
 def _bind_effective_shape_timestep_modulation_identity(
     route_identity: dict[str, Any],
     checkpoint_path: Path,
@@ -1729,6 +2255,160 @@ def _bind_effective_shape_timestep_modulation_identity(
         "shape_timestep_modulation_lut_json": identity_json,
         "shape_timestep_modulation_route": effective,
     }
+
+
+def _bind_effective_sparse_flow_attention_route(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("sparse_flow_attention_backend_requested")
+    if requested not in SUPPORTED_SPARSE_FLOW_ATTENTION_BACKENDS:
+        raise ValueError(
+            "route identity has unsupported requested sparse-flow attention "
+            f"backend {requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "sparse_flow_attention_route_json" not in checkpoint:
+            raise ValueError(
+                "sparse-flow checkpoint omits sparse-flow attention route metadata"
+            )
+        value = np.asarray(checkpoint["sparse_flow_attention_route_json"])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "sparse-flow attention route metadata must be a string scalar"
+            )
+        try:
+            effective_identity = json.loads(str(value.item()))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "sparse-flow attention route metadata is invalid JSON"
+            ) from exc
+    if not isinstance(effective_identity, dict):
+        raise ValueError(
+            "sparse-flow attention route metadata must decode to an object"
+        )
+    effective = effective_identity.get("backend")
+    if effective != requested:
+        raise ValueError(
+            f"effective sparse-flow attention backend {effective!r} does not "
+            f"match requested route {requested!r}"
+        )
+    if effective == SOURCE_CUDA_MATH_TURING_T4_ATTENTION_BACKEND:
+        expected_source_fields = {
+            "scope": "sparse-structure-flow",
+            "algorithm": "pytorch-math-sdpa-on-metal",
+            "source_runtime": "torch-2.10.0+cu128",
+            "source_device": "Tesla T4",
+            "source_backend": "aten::_scaled_dot_product_attention_math",
+            "self_attention_width": 4096,
+            "cross_attention_width": 1029,
+            "score_compute_dtype": "float32",
+            "split_sqrt_qk_scaling": True,
+            "softmax_threads": 1024,
+            "softmax_registers_per_thread": 4,
+            "value_projection": "forward-fp32-fma",
+        }
+        mismatches = {
+            field: {
+                "expected": expected_value,
+                "effective": effective_identity.get(field),
+            }
+            for field, expected_value in expected_source_fields.items()
+            if effective_identity.get(field) != expected_value
+        }
+        if mismatches:
+            raise ValueError(
+                "effective sparse-flow source attention identity is incomplete "
+                f"or mismatched: {mismatches}"
+            )
+    route["sparse_flow_attention_backend_effective"] = effective
+    route["sparse_flow_attention_route_effective"] = effective_identity
+    return str(effective)
+
+
+def _bind_effective_sparse_flow_terminal_linear_identity(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> dict[str, object]:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    expected = route.get("sparse_flow_terminal_linear_identity")
+    if not isinstance(expected, dict):
+        raise ValueError(
+            "route identity has no sparse-flow terminal linear identity"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "sparse_flow_terminal_linear_json" not in checkpoint:
+            raise ValueError(
+                "sparse-flow checkpoint omits terminal linear identity"
+            )
+        value = np.asarray(checkpoint["sparse_flow_terminal_linear_json"])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "sparse-flow terminal linear identity must be a string scalar"
+            )
+        try:
+            effective = json.loads(str(value.item()))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "sparse-flow terminal linear identity is invalid JSON"
+            ) from exc
+    if not isinstance(effective, dict):
+        raise ValueError(
+            "sparse-flow terminal linear identity must decode to an object"
+        )
+    if effective != expected:
+        raise ValueError(
+            "effective sparse-flow terminal linear identity does not match "
+            f"the requested route: expected {expected!r}, got {effective!r}"
+        )
+    route["sparse_flow_terminal_linear_identity_effective"] = effective
+    return effective
+
+
+def _bind_effective_sparse_flow_cfg_rescale_std_identity(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> dict[str, object]:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    expected = route.get("sparse_flow_cfg_rescale_std_identity")
+    if not isinstance(expected, dict):
+        raise ValueError(
+            "route identity has no sparse-flow CFG-rescale std identity"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "sparse_flow_cfg_rescale_std_json" not in checkpoint:
+            raise ValueError(
+                "sparse-flow checkpoint omits CFG-rescale std identity"
+            )
+        value = np.asarray(checkpoint["sparse_flow_cfg_rescale_std_json"])
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise ValueError(
+                "sparse-flow CFG-rescale std identity must be a string scalar"
+            )
+        try:
+            effective = json.loads(str(value.item()))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "sparse-flow CFG-rescale std identity is invalid JSON"
+            ) from exc
+    if not isinstance(effective, dict):
+        raise ValueError(
+            "sparse-flow CFG-rescale std identity must decode to an object"
+        )
+    if effective != expected:
+        raise ValueError(
+            "effective sparse-flow CFG-rescale std identity does not match "
+            f"the requested route: expected {expected!r}, got {effective!r}"
+        )
+    route["sparse_flow_cfg_rescale_std_identity_effective"] = effective
+    return effective
 
 
 def _bind_effective_shape_flow_attention_route(
@@ -1833,13 +2513,15 @@ def _normalize_attention_backend(requested: str) -> str:
     if requested in {"fast", "mlx-fast"}:
         return "fast"
     if requested == "source-cuda-self":
-        return "source-cuda-self-widths-1029-7697-fast-otherwise"
+        return "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
     return f"unsupported:{requested}"
 
 
 def _bind_effective_qk_norm_backend(
     route_identity: dict[str, Any],
     checkpoint_path: Path,
+    *,
+    context: str = "shape-flow",
 ) -> str:
     route = route_identity.get("route")
     if not isinstance(route, dict):
@@ -1853,25 +2535,40 @@ def _bind_effective_qk_norm_backend(
     with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
         if "qk_norm_backend" not in checkpoint:
             raise ValueError(
-                "shape-flow checkpoint omits effective Q/K norm backend metadata"
+                f"{context} omits effective Q/K norm backend metadata"
             )
         backend_array = np.asarray(checkpoint["qk_norm_backend"])
         if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
             raise ValueError(
-                "shape-flow effective Q/K norm backend must be a string scalar"
+                f"{context} effective Q/K norm backend must be a string scalar"
             )
         effective = str(backend_array.item())
     if effective != requested:
         raise ValueError(
-            f"shape-flow effective Q/K norm backend {effective!r} "
+            f"{context} effective Q/K norm backend {effective!r} "
             f"does not match requested {requested!r}"
         )
     return effective
 
 
+def _bind_effective_sparse_flow_qk_norm_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    return _bind_effective_qk_norm_backend(
+        route_identity,
+        checkpoint_path,
+        context="sparse-flow checkpoint",
+    )
+
+
 def _bind_effective_rope_backend(
     route_identity: dict[str, Any],
     checkpoint_path: Path,
+    *,
+    context: str = "shape-flow",
+    lut_key: str = "shape_flow_turing_rope_phase_lut_sha256",
+    route_lut_key: str = "shape_flow_turing_rope_phase_lut_sha256_effective",
 ) -> str:
     route = route_identity.get("route")
     if not isinstance(route, dict):
@@ -1885,28 +2582,110 @@ def _bind_effective_rope_backend(
     with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
         if "rope_backend" not in checkpoint:
             raise ValueError(
-                "shape-flow checkpoint omits effective RoPE backend metadata"
+                f"{context} omits effective RoPE backend metadata"
             )
         backend_array = np.asarray(checkpoint["rope_backend"])
         if backend_array.shape != () or backend_array.dtype.kind not in {"U", "S"}:
             raise ValueError(
-                "shape-flow effective RoPE backend must be a string scalar"
+                f"{context} effective RoPE backend must be a string scalar"
             )
         effective = str(backend_array.item())
         effective_lut_sha256 = _checkpoint_turing_rope_lut_sha256(
             checkpoint,
             backend=effective,
             expected_route=route,
-            context="shape-flow checkpoint",
+            context=context,
+            key=lut_key,
         )
     if effective != requested:
         raise ValueError(
-            f"shape-flow effective RoPE backend {effective!r} "
+            f"{context} effective RoPE backend {effective!r} "
             f"does not match requested {requested!r}"
         )
     if requested == TURING_T4_ROPE_BACKEND:
-        route["shape_flow_turing_rope_phase_lut_sha256_effective"] = (
-            effective_lut_sha256
+        route[route_lut_key] = effective_lut_sha256
+    return effective
+
+
+def _bind_effective_sparse_flow_global_rope_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    return _bind_effective_rope_backend(
+        route_identity,
+        checkpoint_path,
+        context="sparse-flow checkpoint",
+        lut_key="sparse_flow_turing_rope_phase_lut_sha256",
+        route_lut_key=(
+            "sparse_flow_turing_rope_phase_lut_sha256_effective"
+        ),
+    )
+
+
+def _bind_effective_sparse_flow_rope_backend(
+    route_identity: dict[str, Any],
+    checkpoint_path: Path,
+) -> str:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+    requested = route.get("sparse_flow_rope_backend_requested")
+    if requested not in SUPPORTED_SPARSE_FLOW_ROPE_BACKENDS:
+        raise ValueError(
+            "route identity has unsupported requested sparse-flow RoPE "
+            f"backend {requested!r}"
+        )
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        required = {
+            "sparse_flow_rope_backend",
+            "sparse_flow_rope_phase_lut_artifact_sha256_attested",
+            "sparse_flow_rope_phase_lut_content_sha256",
+        }
+        missing = sorted(required - set(checkpoint.files))
+        if missing:
+            raise ValueError(
+                "sparse-flow checkpoint omits effective sparse-flow RoPE "
+                f"metadata: {missing}"
+            )
+        values: dict[str, str] = {}
+        for key in required:
+            value = np.asarray(checkpoint[key])
+            if value.shape != () or value.dtype.kind not in {"U", "S"}:
+                raise ValueError(
+                    f"sparse-flow checkpoint {key} must be a string scalar"
+                )
+            values[key] = str(value.item())
+    effective = values["sparse_flow_rope_backend"]
+    if effective != requested:
+        raise ValueError(
+            "sparse-flow checkpoint effective sparse-flow RoPE backend "
+            f"{effective!r} does not match requested {requested!r}"
+        )
+    artifact_sha = values[
+        "sparse_flow_rope_phase_lut_artifact_sha256_attested"
+    ]
+    content_sha = values["sparse_flow_rope_phase_lut_content_sha256"]
+    if requested == SOURCE_CPU_POLAR_TORCH_2_10_BACKEND:
+        expected_artifact = route.get(
+            "sparse_flow_rope_phase_lut_sha256_effective"
+        )
+        expected_content = route.get(
+            "sparse_flow_rope_phase_lut_content_sha256_effective"
+        )
+        if artifact_sha != expected_artifact:
+            raise ValueError(
+                "sparse-flow checkpoint phase LUT artifact SHA256 differs "
+                "from the requested route"
+            )
+        if content_sha != expected_content:
+            raise ValueError(
+                "sparse-flow checkpoint phase LUT content SHA256 differs "
+                "from the requested route"
+            )
+    elif artifact_sha or content_sha:
+        raise ValueError(
+            "inherited sparse-flow RoPE route unexpectedly carries source "
+            "CPU phase LUT identity"
         )
     return effective
 
@@ -1917,8 +2696,8 @@ def _checkpoint_turing_rope_lut_sha256(
     backend: str,
     expected_route: dict[str, Any],
     context: str,
+    key: str = "shape_flow_turing_rope_phase_lut_sha256",
 ) -> str | None:
-    key = "shape_flow_turing_rope_phase_lut_sha256"
     if backend == TURING_T4_ROPE_BACKEND:
         if key not in checkpoint:
             raise ValueError(
@@ -1965,9 +2744,10 @@ def _checkpoint_turing_lut_sha256(
     backend: str,
     expected_route: dict[str, Any],
     context: str,
+    key_prefix: str = "shape_flow",
 ) -> tuple[str | None, str | None]:
-    key = "shape_flow_turing_rsqrt_lut_sha256"
-    content_key = "shape_flow_turing_rsqrt_lut_content_sha256"
+    key = f"{key_prefix}_turing_rsqrt_lut_sha256"
+    content_key = f"{key_prefix}_turing_rsqrt_lut_content_sha256"
     if backend == TURING_T4_BACKEND:
         if key not in checkpoint:
             raise ValueError(
@@ -2707,6 +3487,38 @@ def _validate_shape_flow_steps_checkpoint(
     }
 
 
+def _validate_sparse_timestep_modulation_identity(
+    identity: dict[str, Any] | None,
+    *,
+    expected_route: dict[str, Any],
+) -> dict[str, Any] | None:
+    expected_identity = expected_route.get(
+        "sparse_timestep_modulation_identity"
+    )
+    if expected_identity is None:
+        if identity is not None:
+            raise ValueError(
+                "sparse-flow checkpoint carries timestep modulation identity but "
+                "the requested route carries none"
+            )
+        return None
+    if identity is None:
+        raise ValueError(
+            "sparse-flow checkpoint omits requested timestep modulation identity"
+        )
+    if identity.get("route_identity_evidence") is not True:
+        raise ValueError(
+            "sparse-flow checkpoint timestep modulation identity omits "
+            "route_identity_evidence=true"
+        )
+    if identity != expected_identity:
+        raise ValueError(
+            "sparse-flow checkpoint effective timestep modulation identity does "
+            "not match the authenticated requested route"
+        )
+    return identity
+
+
 def _validate_shape_timestep_modulation_identity(
     identity: dict[str, Any] | None,
     *,
@@ -2847,6 +3659,7 @@ def _validate_shape_flow_injection_identity(
 
 
 def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> list[str]:
+    _validate_decoder_route_args(args)
     trace_sample_args = (
         args.shape_flow_trace_sample,
         args.expected_shape_flow_trace_sample_sha256,
@@ -3036,13 +3849,58 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             ]
         )
     command.extend([
+        "--sparse-flow-attention-backend",
+        args.sparse_flow_attention_backend,
+        "--sparse-flow-layernorm-backend",
+        args.sparse_flow_layernorm_backend,
+        "--sparse-flow-terminal-linear-backend",
+        getattr(
+            args,
+            "sparse_flow_terminal_linear_backend",
+            DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+        ),
         "--shape-flow-layernorm-backend",
         args.shape_flow_layernorm_backend,
         "--qk-norm-backend",
         args.qk_norm_backend,
         "--rope-backend",
         args.rope_backend,
+        "--sparse-flow-rope-backend",
+        args.sparse_flow_rope_backend,
+        "--decoder-linear-backend",
+        args.decoder_linear_backend,
+        "--decoder-sparse-conv-matmul-backend",
+        args.decoder_sparse_conv_matmul_backend,
+        "--decoder-layernorm-backend",
+        args.decoder_layernorm_backend,
+        "--decoder-silu-backend",
+        args.decoder_silu_backend,
     ])
+    if args.decoder_silu_lut:
+        command.extend(
+            ["--decoder-silu-lut", str(Path(args.decoder_silu_lut))]
+        )
+    if args.expected_decoder_silu_lut_sha256:
+        command.extend(
+            [
+                "--expected-decoder-silu-lut-sha256",
+                args.expected_decoder_silu_lut_sha256,
+            ]
+        )
+    if args.sparse_flow_rope_phase_lut:
+        command.extend(
+            [
+                "--sparse-flow-rope-phase-lut",
+                str(Path(args.sparse_flow_rope_phase_lut)),
+            ]
+        )
+    if args.expected_sparse_flow_rope_phase_lut_sha256:
+        command.extend(
+            [
+                "--expected-sparse-flow-rope-phase-lut-sha256",
+                args.expected_sparse_flow_rope_phase_lut_sha256,
+            ]
+        )
     if args.turing_rope_phase_lut:
         command.extend(
             [
@@ -3076,6 +3934,23 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
             "--shape-flow-noise-sample",
             str(Path(args.shape_flow_noise_sample)),
         ])
+    if args.sparse_timestep_modulation_lut:
+        command.extend(
+            [
+                "--sparse-timestep-modulation-lut",
+                str(Path(args.sparse_timestep_modulation_lut)),
+                "--sparse-timestep-modulation-report",
+                str(Path(args.sparse_timestep_modulation_report)),
+                "--expected-sparse-timestep-modulation-lut-sha256",
+                args.expected_sparse_timestep_modulation_lut_sha256,
+                "--expected-sparse-timestep-modulation-report-sha256",
+                args.expected_sparse_timestep_modulation_report_sha256,
+                "--expected-sparse-timestep-modulation-source-checkpoint-sha256",
+                (
+                    args.expected_sparse_timestep_modulation_source_checkpoint_sha256
+                ),
+            ]
+        )
     if args.shape_timestep_modulation_lut:
         command.extend(
             [
@@ -3213,6 +4088,81 @@ def _validate_shape_flow_trace_sample_route_args(
     }
 
 
+def _validate_sparse_timestep_modulation_route_args(
+    args: argparse.Namespace,
+) -> dict[str, object | None]:
+    values = (
+        args.sparse_timestep_modulation_lut,
+        args.sparse_timestep_modulation_report,
+        args.expected_sparse_timestep_modulation_lut_sha256,
+        args.expected_sparse_timestep_modulation_report_sha256,
+        args.expected_sparse_timestep_modulation_source_checkpoint_sha256,
+    )
+    if not any(values):
+        return {
+            "npz_path": None,
+            "npz_sha256_requested": None,
+            "npz_sha256_effective": None,
+            "report_path": None,
+            "report_sha256_requested": None,
+            "report_sha256_effective": None,
+            "source_checkpoint_sha256": None,
+            "identity": None,
+        }
+    if not all(values):
+        raise ValueError(
+            "source-CUDA sparse timestep modulation replay requires the LUT, "
+            "witness report, both expected artifact SHA256 values, and the "
+            "expected source checkpoint SHA256"
+        )
+    if args.stop_after_stage == "conditioning":
+        raise ValueError(
+            "source-CUDA sparse timestep modulation replay requires a sparse-flow "
+            "or downstream consumer"
+        )
+    if args.shape_slat_sample:
+        raise ValueError(
+            "source-CUDA sparse timestep modulation replay is incompatible with "
+            "shape-SLat replay"
+        )
+
+    from trellmlx.timestep_modulation_lut import (
+        load_source_cuda_timestep_modulation_lut,
+    )
+
+    lut = load_source_cuda_timestep_modulation_lut(
+        npz_path=args.sparse_timestep_modulation_lut,
+        report_path=args.sparse_timestep_modulation_report,
+        expected_npz_sha256=(
+            args.expected_sparse_timestep_modulation_lut_sha256
+        ),
+        expected_report_sha256=(
+            args.expected_sparse_timestep_modulation_report_sha256
+        ),
+        expected_source_checkpoint_sha256=(
+            args.expected_sparse_timestep_modulation_source_checkpoint_sha256
+        ),
+        expected_schedule_profile="sparse-structure-rescale-5",
+    )
+    identity = lut.report_identity()
+    return {
+        "npz_path": str(Path(args.sparse_timestep_modulation_lut)),
+        "npz_sha256_requested": (
+            args.expected_sparse_timestep_modulation_lut_sha256
+        ),
+        "npz_sha256_effective": identity["npz_sha256_effective"],
+        "report_path": str(Path(args.sparse_timestep_modulation_report)),
+        "report_sha256_requested": (
+            args.expected_sparse_timestep_modulation_report_sha256
+        ),
+        "report_sha256_effective": identity["report_sha256_effective"],
+        "source_checkpoint_sha256": (
+            identity["source_checkpoint_sha256_effective"]
+        ),
+        "identity": identity,
+    }
+
+
 def _validate_shape_timestep_modulation_route_args(
     args: argparse.Namespace,
 ) -> dict[str, object | None]:
@@ -3273,6 +4223,7 @@ def _validate_shape_timestep_modulation_route_args(
         expected_source_checkpoint_sha256=(
             args.expected_shape_timestep_modulation_source_checkpoint_sha256
         ),
+        expected_schedule_profile="shape-slat-rescale-3",
     )
     identity = lut.report_identity()
     return {
@@ -3301,7 +4252,9 @@ def _validate_turing_rsqrt_route_args(
         args, "expected_turing_rsqrt_lut_sha256", None
     )
     if (
-        args.shape_flow_layernorm_backend == TURING_T4_BACKEND
+        args.sparse_flow_layernorm_backend == TURING_T4_BACKEND
+        or args.shape_flow_layernorm_backend == TURING_T4_BACKEND
+        or getattr(args, "decoder_layernorm_backend", None) == TURING_T4_BACKEND
         or (
             args.reference_cleanup
             and args.qem_simplify
@@ -3329,7 +4282,7 @@ def _validate_turing_rsqrt_route_args(
     if path or expected:
         raise ValueError(
             "Turing rsqrt LUT arguments only apply to "
-            f"{TURING_T4_BACKEND} or source-native QEM"
+            f"{TURING_T4_BACKEND} flow/decoder LayerNorm or source-native QEM"
         )
     return {
         "path": None,
@@ -3337,6 +4290,86 @@ def _validate_turing_rsqrt_route_args(
         "sha256_effective": None,
         "content_sha256_effective": None,
     }
+
+
+def _validate_decoder_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    backend = getattr(
+        args,
+        "decoder_silu_backend",
+        DEFAULT_DECODER_SILU_BACKEND,
+    )
+    path = getattr(args, "decoder_silu_lut", None)
+    expected = getattr(args, "expected_decoder_silu_lut_sha256", None)
+    if backend == CUDA_TURING_T4_DECODER_SILU_BACKEND:
+        if not path or not expected:
+            raise DecoderRouteError(
+                f"{CUDA_TURING_T4_DECODER_SILU_BACKEND} requires "
+                "--decoder-silu-lut and "
+                "--expected-decoder-silu-lut-sha256"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise DecoderRouteError(
+                "--expected-decoder-silu-lut-sha256 must be 64 lowercase "
+                "hex characters"
+            )
+        effective = _sha256_file(path)
+        if effective != expected:
+            raise DecoderRouteError(
+                "decoder SiLU LUT SHA256 mismatch: "
+                f"expected {expected}, got {effective}"
+            )
+        return {
+            "path": str(Path(path)),
+            "sha256_requested": expected,
+            "sha256_effective": effective,
+            "content_sha256_effective": (
+                _validate_decoder_silu_lut_payload(Path(path))
+            ),
+        }
+    if path or expected:
+        raise DecoderRouteError(
+            "decoder SiLU LUT arguments only apply to "
+            f"{CUDA_TURING_T4_DECODER_SILU_BACKEND}"
+        )
+    return {
+        "path": None,
+        "sha256_requested": None,
+        "sha256_effective": None,
+        "content_sha256_effective": None,
+    }
+
+
+def _validate_decoder_silu_lut_payload(path: Path) -> str:
+    try:
+        with np.load(path, allow_pickle=False) as artifact:
+            if set(artifact.files) != {"input_bits", "output_bits"}:
+                raise DecoderRouteError(
+                    "decoder SiLU LUT requires exactly input_bits and output_bits"
+                )
+            input_bits = np.asarray(artifact["input_bits"])
+            output_bits = np.asarray(artifact["output_bits"])
+    except DecoderRouteError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise DecoderRouteError(
+            f"decoder SiLU LUT is not a readable NPZ: {exc}"
+        ) from exc
+    expected_inputs = np.arange(1 << 16, dtype=np.uint16)
+    if input_bits.dtype != np.uint16 or not np.array_equal(
+        input_bits, expected_inputs
+    ):
+        raise DecoderRouteError(
+            "decoder SiLU LUT input_bits must be exhaustive ordered uint16"
+        )
+    if output_bits.dtype != np.uint16 or output_bits.shape != (1 << 16,):
+        raise DecoderRouteError(
+            "decoder SiLU LUT output_bits must be uint16[65536]"
+        )
+    return hashlib.sha256(
+        np.ascontiguousarray(output_bits).tobytes()
+    ).hexdigest()
 
 
 def _validate_source_native_postprocess_route_args(
@@ -3546,18 +4579,98 @@ def _describe_turing_rope_route_args(
     return identity
 
 
+def _validate_sparse_flow_rope_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    path = getattr(args, "sparse_flow_rope_phase_lut", None)
+    expected = getattr(
+        args, "expected_sparse_flow_rope_phase_lut_sha256", None
+    )
+    if args.sparse_flow_rope_backend == SOURCE_CPU_POLAR_TORCH_2_10_BACKEND:
+        if not path or not expected:
+            raise ValueError(
+                f"{SOURCE_CPU_POLAR_TORCH_2_10_BACKEND} requires "
+                "--sparse-flow-rope-phase-lut and "
+                "--expected-sparse-flow-rope-phase-lut-sha256"
+            )
+        effective = _sha256_file(path)
+        if effective != expected:
+            raise ValueError(
+                "sparse-flow source CPU RoPE phase LUT SHA256 mismatch: "
+                f"expected {expected}, got {effective}"
+            )
+        content = _validate_rope_phase_lut_payload(
+            Path(path),
+            label="sparse-flow source CPU RoPE",
+        )
+        return {
+            "path": str(Path(path)),
+            "sha256_requested": expected,
+            "sha256_effective": effective,
+            "content_sha256_effective": content,
+        }
+    if path or expected:
+        raise ValueError(
+            "sparse-flow source CPU RoPE phase LUT arguments only apply to "
+            f"{SOURCE_CPU_POLAR_TORCH_2_10_BACKEND}"
+        )
+    return {
+        "path": None,
+        "sha256_requested": None,
+        "sha256_effective": None,
+        "content_sha256_effective": None,
+    }
+
+
+def _describe_sparse_flow_rope_route_args(
+    args: argparse.Namespace,
+) -> dict[str, str | None]:
+    raw_path = getattr(args, "sparse_flow_rope_phase_lut", None)
+    path = Path(raw_path) if raw_path else None
+    effective = None
+    read_error = None
+    if path is not None and path.is_file():
+        try:
+            effective = _sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    identity = {
+        "path": str(path) if path is not None else None,
+        "sha256_requested": getattr(
+            args,
+            "expected_sparse_flow_rope_phase_lut_sha256",
+            None,
+        ),
+        "sha256_effective": effective,
+    }
+    if read_error is not None:
+        identity["read_error"] = read_error
+    return identity
+
+
 def _validate_turing_rope_phase_lut_payload(path: Path) -> None:
+    _validate_rope_phase_lut_payload(path, label="Turing RoPE")
+
+
+def _validate_rope_phase_lut_payload(
+    path: Path,
+    *,
+    label: str,
+) -> str:
     with np.load(path, allow_pickle=False) as loaded:
         if "phase_pairs" not in loaded.files:
-            raise ValueError("Turing RoPE phase LUT NPZ omits phase_pairs")
+            raise ValueError(f"{label} phase LUT NPZ omits phase_pairs")
         phase_pairs = np.asarray(loaded["phase_pairs"])
     if phase_pairs.dtype != np.float32 or phase_pairs.shape != (64, 21, 2):
         raise ValueError(
-            "Turing RoPE phase LUT must be float32[64,21,2], "
+            f"{label} phase LUT must be float32[64,21,2], "
             f"got {phase_pairs.dtype}{phase_pairs.shape}"
         )
     if not np.isfinite(phase_pairs).all():
-        raise ValueError("Turing RoPE phase LUT contains non-finite values")
+        raise ValueError(f"{label} phase LUT contains non-finite values")
+    return hashlib.sha256(
+        np.ascontiguousarray(phase_pairs).tobytes()
+    ).hexdigest()
 
 
 def _resolve_target_faces(args: argparse.Namespace) -> int:

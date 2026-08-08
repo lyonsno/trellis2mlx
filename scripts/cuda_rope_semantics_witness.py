@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA = "trellis2mlx.cuda_rope_semantics_witness.v1"
+SCHEMA = "trellis2mlx.cuda_rope_semantics_witness.v2"
 EXPECTED_TORCH = "2.10.0+cu128"
 EXPECTED_DEVICE = "Tesla T4"
 EXPECTED_COORDINATE_COUNT = 64
@@ -121,18 +121,30 @@ def analyze_cuda_results(
     }
 
 
-def _load_witness(path: Path) -> dict[str, np.ndarray]:
-    required = (
+def _load_witness(
+    path: Path,
+    *,
+    phase_mode: str = "generated",
+) -> dict[str, np.ndarray]:
+    if phase_mode not in {"generated", "cpu-generated", "explicit"}:
+        raise ValueError(f"unsupported phase mode {phase_mode!r}")
+    required = [
         "coordinate_values",
         "frequencies",
         "case_input",
         "case_coordinate_index",
         "case_frequency_index",
         "expected_case_output",
-    )
+    ]
+    if phase_mode == "explicit":
+        required.append("case_phase_pairs")
     with np.load(path, allow_pickle=False) as archive:
         missing = [name for name in required if name not in archive.files]
         if missing:
+            if phase_mode == "explicit" and "case_phase_pairs" in missing:
+                raise ValueError(
+                    "explicit phase mode requires case_phase_pairs"
+                )
             raise ValueError(f"witness archive missing arrays: {missing}")
         arrays = {name: np.asarray(archive[name]) for name in required}
 
@@ -191,14 +203,33 @@ def _load_witness(path: Path) -> dict[str, np.ndarray]:
         case_frequency_index >= EXPECTED_FREQUENCY_COUNT
     ):
         raise ValueError("case frequency index escapes the phase table")
+    if phase_mode == "explicit":
+        case_phase_pairs = arrays["case_phase_pairs"]
+        if case_phase_pairs.shape != case_input.shape:
+            raise ValueError(
+                "case_phase_pairs must match case_input shape"
+            )
+        if (
+            case_phase_pairs.dtype != np.float32
+            or not np.isfinite(case_phase_pairs).all()
+        ):
+            raise ValueError(
+                "case_phase_pairs must be finite float32 values"
+            )
     return arrays
 
 
 def _run_cuda(
-    torch: Any, arrays: dict[str, np.ndarray]
-) -> tuple[np.ndarray, np.ndarray]:
-    coordinates = torch.from_numpy(arrays["coordinate_values"]).cuda()
-    frequencies = torch.from_numpy(arrays["frequencies"]).cuda()
+    torch: Any,
+    arrays: dict[str, np.ndarray],
+    *,
+    phase_mode: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    coordinates = torch.from_numpy(arrays["coordinate_values"])
+    frequencies = torch.from_numpy(arrays["frequencies"])
+    if phase_mode != "cpu-generated":
+        coordinates = coordinates.cuda()
+        frequencies = frequencies.cuda()
     angles = torch.outer(coordinates, frequencies)
     phases = torch.polar(torch.ones_like(angles), angles)
 
@@ -207,18 +238,40 @@ def _run_cuda(
     )
     coordinate_index = torch.from_numpy(
         arrays["case_coordinate_index"].astype(np.int64, copy=False)
-    ).cuda()
+    )
     frequency_index = torch.from_numpy(
         arrays["case_frequency_index"].astype(np.int64, copy=False)
-    ).cuda()
-    case_phases = phases[coordinate_index, frequency_index]
+    )
+    if phase_mode != "cpu-generated":
+        coordinate_index = coordinate_index.cuda()
+        frequency_index = frequency_index.cuda()
+    if phase_mode == "explicit":
+        case_phases = torch.view_as_complex(
+            torch.from_numpy(arrays["case_phase_pairs"])
+            .cuda()
+            .reshape(-1, 2)
+        )
+    else:
+        case_phases = phases[coordinate_index, frequency_index]
+        if phase_mode == "cpu-generated":
+            case_phases = case_phases.cuda()
     case_complex = torch.view_as_complex(case_input.float().reshape(-1, 2))
-    case_output = torch.view_as_real(case_complex * case_phases)
-    case_output = case_output.to(torch.bfloat16).float()
+    case_output_float32_precast = torch.view_as_real(
+        case_complex * case_phases
+    )
+    case_output = case_output_float32_precast.to(torch.bfloat16).float()
     torch.cuda.synchronize()
 
     phase_pairs = torch.view_as_real(phases).float().cpu().numpy()
-    return phase_pairs, case_output.cpu().numpy()
+    effective_case_phases = (
+        torch.view_as_real(case_phases).float().cpu().numpy()
+    )
+    return (
+        phase_pairs,
+        effective_case_phases,
+        case_output_float32_precast.float().cpu().numpy(),
+        case_output.cpu().numpy(),
+    )
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:
@@ -231,6 +284,8 @@ def _write_result(
     path: Path,
     *,
     phase_pairs: np.ndarray,
+    case_phase_pairs: np.ndarray,
+    case_output_float32_precast: np.ndarray,
     case_output: np.ndarray,
     arrays: dict[str, np.ndarray],
 ) -> None:
@@ -240,6 +295,14 @@ def _write_result(
         np.savez(
             handle,
             phase_pairs=np.asarray(phase_pairs, dtype=np.float32),
+            case_phase_pairs=np.asarray(
+                case_phase_pairs,
+                dtype=np.float32,
+            ),
+            case_output_float32_precast=np.asarray(
+                case_output_float32_precast,
+                dtype=np.float32,
+            ),
             case_output=np.asarray(case_output, dtype=np.float32),
             coordinate_values=arrays["coordinate_values"],
             frequencies=arrays["frequencies"],
@@ -255,6 +318,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--witness", type=Path, default=Path("rope_witness.npz"))
     parser.add_argument("--expected-witness-sha256")
     parser.add_argument(
+        "--phase-mode",
+        choices=("generated", "cpu-generated", "explicit"),
+        default="generated",
+    )
+    parser.add_argument(
         "--output-json", type=Path, default=Path("cuda_rope_result.json")
     )
     parser.add_argument(
@@ -268,6 +336,7 @@ def main() -> int:
     phase = "argument_parsing"
     last_trustworthy = "process_started"
     args: argparse.Namespace | None = None
+    diagnostic_output_written = False
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "status": "failed",
@@ -279,6 +348,8 @@ def main() -> int:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_npz.parent.mkdir(parents=True, exist_ok=True)
         args.output_npz.unlink(missing_ok=True)
+        report["phase_mode_requested"] = args.phase_mode
+        report["phase_mode_effective"] = args.phase_mode
         phase = "runtime_validation"
         last_trustworthy = "output_paths_validated"
 
@@ -315,11 +386,35 @@ def main() -> int:
                 "witness sha256 mismatch: "
                 f"requested {requested_identity['sha256']}, got {actual_sha256}"
             )
-        arrays = _load_witness(args.witness)
+        arrays = _load_witness(args.witness, phase_mode=args.phase_mode)
         phase = "cuda_execution"
         last_trustworthy = "witness_validated"
 
-        phase_pairs, case_output = _run_cuda(torch, arrays)
+        (
+            phase_pairs,
+            case_phase_pairs,
+            case_output_float32_precast,
+            case_output,
+        ) = _run_cuda(
+            torch,
+            arrays,
+            phase_mode=args.phase_mode,
+        )
+        phase = "result_write"
+        last_trustworthy = "cuda_execution_completed"
+
+        _write_result(
+            args.output_npz,
+            phase_pairs=phase_pairs,
+            case_phase_pairs=case_phase_pairs,
+            case_output_float32_precast=case_output_float32_precast,
+            case_output=case_output,
+            arrays=arrays,
+        )
+        diagnostic_output_written = True
+        phase = "cuda_self_authentication"
+        last_trustworthy = "cuda_output_preserved"
+
         analysis = analyze_cuda_results(
             phase_pairs=phase_pairs,
             case_output=case_output,
@@ -327,21 +422,16 @@ def main() -> int:
             coordinate_count=EXPECTED_COORDINATE_COUNT,
             frequency_count=EXPECTED_FREQUENCY_COUNT,
         )
-        phase = "result_write"
+        phase = "report_write"
         last_trustworthy = "cuda_output_authenticated"
-
-        _write_result(
-            args.output_npz,
-            phase_pairs=phase_pairs,
-            case_output=case_output,
-            arrays=arrays,
-        )
         report.update(
             {
                 "status": "done",
                 "failure_phase": None,
                 "last_trustworthy_phase": "result_archive_written",
                 "analysis": analysis,
+                "phase_mode_requested": args.phase_mode,
+                "phase_mode_effective": args.phase_mode,
                 "arrays": {
                     "phase_pairs": {
                         "sha256": sha256_array(phase_pairs),
@@ -351,10 +441,21 @@ def main() -> int:
                         "sha256": sha256_array(case_output),
                         "shape": list(case_output.shape),
                     },
+                    "case_output_float32_precast": {
+                        "sha256": sha256_array(
+                            case_output_float32_precast
+                        ),
+                        "shape": list(case_output_float32_precast.shape),
+                    },
+                    "case_phase_pairs": {
+                        "sha256": sha256_array(case_phase_pairs),
+                        "shape": list(case_phase_pairs.shape),
+                    },
                 },
                 "primary_output": {
                     "path": str(args.output_npz),
                     "exists": True,
+                    "authority": "authenticated",
                     "sha256": sha256_file(args.output_npz),
                     "size_bytes": args.output_npz.stat().st_size,
                 },
@@ -364,8 +465,23 @@ def main() -> int:
         _write_report(args.output_json, report)
         return 0
     except Exception as exc:
-        if args is not None:
+        if args is not None and not diagnostic_output_written:
             args.output_npz.unlink(missing_ok=True)
+        output_exists = bool(
+            args is not None and args.output_npz.exists()
+        )
+        primary_output: dict[str, Any] = {
+            "path": str(args.output_npz) if args is not None else None,
+            "exists": output_exists,
+        }
+        if output_exists and args is not None:
+            primary_output.update(
+                {
+                    "authority": "diagnostic-only",
+                    "sha256": sha256_file(args.output_npz),
+                    "size_bytes": args.output_npz.stat().st_size,
+                }
+            )
         report.update(
             {
                 "status": "failed",
@@ -373,12 +489,7 @@ def main() -> int:
                 "last_trustworthy_phase": last_trustworthy,
                 "error": f"{type(exc).__name__}: {exc}",
                 "traceback": traceback.format_exc(),
-                "primary_output": {
-                    "path": (
-                        str(args.output_npz) if args is not None else None
-                    ),
-                    "exists": False,
-                },
+                "primary_output": primary_output,
                 "elapsed_seconds": time.time() - started,
             }
         )

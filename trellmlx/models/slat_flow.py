@@ -41,7 +41,7 @@ from ..modules.rope import build_sparse_rope_phases
 
 
 _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS = (0, 308, 616, 924, 1232, 1536)
-_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = 6038
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = (6022, 6038)
 _source_cuda_terminal_linear_kernel = None
 
 
@@ -62,13 +62,10 @@ def shape_flow_terminal_linear_backend_identity(
     }
     if (
         source_cuda_terminal
-        and geometry
-        == {
-            "rows": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
-            "input_width": 1536,
-            "output_width": 32,
-            "has_bias": True,
-        }
+        and row_count in _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS
+        and input_width == 1536
+        and output_width == 32
+        and has_bias
     ):
         return {
             "backend": "source-cuda-t4-volta-sgemm-32x128-tn-metal",
@@ -76,7 +73,7 @@ def shape_flow_terminal_linear_backend_identity(
             "experimental": True,
             "cuda_source_kernel": "volta_sgemm_32x128_tn",
             "authenticated_contract": {
-                "rows": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
+                "rows": list(_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS),
                 "input_width": 1536,
                 "output_width": 32,
                 "input_dtype": "float32",
@@ -88,9 +85,10 @@ def shape_flow_terminal_linear_backend_identity(
                 ),
                 "cuda_device_anchor": "Tesla T4 sm_75",
                 "torch_anchor": "2.10.0+cu128",
-                "source_recurrence_sha256": (
-                    "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f"
-                ),
+                "source_recurrence_sha256": [
+                    "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f",
+                    "ebde6bc1f271813801e44a312da8077d7c46cf5092f7dfee8b0100e48e3d874c",
+                ],
                 "cuda_prefix_ladder_sha256": (
                     "b21bad4d52e8202efdeec5a87af4fa9b52edaa7d513bd57fddf393a6f80dd6cc"
                 ),
@@ -102,7 +100,7 @@ def shape_flow_terminal_linear_backend_identity(
             "algorithm": "numpy-matmul-then-bias",
             "experimental": True,
             "effective_contract": geometry,
-            "excluded_row_geometry": _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS,
+            "excluded_row_geometry": list(_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS),
         }
     return {
         "backend": "mlx-native-linear",
@@ -209,7 +207,8 @@ def _source_cuda_terminal_linear(
     """Dispatch only source-authenticated terminal projection schedules."""
     if (
         x.ndim == 2
-        and x.shape == (_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS, 1536)
+        and x.shape[0] in _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS
+        and x.shape[1] == 1536
         and linear.weight.shape == (32, 1536)
         and linear.bias is not None
         and linear.bias.shape == (32,)

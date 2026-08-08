@@ -15,19 +15,34 @@ SCHEMA = "trellis2mlx.source_cuda_timestep_modulation_lut.v1"
 SOURCE_REPORT_SCHEMA = "trellis2mlx.cuda_timestep_modulation_witness.v1"
 PROJECTION_BATCH_MODE = "independent-singletons"
 CANONICAL_STEP_INDICES = np.arange(8, dtype=np.int32)
-CANONICAL_TIMESTEP_BITS = np.asarray(
-    [
-        0x447A0000,
-        0x446EA2E9,
-        0x44610000,
-        0x44505555,
-        0x443B8000,
-        0x4420B6DB,
-        0x43FA0000,
-        0x43960000,
-    ],
-    dtype=np.uint32,
-)
+SCHEDULE_TIMESTEP_BITS = {
+    "shape-slat-rescale-3": np.asarray(
+        [
+            0x447A0000,
+            0x446EA2E9,
+            0x44610000,
+            0x44505555,
+            0x443B8000,
+            0x4420B6DB,
+            0x43FA0000,
+            0x43960000,
+        ],
+        dtype=np.uint32,
+    ),
+    "sparse-structure-rescale-5": np.asarray(
+        [
+            0x447A0000,
+            0x44730E39,
+            0x446A6000,
+            0x445F36DB,
+            0x44505555,
+            0x443B8000,
+            0x441C4000,
+            0x43D05555,
+        ],
+        dtype=np.uint32,
+    ),
+}
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -63,6 +78,7 @@ class SourceCudaTimestepModulationLut:
     report_sha256: str
     source_checkpoint_sha256: str
     projection_batch_mode: str
+    schedule_profile: str
     timestep_bits: np.ndarray
     modulation_bfloat16_bits: np.ndarray
 
@@ -105,6 +121,7 @@ class SourceCudaTimestepModulationLut:
                 self.source_checkpoint_sha256
             ),
             "projection_batch_mode": self.projection_batch_mode,
+            "schedule_profile": self.schedule_profile,
             "step_indices": CANONICAL_STEP_INDICES.tolist(),
             "timestep_float32_bits": [
                 f"0x{int(value):08x}" for value in self.timestep_bits
@@ -120,6 +137,7 @@ def load_source_cuda_timestep_modulation_lut(
     expected_npz_sha256: str,
     expected_report_sha256: str,
     expected_source_checkpoint_sha256: str,
+    expected_schedule_profile: str = "shape-slat-rescale-3",
 ) -> SourceCudaTimestepModulationLut:
     npz_path = Path(npz_path)
     report_path = Path(report_path)
@@ -135,6 +153,14 @@ def load_source_cuda_timestep_modulation_lut(
         expected_source_checkpoint_sha256,
         name="expected source checkpoint SHA256",
     )
+    if expected_schedule_profile not in SCHEDULE_TIMESTEP_BITS:
+        raise ValueError(
+            "unsupported source-CUDA timestep modulation schedule profile: "
+            f"{expected_schedule_profile!r}"
+        )
+    canonical_timestep_bits = SCHEDULE_TIMESTEP_BITS[
+        expected_schedule_profile
+    ]
 
     effective_npz_sha256 = _sha256_file(npz_path)
     if effective_npz_sha256 != expected_npz_sha256:
@@ -163,11 +189,18 @@ def load_source_cuda_timestep_modulation_lut(
             "source-CUDA timestep modulation report must record "
             "independent-singletons projection batch mode"
         )
+    if route.get("schedule_profile") != expected_schedule_profile:
+        raise ValueError(
+            "source-CUDA timestep modulation report schedule profile mismatch: "
+            f"expected {expected_schedule_profile!r}, "
+            f"got {route.get('schedule_profile')!r}"
+        )
     if route != {
         "cuda_device": "Tesla T4",
         "device_type": "cuda",
         "torch": "2.10.0+cu128",
         "projection_batch_mode": PROJECTION_BATCH_MODE,
+        "schedule_profile": expected_schedule_profile,
     }:
         raise ValueError(
             "source-CUDA timestep modulation report has an unsupported effective route"
@@ -198,7 +231,7 @@ def load_source_cuda_timestep_modulation_lut(
         )
 
     expected_schedule_bits = [
-        f"0x{int(value):08x}" for value in CANONICAL_TIMESTEP_BITS
+        f"0x{int(value):08x}" for value in canonical_timestep_bits
     ]
     schedule = report.get("schedule_identity")
     if not isinstance(schedule, dict):
@@ -206,7 +239,9 @@ def load_source_cuda_timestep_modulation_lut(
             "source-CUDA timestep modulation report omits schedule identity"
         )
     if (
-        schedule.get("step_indices_effective")
+        schedule.get("profile_effective") != expected_schedule_profile
+        or schedule.get("profile_expected") != expected_schedule_profile
+        or schedule.get("step_indices_effective")
         != CANONICAL_STEP_INDICES.tolist()
         or schedule.get("step_indices_expected")
         != CANONICAL_STEP_INDICES.tolist()
@@ -230,6 +265,7 @@ def load_source_cuda_timestep_modulation_lut(
         required = {
             "step_indices",
             "timestep_float32",
+            "schedule_profile",
             "source_modulation_bfloat16_bits",
         }
         missing = sorted(required.difference(source.files))
@@ -247,6 +283,7 @@ def load_source_cuda_timestep_modulation_lut(
             if "projection_batch_mode" in source.files
             else None
         )
+        schedule_profile = np.asarray(source["schedule_profile"])
 
     if (
         projection_batch_mode is None
@@ -260,6 +297,16 @@ def load_source_cuda_timestep_modulation_lut(
         )
 
     if (
+        schedule_profile.shape != ()
+        or schedule_profile.dtype.kind not in {"U", "S"}
+        or str(schedule_profile.item()) != expected_schedule_profile
+    ):
+        raise ValueError(
+            "source-CUDA timestep modulation NPZ schedule profile mismatch: "
+            f"expected {expected_schedule_profile!r}"
+        )
+
+    if (
         step_indices.dtype != np.int32
         or step_indices.shape != (8,)
         or not np.array_equal(step_indices, CANONICAL_STEP_INDICES)
@@ -267,7 +314,7 @@ def load_source_cuda_timestep_modulation_lut(
         or timesteps.shape != (8,)
         or not np.array_equal(
             timesteps.view(np.uint32),
-            CANONICAL_TIMESTEP_BITS,
+            canonical_timestep_bits,
         )
     ):
         raise ValueError(
@@ -290,6 +337,7 @@ def load_source_cuda_timestep_modulation_lut(
         report_sha256=effective_report_sha256,
         source_checkpoint_sha256=effective_checkpoint,
         projection_batch_mode=PROJECTION_BATCH_MODE,
+        schedule_profile=expected_schedule_profile,
         timestep_bits=timestep_bits,
         modulation_bfloat16_bits=modulation_bits,
     )

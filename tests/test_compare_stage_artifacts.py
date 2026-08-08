@@ -145,6 +145,26 @@ def test_shape_flow_block_trace_comparison_separates_metadata_and_reports_key_co
     }
 
 
+def test_shape_flow_block_trace_compares_headed_source_attention_to_flat_mlx(
+    tmp_path,
+):
+    from scripts.compare_stage_artifacts import compare_stage
+
+    reference = tmp_path / "reference.npz"
+    candidate = tmp_path / "candidate.npz"
+    headed = np.arange(16, dtype=np.float32).reshape(1, 2, 2, 4)
+    np.savez(reference, pos_block0_attention_raw=headed)
+    np.savez(candidate, pos_block0_attention_raw=headed.reshape(1, 2, 8))
+
+    report = compare_stage("shape_flow_block_trace", reference, candidate)
+    delta = report["arrays"]["pos_block0_attention_raw"]
+
+    assert delta["max_abs_diff"] == 0.0
+    assert delta["exact_match"] is True
+    assert delta["candidate_recorded_shape"] == [1, 2, 8]
+    assert delta["shape_normalization"] == "flattened-head-dimension-to-reference"
+
+
 def test_shape_flow_block_trace_comparison_reports_singleton_route_values(tmp_path):
     from scripts.compare_stage_artifacts import compare_stage
 

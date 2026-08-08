@@ -146,10 +146,10 @@ def test_native_decoder_silu_rejects_unconsumed_artifact_identity():
         )
 
 
-def test_decoder_output_checkpoint_records_effective_decoder_route():
+def test_decoder_consumers_record_effective_decoder_route():
     source = (Path(__file__).parents[1] / "generate.py").read_text()
 
-    assert source.count("decoder_route_json=np.array(") == 2
+    assert source.count("decoder_route_json=np.array(") == 3
 
 
 def test_generate_cli_exposes_all_decoder_route_coordinates():

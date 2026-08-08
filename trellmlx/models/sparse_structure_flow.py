@@ -20,11 +20,182 @@ import mlx.utils
 import numpy as np
 
 from ..modules.norm import LayerNorm32
-from ..modules.attention import scaled_dot_product_attention, MultiHeadRMSNorm
-from ..modules.rope import apply_rope, build_rope_phases
+from ..modules.attention import MultiHeadRMSNorm
+from ..sparse_flow_attention import scaled_dot_product_attention
+from ..sparse_flow_rope import (
+    apply_sparse_flow_rope as apply_rope,
+    build_sparse_flow_rope_phases as build_rope_phases,
+)
+from ..sparse_flow_layernorm import (
+    layernorm_noaffine as _sparse_flow_layernorm_noaffine,
+    layernorm_noaffine_float32_output as _sparse_flow_terminal_layernorm,
+)
 from ..source_cuda_gelu import SOURCE_CUDA_BF16_GELU_TANH_BITS_SHA256
 
 _SOURCE_CUDA_BF16_GELU_TANH_TABLE: mx.array | None = None
+_SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS = (0, 308, 616, 924, 1232, 1536)
+_SOURCE_CUDA_SPARSE_TERMINAL_ROWS = 4096
+_source_cuda_sparse_terminal_linear_kernel = None
+MLX_NATIVE_SPARSE_TERMINAL_LINEAR_BACKEND = "mlx-native-linear"
+SOURCE_CUDA_T4_SPARSE_TERMINAL_LINEAR_BACKEND = (
+    "source-cuda-t4-volta-sgemm-32x128-tn-metal"
+)
+DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND = MLX_NATIVE_SPARSE_TERMINAL_LINEAR_BACKEND
+SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS = (
+    DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+    SOURCE_CUDA_T4_SPARSE_TERMINAL_LINEAR_BACKEND,
+)
+
+
+def sparse_flow_terminal_linear_backend_identity(
+    row_count: int,
+    *,
+    input_width: int,
+    output_width: int,
+    has_bias: bool,
+    backend: str = DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+) -> dict[str, object]:
+    geometry = {
+        "rows": row_count,
+        "input_width": input_width,
+        "output_width": output_width,
+        "has_bias": has_bias,
+    }
+    if backend not in SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS:
+        raise ValueError(
+            f"unsupported sparse terminal linear backend {backend!r}; "
+            f"expected one of {SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS}"
+        )
+    source_geometry = {
+        "rows": _SOURCE_CUDA_SPARSE_TERMINAL_ROWS,
+        "input_width": 1536,
+        "output_width": 8,
+        "has_bias": True,
+    }
+    if backend == SOURCE_CUDA_T4_SPARSE_TERMINAL_LINEAR_BACKEND:
+        if geometry != source_geometry:
+            raise ValueError(
+                "source-CUDA sparse terminal linear requires authenticated "
+                f"geometry {source_geometry}, got {geometry}"
+            )
+        return {
+            "backend": backend,
+            "algorithm": (
+                "five-contiguous-fp32-fma-partitions-with-bias-epilogue"
+            ),
+            "experimental": True,
+            "cuda_source_kernel": "volta_sgemm_32x128_tn",
+            "authenticated_contract": {
+                **geometry,
+                "input_dtype": "float32",
+                "weight_dtype": "float32",
+                "bias_dtype": "float32",
+                "output_dtype": "float32",
+                "partition_bounds": list(
+                    _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
+                ),
+                "cuda_device_anchor": "Tesla T4 sm_75",
+                "torch_anchor": "2.10.0+cu128",
+                "source_block_trace_sha256": (
+                    "83d7e731dbda4c2244907d7402de166b69df7f1c2d3fef93e5842685064b5ded"
+                ),
+            },
+        }
+    return {
+        "backend": backend,
+        "algorithm": "mlx-nn-linear",
+        "experimental": False,
+        "effective_contract": geometry,
+    }
+
+
+def _source_cuda_t4_sparse_terminal_linear(
+    x: mx.array,
+    linear: nn.Linear,
+) -> mx.array:
+    """Execute the observed T4 SGEMM reduction law for sparse projection."""
+    global _source_cuda_sparse_terminal_linear_kernel
+
+    if x.ndim != 2 or x.shape[1] != 1536:
+        raise ValueError("T4 sparse terminal linear requires width-1536 input")
+    if linear.weight.ndim != 2 or linear.weight.shape != (8, 1536):
+        raise ValueError("T4 sparse terminal linear requires 8x1536 weight")
+    if linear.bias is None or linear.bias.shape != (8,):
+        raise ValueError("T4 sparse terminal linear requires width-8 bias")
+
+    if _source_cuda_sparse_terminal_linear_kernel is None:
+        source = r"""
+                constexpr uint reduction = 1536;
+                constexpr uint columns = 8;
+                constexpr uint partition_bounds[6] = {
+                    0, 308, 616, 924, 1232, 1536
+                };
+
+                uint output_index = thread_position_in_grid.x;
+                uint row_count = row_count_input[0];
+                uint output_count = row_count * columns;
+                if (output_index >= output_count) {
+                    return;
+                }
+
+                uint row = output_index / columns;
+                uint column = output_index - row * columns;
+                uint input_offset = row * reduction;
+                uint weight_offset = column * reduction;
+                float accumulator = bias[column];
+
+                for (uint partition = 0; partition < 5; ++partition) {
+                    float partial = 0.0f;
+                    for (uint k = partition_bounds[partition];
+                         k < partition_bounds[partition + 1];
+                         ++k) {
+                        partial = metal::fma(
+                            inp[input_offset + k],
+                            weight[weight_offset + k],
+                            partial);
+                    }
+                    accumulator = accumulator + partial;
+                }
+                out[output_index] = accumulator;
+            """
+        _source_cuda_sparse_terminal_linear_kernel = mx.fast.metal_kernel(
+            name="sparse_flow_source_cuda_t4_terminal_linear_fp32",
+            input_names=["inp", "weight", "bias", "row_count_input"],
+            output_names=["out"],
+            source=source,
+            ensure_row_contiguous=True,
+        )
+
+    return _source_cuda_sparse_terminal_linear_kernel(
+        inputs=[
+            x.astype(mx.float32),
+            linear.weight.astype(mx.float32),
+            linear.bias.astype(mx.float32),
+            mx.array([x.shape[0]], dtype=mx.uint32),
+        ],
+        grid=(x.shape[0] * 8, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(x.shape[0], 8)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def _sparse_terminal_linear(
+    x: mx.array,
+    linear: nn.Linear,
+    *,
+    backend: str = DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
+) -> mx.array:
+    identity = sparse_flow_terminal_linear_backend_identity(
+        int(x.shape[0]),
+        input_width=int(linear.weight.shape[1]),
+        output_width=int(linear.weight.shape[0]),
+        has_bias=linear.bias is not None,
+        backend=backend,
+    )
+    if identity["backend"] == SOURCE_CUDA_T4_SPARSE_TERMINAL_LINEAR_BACKEND:
+        return _source_cuda_t4_sparse_terminal_linear(x, linear)
+    return linear(x)
 
 
 class TimestepEmbedder(nn.Module):
@@ -70,6 +241,23 @@ def _source_shared_modulation(
     t1 = _source_linear(_source_silu(t0), t_embedder.mlp_2)
     mod = _source_linear(_source_silu(t1), adaLN_modulation.layers[1])
     return mx.array(mod).astype(dtype)
+
+
+def _sparse_shared_modulation(
+    t: mx.array,
+    t_embedder: TimestepEmbedder,
+    adaLN_modulation: nn.Sequential,
+    compute_dtype: mx.Dtype,
+    sparse_timestep_modulation_lut=None,
+) -> mx.array:
+    if sparse_timestep_modulation_lut is not None:
+        return sparse_timestep_modulation_lut.lookup_mlx(t, compute_dtype)
+    return _source_shared_modulation(
+        t,
+        t_embedder,
+        adaLN_modulation,
+        compute_dtype,
+    )
 
 
 def _source_linear(x: np.ndarray, linear: nn.Linear) -> np.ndarray:
@@ -339,10 +527,12 @@ class ModulatedBlock(nn.Module):
         context_channels: int,
         mlp_hidden: int,
         *,
+        sparse_flow_layernorm: bool = False,
         shape_flow_layernorm: bool = False,
     ):
         super().__init__()
         self.channels = channels
+        self.sparse_flow_layernorm = sparse_flow_layernorm
         self.shape_flow_layernorm = shape_flow_layernorm
 
         # Self-attention (no separate norm — adaLN handles it)
@@ -352,6 +542,7 @@ class ModulatedBlock(nn.Module):
         self.norm2 = LayerNorm32(
             channels,
             affine=True,
+            sparse_flow_layernorm=sparse_flow_layernorm,
             shape_flow_layernorm=shape_flow_layernorm,
         )
         self.cross_attn = MultiHeadAttention(channels, num_heads, context_channels)
@@ -615,6 +806,8 @@ class ModulatedBlock(nn.Module):
         return x, trace
 
     def _layernorm_noaffine(self, x: mx.array, eps: float = 1e-6) -> mx.array:
+        if self.sparse_flow_layernorm:
+            return _sparse_flow_layernorm_noaffine(x, eps=eps)
         if self.shape_flow_layernorm:
             from ..shape_flow_layernorm import layernorm_noaffine
 
@@ -802,6 +995,7 @@ class SparseStructureFlowModel(nn.Module):
         mlp_hidden: int = 8192,
         context_channels: int = 1024,
         resolution: int = 16,
+        terminal_linear_backend: str = DEFAULT_SPARSE_TERMINAL_LINEAR_BACKEND,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -809,6 +1003,12 @@ class SparseStructureFlowModel(nn.Module):
         self.model_channels = model_channels
         self.num_heads = num_heads
         self.resolution = resolution
+        if terminal_linear_backend not in SUPPORTED_SPARSE_TERMINAL_LINEAR_BACKENDS:
+            raise ValueError(
+                f"unsupported sparse terminal linear backend "
+                f"{terminal_linear_backend!r}"
+            )
+        self.terminal_linear_backend = terminal_linear_backend
 
         # Timestep embedder
         self.t_embedder = TimestepEmbedder(model_channels)
@@ -825,7 +1025,13 @@ class SparseStructureFlowModel(nn.Module):
 
         # Transformer blocks
         self.blocks = [
-            ModulatedBlock(model_channels, num_heads, context_channels, mlp_hidden)
+            ModulatedBlock(
+                model_channels,
+                num_heads,
+                context_channels,
+                mlp_hidden,
+                sparse_flow_layernorm=True,
+            )
             for _ in range(num_blocks)
         ]
         for block in self.blocks:
@@ -834,6 +1040,15 @@ class SparseStructureFlowModel(nn.Module):
         # Compilation state (call .compile() to enable)
         self._compiled = False
         self._run_blocks = self._run_blocks_impl
+
+    def terminal_linear_backend_identity(self, row_count: int) -> dict[str, object]:
+        return sparse_flow_terminal_linear_backend_identity(
+            row_count,
+            input_width=int(self.out_layer.weight.shape[1]),
+            output_width=int(self.out_layer.weight.shape[0]),
+            has_bias=self.out_layer.bias is not None,
+            backend=self.terminal_linear_backend,
+        )
 
     def _run_blocks_impl(self, x, mod, cond, rope_phases):
         """Pure forward pass through all blocks (no mx.eval)."""
@@ -867,8 +1082,16 @@ class SparseStructureFlowModel(nn.Module):
         t: mx.array,
         cond: mx.array,
         cross_kv_cache: list = None,
+        sparse_timestep_modulation_lut=None,
     ) -> dict[str, mx.array]:
-        return self.trace_block(x, t, cond, block_index=0, cross_kv_cache=cross_kv_cache)
+        return self.trace_block(
+            x,
+            t,
+            cond,
+            block_index=0,
+            cross_kv_cache=cross_kv_cache,
+            sparse_timestep_modulation_lut=sparse_timestep_modulation_lut,
+        )
 
     def trace_block(
         self,
@@ -879,6 +1102,7 @@ class SparseStructureFlowModel(nn.Module):
         cross_kv_cache: list = None,
         sparse_block_injection=None,
         sparse_block_injection_branch: str | None = None,
+        sparse_timestep_modulation_lut=None,
     ) -> dict[str, mx.array]:
         if block_index < 0 or block_index >= len(self.blocks):
             raise ValueError(f"block_index must be in [0, {len(self.blocks) - 1}], got {block_index}")
@@ -888,7 +1112,13 @@ class SparseStructureFlowModel(nn.Module):
         R = x.shape[2]
 
         compute_dtype = _infer_compute_dtype(self)
-        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
+        mod = _sparse_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            sparse_timestep_modulation_lut,
+        )
 
         x = x.reshape(B, self.in_channels, -1)
         x = x.transpose(0, 2, 1)
@@ -924,10 +1154,13 @@ class SparseStructureFlowModel(nn.Module):
                 if i == len(self.blocks) - 1:
                     x = _x_after
                     trace["final_input"] = x
-                    x = x.astype(input_dtype)
-                    x = _layernorm_noaffine(x, eps=1e-5)
+                    x = _sparse_flow_terminal_layernorm(x, eps=1e-5)
                     trace["final_norm"] = x
-                    x = self.out_layer(x)
+                    x = _sparse_terminal_linear(
+                        x,
+                        self.out_layer,
+                        backend=self.terminal_linear_backend,
+                    )
                     trace["final_out_flat"] = x
                     trace["final_output"] = x.reshape(B, R, R, R, self.out_channels).transpose(0, 4, 1, 2, 3)
                 break
@@ -964,6 +1197,7 @@ class SparseStructureFlowModel(nn.Module):
         cross_kv_cache: list = None,
         sparse_block_injection=None,
         sparse_block_injection_branch: str | None = None,
+        sparse_timestep_modulation_lut=None,
     ) -> dict[str, mx.array]:
         """Trace one block starting from a saved projected block input.
 
@@ -1009,7 +1243,13 @@ class SparseStructureFlowModel(nn.Module):
 
         input_dtype = block_input.dtype
         compute_dtype = _infer_compute_dtype(self)
-        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
+        mod = _sparse_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            sparse_timestep_modulation_lut,
+        )
         x = block_input.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
@@ -1035,10 +1275,13 @@ class SparseStructureFlowModel(nn.Module):
         trace.update(block_trace)
         if block_index == len(self.blocks) - 1:
             trace["final_input"] = x_after
-            x_final = x_after.astype(input_dtype)
-            x_final = _layernorm_noaffine(x_final, eps=1e-5)
+            x_final = _sparse_flow_terminal_layernorm(x_after, eps=1e-5)
             trace["final_norm"] = x_final
-            x_final = self.out_layer(x_final)
+            x_final = _sparse_terminal_linear(
+                x_final,
+                self.out_layer,
+                backend=self.terminal_linear_backend,
+            )
             trace["final_out_flat"] = x_final
             trace["final_output"] = (
                 x_final.reshape(1, resolution, resolution, resolution, self.out_channels)
@@ -1055,6 +1298,7 @@ class SparseStructureFlowModel(nn.Module):
         cross_kv_cache: list = None,
         sparse_block_injection=None,
         sparse_block_injection_branch: str | None = None,
+        sparse_timestep_modulation_lut=None,
     ) -> mx.array:
         input_dtype = x.dtype
         B = x.shape[0]
@@ -1068,7 +1312,13 @@ class SparseStructureFlowModel(nn.Module):
         # Project to model channels
         x = self.input_layer(x)
         compute_dtype = _infer_compute_dtype(self)
-        mod = _source_shared_modulation(t, self.t_embedder, self.adaLN_modulation, compute_dtype)
+        mod = _sparse_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            sparse_timestep_modulation_lut,
+        )
         x = x.astype(compute_dtype)
         cond = cond.astype(compute_dtype)
 
@@ -1103,10 +1353,13 @@ class SparseStructureFlowModel(nn.Module):
                     mx.eval(x)
 
         # Output projection
-        x = x.astype(input_dtype)
         # PyTorch F.layer_norm defaults to eps=1e-5 in the TRELLIS.2 source.
-        x = _layernorm_noaffine(x, eps=1e-5)
-        x = self.out_layer(x)                          # [B*R³, out_C]
+        x = _sparse_flow_terminal_layernorm(x, eps=1e-5)
+        x = _sparse_terminal_linear(
+            x,
+            self.out_layer,
+            backend=self.terminal_linear_backend,
+        )  # [B*R³, out_C]
 
         # Reshape back to 3D
         x = x.reshape(B, R, R, R, self.out_channels)

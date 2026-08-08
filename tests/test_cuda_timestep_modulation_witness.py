@@ -17,6 +17,7 @@ STAGES = (
     "modulation_bfloat16_bits",
 )
 PROJECTION_BATCH_MODE = "independent-singletons"
+SCHEDULE_PROFILE = "shape-slat-rescale-3"
 
 
 def _arrays(*, steps=3, width=4):
@@ -172,6 +173,7 @@ def test_modulation_candidate_requires_projection_batch_identity(tmp_path):
             dtype=np.uint32,
         ).view(np.float32),
         candidate_route=np.asarray("trellis2mlx/source-shared-modulation"),
+        schedule_profile=np.asarray(SCHEDULE_PROFILE),
         **_arrays(steps=8),
     )
 
@@ -210,6 +212,7 @@ def test_modulation_primary_validation_rejects_partial_or_corrupted_output(
             timesteps=timesteps,
             source_arrays=source_arrays,
             projection_batch_mode=PROJECTION_BATCH_MODE,
+            schedule_profile=SCHEDULE_PROFILE,
         )
 
 
@@ -227,6 +230,7 @@ def test_modulation_primary_validation_rejects_batch_mode_substitution(tmp_path)
         step_indices=step_indices,
         timestep_float32=timesteps,
         projection_batch_mode=np.asarray("batched-eight"),
+        schedule_profile=np.asarray(SCHEDULE_PROFILE),
         **{
             f"source_{name}": value
             for name, value in source_arrays.items()
@@ -243,6 +247,7 @@ def test_modulation_primary_validation_rejects_batch_mode_substitution(tmp_path)
             timesteps=timesteps,
             source_arrays=source_arrays,
             projection_batch_mode=PROJECTION_BATCH_MODE,
+            schedule_profile=SCHEDULE_PROFILE,
         )
 
 
@@ -283,6 +288,37 @@ def test_modulation_schedule_requires_exact_eight_canonical_coordinates(case):
         validate_schedule(step_indices=step_indices, timesteps=timesteps)
 
 
+def test_modulation_schedule_profile_distinguishes_sparse_from_shape():
+    from scripts.cuda_timestep_modulation_witness import validate_schedule
+
+    sparse_bits = np.asarray(
+        [
+            0x447A0000,
+            0x44730E39,
+            0x446A6000,
+            0x445F36DB,
+            0x44505555,
+            0x443B8000,
+            0x441C4000,
+            0x43D05555,
+        ],
+        dtype=np.uint32,
+    )
+    identity = validate_schedule(
+        step_indices=np.arange(8, dtype=np.int32),
+        timesteps=sparse_bits.view(np.float32),
+        schedule_profile="sparse-structure-rescale-5",
+    )
+
+    assert identity["profile_effective"] == "sparse-structure-rescale-5"
+    with pytest.raises(ValueError, match="canonical eight-step schedule"):
+        validate_schedule(
+            step_indices=np.arange(8, dtype=np.int32),
+            timesteps=sparse_bits.view(np.float32),
+            schedule_profile="shape-slat-rescale-3",
+        )
+
+
 def test_modulation_main_preserves_input_when_primary_aliases_it(
     monkeypatch, tmp_path
 ):
@@ -312,6 +348,8 @@ def test_modulation_main_preserves_input_when_primary_aliases_it(
             "trellis2mlx/source-shared-modulation",
             "--projection-batch-mode",
             PROJECTION_BATCH_MODE,
+            "--schedule-profile",
+            SCHEDULE_PROFILE,
             "--output-json",
             str(output_json),
             "--output-npz",
@@ -359,6 +397,8 @@ def test_modulation_main_routes_hardlinked_failure_report_away_from_input(
             "trellis2mlx/source-shared-modulation",
             "--projection-batch-mode",
             PROJECTION_BATCH_MODE,
+            "--schedule-profile",
+            SCHEDULE_PROFILE,
             "--output-json",
             str(requested_json),
             "--output-npz",
@@ -396,6 +436,7 @@ def test_modulation_main_rejects_partial_schedule_before_torch_and_clears_primar
             "trellis2mlx/source-shared-modulation"
         ),
         projection_batch_mode=np.asarray(PROJECTION_BATCH_MODE),
+        schedule_profile=np.asarray(SCHEDULE_PROFILE),
         **candidate_arrays,
     )
     monkeypatch.setattr(
@@ -425,6 +466,8 @@ def test_modulation_main_rejects_partial_schedule_before_torch_and_clears_primar
             "trellis2mlx/source-shared-modulation",
             "--projection-batch-mode",
             PROJECTION_BATCH_MODE,
+            "--schedule-profile",
+            SCHEDULE_PROFILE,
             "--output-json",
             str(output_json),
             "--output-npz",
@@ -474,6 +517,8 @@ def test_modulation_main_rejects_substituted_input_and_removes_stale_primary(
             "trellis2mlx/source-shared-modulation",
             "--projection-batch-mode",
             PROJECTION_BATCH_MODE,
+            "--schedule-profile",
+            SCHEDULE_PROFILE,
             "--output-json",
             str(output_json),
             "--output-npz",

@@ -23,7 +23,8 @@ SUPPORTED_QK_NORM_BACKENDS = (
 
 _source_cuda_warp32_norm_kernel = None
 _source_cuda_sequential_value_kernel = None
-_source_cuda_long_row_softmax_kernel = None
+_source_cuda_long_row_softmax_kernels = {}
+_source_cuda_register_softmax_4096_kernel = None
 _source_cuda_warp_softmax_kernel = None
 
 
@@ -117,20 +118,25 @@ def _manual_scaled_dot_product_attention(
     v: mx.array,
     scale: float,
     mask: mx.array = None,
+    *,
+    softmax_backend: str | None = None,
+    value_backend: str | None = None,
 ) -> mx.array:
     """Chunked MLX matmul/softmax attention for source-parity diagnostics."""
     out_chunks = []
     chunk_size = int(os.environ.get("TRELLIS2MLX_ATTENTION_CHUNK_SIZE", "512"))
     if chunk_size <= 0:
         raise ValueError("TRELLIS2MLX_ATTENTION_CHUNK_SIZE must be positive")
-    value_backend = os.environ.get(
-        "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
-        "mlx-matmul",
-    ).lower()
-    softmax_backend = os.environ.get(
-        "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
-        "mlx-softmax",
-    ).lower()
+    if value_backend is None:
+        value_backend = os.environ.get(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
+            "mlx-matmul",
+        ).lower()
+    if softmax_backend is None:
+        softmax_backend = os.environ.get(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
+            "mlx-softmax",
+        ).lower()
     if softmax_backend not in {"mlx-softmax", "source-cuda-turing"}:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND must be one of "
@@ -246,7 +252,8 @@ def _source_cuda_sequential_value_projection(
 
 def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
     """Reproduce authenticated source CUDA FP32 softmax schedules."""
-    global _source_cuda_long_row_softmax_kernel
+    global _source_cuda_long_row_softmax_kernels
+    global _source_cuda_register_softmax_4096_kernel
     global _source_cuda_warp_softmax_kernel
 
     if scores.ndim < 1:
@@ -254,9 +261,10 @@ def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
     if scores.dtype != mx.float32:
         raise ValueError("softmax scores must use float32")
     width = int(scores.shape[-1])
-    if width not in {1029, 7697}:
+    if width not in {1029, 4096, 6022, 7697}:
         raise ValueError(
-            "source CUDA softmax requires an authenticated width of 1029 or 7697"
+            "source CUDA softmax requires an authenticated width of "
+            "1029, 4096, 6022, or 7697"
         )
     row_count = scores.size // scores.shape[-1]
     if row_count <= 0:
@@ -336,9 +344,104 @@ def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
             output_dtypes=[mx.float32],
         )[0]
 
-    if _source_cuda_long_row_softmax_kernel is None:
+    if width == 4096:
+        if _source_cuda_register_softmax_4096_kernel is None:
+            source = r"""
+                constexpr uint width = 4096;
+                constexpr uint threads = 1024;
+                constexpr uint warps = 32;
+                constexpr uint registers_per_thread = 4;
+                constexpr float lowest = -3.402823466e+38f;
+
+                uint tid = thread_position_in_threadgroup.x;
+                uint lane = tid & 31;
+                uint warp = tid >> 5;
+                uint row = threadgroup_position_in_grid.y;
+                uint row_offset = row * width;
+                threadgroup float shared[warps];
+                float registers[registers_per_thread];
+                float thread_max = lowest;
+
+                for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                    uint offset = tid + reg * threads;
+                    float value = scores[row_offset + offset];
+                    registers[reg] = value;
+                    thread_max = thread_max < value ? value : thread_max;
+                }
+
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    float upper = simd_shuffle_down(thread_max, delta);
+                    thread_max = thread_max < upper ? upper : thread_max;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) {
+                    shared[warp] = thread_max;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float row_max = tid < warps ? shared[lane] : lowest;
+                if (warp == 0) {
+                    for (ushort delta = 16; delta > 0; delta >>= 1) {
+                        float upper = simd_shuffle_down(row_max, delta);
+                        row_max = row_max < upper ? upper : row_max;
+                    }
+                }
+                if (tid == 0) {
+                    shared[0] = row_max;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                row_max = shared[0];
+
+                float thread_sum = 0.0f;
+                for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                    registers[reg] = source_cuda_expf(
+                        registers[reg] - row_max);
+                    thread_sum = thread_sum + registers[reg];
+                }
+
+                for (ushort delta = 16; delta > 0; delta >>= 1) {
+                    thread_sum += simd_shuffle_down(thread_sum, delta);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) {
+                    shared[warp] = thread_sum;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float row_sum = tid < warps ? shared[lane] : 0.0f;
+                if (warp == 0) {
+                    for (ushort delta = 16; delta > 0; delta >>= 1) {
+                        row_sum += simd_shuffle_down(row_sum, delta);
+                    }
+                }
+                if (tid == 0) {
+                    shared[0] = row_sum;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                row_sum = shared[0];
+
+                for (uint reg = 0; reg < registers_per_thread; ++reg) {
+                    uint offset = tid + reg * threads;
+                    out[row_offset + offset] = registers[reg] / row_sum;
+                }
+            """
+            _source_cuda_register_softmax_4096_kernel = mx.fast.metal_kernel(
+                name="attention_source_cuda_register_softmax_fp32_4096",
+                input_names=["scores"],
+                output_names=["out"],
+                header=SOURCE_CUDA_EX2_METAL_HEADER,
+                source=source,
+            )
+        return _source_cuda_register_softmax_4096_kernel(
+            inputs=[scores],
+            template=[],
+            grid=(1024, row_count, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[scores.shape],
+            output_dtypes=[mx.float32],
+        )[0]
+
+    if width not in _source_cuda_long_row_softmax_kernels:
         source = r"""
-            constexpr uint width = 7697;
+            constexpr uint width = __SOURCE_WIDTH__;
             constexpr uint threads = 1024;
             constexpr uint warps = 32;
             constexpr uint registers_per_thread = 8;
@@ -421,15 +524,16 @@ def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
                 }
             }
         """
-        _source_cuda_long_row_softmax_kernel = mx.fast.metal_kernel(
-            name="attention_source_cuda_long_row_softmax_fp32_7697",
+        source = source.replace("__SOURCE_WIDTH__", str(width))
+        _source_cuda_long_row_softmax_kernels[width] = mx.fast.metal_kernel(
+            name=f"attention_source_cuda_long_row_softmax_fp32_{width}",
             input_names=["scores"],
             output_names=["out"],
             header=SOURCE_CUDA_EX2_METAL_HEADER,
             source=source,
         )
 
-    return _source_cuda_long_row_softmax_kernel(
+    return _source_cuda_long_row_softmax_kernels[width](
         inputs=[scores],
         template=[],
         grid=(1024, row_count, 1),
@@ -439,32 +543,38 @@ def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
     )[0]
 
 
-def scaled_dot_product_attention(
+def scaled_dot_product_attention_for_backend(
     q: mx.array,  # [B, H, T, D]
     k: mx.array,  # [B, H, S, D]
     v: mx.array,  # [B, H, S, D]
     mask: mx.array = None,  # [B, 1, T, S] or None
+    *,
+    backend: str,
+    softmax_backend: str,
+    value_backend: str,
 ) -> mx.array:
-    """Scaled dot-product attention using the selected diagnostic backend.
+    """Scaled dot-product attention using an explicit execution route.
 
     MLX's mx.fast.scaled_dot_product_attention uses tiled online softmax
     and never materializes the full N×N attention matrix (O(N) memory).
     """
     scale = 1.0 / math.sqrt(q.shape[-1])
-    backend = os.environ.get("TRELLIS2MLX_ATTENTION_BACKEND", "fast").lower()
+    backend = backend.lower()
+    softmax_backend = softmax_backend.lower()
+    value_backend = value_backend.lower()
     if backend in {"fast", "mlx-fast"}:
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
     if backend in {"manual", "mlx-manual"}:
-        return _manual_scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        return _manual_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            mask=mask,
+            softmax_backend=softmax_backend,
+            value_backend=value_backend,
+        )
     if backend == "source-cuda-self":
-        softmax_backend = os.environ.get(
-            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND",
-            "mlx-softmax",
-        ).lower()
-        value_backend = os.environ.get(
-            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND",
-            "mlx-matmul",
-        ).lower()
         if (
             softmax_backend != "source-cuda-turing"
             or value_backend != "source-cuda-sequential"
@@ -473,19 +583,45 @@ def scaled_dot_product_attention(
                 "source-cuda-self requires source-cuda-turing softmax and "
                 "source-cuda-sequential value projection"
             )
-        if k.shape[-2] in {1029, 7697}:
+        if k.shape[-2] in {1029, 4096, 6022, 7697}:
             return _manual_scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 scale=scale,
                 mask=mask,
+                softmax_backend=softmax_backend,
+                value_backend=value_backend,
             )
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
     raise ValueError(
         "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
         "'fast', 'manual', or 'source-cuda-self', "
         f"got {backend!r}"
+    )
+
+
+def scaled_dot_product_attention(
+    q: mx.array,  # [B, H, T, D]
+    k: mx.array,  # [B, H, S, D]
+    v: mx.array,  # [B, H, S, D]
+    mask: mx.array = None,  # [B, 1, T, S] or None
+) -> mx.array:
+    """Scaled dot-product attention using the process environment route."""
+    return scaled_dot_product_attention_for_backend(
+        q,
+        k,
+        v,
+        mask,
+        backend=os.environ.get(
+            "TRELLIS2MLX_ATTENTION_BACKEND", "fast"
+        ),
+        softmax_backend=os.environ.get(
+            "TRELLIS2MLX_ATTENTION_SOFTMAX_BACKEND", "mlx-softmax"
+        ),
+        value_backend=os.environ.get(
+            "TRELLIS2MLX_ATTENTION_VALUE_BACKEND", "mlx-matmul"
+        ),
     )
 
 

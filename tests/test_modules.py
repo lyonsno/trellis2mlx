@@ -333,6 +333,26 @@ class TestScaledDotProductAttention:
         assert actual.shape == q.shape
         assert actual.dtype == mx.bfloat16
 
+    def test_source_cuda_softmax_accepts_sparse_structure_width(self):
+        from trellmlx.modules.attention import _source_cuda_long_row_softmax
+
+        scores = mx.zeros((1, 1, 1, 4096), dtype=mx.float32)
+        actual = _source_cuda_long_row_softmax(scores)
+        mx.eval(actual)
+
+        expected = np.full((1, 1, 1, 4096), 1.0 / 4096.0, dtype=np.float32)
+        assert np.array_equal(np.asarray(actual), expected)
+
+    def test_source_cuda_softmax_accepts_exact_shape_support_width(self):
+        from trellmlx.modules.attention import _source_cuda_long_row_softmax
+
+        scores = mx.zeros((1, 1, 1, 6022), dtype=mx.float32)
+        actual = _source_cuda_long_row_softmax(scores)
+        mx.eval(actual)
+
+        expected = np.full((1, 1, 1, 6022), 1.0 / 6022.0, dtype=np.float32)
+        assert np.array_equal(np.asarray(actual), expected)
+
     def test_source_cuda_self_backend_uses_exact_route_at_authenticated_widths(
         self, monkeypatch
     ):
@@ -340,7 +360,7 @@ class TestScaledDotProductAttention:
 
         calls = []
 
-        def manual(q, k, v, scale, mask=None):
+        def manual(q, k, v, scale, mask=None, **_route):
             calls.append(("manual", k.shape[-2]))
             return mx.full(q.shape, 2.0, dtype=q.dtype)
 
@@ -360,22 +380,40 @@ class TestScaledDotProductAttention:
         monkeypatch.setattr(attention, "_manual_scaled_dot_product_attention", manual)
         monkeypatch.setattr(attention.mx.fast, "scaled_dot_product_attention", fast)
         q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
+        sparse_kv = mx.ones((1, 1, 4096, 4), dtype=mx.bfloat16)
+        exact_shape_kv = mx.ones((1, 1, 6022, 4), dtype=mx.bfloat16)
         self_kv = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
         cross_kv = mx.ones((1, 1, 1029, 4), dtype=mx.bfloat16)
         unsupported_kv = mx.ones((1, 1, 16, 4), dtype=mx.bfloat16)
 
+        sparse_out = attention.scaled_dot_product_attention(
+            q, sparse_kv, sparse_kv
+        )
+        exact_shape_out = attention.scaled_dot_product_attention(
+            q, exact_shape_kv, exact_shape_kv
+        )
         self_out = attention.scaled_dot_product_attention(q, self_kv, self_kv)
         cross_out = attention.scaled_dot_product_attention(q, cross_kv, cross_kv)
         unsupported_out = attention.scaled_dot_product_attention(
             q, unsupported_kv, unsupported_kv
         )
-        mx.eval(self_out, cross_out, unsupported_out)
+        mx.eval(exact_shape_out, self_out, cross_out, unsupported_out)
 
         assert calls == [
+            ("manual", 4096),
+            ("manual", 6022),
             ("manual", 7697),
             ("manual", 1029),
             ("fast", 16),
         ]
+        assert np.array_equal(
+            np.asarray(sparse_out.astype(mx.float32)),
+            np.full(q.shape, 2.0, dtype=np.float32),
+        )
+        assert np.array_equal(
+            np.asarray(exact_shape_out.astype(mx.float32)),
+            np.full(q.shape, 2.0, dtype=np.float32),
+        )
         assert np.array_equal(
             np.asarray(self_out.astype(mx.float32)),
             np.full(q.shape, 2.0, dtype=np.float32),
@@ -511,13 +549,17 @@ class TestSparseStructureFlowModel:
         import trellmlx.models.sparse_structure_flow as sparse_flow
 
         seen_eps = []
-        original_layernorm = sparse_flow._layernorm_noaffine
+        original_layernorm = sparse_flow._sparse_flow_terminal_layernorm
 
         def capture_layernorm(x, eps=1e-6):
             seen_eps.append(eps)
             return original_layernorm(x, eps=eps)
 
-        monkeypatch.setattr(sparse_flow, "_layernorm_noaffine", capture_layernorm)
+        monkeypatch.setattr(
+            sparse_flow,
+            "_sparse_flow_terminal_layernorm",
+            capture_layernorm,
+        )
         model = sparse_flow.SparseStructureFlowModel(
             in_channels=8, out_channels=8, model_channels=16,
             num_heads=4, num_blocks=0, mlp_hidden=32,

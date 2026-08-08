@@ -11,6 +11,43 @@ import numpy as np
 
 
 _source_sparse_cfg_std_kernel = None
+_source_cuda_dense_cfg_std_kernel = None
+
+
+def dense_cfg_rescale_std_backend_identity(
+    shape: tuple[int, ...],
+    *,
+    dtype: str,
+) -> dict[str, object]:
+    geometry = {"shape": list(shape), "dtype": dtype}
+    if tuple(shape) == (1, 8, 16, 16, 16) and dtype == "float32":
+        return {
+            "backend": "source-cuda-t4-welford-metal",
+            "algorithm": "pytorch-2.10-cuda-welford-vt2-block512",
+            "experimental": True,
+            "authenticated_contract": {
+                **geometry,
+                "thread_count": 512,
+                "input_vector_width": 2,
+                "online_m2_update": "fp32-fma",
+                "shared_tree_offsets": [256, 128, 64, 32],
+                "warp_tree_offsets": [16, 8, 4, 2, 1],
+                "correction": 1,
+                "cuda_device_anchor": "Tesla T4 sm_75",
+                "torch_anchor": "2.10.0+cu128",
+                "source_checkpoint_sha256": (
+                    "c202368155d3f1c28ea7132b2909f4656e79df4a073f2ff04905b5a452ce6520"
+                ),
+                "authenticated_scalar_count": 12,
+            },
+        }
+    return {
+        "backend": "mlx-native-var",
+        "algorithm": "mlx-var-bessel-corrected",
+        "experimental": True,
+        "effective_contract": geometry,
+        "excluded_shape": [1, 8, 16, 16, 16],
+    }
 
 
 def flow_euler_sample(
@@ -304,6 +341,9 @@ def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:
     if sparse_tokens:
         return _source_sparse_cfg_rescale_std(x_0)
 
+    if x_0.ndim == 5 and x_0.shape == (1, 8, 16, 16, 16):
+        return _source_cuda_dense_cfg_rescale_std(x_0)
+
     reduce_dims = list(range(1, x_0.ndim))
     n = 1
     for d in reduce_dims:
@@ -311,6 +351,138 @@ def _cfg_rescale_std(x_0: mx.array, *, sparse_tokens: bool) -> mx.array:
     # Match PyTorch torch.std() Bessel correction (correction=1) for dense tensors.
     bessel = n / (n - 1)
     return mx.sqrt(mx.var(x_0, axis=reduce_dims, keepdims=True) * bessel)
+
+
+def _source_cuda_dense_cfg_rescale_std(x_0: mx.array) -> mx.array:
+    """Reproduce PyTorch 2.10 CUDA's dense CFG Welford reduction."""
+    global _source_cuda_dense_cfg_std_kernel
+
+    if x_0.ndim != 5 or x_0.shape != (1, 8, 16, 16, 16):
+        raise ValueError(
+            "source-CUDA dense CFG rescale requires 1x8x16x16x16 input"
+        )
+
+    if _source_cuda_dense_cfg_std_kernel is None:
+        header = r"""
+            struct WelfordDataCfg {
+                float mean;
+                float m2;
+                float count;
+            };
+
+            inline WelfordDataCfg cfg_welford_online(
+                float value,
+                WelfordDataCfg current
+            ) {
+                float new_count = current.count + 1.0f;
+                float delta = value - current.mean;
+                float new_mean = current.mean + delta / new_count;
+                float new_delta = value - new_mean;
+                return {
+                    new_mean,
+                    metal::fma(delta, new_delta, current.m2),
+                    new_count
+                };
+            }
+
+            inline WelfordDataCfg cfg_welford_combine(
+                WelfordDataCfg first,
+                WelfordDataCfg second
+            ) {
+                if (first.count == 0.0f) {
+                    return second;
+                }
+                if (second.count == 0.0f) {
+                    return first;
+                }
+                float delta = second.mean - first.mean;
+                float count = first.count + second.count;
+                float second_fraction = second.count / count;
+                return {
+                    first.mean + delta * second_fraction,
+                    first.m2 + second.m2
+                        + delta * delta * first.count * second_fraction,
+                    count
+                };
+            }
+        """
+        source = r"""
+            constexpr uint thread_count = 512;
+            constexpr uint vector_count = 16384;
+
+            uint thread_index = thread_position_in_threadgroup.x;
+            WelfordDataCfg even = {0.0f, 0.0f, 0.0f};
+            WelfordDataCfg odd = {0.0f, 0.0f, 0.0f};
+            for (uint vector_index = thread_index;
+                 vector_index < vector_count;
+                 vector_index += thread_count) {
+                uint offset = vector_index * 2;
+                even = cfg_welford_online(
+                    static_cast<float>(inp[offset]), even);
+                odd = cfg_welford_online(
+                    static_cast<float>(inp[offset + 1]), odd);
+            }
+            WelfordDataCfg value = cfg_welford_combine(even, odd);
+
+            threadgroup float shared_mean[thread_count];
+            threadgroup float shared_m2[thread_count];
+            threadgroup float shared_count[thread_count];
+            shared_mean[thread_index] = value.mean;
+            shared_m2[thread_index] = value.m2;
+            shared_count[thread_index] = value.count;
+
+            for (uint offset = 256; offset >= 32; offset >>= 1) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (thread_index < offset) {
+                    WelfordDataCfg upper = {
+                        shared_mean[thread_index + offset],
+                        shared_m2[thread_index + offset],
+                        shared_count[thread_index + offset]
+                    };
+                    value = cfg_welford_combine(value, upper);
+                    shared_mean[thread_index] = value.mean;
+                    shared_m2[thread_index] = value.m2;
+                    shared_count[thread_index] = value.count;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (thread_index < 32) {
+                value = {
+                    shared_mean[thread_index],
+                    shared_m2[thread_index],
+                    shared_count[thread_index]
+                };
+                for (ushort offset = 16; offset > 0; offset >>= 1) {
+                    WelfordDataCfg upper = {
+                        simd_shuffle_down(value.mean, offset),
+                        simd_shuffle_down(value.m2, offset),
+                        simd_shuffle_down(value.count, offset)
+                    };
+                    value = cfg_welford_combine(value, upper);
+                }
+                if (thread_index == 0) {
+                    float variance = value.m2 / (value.count - 1.0f);
+                    out[0] = metal::precise::sqrt(variance);
+                }
+            }
+        """
+        _source_cuda_dense_cfg_std_kernel = mx.fast.metal_kernel(
+            name="cfg_rescale_source_cuda_t4_welford_fp32",
+            input_names=["inp"],
+            output_names=["out"],
+            header=header,
+            source=source,
+            ensure_row_contiguous=True,
+        )
+
+    return _source_cuda_dense_cfg_std_kernel(
+        inputs=[x_0.astype(mx.float32)],
+        grid=(512, 1, 1),
+        threadgroup=(512, 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[mx.float32],
+    )[0].reshape((1, 1, 1, 1, 1))
 
 
 def _source_sparse_cfg_rescale_std(x_0: mx.array) -> mx.array:

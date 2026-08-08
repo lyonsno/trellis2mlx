@@ -48,6 +48,106 @@ def test_sparse_cfg_rescale_std_matches_source_reduction_topology():
         assert actual.view(np.uint32) == expected.view(np.uint32)
 
 
+def test_dense_cfg_rescale_std_matches_source_cuda_welford_topology():
+    from trellmlx.samplers import _source_cuda_dense_cfg_rescale_std
+
+    values = np.random.default_rng(7).standard_normal(
+        (1, 8, 16, 16, 16),
+        dtype=np.float32,
+    )
+    actual = np.asarray(
+        _source_cuda_dense_cfg_rescale_std(mx.array(values)),
+        dtype=np.float32,
+    ).reshape(())
+
+    assert actual.view(np.uint32) == np.uint32(0x3F80CAA7)
+
+
+def test_dense_cfg_rescale_std_identity_binds_only_authenticated_geometry():
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
+    exact = dense_cfg_rescale_std_backend_identity(
+        (1, 8, 16, 16, 16),
+        dtype="float32",
+    )
+    fallback = dense_cfg_rescale_std_backend_identity(
+        (1, 8, 8, 8, 8),
+        dtype="float32",
+    )
+
+    assert exact["backend"] == "source-cuda-t4-welford-metal"
+    assert exact["authenticated_contract"]["thread_count"] == 512
+    assert exact["authenticated_contract"]["input_vector_width"] == 2
+    assert exact["authenticated_contract"]["source_checkpoint_sha256"] == (
+        "c202368155d3f1c28ea7132b2909f4656e79df4a073f2ff04905b5a452ce6520"
+    )
+    assert fallback["backend"] == "mlx-native-var"
+
+
+def test_stage_capture_binds_effective_dense_cfg_rescale_identity(tmp_path):
+    import json
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_cfg_rescale_std_identity,
+    )
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
+    identity = dense_cfg_rescale_std_backend_identity(
+        (1, 8, 16, 16, 16),
+        dtype="float32",
+    )
+    route_identity = {
+        "route": {"sparse_flow_cfg_rescale_std_identity": identity}
+    }
+    checkpoint = tmp_path / "sparse_flow_steps.npz"
+    np.savez(
+        checkpoint,
+        sparse_flow_cfg_rescale_std_json=np.asarray(
+            json.dumps(identity, sort_keys=True)
+        ),
+    )
+
+    effective = _bind_effective_sparse_flow_cfg_rescale_std_identity(
+        route_identity,
+        checkpoint,
+    )
+
+    assert effective == identity
+    assert route_identity["route"][
+        "sparse_flow_cfg_rescale_std_identity_effective"
+    ] == identity
+
+
+def test_stage_capture_rejects_substituted_dense_cfg_rescale_identity(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_sparse_flow_cfg_rescale_std_identity,
+    )
+    from trellmlx.samplers import dense_cfg_rescale_std_backend_identity
+
+    identity = dense_cfg_rescale_std_backend_identity(
+        (1, 8, 16, 16, 16),
+        dtype="float32",
+    )
+    route_identity = {
+        "route": {"sparse_flow_cfg_rescale_std_identity": identity}
+    }
+    checkpoint = tmp_path / "sparse_flow_steps.npz"
+    np.savez(
+        checkpoint,
+        sparse_flow_cfg_rescale_std_json=np.asarray(
+            '{"backend":"mlx-native-var"}'
+        ),
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="CFG-rescale std identity"):
+        _bind_effective_sparse_flow_cfg_rescale_std_identity(
+            route_identity,
+            checkpoint,
+        )
+
+
 def test_sparse_cfg_rescale_rejects_multiple_conditioning_batches():
     from trellmlx.samplers import flow_euler_sample
 
