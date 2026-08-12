@@ -1,0 +1,43 @@
+{
+  "schema": "gpu-greenroom.command.v1",
+  "repo_root": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "cwd": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "env": {
+    "PYTHONPATH": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812"
+  },
+  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-20260812",
+  "route_identity": "trellis2mlx/fur-crop-pymeshlab-2025.7.post1-continuation-v1",
+  "timeout": null,
+  "argv": [
+    "/Users/noahlyons/dev/trellis-mac/.venv/bin/python",
+    "-u",
+    "scripts/run_pymeshlab_continuation_assay.py",
+    "--input",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-core-halo-crop-20260811/candidate-r3.glb",
+    "--expected-input-sha256",
+    "14b3e5b5fb2fb29cd9f4b50c200c119f49b25474053d99e487aa391d2b87efb5",
+    "--output-dir",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-20260812/meshes",
+    "--report",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-20260812/run-report.json",
+    "--target-faces",
+    "2500000",
+    "1500000",
+    "800000",
+    "400000",
+    "200000",
+    "100000",
+    "--repeats",
+    "2",
+    "--expected-pymeshlab-version",
+    "2025.7.post1",
+    "--lineage-ref",
+    "whole-object-pymeshlab-partial-report",
+    "/private/tmp/kaminos-molten-triradial-proposals-0808/artifacts/trellis-official-fine-fur-conformance-v0/mps-geometry-output/run-report.json",
+    "3c3534373778e8cd577899104300b22742f6cf28d6d5990e4e15bc0014859a15",
+    "--lineage-ref",
+    "authenticated-crop-report",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-core-halo-crop-20260811/candidate-r3.report.json",
+    "04e0ebc3b8485cbfccf417883a7e43c6f7e08dc284e233b17d54160073c7449a"
+  ]
+}

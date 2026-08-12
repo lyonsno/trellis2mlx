@@ -1,0 +1,35 @@
+{
+  "schema": "gpu-greenroom.command.v1",
+  "repo_root": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "cwd": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "env": {
+    "PYTHONPATH": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812"
+  },
+  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-smoke-20260812",
+  "route_identity": "trellis2mlx/fur-pymeshlab-2025.7.post1-continuation-smoke-v1",
+  "timeout": null,
+  "argv": [
+    "/Users/noahlyons/dev/trellis-mac/.venv/bin/python",
+    "-u",
+    "scripts/run_pymeshlab_continuation_assay.py",
+    "--input",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/kaminos-generated-asset-lod-v0-20260628T1010Z/nocascade8-face350k-tex4096-lod/lod02-30000faces/asset.glb",
+    "--expected-input-sha256",
+    "c33afff12b6062323fabdc497d938fd0dfa33029bef8929d743499a8b0c33344",
+    "--output-dir",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-smoke-20260812/meshes",
+    "--report",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-pymeshlab-continuation-smoke-20260812/run-report.json",
+    "--target-faces",
+    "30000",
+    "20000",
+    "--repeats",
+    "2",
+    "--expected-pymeshlab-version",
+    "2025.7.post1",
+    "--lineage-ref",
+    "smoke-fixture-assay",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/kaminos-generated-asset-lod-v0-20260628T1010Z/nocascade8-face350k-tex4096-lod/lod02-30000faces/generated-asset-assay.json",
+    "c04b2ef371cf8b1b9b59750db6e9db235ccd1c277e27677f27a352aa63fb119e"
+  ]
+}
