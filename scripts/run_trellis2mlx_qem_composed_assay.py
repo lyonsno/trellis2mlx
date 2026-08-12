@@ -27,7 +27,7 @@ HARNESS_PATH = Path(__file__).resolve()
 CLEANUP_CONFIG = {
     "max_hole_perimeter": 3e-2,
     "keep_largest": False,
-    "min_component_ratio": 1e-5,
+    "min_component_area": 1e-5,
     "verbose": False,
 }
 QEM_CONFIG = {

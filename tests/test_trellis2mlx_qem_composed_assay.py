@@ -158,7 +158,7 @@ def test_composed_assay_binds_exact_production_stage_contract(tmp_path, monkeypa
         assert config == {
             "max_hole_perimeter": 3e-2,
             "keep_largest": False,
-            "min_component_ratio": 1e-5,
+            "min_component_area": 1e-5,
             "do_fix_normals": stage == "final_cleanup",
             "verbose": False,
         }

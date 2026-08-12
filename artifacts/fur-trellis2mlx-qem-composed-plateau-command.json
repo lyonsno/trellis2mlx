@@ -5,8 +5,8 @@
   "env": {
     "PYTHONPATH": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812"
   },
-  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-plateau-20260812",
-  "route_identity": "trellis2mlx/fur-fast-plateau-qem-composed-v1",
+  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-source-primitives-20260812",
+  "route_identity": "trellis2mlx/fur-fast-plateau-qem-composed-source-primitives-v2",
   "timeout": null,
   "argv": [
     "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812/.venv/bin/python",
@@ -17,9 +17,9 @@
     "--expected-input-sha256",
     "439d2830ec97cb5c8d482463d19656e177d8bf81f7f1e8d30ac3e87aaa2a6cd3",
     "--output-dir",
-    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-plateau-20260812/meshes",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-source-primitives-20260812/meshes",
     "--report",
-    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-plateau-20260812/run-report.json",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-source-primitives-20260812/run-report.json",
     "--target-faces",
     "400000",
     "--max-iterations",
@@ -31,7 +31,7 @@
     "--expected-qem-module-sha256",
     "4ce0fb3e244e68727971accd9ea2a47d5ad76485531d609d2a2a1c1143c2f7d0",
     "--expected-cleanup-module-sha256",
-    "32cdec25964dddd8f2123aca4611b5d7bcf2544e1bbeb5fe75f6b6f8065a2b8b",
+    "e59aec904f9d4ef9504bbd4dee55a4126e3dcefa9dce5c27ce7cd484704b0e5f",
     "--lineage-ref",
     "fast-prefix-run-report",
     "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-fast-prefix-20260811/run-report-ladder-r1.json",
