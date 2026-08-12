@@ -112,6 +112,28 @@ def _fake_package(version: str = EXPECTED_VERSION):
     return SimpleNamespace(__version__=version, __file__="/fake/pymeshlab/__init__.py", MeshSet=_FakeMeshSet)
 
 
+def test_module_identity_falls_back_to_distribution_metadata(monkeypatch) -> None:
+    runner = _load_runner()
+    package = SimpleNamespace(
+        __file__="/fake/pymeshlab/__init__.py",
+        MeshSet=_FakeMeshSet,
+    )
+    observed_distributions: list[str] = []
+
+    def fake_version(distribution: str) -> str:
+        observed_distributions.append(distribution)
+        return EXPECTED_VERSION
+
+    monkeypatch.setattr("importlib.metadata.version", fake_version)
+
+    identity = runner._module_identity(package)
+
+    assert identity["package_version"] == EXPECTED_VERSION
+    assert identity["package_version_source"] == "distribution-metadata"
+    assert identity["distribution"] == "pymeshlab"
+    assert observed_distributions == ["pymeshlab"]
+
+
 def _invoke(
     runner,
     monkeypatch,

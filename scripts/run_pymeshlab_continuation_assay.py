@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.metadata
 import json
 from pathlib import Path
 import platform
@@ -170,9 +171,19 @@ def _module_identity(package: Any) -> dict[str, Any]:
     module_sha256 = None
     if module_path is not None and module_path.is_file():
         module_sha256 = sha256_file(module_path)
+    package_version = getattr(package, "__version__", None)
+    version_source = "module-attribute" if package_version is not None else None
+    if package_version is None:
+        try:
+            package_version = importlib.metadata.version("pymeshlab")
+            version_source = "distribution-metadata"
+        except importlib.metadata.PackageNotFoundError:
+            pass
     return {
         "package": "pymeshlab",
-        "package_version": getattr(package, "__version__", None),
+        "distribution": "pymeshlab",
+        "package_version": package_version,
+        "package_version_source": version_source,
         "module_path": str(module_path) if module_path is not None else None,
         "module_sha256": module_sha256,
         "python": platform.python_version(),
