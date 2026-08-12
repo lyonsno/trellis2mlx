@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import errno
 import json
 import os
 from pathlib import Path
@@ -50,31 +49,66 @@ class SurvivalError(RuntimeError):
 
 @dataclass
 class ReportCustody:
-    path: Path
+    owned_path: Path
     file_descriptor: int
     requested_path: Path
+    effective_path: Path
     rerouted: bool
     invocation_id: str
+    requested_linked: bool
+    lost_effective_path: Path | None = None
 
-    def _assert_owned(self) -> None:
+    def _assert_owned_alias(self) -> None:
         try:
-            path_stat = self.path.stat(follow_symlinks=False)
+            path_stat = self.owned_path.stat(follow_symlinks=False)
         except FileNotFoundError as exc:
-            raise SurvivalError("report_custody", f"reserved report path disappeared: {self.path}") from exc
+            raise SurvivalError(
+                "report_custody", f"owned report alias disappeared: {self.owned_path}"
+            ) from exc
         descriptor_stat = os.fstat(self.file_descriptor)
         if not stat.S_ISREG(path_stat.st_mode):
-            raise SurvivalError("report_custody", f"reserved report path is no longer regular: {self.path}")
+            raise SurvivalError(
+                "report_custody", f"owned report alias is no longer regular: {self.owned_path}"
+            )
         if (path_stat.st_dev, path_stat.st_ino) != (
             descriptor_stat.st_dev,
             descriptor_stat.st_ino,
         ):
-            raise SurvivalError("report_custody", f"reserved report path changed ownership: {self.path}")
+            raise SurvivalError(
+                "report_custody", f"owned report alias changed ownership: {self.owned_path}"
+            )
 
-    def write(self, payload: dict[str, Any]) -> None:
-        self._assert_owned()
+    def _assert_requested_link(self) -> None:
+        if not self.requested_linked:
+            return
+        try:
+            path_stat = self.requested_path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            self.lost_effective_path = self.requested_path
+            raise SurvivalError(
+                "report_custody", f"requested report path disappeared: {self.requested_path}"
+            ) from exc
+        descriptor_stat = os.fstat(self.file_descriptor)
+        if (path_stat.st_dev, path_stat.st_ino) != (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ):
+            self.lost_effective_path = self.requested_path
+            raise SurvivalError(
+                "report_custody", f"requested report path changed ownership: {self.requested_path}"
+            )
+
+    def write(self, payload: dict[str, Any], *, require_requested_link: bool = True) -> None:
+        self._assert_owned_alias()
+        if require_requested_link:
+            self._assert_requested_link()
         payload["report"] = {
             "requested_path": str(self.requested_path),
-            "effective_path": str(self.path),
+            "effective_path": str(self.effective_path),
+            "owned_path": str(self.owned_path),
+            "lost_effective_path": (
+                str(self.lost_effective_path) if self.lost_effective_path is not None else None
+            ),
             "rerouted": self.rerouted,
             "invocation_id": self.invocation_id,
         }
@@ -85,6 +119,9 @@ class ReportCustody:
         while written < len(encoded):
             written += os.write(self.file_descriptor, encoded[written:])
         os.fsync(self.file_descriptor)
+        self._assert_owned_alias()
+        if require_requested_link:
+            self._assert_requested_link()
 
     def close(self) -> None:
         if self.file_descriptor >= 0:
@@ -235,45 +272,56 @@ def _open_exclusive(path: Path) -> int:
     return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
 
 
-def _reserve_unique_failure_report(args: argparse.Namespace) -> tuple[Path, int]:
+def _reserve_owned_alias(
+    args: argparse.Namespace, invocation_id: str, *, failure: bool
+) -> tuple[Path, int]:
     requested = args.report
     output = args.output_dir.resolve()
     parent = args.output_dir.parent if _is_within(requested, args.output_dir) else requested.parent
     parent.mkdir(parents=True, exist_ok=True)
-    prefix = f"{requested.name}.face-survival-error."
+    kind = "error" if failure else "invocation"
+    prefix = f"{requested.name}.face-survival-{kind}."
     while True:
-        candidate = parent / f"{prefix}{uuid.uuid4().hex}.json"
+        candidate = parent / f"{prefix}{invocation_id}.json"
         if candidate.resolve() in _input_paths(args) or _is_within(candidate, output):
-            continue
+            raise SurvivalError("validate_paths", "owned report alias falls inside protected custody")
         try:
             return candidate, _open_exclusive(candidate)
         except FileExistsError:
-            continue
+            invocation_id = uuid.uuid4().hex
 
 
 def _reserve_report_custody(args: argparse.Namespace) -> ReportCustody:
     requested = args.report.resolve()
+    invocation_id = uuid.uuid4().hex
     unsafe = requested in _input_paths(args) or _is_within(requested, args.output_dir)
     if not unsafe:
+        owned_path, descriptor = _reserve_owned_alias(
+            args, invocation_id, failure=False
+        )
         try:
-            descriptor = _open_exclusive(args.report)
+            os.link(owned_path, args.report)
             return ReportCustody(
-                path=args.report,
+                owned_path=owned_path,
                 file_descriptor=descriptor,
                 requested_path=args.report,
+                effective_path=args.report,
                 rerouted=False,
-                invocation_id=uuid.uuid4().hex,
+                invocation_id=invocation_id,
+                requested_linked=True,
             )
-        except OSError as exc:
-            if exc.errno != errno.EEXIST:
-                raise
-    path, descriptor = _reserve_unique_failure_report(args)
+        except FileExistsError:
+            os.close(descriptor)
+            owned_path.unlink()
+    path, descriptor = _reserve_owned_alias(args, invocation_id, failure=True)
     return ReportCustody(
-        path=path,
+        owned_path=path,
         file_descriptor=descriptor,
         requested_path=args.report,
+        effective_path=path,
         rerouted=True,
-        invocation_id=uuid.uuid4().hex,
+        invocation_id=invocation_id,
+        requested_linked=False,
     )
 
 
@@ -298,7 +346,7 @@ def _validate_request(args: argparse.Namespace, custody: ReportCustody) -> None:
         _validate_digest(digest, label)
     if args.output_dir.exists():
         raise SurvivalError("validate_paths", f"output directory already exists: {args.output_dir}")
-    report = custody.path.resolve()
+    report = custody.owned_path.resolve()
     if report in input_paths or _is_within(report, args.output_dir):
         raise SurvivalError("validate_paths", "report path collides with input or output custody")
 
@@ -619,7 +667,7 @@ def run(args: argparse.Namespace) -> int:
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["timing_seconds"]["total"] = time.perf_counter() - started
         try:
-            custody.write(report)
+            custody.write(report, require_requested_link=False)
         except Exception as report_exc:
             print(f"failure report could not be written: {report_exc}", file=sys.stderr)
         print(f"{report['failure_phase']}: {report['error']}", file=sys.stderr)

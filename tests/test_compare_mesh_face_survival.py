@@ -326,24 +326,24 @@ def test_concurrent_report_capture_is_preserved_and_reservation_reroutes(
         output_dir=output_dir,
         report=report,
     )
-    original_open = os.open
+    original_link = os.link
     injected = False
 
-    def capture_before_open(path, flags, mode=0o777):
+    def capture_before_link(source_path, destination_path, *args, **kwargs):
         nonlocal injected
-        if Path(path) == report and not injected:
+        if Path(destination_path) == report and not injected:
             injected = True
             report.write_text("competing evidence")
-        return original_open(path, flags, mode)
+        return original_link(source_path, destination_path, *args, **kwargs)
 
-    monkeypatch.setattr(RUNNER.os, "open", capture_before_open)
+    monkeypatch.setattr(RUNNER.os, "link", capture_before_link)
 
     custody = RUNNER._reserve_report_custody(args)
     try:
         assert report.read_text() == "competing evidence"
-        assert custody.path != report
+        assert custody.effective_path != report
         assert custody.rerouted is True
-        assert custody.path.parent == tmp_path
+        assert custody.owned_path.parent == tmp_path
     finally:
         custody.close()
 
@@ -399,3 +399,54 @@ def test_pairwise_records_preserve_all_pairs_for_delimiter_colliding_labels(
         ("b__c", "c"),
         ("a__b", "c"),
     }
+
+
+def test_post_reservation_report_replacement_publishes_owned_terminal_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "source.glb"
+    first = tmp_path / "first.glb"
+    second = tmp_path / "second.glb"
+    output_dir = tmp_path / "survival"
+    report = tmp_path / "report.json"
+    _write_assay_fixtures(source, first, second)
+    args = SimpleNamespace(
+        source=(str(source), _sha256(source)),
+        candidate=[("first", str(first), _sha256(first))],
+        output_dir=output_dir,
+        report=report,
+        chunk_faces=2,
+    )
+    original_write = RUNNER.ReportCustody.write
+    replaced = False
+
+    def replace_before_completed_write(custody, payload, *args, **kwargs):
+        nonlocal replaced
+        if payload["status"] == "completed" and not replaced:
+            replaced = True
+            report.unlink()
+            report.write_text("competing completed evidence")
+        return original_write(custody, payload, *args, **kwargs)
+
+    monkeypatch.setattr(RUNNER.ReportCustody, "write", replace_before_completed_write)
+
+    result = RUNNER.run(args)
+
+    assert result != 0
+    assert report.read_text() == "competing completed evidence"
+    assert output_dir.is_dir()
+    owned_reports = sorted(tmp_path.glob("report.json.face-survival-invocation.*.json"))
+    assert len(owned_reports) == 1
+    failure = json.loads(owned_reports[0].read_text())
+    assert failure["status"] == "failed"
+    assert failure["failure_phase"] == "report_custody"
+    assert failure["primary_output_status"] == "validated"
+    assert failure["report"]["requested_path"] == str(report)
+    assert failure["report"]["lost_effective_path"] == str(report)
+    assert failure["report"]["owned_path"] == str(owned_reports[0])
+    assert failure["report"]["invocation_id"]
+
+    retry = _run(source, [("first", first)], output_dir, report)
+    assert retry.returncode != 0
+    assert report.read_text() == "competing completed evidence"
+    assert len(list(tmp_path.glob("report.json.face-survival-*.json"))) == 2
