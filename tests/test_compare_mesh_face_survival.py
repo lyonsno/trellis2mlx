@@ -6,9 +6,12 @@ import importlib.util
 import hashlib
 import json
 import numpy as np
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from trellmlx.glb_aabb_crop import write_geometry_glb
 
@@ -25,7 +28,8 @@ def _load_runner():
     return module
 
 
-match_exact_source_faces = _load_runner().match_exact_source_faces
+RUNNER = _load_runner()
+match_exact_source_faces = RUNNER.match_exact_source_faces
 
 
 def _sha256(path: Path) -> str:
@@ -50,7 +54,7 @@ def _run(
     for label, path in candidates:
         command.extend(("--candidate", label, str(path), _sha256(path)))
     command.extend(("--output-dir", str(output_dir), "--report", str(report)))
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+    return subprocess.run(command, text=True, capture_output=True, check=False, timeout=10)
 
 
 def _write_assay_fixtures(source: Path, first: Path, second: Path) -> None:
@@ -183,8 +187,17 @@ def test_cli_publishes_uncapped_survival_arrays_and_cross_route_comparison(
     assert data["candidates"]["first"]["generated_or_modified_faces"] == 0
     assert data["candidates"]["second"]["exact_source_faces"] == 1
     assert data["candidates"]["second"]["generated_or_modified_faces"] == 1
-    assert data["pairwise"]["first__second"]["intersection"] == 0
-    assert data["pairwise"]["first__second"]["union"] == 2
+    assert data["pairwise"] == [
+        {
+            "left_label": "first",
+            "right_label": "second",
+            "intersection": 0,
+            "union": 2,
+            "jaccard": 0.0,
+            "left_only": 1,
+            "right_only": 1,
+        }
+    ]
     assert data["consensus"]["surviving_route_count_histogram"] == {
         "0": 1,
         "1": 2,
@@ -270,7 +283,7 @@ def test_report_input_collision_preserves_input_and_reroutes_failure(tmp_path: P
 
     assert result.returncode != 0
     assert _sha256(source) == source_before
-    safe_report = tmp_path / "source.glb.face-survival-error.json"
+    safe_report = next(tmp_path.glob("source.glb.face-survival-error.*.json"))
     data = json.loads(safe_report.read_text())
     assert data["failure_phase"] == "validate_paths"
     assert data["report"]["requested_path"] == str(source)
@@ -292,7 +305,97 @@ def test_existing_report_is_preserved_and_failure_is_rerouted(tmp_path: Path) ->
 
     assert result.returncode != 0
     assert report.read_text() == "existing evidence"
-    safe_report = tmp_path / "report.json.face-survival-error.json"
+    safe_report = next(tmp_path.glob("report.json.face-survival-error.*.json"))
     data = json.loads(safe_report.read_text())
     assert data["failure_phase"] == "validate_paths"
     assert data["report"]["rerouted"] is True
+
+
+def test_concurrent_report_capture_is_preserved_and_reservation_reroutes(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "source.glb"
+    first = tmp_path / "first.glb"
+    second = tmp_path / "second.glb"
+    output_dir = tmp_path / "survival"
+    report = tmp_path / "report.json"
+    _write_assay_fixtures(source, first, second)
+    args = SimpleNamespace(
+        source=(str(source), _sha256(source)),
+        candidate=[("first", str(first), _sha256(first))],
+        output_dir=output_dir,
+        report=report,
+    )
+    original_open = os.open
+    injected = False
+
+    def capture_before_open(path, flags, mode=0o777):
+        nonlocal injected
+        if Path(path) == report and not injected:
+            injected = True
+            report.write_text("competing evidence")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(RUNNER.os, "open", capture_before_open)
+
+    custody = RUNNER._reserve_report_custody(args)
+    try:
+        assert report.read_text() == "competing evidence"
+        assert custody.path != report
+        assert custody.rerouted is True
+        assert custody.path.parent == tmp_path
+    finally:
+        custody.close()
+
+
+def test_report_below_output_fails_promptly_outside_output_on_first_run_and_retry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.glb"
+    first = tmp_path / "first.glb"
+    second = tmp_path / "second.glb"
+    output_dir = tmp_path / "survival"
+    requested_report = output_dir / "report.json"
+    _write_assay_fixtures(source, first, second)
+
+    first_result = _run(source, [("first", first)], output_dir, requested_report)
+    second_result = _run(source, [("first", first)], output_dir, requested_report)
+
+    assert first_result.returncode != 0
+    assert second_result.returncode != 0
+    assert not output_dir.exists()
+    failure_reports = sorted(tmp_path.glob("report.json.face-survival-error.*.json"))
+    assert len(failure_reports) == 2
+    assert all(json.loads(path.read_text())["failure_phase"] == "validate_paths" for path in failure_reports)
+    assert all(json.loads(path.read_text())["report"]["rerouted"] is True for path in failure_reports)
+
+
+def test_pairwise_records_preserve_all_pairs_for_delimiter_colliding_labels(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.glb"
+    first = tmp_path / "first.glb"
+    second = tmp_path / "second.glb"
+    _write_assay_fixtures(source, first, second)
+    candidates = []
+    for index, label in enumerate(("a", "b__c", "a__b", "c")):
+        path = tmp_path / f"candidate-{index}.glb"
+        shutil.copyfile(first, path)
+        candidates.append((label, path))
+    output_dir = tmp_path / "survival"
+    report = tmp_path / "report.json"
+
+    result = _run(source, candidates, output_dir, report)
+
+    assert result.returncode == 0, result.stderr
+    pairwise = json.loads(report.read_text())["pairwise"]
+    assert len(pairwise) == 6
+    identities = {(record["left_label"], record["right_label"]) for record in pairwise}
+    assert identities == {
+        ("a", "b__c"),
+        ("a", "a__b"),
+        ("a", "c"),
+        ("b__c", "a__b"),
+        ("b__c", "c"),
+        ("a__b", "c"),
+    }

@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import errno
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 
@@ -42,6 +46,50 @@ class SurvivalError(RuntimeError):
     def __init__(self, phase: str, message: str):
         super().__init__(message)
         self.phase = phase
+
+
+@dataclass
+class ReportCustody:
+    path: Path
+    file_descriptor: int
+    requested_path: Path
+    rerouted: bool
+    invocation_id: str
+
+    def _assert_owned(self) -> None:
+        try:
+            path_stat = self.path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise SurvivalError("report_custody", f"reserved report path disappeared: {self.path}") from exc
+        descriptor_stat = os.fstat(self.file_descriptor)
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise SurvivalError("report_custody", f"reserved report path is no longer regular: {self.path}")
+        if (path_stat.st_dev, path_stat.st_ino) != (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        ):
+            raise SurvivalError("report_custody", f"reserved report path changed ownership: {self.path}")
+
+    def write(self, payload: dict[str, Any]) -> None:
+        self._assert_owned()
+        payload["report"] = {
+            "requested_path": str(self.requested_path),
+            "effective_path": str(self.path),
+            "rerouted": self.rerouted,
+            "invocation_id": self.invocation_id,
+        }
+        encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        os.lseek(self.file_descriptor, 0, os.SEEK_SET)
+        os.ftruncate(self.file_descriptor, 0)
+        written = 0
+        while written < len(encoded):
+            written += os.write(self.file_descriptor, encoded[written:])
+        os.fsync(self.file_descriptor)
+
+    def close(self) -> None:
+        if self.file_descriptor >= 0:
+            os.close(self.file_descriptor)
+            self.file_descriptor = -1
 
 
 def _validate_mesh(vertices: np.ndarray, faces: np.ndarray, label: str) -> None:
@@ -162,27 +210,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-            stream.flush()
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
 def _validate_digest(digest: str, label: str) -> None:
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise SurvivalError("validate_request", f"{label} SHA256 must be lowercase hex")
@@ -196,21 +223,61 @@ def _is_within(path: Path, directory: Path) -> bool:
         return False
 
 
-def _effective_report_path(args: argparse.Namespace) -> tuple[Path, bool]:
-    requested = args.report.resolve()
-    inputs = {
+def _input_paths(args: argparse.Namespace) -> set[Path]:
+    return {
         Path(args.source[0]).resolve(),
         *(Path(path).resolve() for _label, path, _digest in args.candidate),
     }
-    if requested not in inputs and not args.report.exists():
-        return args.report, False
-    candidate = args.report.with_name(args.report.name + ".face-survival-error.json")
-    while candidate.resolve() in inputs or candidate.exists() or _is_within(candidate, args.output_dir):
-        candidate = candidate.with_name(candidate.name + ".face-survival-error.json")
-    return candidate, True
 
 
-def _validate_request(args: argparse.Namespace, report_path: Path) -> None:
+def _open_exclusive(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+
+
+def _reserve_unique_failure_report(args: argparse.Namespace) -> tuple[Path, int]:
+    requested = args.report
+    output = args.output_dir.resolve()
+    parent = args.output_dir.parent if _is_within(requested, args.output_dir) else requested.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    prefix = f"{requested.name}.face-survival-error."
+    while True:
+        candidate = parent / f"{prefix}{uuid.uuid4().hex}.json"
+        if candidate.resolve() in _input_paths(args) or _is_within(candidate, output):
+            continue
+        try:
+            return candidate, _open_exclusive(candidate)
+        except FileExistsError:
+            continue
+
+
+def _reserve_report_custody(args: argparse.Namespace) -> ReportCustody:
+    requested = args.report.resolve()
+    unsafe = requested in _input_paths(args) or _is_within(requested, args.output_dir)
+    if not unsafe:
+        try:
+            descriptor = _open_exclusive(args.report)
+            return ReportCustody(
+                path=args.report,
+                file_descriptor=descriptor,
+                requested_path=args.report,
+                rerouted=False,
+                invocation_id=uuid.uuid4().hex,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+    path, descriptor = _reserve_unique_failure_report(args)
+    return ReportCustody(
+        path=path,
+        file_descriptor=descriptor,
+        requested_path=args.report,
+        rerouted=True,
+        invocation_id=uuid.uuid4().hex,
+    )
+
+
+def _validate_request(args: argparse.Namespace, custody: ReportCustody) -> None:
     labels = [label for label, _path, _digest in args.candidate]
     if len(labels) != len(set(labels)):
         raise SurvivalError("validate_request", "candidate labels must be unique")
@@ -231,7 +298,7 @@ def _validate_request(args: argparse.Namespace, report_path: Path) -> None:
         _validate_digest(digest, label)
     if args.output_dir.exists():
         raise SurvivalError("validate_paths", f"output directory already exists: {args.output_dir}")
-    report = report_path.resolve()
+    report = custody.path.resolve()
     if report in input_paths or _is_within(report, args.output_dir):
         raise SurvivalError("validate_paths", "report path collides with input or output custody")
 
@@ -385,9 +452,7 @@ def _artifact(path: Path) -> dict[str, Any]:
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
 
 
-def _base_report(
-    args: argparse.Namespace, report_path: Path, report_rerouted: bool
-) -> dict[str, Any]:
+def _base_report(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema": "trellis2mlx.exact_source_face_survival.v1",
         "route": ROUTE,
@@ -408,11 +473,6 @@ def _base_report(
             "output_dir": str(args.output_dir),
             "report": str(args.report),
         },
-        "report": {
-            "requested_path": str(args.report),
-            "effective_path": str(report_path),
-            "rerouted": report_rerouted,
-        },
         "effective_config": {
             "identity": "winding-neutral exact float32 coordinate triples with one-to-one multiplicity",
             "chunk_faces": args.chunk_faces,
@@ -428,17 +488,17 @@ def _base_report(
 
 
 def run(args: argparse.Namespace) -> int:
-    report_path, report_rerouted = _effective_report_path(args)
-    report = _base_report(args, report_path, report_rerouted)
+    custody = _reserve_report_custody(args)
+    report = _base_report(args)
     started = time.perf_counter()
     temporary_dir: Path | None = None
     try:
-        _validate_request(args, report_path)
-        if report_rerouted:
+        _validate_request(args, custody)
+        if custody.rerouted:
             raise SurvivalError(
                 "validate_paths", "requested report path collides with an input or existing evidence"
             )
-        _write_json(report_path, report)
+        custody.write(report)
         report["failure_phase"] = "authenticate_inputs"
         source_path = Path(args.source[0])
         source_digest = _authenticate(source_path, args.source[1], "source")
@@ -498,20 +558,22 @@ def run(args: argparse.Namespace) -> int:
 
         report["failure_phase"] = "compare_routes"
         labels = list(route_masks)
-        pairwise = {}
+        pairwise = []
         for left_index, left_label in enumerate(labels):
             for right_label in labels[left_index + 1 :]:
                 left_mask = route_masks[left_label]
                 right_mask = route_masks[right_label]
                 intersection = int(np.count_nonzero(left_mask & right_mask))
                 union = int(np.count_nonzero(left_mask | right_mask))
-                pairwise[f"{left_label}__{right_label}"] = {
+                pairwise.append({
+                    "left_label": left_label,
+                    "right_label": right_label,
                     "intersection": intersection,
                     "union": union,
                     "jaccard": float(intersection / union) if union else 1.0,
                     "left_only": int(np.count_nonzero(left_mask & ~right_mask)),
                     "right_only": int(np.count_nonzero(right_mask & ~left_mask)),
-                }
+                })
         survival_count = np.zeros(source_index.face_count, dtype=np.uint16)
         for mask in route_masks.values():
             survival_count += mask
@@ -547,7 +609,7 @@ def run(args: argparse.Namespace) -> int:
         report["failure_phase"] = None
         report["primary_output_status"] = "validated"
         report["timing_seconds"]["total"] = time.perf_counter() - started
-        _write_json(report_path, report)
+        custody.write(report)
         return 0
     except Exception as exc:
         if temporary_dir is not None:
@@ -557,11 +619,13 @@ def run(args: argparse.Namespace) -> int:
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["timing_seconds"]["total"] = time.perf_counter() - started
         try:
-            _write_json(report_path, report)
+            custody.write(report)
         except Exception as report_exc:
             print(f"failure report could not be written: {report_exc}", file=sys.stderr)
         print(f"{report['failure_phase']}: {report['error']}", file=sys.stderr)
         return 1
+    finally:
+        custody.close()
 
 
 def main(argv: list[str] | None = None) -> int:
