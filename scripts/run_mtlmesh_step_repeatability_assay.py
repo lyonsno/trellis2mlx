@@ -23,6 +23,9 @@ from trellmlx.glb_aabb_crop import open_triangle_glb, sha256_file, write_geometr
 
 
 ROUTE = "source-native-mtlmesh-metal-step-v1"
+CANONICAL_ROUTE = "canonical-adjacency-metal-step-v1"
+CANONICAL_TURING_ROUTE = "canonical-adjacency-turing-rsqrt-step-v1"
+CANONICAL_ADJACENCY_ORDER = "ascending-face-id-per-vertex"
 
 
 class AssayError(RuntimeError):
@@ -42,6 +45,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-backend-sha256", required=True)
     parser.add_argument("--expected-extension-sha256", required=True)
     parser.add_argument("--expected-metallib-sha256", required=True)
+    parser.add_argument("--canonical-adjacency", action="store_true")
+    parser.add_argument("--turing-rsqrt-lut", type=Path)
+    parser.add_argument("--expected-turing-rsqrt-lut-sha256")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=1e-8)
@@ -97,11 +103,16 @@ def _effective_report_path(args: argparse.Namespace) -> tuple[Path, bool]:
     source = args.input.resolve()
     output = args.output_dir.resolve()
     source_root = args.source_root.resolve()
+    turing_lut = (
+        args.turing_rsqrt_lut.resolve() if args.turing_rsqrt_lut is not None else None
+    )
     requested = args.report.resolve()
     requested_temporary = _legacy_report_temporary(args.report).resolve()
     unsafe = (
         requested == source
         or requested_temporary == source
+        or requested == turing_lut
+        or requested_temporary == turing_lut
         or _same_or_within(requested, output)
         or _same_or_within(requested, source_root)
         or source_root.is_relative_to(requested)
@@ -115,6 +126,8 @@ def _effective_report_path(args: argparse.Namespace) -> tuple[Path, bool]:
     while (
         candidate.resolve() == source
         or _legacy_report_temporary(candidate).resolve() == source
+        or candidate.resolve() == turing_lut
+        or _legacy_report_temporary(candidate).resolve() == turing_lut
         or _same_or_within(candidate, output)
         or _same_or_within(candidate, source_root)
         or source_root.is_relative_to(candidate.resolve())
@@ -228,6 +241,52 @@ def _load_source(path: Path) -> tuple[np.ndarray, np.ndarray]:
         raise AssayError("load_source", str(exc)) from exc
 
 
+def _turing_tensor(normalized_delta: np.ndarray) -> Any:
+    torch = importlib.import_module("torch")
+    return torch.from_numpy(normalized_delta)
+
+
+def _load_turing_rsqrt_lut(args: argparse.Namespace) -> tuple[Any, dict[str, Any]] | None:
+    if args.turing_rsqrt_lut is None:
+        return None
+    path = args.turing_rsqrt_lut.resolve()
+    try:
+        actual_sha256 = sha256_file(path)
+    except Exception as exc:
+        raise AssayError("authenticate_turing_lut", str(exc)) from exc
+    if actual_sha256 != args.expected_turing_rsqrt_lut_sha256:
+        raise AssayError(
+            "authenticate_turing_lut",
+            "Turing rsqrt LUT SHA256 mismatch: "
+            f"expected {args.expected_turing_rsqrt_lut_sha256}, found {actual_sha256}",
+        )
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if "normalized_delta" not in archive.files:
+                raise AssayError(
+                    "authenticate_turing_lut",
+                    "Turing rsqrt LUT NPZ lacks normalized_delta",
+                )
+            normalized_delta = np.ascontiguousarray(archive["normalized_delta"])
+    except AssayError:
+        raise
+    except Exception as exc:
+        raise AssayError("authenticate_turing_lut", str(exc)) from exc
+    if normalized_delta.dtype != np.int8 or normalized_delta.shape != (1 << 24,):
+        raise AssayError(
+            "authenticate_turing_lut",
+            "Turing rsqrt normalized_delta must be int8 with 2^24 entries",
+        )
+    return _turing_tensor(normalized_delta), {
+        "id": CANONICAL_TURING_ROUTE,
+        "adjacency_order": CANONICAL_ADJACENCY_ORDER,
+        "reuse_vertex_face_adjacency": True,
+        "rsqrt_lut_npz": str(path),
+        "rsqrt_lut_sha256": actual_sha256,
+        "normalized_delta_sha256": _array_sha256(normalized_delta),
+    }
+
+
 def _initialize_mesh(mesh: Any, vertices: np.ndarray, faces: np.ndarray) -> None:
     if mesh.__class__.__module__.startswith("cumesh."):
         torch = importlib.import_module("torch")
@@ -255,6 +314,9 @@ def _validate(args: argparse.Namespace, report_path: Path) -> None:
     output = args.output_dir.resolve()
     report = report_path.resolve()
     source_root = args.source_root.resolve()
+    turing_lut = (
+        args.turing_rsqrt_lut.resolve() if args.turing_rsqrt_lut is not None else None
+    )
     if source == output or source.is_relative_to(output):
         raise AssayError("validate_paths", "output directory must not contain the input")
     if report == source or report == output or report.is_relative_to(output):
@@ -273,6 +335,15 @@ def _validate(args: argparse.Namespace, report_path: Path) -> None:
         raise AssayError("validate_paths", "effective report must not overlap source root")
     if args.report.resolve() == source or _legacy_report_temporary(args.report).resolve() == source:
         raise AssayError("validate_paths", "requested report path collides with input custody")
+    if turing_lut is not None and (
+        args.report.resolve() == turing_lut
+        or _legacy_report_temporary(args.report).resolve() == turing_lut
+    ):
+        raise AssayError("validate_paths", "requested report path collides with LUT custody")
+    if turing_lut is not None and (
+        turing_lut == output or turing_lut.is_relative_to(output)
+    ):
+        raise AssayError("validate_paths", "output directory must not contain the Turing LUT")
     if _same_or_within(args.report, source_root) or source_root.is_relative_to(
         args.report.resolve()
     ):
@@ -281,6 +352,17 @@ def _validate(args: argparse.Namespace, report_path: Path) -> None:
         raise AssayError("validate_config", "repeats must be at least two")
     if args.max_steps < 1:
         raise AssayError("validate_config", "max-steps must be positive")
+    if args.turing_rsqrt_lut is not None and not args.canonical_adjacency:
+        raise AssayError(
+            "validate_config", "Turing rsqrt route requires canonical adjacency"
+        )
+    if (args.turing_rsqrt_lut is None) != (
+        args.expected_turing_rsqrt_lut_sha256 is None
+    ):
+        raise AssayError(
+            "validate_config",
+            "Turing rsqrt LUT path and expected SHA256 must be provided together",
+        )
     values = (args.threshold, args.lambda_edge_length, args.lambda_skinny)
     if not all(np.isfinite(value) and value >= 0 for value in values):
         raise AssayError("validate_config", "simplifier scalars must be finite and nonnegative")
@@ -297,6 +379,11 @@ def _request(args: argparse.Namespace) -> dict[str, Any]:
         "expected_backend_sha256": args.expected_backend_sha256,
         "expected_extension_sha256": args.expected_extension_sha256,
         "expected_metallib_sha256": args.expected_metallib_sha256,
+        "canonical_adjacency": args.canonical_adjacency,
+        "turing_rsqrt_lut": (
+            str(args.turing_rsqrt_lut) if args.turing_rsqrt_lut is not None else None
+        ),
+        "expected_turing_rsqrt_lut_sha256": args.expected_turing_rsqrt_lut_sha256,
         "repeats": args.repeats,
         "max_steps": args.max_steps,
     }
@@ -326,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
             "threshold_growth_predicate": "removed_faces / input_faces < 0.01",
             "lambda_edge_length": args.lambda_edge_length,
             "lambda_skinny": args.lambda_skinny,
+            "canonical_adjacency": args.canonical_adjacency,
+            "turing_rsqrt": args.turing_rsqrt_lut is not None,
         },
         "source": None,
         "runs": None,
@@ -335,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         "partial_output_cleanup": None,
         "elapsed_seconds": None,
     }
+    output_owned = False
     try:
         _validate(args, effective_report)
         _write_json(effective_report, report)
@@ -356,8 +446,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"input SHA256 mismatch: expected {args.expected_input_sha256}, found {source_sha256}",
             )
 
+        report["failure_phase"] = "authenticate_turing_lut"
+        turing_lut = _load_turing_rsqrt_lut(args)
+
         report["failure_phase"] = "authenticate_route"
         route = _probe_source_route(args)
+        if turing_lut is not None:
+            route["simplifier"] = turing_lut[1]
+        elif args.canonical_adjacency:
+            route["simplifier"] = {
+                "id": CANONICAL_ROUTE,
+                "adjacency_order": CANONICAL_ADJACENCY_ORDER,
+                "reuse_vertex_face_adjacency": True,
+            }
+        else:
+            route["simplifier"] = {
+                "id": ROUTE,
+                "adjacency_order": "native-atomic-fill",
+                "reuse_vertex_face_adjacency": False,
+            }
         mesh_class = _load_mesh_class(route)
         report["route"] = route
         _write_json(effective_report, report)
@@ -373,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
 
         report["failure_phase"] = "prepare_outputs"
         _clean_output_dir(args.output_dir)
+        output_owned = True
         report["primary_output_status"] = "partial"
 
         report["failure_phase"] = "run_steps"
@@ -388,12 +496,32 @@ def main(argv: list[str] | None = None) -> int:
             for step in range(1, args.max_steps + 1):
                 input_faces = int(mesh.num_faces)
                 step_started = time.perf_counter()
-                output_vertices, output_faces = mesh.simplify_step(
-                    float(args.lambda_edge_length),
-                    float(args.lambda_skinny),
-                    threshold,
-                    False,
-                )
+                if args.canonical_adjacency:
+                    mesh.get_vertex_face_adjacency()
+                    mesh.sort_vertex_face_adjacency()
+                    step_args = (
+                        float(args.lambda_edge_length),
+                        float(args.lambda_skinny),
+                        threshold,
+                        False,
+                        True,
+                    )
+                    if turing_lut is not None:
+                        simplify_method = "simplify_step_turing"
+                        output_vertices, output_faces = mesh.simplify_step_turing(
+                            turing_lut[0], *step_args
+                        )
+                    else:
+                        simplify_method = "simplify_step"
+                        output_vertices, output_faces = mesh.simplify_step(*step_args)
+                else:
+                    simplify_method = "simplify_step"
+                    output_vertices, output_faces = mesh.simplify_step(
+                        float(args.lambda_edge_length),
+                        float(args.lambda_skinny),
+                        threshold,
+                        False,
+                    )
                 output_vertices = int(output_vertices)
                 output_faces = int(output_faces)
                 mesh_vertices_raw, mesh_faces_raw = mesh.read()
@@ -413,6 +541,11 @@ def main(argv: list[str] | None = None) -> int:
                     "output_faces": output_faces,
                     "removed_faces": removed,
                     "removed_fraction": removed / max(input_faces, 1),
+                    "simplify_method": simplify_method,
+                    "adjacency_order": route["simplifier"]["adjacency_order"],
+                    "reuse_vertex_face_adjacency": route["simplifier"][
+                        "reuse_vertex_face_adjacency"
+                    ],
                     "vertex_sha256": _array_sha256(mesh_vertices),
                     "face_sha256": _array_sha256(mesh_faces),
                     "mesh_path": str(mesh_path),
@@ -469,6 +602,12 @@ def main(argv: list[str] | None = None) -> int:
         if sha256_file(args.input) != source_sha256:
             raise AssayError("source_identity", "input GLB changed before report publication")
         final_route = _probe_source_route(args)
+        if turing_lut is not None:
+            final_turing_lut = _load_turing_rsqrt_lut(args)
+            if final_turing_lut is None or final_turing_lut[1] != turing_lut[1]:
+                raise AssayError(
+                    "source_identity", "Turing rsqrt LUT identity changed during assay"
+                )
         for field in (
             "source_root",
             "source_commit",
@@ -494,7 +633,11 @@ def main(argv: list[str] | None = None) -> int:
         report["status"] = "failed"
         report["failure_phase"] = getattr(exc, "phase", report["failure_phase"])
         report["error"] = f"{type(exc).__name__}: {exc}"
-        existed = args.output_dir.is_dir() and not args.output_dir.is_symlink()
+        existed = (
+            output_owned
+            and args.output_dir.is_dir()
+            and not args.output_dir.is_symlink()
+        )
         artifact_count = (
             sum(1 for path in args.output_dir.rglob("*") if path.is_file()) if existed else 0
         )

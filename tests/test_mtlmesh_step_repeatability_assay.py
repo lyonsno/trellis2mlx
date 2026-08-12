@@ -74,6 +74,7 @@ def _argv(source: Path, output_dir: Path, report: Path, source_root: Path) -> li
 class _FakeMesh:
     run_index = 0
     divergent = False
+    action_log: list[tuple] = []
 
     def __init__(self) -> None:
         type(self).run_index += 1
@@ -93,11 +94,39 @@ class _FakeMesh:
         _lambda_skinny: float,
         _threshold: float,
         _timing: bool,
+        _reuse_vertex_face_adjacency: bool = False,
     ) -> tuple[int, int]:
+        type(self).action_log.append(("ordinary", _reuse_vertex_face_adjacency))
         remove = 8
         if self.divergent and self.repeat == 3:
             remove = 10
         self.faces = self.faces[:-remove]
+        return len(self.vertices), len(self.faces)
+
+    def get_vertex_face_adjacency(self) -> None:
+        type(self).action_log.append(("get_adjacency",))
+
+    def sort_vertex_face_adjacency(self) -> None:
+        type(self).action_log.append(("sort_adjacency",))
+
+    def simplify_step_turing(
+        self,
+        rsqrt_delta,
+        _lambda_edge_length: float,
+        _lambda_skinny: float,
+        _threshold: float,
+        _timing: bool,
+        reuse_vertex_face_adjacency: bool = False,
+    ) -> tuple[int, int]:
+        type(self).action_log.append(
+            (
+                "turing",
+                str(rsqrt_delta.dtype),
+                tuple(rsqrt_delta.shape),
+                reuse_vertex_face_adjacency,
+            )
+        )
+        self.faces = self.faces[:-8]
         return len(self.vertices), len(self.faces)
 
     def read(self) -> tuple[np.ndarray, np.ndarray]:
@@ -128,6 +157,7 @@ def test_repeated_fresh_mesh_steps_record_exact_trajectory(tmp_path: Path, monke
     _write_grid(source)
     _FakeMesh.run_index = 0
     _FakeMesh.divergent = False
+    _FakeMesh.action_log = []
     monkeypatch.setattr(runner, "_probe_source_route", lambda _args: _route(source_root))
     monkeypatch.setattr(runner, "_load_mesh_class", lambda _route: _FakeMesh)
 
@@ -151,6 +181,214 @@ def test_repeated_fresh_mesh_steps_record_exact_trajectory(tmp_path: Path, monke
         assert Path(run["steps"][0]["mesh_path"]).is_file()
     assert data["step_stability"][0]["exact"] is True
     assert data["step_stability"][1]["exact"] is True
+
+
+def test_canonical_turing_route_sorts_consumed_cache_and_cannot_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _load_runner()
+    source = tmp_path / "grid.glb"
+    output_dir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    source_root = tmp_path / "mtlmesh"
+    lut = tmp_path / "turing-rsqrt.npz"
+    source_root.mkdir()
+    _write_grid(source)
+    np.savez(lut, normalized_delta=np.zeros(1 << 24, dtype=np.int8))
+    _FakeMesh.run_index = 0
+    _FakeMesh.divergent = False
+    _FakeMesh.action_log = []
+    monkeypatch.setattr(runner, "_probe_source_route", lambda _args: _route(source_root))
+    monkeypatch.setattr(runner, "_load_mesh_class", lambda _route: _FakeMesh)
+    monkeypatch.setattr(runner, "_turing_tensor", lambda array: array)
+
+    returncode = runner.main(
+        [
+            *_argv(source, output_dir, report, source_root),
+            "--canonical-adjacency",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            _sha256(lut),
+        ]
+    )
+
+    assert returncode == 0
+    data = json.loads(report.read_text())
+    assert data["route"]["simplifier"] == {
+        "id": "canonical-adjacency-turing-rsqrt-step-v1",
+        "adjacency_order": "ascending-face-id-per-vertex",
+        "reuse_vertex_face_adjacency": True,
+        "rsqrt_lut_npz": str(lut.resolve()),
+        "rsqrt_lut_sha256": _sha256(lut),
+        "normalized_delta_sha256": hashlib.sha256(bytes(1 << 24)).hexdigest(),
+    }
+    assert data["effective_config"]["canonical_adjacency"] is True
+    assert data["effective_config"]["turing_rsqrt"] is True
+    assert data["runs"][0]["steps"][0]["simplify_method"] == "simplify_step_turing"
+    assert _FakeMesh.action_log == [
+        ("get_adjacency",),
+        ("sort_adjacency",),
+        ("turing", "int8", (1 << 24,), True),
+        ("get_adjacency",),
+        ("sort_adjacency",),
+        ("turing", "int8", (1 << 24,), True),
+    ] * 3
+    assert not any(action[0] == "ordinary" for action in _FakeMesh.action_log)
+
+
+def test_turing_lut_hash_mismatch_fails_before_route_or_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _load_runner()
+    source = tmp_path / "grid.glb"
+    output_dir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    source_root = tmp_path / "mtlmesh"
+    lut = tmp_path / "turing-rsqrt.npz"
+    source_root.mkdir()
+    _write_grid(source)
+    np.savez(lut, normalized_delta=np.zeros(1 << 24, dtype=np.int8))
+    calls = 0
+
+    def should_not_probe(_args):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("route probe should not run after LUT digest mismatch")
+
+    monkeypatch.setattr(runner, "_probe_source_route", should_not_probe)
+
+    returncode = runner.main(
+        [
+            *_argv(source, output_dir, report, source_root),
+            "--canonical-adjacency",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            "0" * 64,
+        ]
+    )
+
+    assert returncode != 0
+    data = json.loads(report.read_text())
+    assert data["failure_phase"] == "authenticate_turing_lut"
+    assert data["primary_output_status"] == "not_started"
+    assert calls == 0
+    assert not output_dir.exists()
+
+
+def test_report_lut_collision_preserves_lut_and_reroutes_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _load_runner()
+    source = tmp_path / "grid.glb"
+    output_dir = tmp_path / "out"
+    source_root = tmp_path / "mtlmesh"
+    lut = tmp_path / "turing-rsqrt.npz"
+    source_root.mkdir()
+    _write_grid(source)
+    np.savez(lut, normalized_delta=np.zeros(1 << 24, dtype=np.int8))
+    lut_hash = _sha256(lut)
+    calls = 0
+
+    def should_not_probe(_args):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("route probe should not run after invalid LUT custody")
+
+    monkeypatch.setattr(runner, "_probe_source_route", should_not_probe)
+
+    returncode = runner.main(
+        [
+            *_argv(source, output_dir, lut, source_root),
+            "--canonical-adjacency",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_hash,
+        ]
+    )
+
+    safe_report = source.with_name(source.name + ".assay-error.json")
+    assert returncode != 0
+    assert _sha256(lut) == lut_hash
+    assert safe_report.is_file()
+    data = json.loads(safe_report.read_text())
+    assert data["failure_phase"] == "validate_paths"
+    assert data["report"] == {
+        "requested_path": str(lut),
+        "effective_path": str(safe_report),
+        "rerouted": True,
+    }
+    assert calls == 0
+    assert not output_dir.exists()
+
+
+def test_output_containing_lut_fails_before_probe_or_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _load_runner()
+    source = tmp_path / "grid.glb"
+    output_dir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    source_root = tmp_path / "mtlmesh"
+    lut = output_dir / "turing-rsqrt.npz"
+    source_root.mkdir()
+    output_dir.mkdir()
+    _write_grid(source)
+    np.savez(lut, normalized_delta=np.zeros(1 << 24, dtype=np.int8))
+    lut_hash = _sha256(lut)
+    calls = 0
+
+    def should_not_probe(_args):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("route probe should not run after invalid LUT custody")
+
+    monkeypatch.setattr(runner, "_probe_source_route", should_not_probe)
+
+    returncode = runner.main(
+        [
+            *_argv(source, output_dir, report, source_root),
+            "--canonical-adjacency",
+            "--turing-rsqrt-lut",
+            str(lut),
+            "--expected-turing-rsqrt-lut-sha256",
+            lut_hash,
+        ]
+    )
+
+    assert returncode != 0
+    assert _sha256(lut) == lut_hash
+    data = json.loads(report.read_text())
+    assert data["failure_phase"] == "validate_paths"
+    assert data["primary_output_status"] == "not_started"
+    assert calls == 0
+
+
+def test_turing_route_requires_canonical_adjacency_and_expected_digest(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    source = tmp_path / "grid.glb"
+    source_root = tmp_path / "mtlmesh"
+    source_root.mkdir()
+    _write_grid(source)
+    base = _argv(source, tmp_path / "out", tmp_path / "report.json", source_root)
+
+    for suffix in (
+        ["--turing-rsqrt-lut", str(tmp_path / "lut.npz")],
+        [
+            "--canonical-adjacency",
+            "--turing-rsqrt-lut",
+            str(tmp_path / "lut.npz"),
+        ],
+    ):
+        returncode = runner.main([*base, *suffix])
+        assert returncode != 0
+        data = json.loads((tmp_path / "report.json").read_text())
+        assert data["failure_phase"] == "validate_config"
+        assert data["primary_output_status"] == "not_started"
 
 
 def test_repeat_divergence_is_reported_without_false_exact_claim(tmp_path: Path, monkeypatch) -> None:
@@ -312,6 +550,7 @@ def test_output_and_report_cannot_overlap_authenticated_source_root(
     ]
     for index, (source_root, output_dir, report) in enumerate(cases):
         source_root.mkdir(parents=True, exist_ok=True)
+        output_existed = output_dir.exists()
         returncode = runner.main(_argv(source, output_dir, report, source_root))
         assert returncode != 0, index
         effective_report = report
@@ -319,7 +558,7 @@ def test_output_and_report_cannot_overlap_authenticated_source_root(
             effective_report = source.with_name(source.name + ".assay-error.json")
         data = json.loads(effective_report.read_text())
         assert data["failure_phase"] == "validate_paths"
-        assert not output_dir.exists() or output_dir == source_root
+        assert output_dir.exists() is output_existed
     assert calls == 0
 
 
