@@ -1,0 +1,38 @@
+{
+  "schema": "gpu-greenroom.command.v1",
+  "repo_root": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "cwd": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "env": {
+    "PYTHONPATH": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812:/private/tmp/mtlmesh-fur-mtlmesh-c515943-assay-0812"
+  },
+  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-mtlmesh-c515943-step-repeatability-20260811",
+  "route_identity": "trellis2mlx/fur-crop-mtlmesh-c515943-step-repeatability-v1",
+  "timeout": null,
+  "argv": [
+    "/Users/noahlyons/dev/trellis-mac/.venv/bin/python",
+    "-u",
+    "scripts/run_mtlmesh_step_repeatability_assay.py",
+    "--input",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-core-halo-crop-20260811/candidate-r3.glb",
+    "--expected-input-sha256",
+    "14b3e5b5fb2fb29cd9f4b50c200c119f49b25474053d99e487aa391d2b87efb5",
+    "--output-dir",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-mtlmesh-c515943-step-repeatability-20260811/meshes",
+    "--report",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-mtlmesh-c515943-step-repeatability-20260811/run-report.json",
+    "--source-root",
+    "/private/tmp/mtlmesh-fur-mtlmesh-c515943-assay-0812",
+    "--expected-source-commit",
+    "c51594385d1ec1faa1aafcd82b45e1cfcfcd49b7",
+    "--expected-backend-sha256",
+    "5212cb08a421b13a40247d57ac5bede961d82e9d986d67817ef6256197f6c3bb",
+    "--expected-extension-sha256",
+    "b2319a2e77e48e0be759c9803c2fa48d7149aa619de248babdb5e88b2446c756",
+    "--expected-metallib-sha256",
+    "6c31dcca5f9afff5a79a5d4b91f44c02265bd5bd028c0dc70d05d74030dc0a56",
+    "--repeats",
+    "5",
+    "--max-steps",
+    "1"
+  ]
+}
