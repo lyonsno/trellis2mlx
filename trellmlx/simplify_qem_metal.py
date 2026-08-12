@@ -160,11 +160,33 @@ def simplify_qem(
     lambda_edge_length: float = 1e-2,
     lambda_skinny: float = 1e-3,
     initial_thresh: float = 1e-8,
+    max_iterations: int = 500,
+    return_receipt: bool = False,
     verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict]:
     """Simplify mesh using QEM edge collapse with topology guards."""
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int) or max_iterations <= 0:
+        raise ValueError("max_iterations must be a positive integer")
+
+    source_faces = len(faces)
+    receipt = {
+        "route": "trellis2mlx-sequential-qem-v1",
+        "scheduler": "sequential-mutating-conflict-check",
+        "source_faces": source_faces,
+        "requested_target_faces": target_faces,
+        "achieved_faces": source_faces,
+        "target_satisfied": source_faces <= target_faces,
+        "termination_reason": "input_at_or_below_target",
+        "iterations": 0,
+        "max_iterations": max_iterations,
+        "zero_removal_iterations": 0,
+        "final_iteration_removed_faces": 0,
+        "initial_threshold": initial_thresh,
+        "final_executed_threshold": None,
+        "next_scheduled_threshold": initial_thresh,
+    }
     if len(faces) <= target_faces:
-        return vertices, faces
+        return (vertices, faces, receipt) if return_receipt else (vertices, faces)
 
     vertices = vertices.astype(np.float32).copy()
     faces = faces.astype(np.int32).copy()
@@ -172,10 +194,13 @@ def simplify_qem(
     thresh = initial_thresh
     t0 = time.perf_counter()
     iteration = 0
+    zero_removal_iterations = 0
+    final_removed = 0
+    last_executed_threshold = None
 
-    max_iterations = 500
     while len(faces) > target_faces and iteration < max_iterations:
         n_before = len(faces)
+        last_executed_threshold = thresh
 
         vertices, faces = _simplify_step(
             vertices, faces,
@@ -186,6 +211,9 @@ def simplify_qem(
 
         n_after = len(faces)
         removed = n_before - n_after
+        final_removed = removed
+        if removed == 0:
+            zero_removal_iterations += 1
         iteration += 1
 
         if verbose and iteration % 5 == 0:
@@ -205,7 +233,22 @@ def simplify_qem(
         print(f"  QEM simplify: {len(vertices):,}V {len(faces):,}F "
               f"({iteration} iters, {elapsed:.1f}s)", flush=True)
 
-    return vertices, faces
+    target_satisfied = len(faces) <= target_faces
+    receipt.update(
+        {
+            "achieved_faces": len(faces),
+            "target_satisfied": target_satisfied,
+            "termination_reason": (
+                "target_reached" if target_satisfied else "max_iterations_reached"
+            ),
+            "iterations": iteration,
+            "zero_removal_iterations": zero_removal_iterations,
+            "final_iteration_removed_faces": final_removed,
+            "final_executed_threshold": last_executed_threshold,
+            "next_scheduled_threshold": thresh,
+        }
+    )
+    return (vertices, faces, receipt) if return_receipt else (vertices, faces)
 
 
 def _build_adjacency(faces, V):
