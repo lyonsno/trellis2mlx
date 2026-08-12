@@ -1,0 +1,50 @@
+{
+  "schema": "gpu-greenroom.command.v1",
+  "harness_commit": "13ffdb1c7637664a69aee13ee0aded495ad32cb9",
+  "harness_sha256": "8df8c324f916b9d0091f024ba12791dad5d0911b97d7e099cb09e01c53066ece",
+  "repo_root": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "cwd": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812",
+  "env": {
+    "PYTHONPATH": "/private/tmp/trellis2mlx-fur-mtlmesh-step-assay-0812:/private/tmp/mtlmesh-fur-mtlmesh-c515943-assay-0812"
+  },
+  "output_dir": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-repaired-intermediate-canonical-adjacency-c515943-progressive-replicates-20260812",
+  "route_identity": "trellis2mlx/fur-repaired-intermediate-canonical-adjacency-c515943-progressive-replicates-v1",
+  "timeout": null,
+  "argv": [
+    "/Users/noahlyons/dev/trellis-mac/.venv/bin/python",
+    "-u",
+    "scripts/run_mtlmesh_step_repeatability_assay.py",
+    "--input",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-qem-composed-source-primitives-20260812/meshes/01-intermediate-cleanup.glb",
+    "--expected-input-sha256",
+    "21a6ec7248d37880c553a9de1a24b6163e326d873bfac521db5ca900313afa2c",
+    "--output-dir",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-repaired-intermediate-canonical-adjacency-c515943-progressive-replicates-20260812/meshes",
+    "--report",
+    "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-repaired-intermediate-canonical-adjacency-c515943-progressive-replicates-20260812/run-report.json",
+    "--source-root",
+    "/private/tmp/mtlmesh-fur-mtlmesh-c515943-assay-0812",
+    "--expected-source-commit",
+    "c51594385d1ec1faa1aafcd82b45e1cfcfcd49b7",
+    "--expected-backend-sha256",
+    "5212cb08a421b13a40247d57ac5bede961d82e9d986d67817ef6256197f6c3bb",
+    "--expected-extension-sha256",
+    "b2319a2e77e48e0be759c9803c2fa48d7149aa619de248babdb5e88b2446c756",
+    "--expected-metallib-sha256",
+    "6c31dcca5f9afff5a79a5d4b91f44c02265bd5bd028c0dc70d05d74030dc0a56",
+    "--canonical-adjacency",
+    "--repeats",
+    "5",
+    "--max-steps",
+    "8"
+  ],
+  "greenroom_translation": {
+    "job_type": "trellis2mlx_fur_repaired_intermediate_canonical_adjacency_0812",
+    "input_path_from_argv_index": 4,
+    "output_root": "/Users/noahlyons/.local/state/gpu-greenroom/outputs/trellis2mlx-fur-repaired-intermediate-canonical-adjacency-c515943-progressive-replicates-20260812",
+    "template_substitutions": {
+      "input_path": [4],
+      "output_dir": [8, 10]
+    }
+  }
+}
