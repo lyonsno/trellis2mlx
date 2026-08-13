@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -792,6 +793,49 @@ def test_published_directory_replacement_fails_output_custody(tmp_path: Path, mo
         return original_validate(custody, expected)
 
     monkeypatch.setattr(RUNNER, "_validate_published_outputs", replace_directory)
+
+    result = RUNNER.run(args)
+
+    assert result == 1
+    data = json.loads(report.read_text())
+    assert data["failure_phase"] == "output_custody"
+    assert data["primary_output_status"] == "published_custody_lost"
+
+
+def test_byte_identical_directory_replacement_before_rebind_fails_custody(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    args, output_dir, report = _run_args(tmp_path)
+    original_rebind = RUNNER._rebind_published_outputs
+
+    def replace_before_rebind(custody, destination):
+        captured = destination.with_name("captured-original")
+        destination.rename(captured)
+        shutil.copytree(captured, destination)
+        return original_rebind(custody, destination)
+
+    monkeypatch.setattr(RUNNER, "_rebind_published_outputs", replace_before_rebind)
+
+    result = RUNNER.run(args)
+
+    assert result == 1
+    data = json.loads(report.read_text())
+    assert data["failure_phase"] == "output_custody"
+    assert data["primary_output_status"] == "published_custody_lost"
+
+
+def test_incomplete_directory_replacement_before_rebind_fails_custody(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    args, output_dir, report = _run_args(tmp_path)
+    original_rebind = RUNNER._rebind_published_outputs
+
+    def replace_before_rebind(custody, destination):
+        destination.rename(destination.with_name("captured-original"))
+        destination.mkdir()
+        return original_rebind(custody, destination)
+
+    monkeypatch.setattr(RUNNER, "_rebind_published_outputs", replace_before_rebind)
 
     result = RUNNER.run(args)
 

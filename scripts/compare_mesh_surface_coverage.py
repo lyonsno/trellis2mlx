@@ -522,7 +522,7 @@ def _publish_output_directory(temporary_dir: Path, destination: Path) -> None:
         )
 
 
-def _capture_published_outputs(output_dir: Path, names: list[str]) -> PublishedOutputCustody:
+def _capture_output_custody(output_dir: Path, names: list[str]) -> PublishedOutputCustody:
     directory_descriptor = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
     artifact_descriptors: dict[str, int] = {}
     try:
@@ -548,6 +548,14 @@ def _capture_published_outputs(output_dir: Path, names: list[str]) -> PublishedO
             os.close(descriptor)
         os.close(directory_descriptor)
         raise
+
+
+def _rebind_published_outputs(
+    custody: PublishedOutputCustody, destination: Path
+) -> PublishedOutputCustody:
+    custody.directory_path = destination
+    custody.assert_all()
+    return custody
 
 
 def _validate_published_outputs(
@@ -798,14 +806,15 @@ def run(args: argparse.Namespace) -> int:
             "sample-normal-agreement.npy": result.sample_normal_agreement,
             "sample-candidate-face-index.npy": result.sample_candidate_face_index,
         }
+        output_custody = _capture_output_custody(
+            temporary_dir, list(expected_outputs)
+        )
         report["failure_phase"] = "publish"
         _publish_output_directory(temporary_dir, args.output_dir)
         temporary_dir = None
-        report["primary_output_status"] = "published_unvalidated"
-        output_custody = _capture_published_outputs(
-            args.output_dir, list(expected_outputs)
-        )
         report["failure_phase"] = "output_custody"
+        report["primary_output_status"] = "published_unvalidated"
+        output_custody = _rebind_published_outputs(output_custody, args.output_dir)
         report["artifacts"] = _validate_published_outputs(output_custody, expected_outputs)
         report["output_custody"] = {
             "directory_identity": list(output_custody.directory_identity),
