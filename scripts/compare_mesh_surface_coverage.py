@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import errno
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -108,6 +111,51 @@ class ReportCustody:
         if self.file_descriptor >= 0:
             os.close(self.file_descriptor)
             self.file_descriptor = -1
+
+
+@dataclass
+class PublishedOutputCustody:
+    directory_path: Path
+    directory_descriptor: int
+    directory_identity: tuple[int, int]
+    artifact_descriptors: dict[str, int]
+    artifact_identities: dict[str, tuple[int, int]]
+
+    def _assert_identity(
+        self, path: Path, descriptor: int, expected: tuple[int, int], role: str
+    ) -> None:
+        try:
+            path_stat = path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise CoverageError("output_custody", f"{role} disappeared: {path}") from exc
+        descriptor_stat = os.fstat(descriptor)
+        path_identity = (path_stat.st_dev, path_stat.st_ino)
+        descriptor_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        if path_identity != expected or descriptor_identity != expected:
+            raise CoverageError("output_custody", f"{role} changed ownership: {path}")
+
+    def assert_all(self) -> None:
+        self._assert_identity(
+            self.directory_path,
+            self.directory_descriptor,
+            self.directory_identity,
+            "published output directory",
+        )
+        for name, descriptor in self.artifact_descriptors.items():
+            self._assert_identity(
+                self.directory_path / name,
+                descriptor,
+                self.artifact_identities[name],
+                f"published artifact {name}",
+            )
+
+    def close(self) -> None:
+        for descriptor in self.artifact_descriptors.values():
+            os.close(descriptor)
+        self.artifact_descriptors.clear()
+        if self.directory_descriptor >= 0:
+            os.close(self.directory_descriptor)
+            self.directory_descriptor = -1
 
 
 def _validate_mesh(vertices: np.ndarray, faces: np.ndarray, label: str) -> None:
@@ -353,7 +401,10 @@ def _validate_survival_provenance(
     survival_path: Path,
     survival_digest: str,
     route_count: int,
-) -> None:
+    candidate_label: str,
+    candidate_path: Path,
+    candidate_digest: str,
+) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise CoverageError("validate_provenance", "survival report root must be an object")
     if payload.get("schema") != "trellis2mlx.exact_source_face_survival.v1" or payload.get(
@@ -370,6 +421,24 @@ def _validate_survival_provenance(
         raise CoverageError(
             "validate_provenance", "survival report candidate count does not match route count"
         )
+    candidate = candidates.get(candidate_label)
+    if not isinstance(candidate, dict):
+        raise CoverageError(
+            "validate_provenance", "candidate label is not admitted by the survival report"
+        )
+    upstream_path = candidate.get("path")
+    upstream_digest = candidate.get("sha256")
+    if not isinstance(upstream_path, str) or not isinstance(upstream_digest, str):
+        raise CoverageError(
+            "validate_provenance", "candidate record lacks authoritative path and SHA256"
+        )
+    if (
+        Path(upstream_path).resolve() != candidate_path.resolve()
+        or upstream_digest != candidate_digest
+    ):
+        raise CoverageError(
+            "validate_provenance", "candidate path or SHA256 does not match the survival report"
+        )
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, list):
         raise CoverageError("validate_provenance", "survival report artifact inventory is missing")
@@ -385,6 +454,7 @@ def _validate_survival_provenance(
         raise CoverageError(
             "validate_provenance", "survival count is not uniquely admitted by the survival report"
         )
+    return {"label": candidate_label, "path": upstream_path, "sha256": upstream_digest}
 
 
 def _class_summary(hit: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
@@ -426,6 +496,100 @@ def _threshold_matrix(
 
 def _artifact(path: Path) -> dict[str, Any]:
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _publish_output_directory(temporary_dir: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename_exclusive = libc.renamex_np
+    rename_exclusive.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+    rename_exclusive.restype = ctypes.c_int
+    result = rename_exclusive(os.fsencode(temporary_dir), os.fsencode(destination), 0x00000004)
+    if result != 0:
+        observed_errno = ctypes.get_errno()
+        if observed_errno == errno.EEXIST:
+            raise CoverageError("publish", f"output destination was captured: {destination}")
+        raise CoverageError(
+            "publish", f"exclusive output publication failed: {os.strerror(observed_errno)}"
+        )
+
+
+def _capture_published_outputs(output_dir: Path, names: list[str]) -> PublishedOutputCustody:
+    directory_descriptor = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
+    artifact_descriptors: dict[str, int] = {}
+    try:
+        directory_stat = os.fstat(directory_descriptor)
+        for name in names:
+            artifact_descriptors[name] = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+            )
+        custody = PublishedOutputCustody(
+            directory_path=output_dir,
+            directory_descriptor=directory_descriptor,
+            directory_identity=(directory_stat.st_dev, directory_stat.st_ino),
+            artifact_descriptors=artifact_descriptors,
+            artifact_identities={
+                name: (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+                for name, descriptor in artifact_descriptors.items()
+            },
+        )
+        custody.assert_all()
+        return custody
+    except Exception:
+        for descriptor in artifact_descriptors.values():
+            os.close(descriptor)
+        os.close(directory_descriptor)
+        raise
+
+
+def _validate_published_outputs(
+    custody: PublishedOutputCustody, expected: dict[str, np.ndarray]
+) -> list[dict[str, Any]]:
+    custody.assert_all()
+    artifacts = []
+    for name, expected_array in expected.items():
+        descriptor = custody.artifact_descriptors[name]
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            observed = np.load(stream, allow_pickle=False)
+        if (
+            observed.shape != expected_array.shape
+            or observed.dtype != expected_array.dtype
+            or not np.array_equal(observed, expected_array)
+        ):
+            raise CoverageError("output_custody", f"published artifact validation failed: {name}")
+        custody.assert_all()
+        path = custody.directory_path / name
+        artifacts.append({
+            "path": str(path),
+            "bytes": os.fstat(descriptor).st_size,
+            "sha256": _descriptor_sha256(descriptor),
+            "validated_through_published_path": True,
+            "identity": list(custody.artifact_identities[name]),
+        })
+        custody.assert_all()
+    return artifacts
+
+
+def _confirm_published_digests(
+    custody: PublishedOutputCustody, artifacts: list[dict[str, Any]]
+) -> None:
+    custody.assert_all()
+    expected = {Path(artifact["path"]).name: artifact["sha256"] for artifact in artifacts}
+    for name, digest in expected.items():
+        if _descriptor_sha256(custody.artifact_descriptors[name]) != digest:
+            raise CoverageError(
+                "output_custody", f"published artifact changed after validation: {name}"
+            )
+        custody.assert_all()
 
 
 def _validate_saved_array(path: Path, expected: np.ndarray) -> None:
@@ -498,6 +662,7 @@ def _base_report(args: argparse.Namespace) -> dict[str, Any]:
         "candidate": None,
         "survival_count": None,
         "survival_report": None,
+        "output_custody": None,
         "threshold_matrix": None,
         "artifacts": [],
     }
@@ -508,6 +673,7 @@ def run(args: argparse.Namespace) -> int:
     report = _base_report(args)
     started = time.perf_counter()
     temporary_dir: Path | None = None
+    output_custody: PublishedOutputCustody | None = None
     try:
         _validate_request(args, custody)
         if custody.rerouted:
@@ -546,12 +712,15 @@ def run(args: argparse.Namespace) -> int:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CoverageError("load_inputs", f"cannot load survival report: {exc}") from exc
         report["failure_phase"] = "validate_provenance"
-        _validate_survival_provenance(
+        matched_candidate = _validate_survival_provenance(
             survival_report_payload,
             source_digest=source_digest,
             survival_path=survival_path,
             survival_digest=survival_digest,
             route_count=args.route_count,
+            candidate_label=args.candidate[0],
+            candidate_path=candidate_path,
+            candidate_digest=candidate_digest,
         )
 
         report["failure_phase"] = "measure_coverage"
@@ -573,6 +742,7 @@ def run(args: argparse.Namespace) -> int:
             "sha256": candidate_digest, "vertices": int(len(candidate_vertices)),
             "faces": int(len(candidate_faces)),
             "degenerate_faces_excluded": result.candidate_degenerate_faces,
+            "upstream_identity": matched_candidate,
         }
         report["survival_count"] = {
             "path": str(survival_path), "sha256": survival_digest,
@@ -623,23 +793,43 @@ def run(args: argparse.Namespace) -> int:
         if len(temporary_artifacts) != 3:
             raise CoverageError("validate_outputs", "unexpected primary artifact inventory")
 
+        expected_outputs = {
+            "sample-normalized-distance.npy": result.sample_normalized_distance,
+            "sample-normal-agreement.npy": result.sample_normal_agreement,
+            "sample-candidate-face-index.npy": result.sample_candidate_face_index,
+        }
         report["failure_phase"] = "publish"
-        temporary_dir.replace(args.output_dir)
+        _publish_output_directory(temporary_dir, args.output_dir)
         temporary_dir = None
-        report["artifacts"] = [
-            _artifact(args.output_dir / Path(item["path"]).name) for item in temporary_artifacts
-        ]
+        report["primary_output_status"] = "published_unvalidated"
+        output_custody = _capture_published_outputs(
+            args.output_dir, list(expected_outputs)
+        )
+        report["failure_phase"] = "output_custody"
+        report["artifacts"] = _validate_published_outputs(output_custody, expected_outputs)
+        report["output_custody"] = {
+            "directory_identity": list(output_custody.directory_identity),
+            "artifact_identities": {
+                name: list(identity)
+                for name, identity in output_custody.artifact_identities.items()
+            },
+            "publication": "renamex_np(RENAME_EXCL)",
+        }
         report["status"] = "completed"
         report["failure_phase"] = None
         report["primary_output_status"] = "validated"
         report["timing_seconds"] = time.perf_counter() - started
+        output_custody.assert_all()
         custody.write(report)
+        _confirm_published_digests(output_custody, report["artifacts"])
         return 0
     except Exception as exc:
         if temporary_dir is not None:
             shutil.rmtree(temporary_dir, ignore_errors=True)
         report["status"] = "failed"
         report["failure_phase"] = getattr(exc, "phase", report["failure_phase"])
+        if report["failure_phase"] == "output_custody":
+            report["primary_output_status"] = "published_custody_lost"
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["timing_seconds"] = time.perf_counter() - started
         try:
@@ -649,6 +839,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"{report['failure_phase']}: {report['error']}", file=sys.stderr)
         return 1
     finally:
+        if output_custody is not None:
+            output_custody.close()
         custody.close()
 
 
