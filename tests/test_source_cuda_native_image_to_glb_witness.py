@@ -1,8 +1,10 @@
 import hashlib
 import json
 from pathlib import Path
+import sys
 import types
 
+import numpy as np
 import pytest
 
 
@@ -230,27 +232,259 @@ def test_orientation_observer_does_not_mutate_native_extension_class():
     }
 
 
+def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monkeypatch):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"synthetic-transport-contract-image")
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/native-image-anchor-inputs",
+            kernel_id="operator/native-image-anchor-cuda",
+            title="Native Image Anchor CUDA",
+            entrypoint=entrypoint.name,
+            inputs=(entrypoint.name, image.name),
+            output_json="report.json",
+            output_npz=None,
+            expected_outputs=expected_outputs,
+            entrypoint_args=(
+                "--image",
+                image.name,
+                "--expected-image-sha256",
+                _sha256(image),
+                "--output-dir",
+                ".",
+                "--work-dir",
+                str(tmp_path / "runtime"),
+                "--no-download",
+            ),
+        )
+    )
+    fake_torch = types.SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text().replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    rc = namespace["main"]()
+
+    report = json.loads((work / "report.json").read_text())
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc != 0
+    assert report["status"] == "preflight_stopped"
+    assert report["last_trustworthy_phase"] == "request_validated"
+    assert receipt["failure_phase"] == "output"
+    assert receipt["effective_command"][:3] == [
+        sys.executable,
+        entrypoint.name,
+        "--output-json",
+    ]
+    assert set(packet.expected_outputs).issuperset(expected_outputs)
+
+
+@pytest.mark.parametrize(
+    "mutated_role",
+    ("image", "model.safetensors", "config.json", "preprocessor_config.json"),
+)
+def test_admitted_inputs_reject_requested_path_substitution_before_use(
+    tmp_path,
+    mutated_role,
+):
+    from scripts.source_cuda_native_image_to_glb_witness import (
+        admit_run_inputs,
+        verify_admitted_inputs_before_use,
+    )
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image-authority")
+    dino = tmp_path / "dino"
+    dino.mkdir()
+    dino_files = {
+        "model.safetensors": b"model-authority",
+        "config.json": b"config-authority",
+        "preprocessor_config.json": b"preprocessor-authority",
+    }
+    for name, payload in dino_files.items():
+        (dino / name).write_bytes(payload)
+    args = types.SimpleNamespace(
+        image=image,
+        expected_image_sha256=_sha256(image),
+        dinov3_model_path=dino,
+        work_dir=tmp_path / "runtime",
+        run_id="11111111-1111-4111-8111-111111111111",
+    )
+    report = {}
+    admitted = admit_run_inputs(
+        args,
+        report,
+        expected_dinov3_files={name: _sha256(dino / name) for name in dino_files},
+    )
+    requested = image if mutated_role == "image" else dino / mutated_role
+    requested.write_bytes(b"substituted-after-admission")
+
+    with pytest.raises(RuntimeError, match=mutated_role):
+        verify_admitted_inputs_before_use(
+            admitted,
+            report,
+            expected_dinov3_files={name: _sha256(admitted.dinov3_model_path / name) for name in dino_files},
+        )
+
+    assert Path(admitted.image).read_bytes() == b"image-authority"
+    for name, payload in dino_files.items():
+        assert (Path(admitted.dinov3_model_path) / name).read_bytes() == payload
+
+
 def _write_completed_fixture(tmp_path: Path) -> Path:
     from scripts.source_cuda_native_image_to_glb_witness import (
         CUMESH_COMMIT,
+        CUMESH_REPOSITORY,
+        DINOV3_FILES,
+        DINOV3_REPOSITORY,
+        DINOV3_REVISION,
+        FLEX_GEMM_COMMIT,
+        FLEX_GEMM_REPOSITORY,
+        MODEL_PIPELINE_SHA256,
+        MODEL_REPOSITORY,
+        MODEL_REVISION,
+        NVDIFFRAST_COMMIT,
+        NVDIFFRAST_REPOSITORY,
+        REMBG_REPOSITORY,
+        REMBG_REVISION,
+        SPARSE_DECODER_REPOSITORY,
+        SPARSE_DECODER_REVISION,
         TRELLIS_COMMIT,
+        TRELLIS_REPOSITORY,
     )
+    from PIL import Image
+    import trimesh
 
     output_dir = tmp_path / "outputs"
     output_dir.mkdir()
+    run_id = "11111111-1111-4111-8111-111111111111"
+    image_sha256 = "a" * 64
+    coords = np.asarray(
+        [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]],
+        dtype=np.int32,
+    )
+    voxel_coords = coords[:, 1:].copy()
+    features = np.arange(12, dtype=np.float32).reshape(4, 3)
+    vertices = np.asarray(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        dtype=np.float32,
+    )
+    faces = np.asarray(
+        [[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+        dtype=np.int32,
+    )
+    arrays_by_stage = {
+        "conditioning_512": {
+            "cond": np.ones((1, 2, 3), dtype=np.float32),
+            "neg_cond": np.zeros((1, 2, 3), dtype=np.float32),
+        },
+        "sparse_flow": {
+            "noise": np.ones((1, 2, 2, 2, 2), dtype=np.float32),
+            "sample_next": np.ones((8, 1, 2, 2, 2, 2), dtype=np.float32),
+            "pred_x0": np.zeros((8, 1, 2, 2, 2, 2), dtype=np.float32),
+        },
+        "sparse_support": {"coords": coords},
+        "shape_flow": {
+            "noise_feats": features,
+            "noise_coords": coords,
+            "coords": coords,
+            "sample_next": np.repeat(features[None], 8, axis=0),
+            "pred_x0": np.repeat((features + 1)[None], 8, axis=0),
+        },
+        "shape_slat": {"shape_slat_feats": features, "shape_slat_coords": coords},
+        "texture_flow": {
+            "noise_feats": features,
+            "noise_coords": coords,
+            "coords": coords,
+            "sample_next": np.repeat(features[None], 8, axis=0),
+            "pred_x0": np.repeat((features + 1)[None], 8, axis=0),
+        },
+        "decoder_raw_mesh": {"vertices": vertices, "faces": faces},
+        "texture_voxels": {
+            "texture_voxels_feats": features,
+            "texture_voxels_coords": coords,
+        },
+        "pipeline_filled_mesh": {
+            "vertices": vertices,
+            "faces": faces,
+            "texture_coords": voxel_coords,
+            "texture_attrs": np.ones((4, 6), dtype=np.float32),
+        },
+        "postprocess_stage11_pre_orientation": {"vertices": vertices, "faces": faces},
+        "postprocess_stage12_post_orientation": {"vertices": vertices, "faces": faces},
+    }
     artifacts = {}
     for index, stage in enumerate(EXPECTED_STAGES):
-        suffix = ".glb" if stage == "consumer_glb" else ".npz"
+        suffix = ".png" if stage == "preprocessed_image" else ".glb" if stage == "consumer_glb" else ".npz"
         path = output_dir / f"{index:02d}-{stage}{suffix}"
-        path.write_bytes(f"artifact:{stage}".encode())
+        metadata = {}
+        if stage == "preprocessed_image":
+            image = Image.new("RGB", (2, 2), (80, 120, 160))
+            image.save(path, format="PNG")
+            metadata = {"mode": "RGB", "size": [2, 2]}
+        elif stage == "consumer_glb":
+            uv = np.asarray([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.float64)
+            material = trimesh.visual.material.PBRMaterial(
+                baseColorTexture=Image.new("RGB", (2, 2), (200, 100, 50))
+            )
+            visual = trimesh.visual.texture.TextureVisuals(uv=uv, material=material)
+            mesh = trimesh.Trimesh(
+                vertices=vertices,
+                faces=faces,
+                visual=visual,
+                process=False,
+            )
+            path.write_bytes(trimesh.Scene(mesh).export(file_type="glb"))
+        else:
+            arrays = arrays_by_stage[stage]
+            np.savez(path, **arrays)
+            metadata = {
+                "arrays": {
+                    name: {
+                        "dtype": str(value.dtype),
+                        "shape": list(value.shape),
+                        "sha256": hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest(),
+                    }
+                    for name, value in arrays.items()
+                }
+            }
         artifacts[stage] = {
             "path": path.name,
             "sha256": _sha256(path),
             "size_bytes": path.stat().st_size,
+            "run_id": run_id,
+            **metadata,
         }
 
     report = {
         "schema": "trellis2mlx.source_cuda_native_image_to_glb.v1",
+        "run_id": run_id,
         "status": "completed",
         "failure_phase": None,
         "last_trustworthy_phase": "consumer_glb_validated",
@@ -278,6 +512,43 @@ def _write_completed_fixture(tmp_path: Path) -> Path:
             "native_conditioning": True,
             "native_rng": True,
             "observation_only_instrumentation": True,
+            "run_id": run_id,
+        },
+        "requested_route": {"run_id": run_id, "image_sha256": image_sha256},
+        "effective_inputs": {
+            "run_id": run_id,
+            "image": {"path": "/run/image.png", "sha256": image_sha256, "size_bytes": 100},
+            "dinov3": {
+                "path": "/run/dinov3",
+                "files": {
+                    name: {"path": f"/run/dinov3/{name}", "sha256": digest, "size_bytes": 100}
+                    for name, digest in DINOV3_FILES.items()
+                },
+            },
+        },
+        "model_assets": {
+            "trellis": {
+                "repository": MODEL_REPOSITORY,
+                "revision": MODEL_REVISION,
+                "pipeline_json_sha256": MODEL_PIPELINE_SHA256,
+            },
+            "sparse_decoder": {
+                "repository": SPARSE_DECODER_REPOSITORY,
+                "revision": SPARSE_DECODER_REVISION,
+            },
+            "dinov3": {
+                "repository": DINOV3_REPOSITORY,
+                "revision": DINOV3_REVISION,
+                "files": dict(DINOV3_FILES),
+            },
+            "rembg": {"repository": REMBG_REPOSITORY, "revision": REMBG_REVISION},
+            "path_rewrite_only": True,
+        },
+        "source_identities_after_build": {
+            "trellis": {"repository": TRELLIS_REPOSITORY, "commit": TRELLIS_COMMIT, "clean": True},
+            "cumesh": {"repository": CUMESH_REPOSITORY, "commit": CUMESH_COMMIT, "clean": True},
+            "flex_gemm": {"repository": FLEX_GEMM_REPOSITORY, "commit": FLEX_GEMM_COMMIT, "clean": True},
+            "nvdiffrast": {"repository": NVDIFFRAST_REPOSITORY, "commit": NVDIFFRAST_COMMIT, "clean": True},
         },
         "capture_order": list(EXPECTED_STAGES),
         "orientation_observer": {
@@ -304,6 +575,131 @@ def test_completed_report_admission_reopens_every_boundary(tmp_path):
     assert admitted["status"] == "completed"
     assert admitted["primary_output_status"] == "validated"
     assert admitted["capture_order"] == list(EXPECTED_STAGES)
+
+
+def test_completed_report_rejects_plaintext_npz_and_glb_bytes(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    record = report["artifacts"]["shape_flow"]
+    path = report_path.parent / record["path"]
+    path.write_bytes(b"plain text pretending to be npz")
+    record["sha256"] = _sha256(path)
+    record["size_bytes"] = path.stat().st_size
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="NPZ|GLB|PNG|artifact structure"):
+        validate_completed_report(report_path)
+
+
+def test_completed_report_rejects_malformed_glb_even_with_matching_receipt(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    record = report["artifacts"]["consumer_glb"]
+    path = report_path.parent / record["path"]
+    path.write_bytes(b"plain text pretending to be a glb")
+    record["sha256"] = _sha256(path)
+    record["size_bytes"] = path.stat().st_size
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="GLB"):
+        validate_completed_report(report_path)
+
+
+def test_completed_report_rejects_duplicate_stage_path_even_with_matching_receipt(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    duplicate = report["artifacts"]["shape_flow"]
+    report["artifacts"]["texture_flow"] = dict(duplicate)
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="distinct|duplicate"):
+        validate_completed_report(report_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("missing_array", "NPZ keys"),
+        ("retyped_array", "NPZ dtype"),
+        ("empty_array", "NPZ array is empty"),
+    ],
+)
+def test_completed_report_rejects_invalid_npz_array_contract(tmp_path, mutation, match):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    record = report["artifacts"]["conditioning_512"]
+    path = report_path.parent / record["path"]
+    with np.load(path, allow_pickle=False) as reopened:
+        arrays = {name: np.ascontiguousarray(reopened[name]) for name in reopened.files}
+    if mutation == "missing_array":
+        arrays.pop("neg_cond")
+    elif mutation == "retyped_array":
+        arrays["cond"] = arrays["cond"].astype(np.float64)
+    elif mutation == "empty_array":
+        arrays["cond"] = np.empty((0, 2, 3), dtype=np.float32)
+    np.savez(path, **arrays)
+    record["sha256"] = _sha256(path)
+    record["size_bytes"] = path.stat().st_size
+    record["arrays"] = {
+        name: {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "sha256": hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest(),
+        }
+        for name, value in arrays.items()
+    }
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=match):
+        validate_completed_report(report_path)
+
+
+def test_completed_report_rejects_stale_bundle_from_another_run(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="run identity mismatch"):
+        validate_completed_report(
+            report_path,
+            expected_run_id="22222222-2222-4222-8222-222222222222",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("missing_model_assets", "model assets"),
+        ("wrong_effective_image", "effective image"),
+        ("missing_run_id", "run identity"),
+    ],
+)
+def test_completed_report_rejects_missing_or_wrong_authority(tmp_path, mutation, match):
+    from scripts.source_cuda_native_image_to_glb_witness import validate_completed_report
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    if mutation == "missing_model_assets":
+        report.pop("model_assets", None)
+    elif mutation == "wrong_effective_image":
+        report.setdefault("effective_inputs", {})["image"] = {
+            "sha256": "0" * 64,
+            "size_bytes": 1,
+        }
+    elif mutation == "missing_run_id":
+        report.pop("run_id", None)
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=match):
+        validate_completed_report(report_path)
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import types
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -59,6 +60,66 @@ EXPECTED_CAPTURE_ORDER = (
     "postprocess_stage12_post_orientation",
     "consumer_glb",
 )
+
+EXPECTED_ARTIFACT_FILENAMES = {
+    stage: f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+    for index, stage in enumerate(EXPECTED_CAPTURE_ORDER)
+}
+
+NPZ_STAGE_SCHEMAS: dict[str, dict[str, dict[str, Any]]] = {
+    "conditioning_512": {
+        "cond": {"dtype": "float32", "ndim": 3},
+        "neg_cond": {"dtype": "float32", "ndim": 3},
+    },
+    "sparse_flow": {
+        "noise": {"dtype": "float32", "ndim": 5},
+        "sample_next": {"dtype": "float32", "ndim": 6, "leading": 8},
+        "pred_x0": {"dtype": "float32", "ndim": 6, "leading": 8},
+    },
+    "sparse_support": {
+        "coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+    },
+    "shape_flow": {
+        "noise_feats": {"dtype": "float32", "ndim": 2},
+        "noise_coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+        "coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+        "sample_next": {"dtype": "float32", "ndim": 3, "leading": 8},
+        "pred_x0": {"dtype": "float32", "ndim": 3, "leading": 8},
+    },
+    "shape_slat": {
+        "shape_slat_feats": {"dtype": "float32", "ndim": 2},
+        "shape_slat_coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+    },
+    "texture_flow": {
+        "noise_feats": {"dtype": "float32", "ndim": 2},
+        "noise_coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+        "coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+        "sample_next": {"dtype": "float32", "ndim": 3, "leading": 8},
+        "pred_x0": {"dtype": "float32", "ndim": 3, "leading": 8},
+    },
+    "decoder_raw_mesh": {
+        "vertices": {"dtype": "float32", "ndim": 2, "columns": 3},
+        "faces": {"dtype": "int32", "ndim": 2, "columns": 3},
+    },
+    "texture_voxels": {
+        "texture_voxels_feats": {"dtype": "float32", "ndim": 2},
+        "texture_voxels_coords": {"dtype": "int32", "ndim": 2, "columns": 4, "unique_rows": True},
+    },
+    "pipeline_filled_mesh": {
+        "vertices": {"dtype": "float32", "ndim": 2, "columns": 3},
+        "faces": {"dtype": "int32", "ndim": 2, "columns": 3},
+        "texture_coords": {"dtype": "int32", "ndim": 2, "columns": 3, "unique_rows": True},
+        "texture_attrs": {"dtype": "float32", "ndim": 2},
+    },
+    "postprocess_stage11_pre_orientation": {
+        "vertices": {"dtype": "float32", "ndim": 2, "columns": 3},
+        "faces": {"dtype": "int32", "ndim": 2, "columns": 3},
+    },
+    "postprocess_stage12_post_orientation": {
+        "vertices": {"dtype": "float32", "ndim": 2, "columns": 3},
+        "faces": {"dtype": "int32", "ndim": 2, "columns": 3},
+    },
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -138,6 +199,7 @@ def _requested_route(args: argparse.Namespace) -> dict[str, Any]:
         "torch_version": EXPECTED_TORCH_VERSION,
         "image": str(Path(args.image).resolve()),
         "image_sha256": args.expected_image_sha256,
+        "run_id": args.run_id,
         "pipeline_type": args.pipeline_type,
         "seed": args.seed,
         "sampler_steps": {
@@ -164,6 +226,11 @@ def _validate_request(args: argparse.Namespace) -> None:
     image = Path(args.image).resolve()
     output_dir = Path(args.output_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
+    report_path = (
+        Path(args.output_json).resolve()
+        if args.output_json is not None
+        else output_dir / "report.json"
+    )
     if not image.is_file() or image.stat().st_size <= 0:
         raise ValueError(f"image is missing or blank: {image}")
     if len(args.expected_image_sha256) != 64:
@@ -193,6 +260,12 @@ def _validate_request(args: argparse.Namespace) -> None:
         raise ValueError("the native source route requires sparse_conv_backend='flex_gemm'")
     if args.model_repository != MODEL_REPOSITORY:
         raise ValueError(f"this witness admits only model_repository={MODEL_REPOSITORY!r}")
+    try:
+        parsed_run_id = uuid.UUID(args.run_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("--run-id must be a canonical UUID") from exc
+    if str(parsed_run_id) != args.run_id:
+        raise ValueError("--run-id must be a canonical lowercase UUID")
     if not args.no_download and args.dinov3_model_path is None:
         raise ValueError("live native conditioning requires --dinov3-model-path")
     if args.dinov3_model_path is not None:
@@ -210,10 +283,143 @@ def _validate_request(args: argparse.Namespace) -> None:
                 )
     if output_dir == output_dir.parent or work_dir == work_dir.parent:
         raise ValueError("output and work directories must not be filesystem roots")
-    if image == output_dir or output_dir in image.parents:
-        raise ValueError("image must not live inside output custody")
+    if report_path != output_dir / "report.json":
+        raise ValueError(
+            "--output-json must resolve exactly to <output-dir>/report.json: "
+            f"{report_path} != {output_dir / 'report.json'}"
+        )
+    if image == report_path or (
+        image.parent == output_dir and image.name in set(EXPECTED_ARTIFACT_FILENAMES.values())
+    ):
+        raise ValueError("image aliases a report or canonical output artifact")
     if output_dir == work_dir or output_dir in work_dir.parents or work_dir in output_dir.parents:
         raise ValueError("output and work directories must not overlap")
+
+
+def _copy_admitted_file(source: Path, destination: Path, expected_sha256: str) -> dict[str, Any]:
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise RuntimeError(f"admitted-input destination already exists: {destination}")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".admitting", dir=destination.parent
+    )
+    try:
+        with source.open("rb") as reader, os.fdopen(fd, "wb") as writer:
+            shutil.copyfileobj(reader, writer, length=8 * 1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        temporary = Path(temporary_name)
+        actual_sha256 = sha256_file(temporary)
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"authority changed while admitting {source.name}: "
+                f"expected {expected_sha256}, copied {actual_sha256}"
+            )
+        os.replace(temporary, destination)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+    return {
+        "path": str(destination),
+        "sha256": expected_sha256,
+        "size_bytes": destination.stat().st_size,
+    }
+
+
+def admit_run_inputs(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    *,
+    expected_dinov3_files: dict[str, str] = DINOV3_FILES,
+) -> argparse.Namespace:
+    requested_image = Path(args.image).resolve()
+    requested_dino = Path(args.dinov3_model_path).resolve()
+    custody_root = Path(args.work_dir).resolve() / "admitted-inputs" / args.run_id
+    if custody_root.exists():
+        raise RuntimeError(f"run input custody already exists: {custody_root}")
+    custody_root.mkdir(parents=True)
+
+    requested = {
+        "image": {
+            "path": str(requested_image),
+            "sha256": args.expected_image_sha256,
+            "size_bytes": requested_image.stat().st_size,
+        },
+        "dinov3": {
+            "path": str(requested_dino),
+            "files": {
+                name: {
+                    "path": str(requested_dino / name),
+                    "sha256": expected,
+                    "size_bytes": (requested_dino / name).stat().st_size,
+                }
+                for name, expected in expected_dinov3_files.items()
+            },
+        },
+    }
+    admitted_image = custody_root / "image" / requested_image.name
+    image_record = _copy_admitted_file(
+        requested_image, admitted_image, args.expected_image_sha256
+    )
+    admitted_dino = custody_root / "dinov3"
+    dino_records = {
+        name: _copy_admitted_file(requested_dino / name, admitted_dino / name, expected)
+        for name, expected in expected_dinov3_files.items()
+    }
+    report["requested_inputs"] = requested
+    report["effective_inputs"] = {
+        "run_id": args.run_id,
+        "image": image_record,
+        "dinov3": {
+            "path": str(admitted_dino),
+            "files": dino_records,
+        },
+    }
+    admitted_args = argparse.Namespace(**vars(args))
+    admitted_args.image = admitted_image
+    admitted_args.dinov3_model_path = admitted_dino
+    return admitted_args
+
+
+def verify_admitted_inputs_before_use(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    *,
+    expected_dinov3_files: dict[str, str] = DINOV3_FILES,
+) -> None:
+    requested = report.get("requested_inputs", {})
+    effective = report.get("effective_inputs", {})
+    if effective.get("run_id") != args.run_id:
+        raise RuntimeError("admitted input run identity mismatch")
+
+    checks = [
+        (
+            "image",
+            Path(requested.get("image", {}).get("path", "")),
+            Path(args.image),
+            args.expected_image_sha256,
+        )
+    ]
+    for name, expected in expected_dinov3_files.items():
+        checks.append(
+            (
+                name,
+                Path(requested.get("dinov3", {}).get("files", {}).get(name, {}).get("path", "")),
+                Path(args.dinov3_model_path) / name,
+                expected,
+            )
+        )
+    for role, requested_path, admitted_path, expected in checks:
+        for label, path in (("requested", requested_path), ("admitted", admitted_path)):
+            if not path.is_file() or path.stat().st_size <= 0:
+                raise RuntimeError(f"{role} {label} authority is missing or blank: {path}")
+            actual = sha256_file(path)
+            if actual != expected:
+                raise RuntimeError(
+                    f"{role} {label} authority substitution: expected {expected}, got {actual}"
+                )
 
 
 def _git_identity(path: Path, repository: str, commit: str) -> dict[str, Any]:
@@ -377,6 +583,7 @@ def prepare_runtime(args: argparse.Namespace, report: dict[str, Any]) -> dict[st
 def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path:
     from huggingface_hub import snapshot_download
 
+    verify_admitted_inputs_before_use(args, report)
     work_dir = Path(args.work_dir).resolve()
     hf_cache = work_dir / "huggingface"
     snapshots = {
@@ -482,12 +689,14 @@ class ArtifactRecorder:
         self,
         output_dir: Path,
         *,
+        run_id: str | None = None,
         on_capture: Callable[["ArtifactRecorder"], None] | None = None,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts: dict[str, dict[str, Any]] = {}
         self.capture_order: list[str] = []
+        self.run_id = run_id
         self.on_capture = on_capture
 
     def _next_path(self, stage: str, suffix: str) -> Path:
@@ -506,6 +715,7 @@ class ArtifactRecorder:
             "path": path.name,
             "sha256": sha256_file(path),
             "size_bytes": path.stat().st_size,
+            **({"run_id": self.run_id} if self.run_id is not None else {}),
             **(metadata or {}),
         }
         if self.on_capture is not None:
@@ -785,6 +995,7 @@ def _cleanup_stale_outputs(output_dir: Path) -> None:
 
 def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     output_dir = Path(args.output_dir).resolve()
+    verify_admitted_inputs_before_use(args, report)
     phase_started = time.perf_counter()
     report["phase"] = "prepare_runtime"
     roots = prepare_runtime(args, report)
@@ -854,6 +1065,7 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
         "native_conditioning": True,
         "native_rng": True,
         "observation_only_instrumentation": True,
+        "run_id": args.run_id,
         "cumesh_module_path": str(Path(cumesh.__file__).resolve()),
         "flex_gemm_module_path": str(Path(flex_gemm.__file__).resolve()),
         "o_voxel_module_path": str(Path(o_voxel.__file__).resolve()),
@@ -873,8 +1085,9 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
         report["last_trustworthy_phase"] = f"{current.capture_order[-1]}_captured"
         _atomic_write_json(output_dir / "report.json", report)
 
-    recorder = ArtifactRecorder(output_dir, on_capture=publish_capture)
+    recorder = ArtifactRecorder(output_dir, run_id=args.run_id, on_capture=publish_capture)
     sampler_observers = install_pipeline_observers(pipeline, recorder, steps=args.steps)
+    verify_admitted_inputs_before_use(args, report)
     image = Image.open(args.image)
 
     report["phase"] = "pipeline_run"
@@ -945,6 +1158,19 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
         )
     report["capture_order"] = recorder.capture_order
     report["artifacts"] = recorder.artifacts
+    report["status"] = "running"
+    report["failure_phase"] = None
+    report["last_trustworthy_phase"] = "consumer_glb_written_unvalidated"
+    report["primary_output_status"] = "written_unvalidated"
+    report["phase"] = "artifact_admission"
+    candidate_report_path = output_dir / "report.json"
+    _atomic_write_json(candidate_report_path, report)
+    _validate_completed_bundle(
+        candidate_report_path,
+        report,
+        expected_run_id=args.run_id,
+        expected_image_sha256=args.expected_image_sha256,
+    )
     report["status"] = "completed"
     report["failure_phase"] = None
     report["last_trustworthy_phase"] = "consumer_glb_validated"
@@ -952,19 +1178,228 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     report["phase"] = "completed"
 
 
-def validate_completed_report(report_path: Path) -> dict[str, Any]:
-    report_path = Path(report_path).resolve()
-    if not report_path.is_file() or report_path.stat().st_size <= 0:
-        raise ValueError(f"report is missing or blank: {report_path}")
-    report = json.loads(report_path.read_text())
-    if report.get("schema") != SCHEMA:
-        raise ValueError(f"unexpected schema: {report.get('schema')!r}")
-    if report.get("status") != "completed":
-        raise ValueError(f"report status is not completed: {report.get('status')!r}")
-    if report.get("primary_output_status") != "validated":
-        raise ValueError("primary output is not validated")
-    if report.get("last_trustworthy_phase") != "consumer_glb_validated":
-        raise ValueError("report did not reach consumer_glb_validated")
+def _array_sha256(value: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+
+
+def _validate_npz_artifact(stage: str, path: Path, record: dict[str, Any]) -> None:
+    schema = NPZ_STAGE_SCHEMAS[stage]
+    try:
+        with np.load(path, allow_pickle=False) as reopened:
+            reopened_files = set(reopened.files)
+            arrays = {name: np.ascontiguousarray(reopened[name]) for name in reopened.files}
+    except BaseException as exc:
+        raise ValueError(f"NPZ artifact structure is invalid for {stage}: {exc}") from exc
+    if reopened_files != set(schema):
+        raise ValueError(
+            f"NPZ keys for {stage} must be {sorted(schema)!r}, got {sorted(reopened_files)!r}"
+        )
+
+    recorded_arrays = record.get("arrays")
+    if not isinstance(recorded_arrays, dict) or set(recorded_arrays) != set(schema):
+        raise ValueError(f"NPZ array receipts are incomplete for {stage}")
+    for name, spec in schema.items():
+        value = arrays[name]
+        if str(value.dtype) != spec["dtype"]:
+            raise ValueError(
+                f"NPZ dtype for {stage}.{name} must be {spec['dtype']}, got {value.dtype}"
+            )
+        if value.ndim != spec["ndim"]:
+            raise ValueError(
+                f"NPZ rank for {stage}.{name} must be {spec['ndim']}, got {value.ndim}"
+            )
+        if value.size == 0 or any(dimension <= 0 for dimension in value.shape):
+            raise ValueError(f"NPZ array is empty for {stage}.{name}")
+        if spec.get("columns") is not None and value.shape[1] != spec["columns"]:
+            raise ValueError(
+                f"NPZ columns for {stage}.{name} must be {spec['columns']}, got {value.shape[1]}"
+            )
+        if spec.get("leading") is not None and value.shape[0] != spec["leading"]:
+            raise ValueError(
+                f"NPZ leading dimension for {stage}.{name} must be {spec['leading']}, got {value.shape[0]}"
+            )
+        if value.dtype.kind == "f" and not np.isfinite(value).all():
+            raise ValueError(f"NPZ array contains non-finite values for {stage}.{name}")
+        if spec.get("unique_rows") and len(np.unique(value, axis=0)) != len(value):
+            raise ValueError(f"NPZ coordinate rows are not unique for {stage}.{name}")
+        metadata = recorded_arrays[name]
+        expected_metadata = {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "sha256": _array_sha256(value),
+        }
+        if metadata != expected_metadata:
+            raise ValueError(
+                f"NPZ array receipt mismatch for {stage}.{name}: "
+                f"expected {expected_metadata!r}, got {metadata!r}"
+            )
+
+    if stage == "conditioning_512" and arrays["cond"].shape != arrays["neg_cond"].shape:
+        raise ValueError("conditioning positive/negative shapes differ")
+    if stage == "sparse_flow":
+        if arrays["sample_next"].shape != arrays["pred_x0"].shape:
+            raise ValueError("sparse flow recurrence shapes differ")
+        if arrays["sample_next"].shape[1:] != arrays["noise"].shape:
+            raise ValueError("sparse flow recurrence is not bound to noise shape")
+    if stage in {"shape_flow", "texture_flow"}:
+        if not np.array_equal(arrays["coords"], arrays["noise_coords"]):
+            raise ValueError(f"{stage} recurrence coordinates differ from noise coordinates")
+        feature_shape = arrays["noise_feats"].shape
+        if arrays["sample_next"].shape != (8, *feature_shape):
+            raise ValueError(f"{stage} sample recurrence is not row-bound to noise features")
+        if arrays["pred_x0"].shape != (8, *feature_shape):
+            raise ValueError(f"{stage} x0 recurrence is not row-bound to noise features")
+        if len(arrays["coords"]) != feature_shape[0]:
+            raise ValueError(f"{stage} coordinates are not row-bound to features")
+    for feature_name, coordinate_name in (
+        ("shape_slat_feats", "shape_slat_coords"),
+        ("texture_voxels_feats", "texture_voxels_coords"),
+        ("texture_attrs", "texture_coords"),
+    ):
+        if feature_name in arrays and len(arrays[feature_name]) != len(arrays[coordinate_name]):
+            raise ValueError(
+                f"{stage} {feature_name} rows are not bound to {coordinate_name} rows"
+            )
+    if "vertices" in arrays and "faces" in arrays:
+        vertices = arrays["vertices"]
+        faces = arrays["faces"]
+        if np.any(faces < 0) or int(faces.max()) >= len(vertices):
+            raise ValueError(f"{stage} face indices escape the vertex array")
+
+
+def _validate_png_artifact(path: Path, record: dict[str, Any]) -> None:
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if image.format != "PNG" or image.mode not in {"RGB", "RGBA"}:
+                raise ValueError(
+                    f"PNG artifact must be RGB/RGBA PNG, got {image.format}/{image.mode}"
+                )
+            if image.width <= 0 or image.height <= 0:
+                raise ValueError("PNG artifact has empty dimensions")
+            if record.get("mode") != image.mode or record.get("size") != [image.width, image.height]:
+                raise ValueError("PNG artifact metadata does not match reopened image")
+    except ValueError:
+        raise
+    except BaseException as exc:
+        raise ValueError(f"PNG artifact structure is invalid: {exc}") from exc
+
+
+def _validate_glb_artifact(path: Path) -> None:
+    import trimesh
+
+    try:
+        scene = trimesh.load(path, force="scene", process=False)
+    except BaseException as exc:
+        raise ValueError(f"GLB artifact structure is invalid: {exc}") from exc
+    geometries = list(getattr(scene, "geometry", {}).values())
+    if not geometries:
+        raise ValueError("GLB contains no geometry")
+    textured = False
+    for geometry in geometries:
+        vertices = np.asarray(getattr(geometry, "vertices", ()))
+        faces = np.asarray(getattr(geometry, "faces", ()))
+        if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not len(vertices):
+            raise ValueError("GLB geometry has no nonempty vertex array")
+        if faces.ndim != 2 or faces.shape[1:] != (3,) or not len(faces):
+            raise ValueError("GLB geometry has no nonempty triangle array")
+        if not np.isfinite(vertices).all():
+            raise ValueError("GLB geometry contains non-finite vertices")
+        visual = getattr(geometry, "visual", None)
+        uv = getattr(visual, "uv", None)
+        material = getattr(visual, "material", None)
+        texture = None
+        if material is not None:
+            texture = getattr(material, "baseColorTexture", None)
+            if texture is None:
+                texture = getattr(material, "image", None)
+        if uv is not None and len(np.asarray(uv)) == len(vertices) and texture is not None:
+            width, height = getattr(texture, "size", (0, 0))
+            textured = width > 0 and height > 0
+    if not textured:
+        raise ValueError("GLB has no geometry with bound UVs and a nonempty texture material")
+
+
+def _validate_authority(report: dict[str, Any], *, expected_run_id: str | None, expected_image_sha256: str | None) -> str:
+    run_id = report.get("run_id")
+    try:
+        parsed = uuid.UUID(run_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("run identity is missing or invalid") from exc
+    if str(parsed) != run_id:
+        raise ValueError("run identity is not canonical")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ValueError(f"run identity mismatch: expected {expected_run_id}, got {run_id}")
+    requested_route = report.get("requested_route", {})
+    if requested_route.get("run_id") != run_id:
+        raise ValueError("requested route run identity mismatch")
+    requested_image = requested_route.get("image_sha256")
+    if expected_image_sha256 is not None and requested_image != expected_image_sha256:
+        raise ValueError("requested image identity does not match external admission")
+    effective_inputs = report.get("effective_inputs", {})
+    image = effective_inputs.get("image", {})
+    if image.get("sha256") != requested_image or not isinstance(image.get("size_bytes"), int) or image["size_bytes"] <= 0:
+        raise ValueError("effective image identity does not match requested image")
+    if effective_inputs.get("run_id") != run_id:
+        raise ValueError("effective input run identity mismatch")
+    dino = effective_inputs.get("dinov3", {}).get("files", {})
+    if set(dino) != set(DINOV3_FILES):
+        raise ValueError("effective DINOv3 identity set is incomplete")
+    for name, expected in DINOV3_FILES.items():
+        record = dino[name]
+        if record.get("sha256") != expected or not isinstance(record.get("size_bytes"), int) or record["size_bytes"] <= 0:
+            raise ValueError(f"effective DINOv3 identity mismatch for {name}")
+
+    model_assets = report.get("model_assets")
+    if not isinstance(model_assets, dict):
+        raise ValueError("model assets authority is missing")
+    required_assets = {
+        "trellis": (MODEL_REPOSITORY, MODEL_REVISION),
+        "sparse_decoder": (SPARSE_DECODER_REPOSITORY, SPARSE_DECODER_REVISION),
+        "dinov3": (DINOV3_REPOSITORY, DINOV3_REVISION),
+        "rembg": (REMBG_REPOSITORY, REMBG_REVISION),
+    }
+    for role, (repository, revision) in required_assets.items():
+        record = model_assets.get(role, {})
+        if record.get("repository") != repository or record.get("revision") != revision:
+            raise ValueError(f"model assets authority mismatch for {role}")
+    if model_assets["trellis"].get("pipeline_json_sha256") != MODEL_PIPELINE_SHA256:
+        raise ValueError("model assets pipeline identity mismatch")
+    if model_assets["dinov3"].get("files") != DINOV3_FILES:
+        raise ValueError("model assets DINOv3 file identity mismatch")
+    if model_assets.get("path_rewrite_only") is not True:
+        raise ValueError("model assets path rewrite identity is missing")
+
+    source_identities = report.get("source_identities_after_build")
+    if not isinstance(source_identities, dict):
+        raise ValueError("source checkout identities are missing")
+    required_sources = {
+        "trellis": (TRELLIS_REPOSITORY, TRELLIS_COMMIT),
+        "cumesh": (CUMESH_REPOSITORY, CUMESH_COMMIT),
+        "flex_gemm": (FLEX_GEMM_REPOSITORY, FLEX_GEMM_COMMIT),
+        "nvdiffrast": (NVDIFFRAST_REPOSITORY, NVDIFFRAST_COMMIT),
+    }
+    for role, (repository, commit) in required_sources.items():
+        record = source_identities.get(role, {})
+        if record.get("repository") != repository or record.get("commit") != commit or record.get("clean") is not True:
+            raise ValueError(f"source checkout identity mismatch for {role}")
+    return run_id
+
+
+def _validate_completed_bundle(
+    report_path: Path,
+    report: dict[str, Any],
+    *,
+    expected_run_id: str | None = None,
+    expected_image_sha256: str | None = None,
+) -> None:
+    run_id = _validate_authority(
+        report,
+        expected_run_id=expected_run_id,
+        expected_image_sha256=expected_image_sha256,
+    )
     route = report.get("effective_route", {})
     required_route = {
         "device_type": "cuda",
@@ -988,6 +1423,7 @@ def validate_completed_report(report_path: Path) -> dict[str, Any]:
         "native_conditioning": True,
         "native_rng": True,
         "observation_only_instrumentation": True,
+        "run_id": run_id,
     }
     for key, expected in required_route.items():
         if route.get(key) != expected:
@@ -1014,9 +1450,18 @@ def validate_completed_report(report_path: Path) -> dict[str, Any]:
     artifacts = report.get("artifacts", {})
     if set(artifacts) != set(EXPECTED_CAPTURE_ORDER):
         raise ValueError("artifact set does not match capture order")
+    recorded_paths = [Path(artifacts[stage].get("path", "")).as_posix() for stage in EXPECTED_CAPTURE_ORDER]
+    if len(set(recorded_paths)) != len(recorded_paths):
+        raise ValueError("artifact paths must be distinct; duplicate stage path recorded")
+    resolved_paths: set[Path] = set()
     for stage in EXPECTED_CAPTURE_ORDER:
         record = artifacts[stage]
         recorded = Path(record.get("path", ""))
+        expected_name = EXPECTED_ARTIFACT_FILENAMES[stage]
+        if recorded.as_posix() != expected_name:
+            raise ValueError(
+                f"artifact path for {stage} must be canonical {expected_name!r}, got {recorded.as_posix()!r}"
+            )
         path = recorded if recorded.is_absolute() else report_path.parent / recorded
         path = path.resolve()
         if report_path.parent not in path.parents:
@@ -1030,6 +1475,43 @@ def validate_completed_report(report_path: Path) -> dict[str, Any]:
             )
         if path.stat().st_size != record.get("size_bytes"):
             raise ValueError(f"artifact size mismatch for {stage}")
+        if path in resolved_paths:
+            raise ValueError(f"artifact paths must be distinct; duplicate at {stage}: {path}")
+        resolved_paths.add(path)
+        if record.get("run_id") != run_id:
+            raise ValueError(f"artifact run identity mismatch for {stage}")
+        if stage == "preprocessed_image":
+            _validate_png_artifact(path, record)
+        elif stage == "consumer_glb":
+            _validate_glb_artifact(path)
+        else:
+            _validate_npz_artifact(stage, path, record)
+
+
+def validate_completed_report(
+    report_path: Path,
+    *,
+    expected_run_id: str | None = None,
+    expected_image_sha256: str | None = None,
+) -> dict[str, Any]:
+    report_path = Path(report_path).resolve()
+    if not report_path.is_file() or report_path.stat().st_size <= 0:
+        raise ValueError(f"report is missing or blank: {report_path}")
+    report = json.loads(report_path.read_text())
+    if report.get("schema") != SCHEMA:
+        raise ValueError(f"unexpected schema: {report.get('schema')!r}")
+    if report.get("status") != "completed":
+        raise ValueError(f"report status is not completed: {report.get('status')!r}")
+    if report.get("primary_output_status") != "validated":
+        raise ValueError("primary output is not validated")
+    if report.get("last_trustworthy_phase") != "consumer_glb_validated":
+        raise ValueError("report did not reach consumer_glb_validated")
+    _validate_completed_bundle(
+        report_path,
+        report,
+        expected_run_id=expected_run_id,
+        expected_image_sha256=expected_image_sha256,
+    )
     return report
 
 
@@ -1038,7 +1520,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--expected-image-sha256", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--output-json", type=Path)
     parser.add_argument("--work-dir", required=True, type=Path)
+    parser.add_argument("--run-id")
     parser.add_argument("--model-repository", default=MODEL_REPOSITORY)
     parser.add_argument("--dinov3-model-path", type=Path)
     parser.add_argument("--pipeline-type", default="512")
@@ -1054,12 +1538,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.run_id is None:
+        args.run_id = str(uuid.uuid4())
     started = time.perf_counter()
     output_dir = Path(args.output_dir).resolve()
-    report_path = output_dir / "report.json"
+    report_path = (
+        Path(args.output_json).resolve()
+        if args.output_json is not None
+        else output_dir / "report.json"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "schema": SCHEMA,
+        "run_id": args.run_id,
         "status": "running",
         "failure_phase": None,
         "last_trustworthy_phase": "arguments_parsed",
@@ -1091,12 +1582,20 @@ def main(argv: list[str] | None = None) -> int:
             _atomic_write_json(report_path, report)
             return 0
 
+        phase = "input_admission"
+        args = admit_run_inputs(args, report)
+        report["last_trustworthy_phase"] = "inputs_admitted_to_run_custody"
+        _atomic_write_json(report_path, report)
         _cleanup_stale_outputs(output_dir)
         phase = "runtime"
         run_live(args, report)
         report["elapsed_seconds"] = time.perf_counter() - started
         _atomic_write_json(report_path, report)
-        validate_completed_report(report_path)
+        validate_completed_report(
+            report_path,
+            expected_run_id=args.run_id,
+            expected_image_sha256=args.expected_image_sha256,
+        )
         return 0
     except BaseException as exc:
         report.update(
