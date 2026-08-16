@@ -1515,6 +1515,35 @@ def validate_completed_report(
     return report
 
 
+def validate_downloaded_native_image_to_glb_outputs(
+    packet: Any,
+    output_dir: Path,
+) -> dict[str, Any]:
+    from trellmlx.kaggle_cuda_witness import (
+        WitnessPacketError,
+        validate_downloaded_outputs,
+    )
+
+    if packet.run_id is None:
+        raise WitnessPacketError("native image-to-GLB packet is missing its run identity")
+    if packet.expected_image_sha256 is None:
+        raise WitnessPacketError("native image-to-GLB packet is missing its image identity")
+    expected_stage_outputs = tuple(
+        EXPECTED_ARTIFACT_FILENAMES[stage] for stage in EXPECTED_CAPTURE_ORDER
+    )
+    if packet.output_json != "report.json" or packet.output_npz is not None:
+        raise WitnessPacketError("native image-to-GLB packet output roles are not canonical")
+    if packet.expected_outputs != expected_stage_outputs:
+        raise WitnessPacketError("native image-to-GLB packet stage outputs are not canonical")
+    records = validate_downloaded_outputs(packet, output_dir)
+    report = validate_completed_report(
+        Path(output_dir) / packet.output_json,
+        expected_run_id=packet.run_id,
+        expected_image_sha256=packet.expected_image_sha256,
+    )
+    return {"downloaded_outputs": records, "report": report}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, type=Path)

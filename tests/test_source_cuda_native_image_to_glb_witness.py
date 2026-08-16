@@ -96,7 +96,7 @@ def test_wrong_image_digest_fails_before_touching_existing_output(tmp_path):
     image = tmp_path / "image.png"
     image.write_bytes(b"not-the-authorized-image")
     output_dir = tmp_path / "outputs"
-    output_dir.mkdir()
+    output_dir.mkdir(parents=True)
     stale = output_dir / "consumer.glb"
     stale.write_bytes(b"preserve-until-request-validates")
 
@@ -242,6 +242,8 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
     entrypoint.write_text(Path(witness.__file__).read_text())
     image = capsule / "9_img.png"
     image.write_bytes(b"synthetic-transport-contract-image")
+    run_id = "22222222-2222-4222-8222-222222222222"
+    image_sha256 = _sha256(image)
     expected_outputs = tuple(
         f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
         for index, stage in enumerate(EXPECTED_STAGES)
@@ -255,6 +257,8 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
             title="Native Image Anchor CUDA",
             entrypoint=entrypoint.name,
             inputs=(entrypoint.name, image.name),
+            run_id=run_id,
+            expected_image_sha256=image_sha256,
             output_json="report.json",
             output_npz=None,
             expected_outputs=expected_outputs,
@@ -262,7 +266,9 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
                 "--image",
                 image.name,
                 "--expected-image-sha256",
-                _sha256(image),
+                image_sha256,
+                "--run-id",
+                run_id,
                 "--output-dir",
                 ".",
                 "--work-dir",
@@ -297,12 +303,16 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
     assert report["status"] == "preflight_stopped"
     assert report["last_trustworthy_phase"] == "request_validated"
     assert receipt["failure_phase"] == "output"
+    assert receipt["run_id"] == run_id
+    assert receipt["expected_image_sha256"] == image_sha256
     assert receipt["effective_command"][:3] == [
         sys.executable,
         entrypoint.name,
         "--output-json",
     ]
     assert set(packet.expected_outputs).issuperset(expected_outputs)
+    assert receipt["effective_command"].count("--run-id") == 1
+    assert receipt["effective_command"][receipt["effective_command"].index("--run-id") + 1] == run_id
 
 
 @pytest.mark.parametrize(
@@ -357,7 +367,12 @@ def test_admitted_inputs_reject_requested_path_substitution_before_use(
         assert (Path(admitted.dinov3_model_path) / name).read_bytes() == payload
 
 
-def _write_completed_fixture(tmp_path: Path) -> Path:
+def _write_completed_fixture(
+    tmp_path: Path,
+    *,
+    run_id: str = "11111111-1111-4111-8111-111111111111",
+    image_sha256: str = "a" * 64,
+) -> Path:
     from scripts.source_cuda_native_image_to_glb_witness import (
         CUMESH_COMMIT,
         CUMESH_REPOSITORY,
@@ -382,9 +397,7 @@ def _write_completed_fixture(tmp_path: Path) -> Path:
     import trimesh
 
     output_dir = tmp_path / "outputs"
-    output_dir.mkdir()
-    run_id = "11111111-1111-4111-8111-111111111111"
-    image_sha256 = "a" * 64
+    output_dir.mkdir(parents=True)
     coords = np.asarray(
         [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]],
         dtype=np.int32,
@@ -672,6 +685,126 @@ def test_completed_report_rejects_stale_bundle_from_another_run(tmp_path):
             report_path,
             expected_run_id="22222222-2222-4222-8222-222222222222",
         )
+
+
+def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+        sha256_file,
+    )
+
+    old_run_id = "11111111-1111-4111-8111-111111111111"
+    current_run_id = "22222222-2222-4222-8222-222222222222"
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"packet-owned-image-authority")
+    image_sha256 = _sha256(image)
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+
+    def packet_for(run_id, name):
+        return prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / name,
+                dataset_id="operator/native-image-anchor-inputs",
+                kernel_id="operator/native-image-anchor-cuda",
+                title="Native Image Anchor CUDA",
+                entrypoint=entrypoint.name,
+                inputs=(entrypoint.name, image.name),
+                run_id=run_id,
+                expected_image_sha256=image_sha256,
+                output_json="report.json",
+                output_npz=None,
+                expected_outputs=expected_outputs,
+                entrypoint_args=(
+                    "--image",
+                    image.name,
+                    "--expected-image-sha256",
+                    image_sha256,
+                    "--run-id",
+                    run_id,
+                    "--output-dir",
+                    ".",
+                    "--work-dir",
+                    str(tmp_path / f"runtime-{name}"),
+                ),
+            )
+        )
+
+    old_packet = packet_for(old_run_id, "old-packet")
+    current_packet = packet_for(current_run_id, "current-packet")
+    report_path = _write_completed_fixture(
+        tmp_path / "old-bundle",
+        run_id=old_run_id,
+        image_sha256=image_sha256,
+    )
+    output_dir = report_path.parent
+    def write_receipt(packet, bundle_dir):
+        receipt_outputs = {
+            name: {
+                "exists": True,
+                "sha256": sha256_file(bundle_dir / name),
+                "size_bytes": (bundle_dir / name).stat().st_size,
+            }
+            for name in packet.outputs
+        }
+        manifest = packet.dataset_dir / "witness-manifest.json"
+        receipt = {
+            "schema": "trellis2mlx.kaggle_cuda_witness.receipt.v1",
+            "status": "done",
+            "failure_phase": None,
+            "requested_dataset_id": packet.dataset_id,
+            "requested_kernel_id": packet.kernel_id,
+            "requested_accelerator": packet.accelerator,
+            "source_identity": {
+                "dataset_sources": [packet.dataset_id],
+                "competition_sources": [],
+                "kernel_sources": [],
+                "model_sources": [],
+            },
+            "run_id": packet.run_id,
+            "expected_image_sha256": packet.expected_image_sha256,
+            "cuda_available": True,
+            "cuda_device": "Tesla T4",
+            "input_manifest": {
+                "sha256": sha256_file(manifest),
+                "size_bytes": manifest.stat().st_size,
+            },
+            "outputs": receipt_outputs,
+        }
+        (bundle_dir / "kaggle_cuda_witness_receipt.json").write_text(
+            json.dumps(receipt, sort_keys=True) + "\n"
+        )
+
+    write_receipt(old_packet, output_dir)
+
+    with pytest.raises(WitnessPacketError, match="run identity|run_id"):
+        witness.validate_downloaded_native_image_to_glb_outputs(
+            current_packet,
+            output_dir,
+        )
+
+    current_report_path = _write_completed_fixture(
+        tmp_path / "current-bundle",
+        run_id=current_run_id,
+        image_sha256=image_sha256,
+    )
+    write_receipt(current_packet, current_report_path.parent)
+    admitted = witness.validate_downloaded_native_image_to_glb_outputs(
+        current_packet,
+        current_report_path.parent,
+    )
+    assert admitted["report"]["status"] == "completed"
+    assert admitted["report"]["run_id"] == current_run_id
 
 
 @pytest.mark.parametrize(

@@ -68,6 +68,8 @@ def _write_success_receipt(
         "requested_dataset_id": packet.dataset_id,
         "requested_kernel_id": packet.kernel_id,
         "requested_accelerator": packet.accelerator,
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
         "cuda_available": cuda_available,
         "cuda_device": cuda_device,
         "input_manifest": {
@@ -791,6 +793,117 @@ def test_prepare_packet_rejects_unbound_sparse_flow_noise_role(
                 inputs=inputs,
                 sparse_flow_noise_sample="noise.npz",
                 sparse_flow_noise_sample_sha256=expected_sha256,
+            )
+        )
+
+    assert not (tmp_path / "packet").exists()
+
+
+@pytest.mark.parametrize(
+    ("run_id", "image_sha256", "entrypoint_args", "message"),
+    [
+        (
+            None,
+            "a" * 64,
+            ("--run-id", "11111111-1111-4111-8111-111111111111", "--expected-image-sha256", "a" * 64),
+            "requires packet field run_id",
+        ),
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "a" * 64,
+            ("--expected-image-sha256", "a" * 64),
+            "run_id must appear exactly once",
+        ),
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "a" * 64,
+            (
+                "--run-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--run-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--expected-image-sha256",
+                "a" * 64,
+            ),
+            "run_id must appear exactly once",
+        ),
+        (
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "a" * 64,
+            (
+                "--run-id",
+                "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                "--expected-image-sha256",
+                "a" * 64,
+            ),
+            "canonical lowercase UUID",
+        ),
+        (
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            (
+                "--run-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--expected-image-sha256",
+                "a" * 64,
+            ),
+            "requires packet field expected_image_sha256",
+        ),
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "A" * 64,
+            (
+                "--run-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--expected-image-sha256",
+                "A" * 64,
+            ),
+            "canonical lowercase hex",
+        ),
+        (
+            None,
+            None,
+            ("--run-id=11111111-1111-4111-8111-111111111111",),
+            "assignment form",
+        ),
+        (
+            None,
+            None,
+            ("--expected-image-sha256=" + "a" * 64,),
+            "assignment form",
+        ),
+    ],
+)
+def test_prepare_packet_rejects_unbound_attempt_identity(
+    tmp_path,
+    run_id,
+    image_sha256,
+    entrypoint_args,
+    message,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    with pytest.raises(WitnessPacketError, match=message):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/attempt-inputs",
+                kernel_id="operator/attempt-cuda",
+                title="Attempt CUDA",
+                entrypoint="cuda_probe.py",
+                inputs=("cuda_probe.py",),
+                run_id=run_id,
+                expected_image_sha256=image_sha256,
+                entrypoint_args=entrypoint_args,
             )
         )
 

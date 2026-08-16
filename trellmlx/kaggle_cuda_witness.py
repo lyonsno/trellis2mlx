@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence
@@ -40,6 +41,8 @@ class KaggleCudaWitnessPacket:
     entrypoint: str
     inputs: tuple[str, ...]
     entrypoint_args: tuple[str, ...] = ()
+    run_id: str | None = None
+    expected_image_sha256: str | None = None
     accelerator: str = "NvidiaTeslaT4"
     enable_internet: bool = False
     output_json: str = "cuda_result.json"
@@ -117,6 +120,8 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "title": packet.title,
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
@@ -216,6 +221,8 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         entrypoint=manifest["entrypoint"],
         inputs=inputs,
         entrypoint_args=tuple(manifest.get("entrypoint_args", ())),
+        run_id=manifest.get("run_id"),
+        expected_image_sha256=manifest.get("expected_image_sha256"),
         accelerator=kernel_metadata.get("machine_shape", manifest.get("accelerator", "NvidiaTeslaT4")),
         enable_internet=_bool_metadata(
             kernel_metadata.get("enable_internet", manifest.get("enable_internet", False))
@@ -558,6 +565,8 @@ def validate_downloaded_outputs(
         "requested_kernel_id": packet.kernel_id,
         "requested_accelerator": packet.accelerator,
         "source_identity": expected_source_identity,
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
     }
     for field, expected in expected_receipt_identity.items():
         if receipt.get(field) != expected:
@@ -772,6 +781,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--title", required=True)
     prepare.add_argument("--entrypoint", required=True)
     prepare.add_argument("--entrypoint-arg", action="append", dest="entrypoint_args", default=[])
+    prepare.add_argument("--run-id")
+    prepare.add_argument("--expected-image-sha256")
     prepare.add_argument("--input", action="append", dest="inputs", required=True)
     prepare.add_argument("--accelerator", default="NvidiaTeslaT4")
     prepare.add_argument("--enable-internet", action="store_true")
@@ -815,6 +826,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 entrypoint=args.entrypoint,
                 inputs=tuple(args.inputs),
                 entrypoint_args=tuple(args.entrypoint_args),
+                run_id=args.run_id,
+                expected_image_sha256=args.expected_image_sha256,
                 accelerator=args.accelerator,
                 enable_internet=args.enable_internet,
                 output_json=args.output_json,
@@ -922,6 +935,8 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
         "entrypoint_args": list(packet.entrypoint_args),
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
@@ -940,6 +955,51 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
     }
 
 
+def _canonical_uuid(value: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise WitnessPacketError("run_id must be a canonical UUID") from exc
+    if str(parsed) != value:
+        raise WitnessPacketError("run_id must be a canonical lowercase UUID")
+    return value
+
+
+def _canonical_sha256(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value or "") is None:
+        raise WitnessPacketError("expected_image_sha256 must be canonical lowercase hex")
+    return value
+
+
+def _validate_packet_argument_identity(
+    entrypoint_args: tuple[str, ...],
+    *,
+    flag: str,
+    field: str,
+    expected: str | None,
+    validator: Callable[[str], str],
+) -> None:
+    values = []
+    for index, argument in enumerate(entrypoint_args):
+        if argument.startswith(f"{flag}="):
+            raise WitnessPacketError(
+                f"{flag} assignment form is not canonical; use separate argument tokens"
+            )
+        if argument == flag:
+            if index + 1 >= len(entrypoint_args):
+                raise WitnessPacketError(f"{flag} is missing its value")
+            values.append(entrypoint_args[index + 1])
+    if expected is None:
+        if values:
+            raise WitnessPacketError(f"{flag} requires packet field {field}")
+        return
+    validator(expected)
+    if values != [expected]:
+        raise WitnessPacketError(
+            f"packet field {field} must appear exactly once as {flag} {expected}"
+        )
+
+
 def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
     for field, value in (("dataset_id", packet.dataset_id), ("kernel_id", packet.kernel_id)):
         if len(value.split("/")) != 2 or not all(value.split("/")):
@@ -955,6 +1015,20 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         raise WitnessPacketError(f"unsupported accelerator for this witness bridge: {packet.accelerator}")
     if packet.entrypoint not in packet.inputs:
         raise WitnessPacketError("entrypoint must be one of the staged inputs")
+    _validate_packet_argument_identity(
+        packet.entrypoint_args,
+        flag="--run-id",
+        field="run_id",
+        expected=packet.run_id,
+        validator=_canonical_uuid,
+    )
+    _validate_packet_argument_identity(
+        packet.entrypoint_args,
+        flag="--expected-image-sha256",
+        field="expected_image_sha256",
+        expected=packet.expected_image_sha256,
+        validator=_canonical_sha256,
+    )
     if packet.shape_flow_noise_sample is not None and packet.shape_flow_noise_sample not in packet.inputs:
         raise WitnessPacketError("shape_flow_noise_sample must be one of the staged inputs")
     if packet.sparse_flow_noise_sample is not None and packet.sparse_flow_noise_sample not in packet.inputs:
@@ -1065,6 +1139,8 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "accelerator": packet.accelerator,
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
         "outputs": list(packet.outputs),
         "output_json": packet.output_json,
         "output_npz": packet.output_npz,
@@ -1140,6 +1216,8 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
         "requested_kernel_id": CONFIG["kernel_id"],
         "requested_accelerator": CONFIG["accelerator"],
         "source_identity": CONFIG["source_identity"],
+        "run_id": CONFIG["run_id"],
+        "expected_image_sha256": CONFIG["expected_image_sha256"],
         **CUDA,
         "timestamp": time.time(),
     }}
@@ -1346,6 +1424,8 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "title": packet.title,
         "entrypoint": packet.entrypoint,
         "entrypoint_args": list(packet.entrypoint_args),
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
