@@ -779,6 +779,207 @@ def test_native_packet_rejects_missing_attempt_identities_before_output_mutation
 
 
 @pytest.mark.parametrize(
+    ("declared_output_dir", "declared_work_dir", "assignment_form"),
+    (
+        (".", "/kaggle/working/native-pixal9-runtime", False),
+        ("//kaggle/working", "/kaggle/working/native-pixal9-runtime", False),
+        ("/kaggle/working", "//kaggle/working/native-pixal9-runtime", False),
+        ("outputs", "outputs/runtime", True),
+        ("same", "same", False),
+        ("runtime/output", "runtime", False),
+    ),
+)
+def test_native_packet_rejects_remote_output_work_overlap_before_output_mutation(
+    tmp_path,
+    declared_output_dir,
+    declared_work_dir,
+    assignment_form,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"native-packet-input")
+    image_sha256 = _sha256(image)
+    output_dir = tmp_path / "packet"
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    path_arguments = (
+        (
+            f"--output-dir={declared_output_dir}",
+            f"--work-dir={declared_work_dir}",
+        )
+        if assignment_form
+        else (
+            "--output-dir",
+            declared_output_dir,
+            "--work-dir",
+            declared_work_dir,
+        )
+    )
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=output_dir,
+        dataset_id="operator/native-image-anchor-inputs",
+        kernel_id="operator/native-image-anchor-cuda",
+        title="Native Image Anchor CUDA",
+        entrypoint=entrypoint.name,
+        inputs=(entrypoint.name, image.name),
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=expected_outputs,
+        run_id="31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        expected_image_sha256=image_sha256,
+        entrypoint_args=(
+            "--image",
+            image.name,
+            "--expected-image-sha256",
+            image_sha256,
+            "--run-id",
+            "31fce6b7-853b-4a0f-b99d-518be23ebabc",
+            *path_arguments,
+        ),
+    )
+
+    with pytest.raises(WitnessPacketError, match="Kaggle output and work directories overlap"):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("declared_output_dir", "declared_work_dir"),
+    (("outputs", "runtime"), ("outputs", "outputs-archive"), ("-1", "runtime")),
+)
+def test_native_packet_accepts_disjoint_assignment_form_paths(
+    tmp_path,
+    declared_output_dir,
+    declared_work_dir,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"native-packet-input")
+    image_sha256 = _sha256(image)
+    output_dir = tmp_path / "packet"
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=output_dir,
+        dataset_id="operator/native-image-anchor-inputs",
+        kernel_id="operator/native-image-anchor-cuda",
+        title="Native Image Anchor CUDA",
+        entrypoint=entrypoint.name,
+        inputs=(entrypoint.name, image.name),
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=expected_outputs,
+        run_id="31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        expected_image_sha256=image_sha256,
+        entrypoint_args=(
+            "--image",
+            image.name,
+            "--expected-image-sha256",
+            image_sha256,
+            "--run-id",
+            "31fce6b7-853b-4a0f-b99d-518be23ebabc",
+            f"--output-dir={declared_output_dir}",
+            f"--work-dir={declared_work_dir}",
+        ),
+    )
+
+    assert witness.prepare_native_image_to_glb_packet(packet) is packet
+    assert output_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    "path_arguments",
+    (
+        ("--output-dir", "--work-dir", "runtime"),
+        ("--output-dir", "-x", "--work-dir", "runtime"),
+        ("--", "--output-dir", "outputs", "--work-dir", "runtime"),
+        (
+            "--output-dir",
+            "outputs",
+            "--output-dir=other",
+            "--work-dir",
+            "runtime",
+        ),
+    ),
+)
+def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
+    tmp_path,
+    path_arguments,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"native-packet-input")
+    image_sha256 = _sha256(image)
+    output_dir = tmp_path / "packet"
+    output_dir.mkdir()
+    marker = output_dir / "must-survive-argument-rejection.txt"
+    marker.write_text("preserved")
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=output_dir,
+        dataset_id="operator/native-image-anchor-inputs",
+        kernel_id="operator/native-image-anchor-cuda",
+        title="Native Image Anchor CUDA",
+        entrypoint=entrypoint.name,
+        inputs=(entrypoint.name, image.name),
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=expected_outputs,
+        run_id="31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        expected_image_sha256=image_sha256,
+        entrypoint_args=(
+            "--image",
+            image.name,
+            "--expected-image-sha256",
+            image_sha256,
+            "--run-id",
+            "31fce6b7-853b-4a0f-b99d-518be23ebabc",
+            *path_arguments,
+        ),
+    )
+
+    with pytest.raises(WitnessPacketError):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+    assert marker.read_text() == "preserved"
+
+
+@pytest.mark.parametrize(
     "mutated_role",
     ("image", "model.safetensors", "config.json", "preprocessor_config.json"),
 )

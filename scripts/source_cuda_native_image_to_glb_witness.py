@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr
 import hashlib
 from importlib import metadata as importlib_metadata
+import io
 import json
 import os
 import shutil
@@ -15,7 +17,7 @@ import tempfile
 import time
 import types
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 from urllib.request import urlretrieve
@@ -56,6 +58,7 @@ XFORMERS_WHEEL_URL = (
 )
 XFORMERS_WHEEL_SHA256 = "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c"
 XFORMERS_WHEEL_SIZE_BYTES = 3264751
+KAGGLE_KERNEL_WORKING_DIRECTORY = PurePosixPath("/kaggle/working")
 
 EXPECTED_CAPTURE_ORDER = (
     "preprocessed_image",
@@ -1943,6 +1946,56 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
     if packet.run_id is None or packet.expected_image_sha256 is None:
         raise WitnessPacketError(
             "native image-to-GLB packet requires run identity and image identity"
+        )
+
+    try:
+        with redirect_stderr(io.StringIO()):
+            build_parser().parse_args(packet.entrypoint_args)
+    except SystemExit as exc:
+        raise WitnessPacketError(
+            "native image-to-GLB packet entrypoint arguments are invalid"
+        ) from exc
+
+    def required_argument(flag: str) -> str:
+        values: list[str] = []
+        for index, argument in enumerate(packet.entrypoint_args):
+            if argument.startswith(f"{flag}="):
+                values.append(argument.split("=", 1)[1])
+            elif argument == flag:
+                if (
+                    index + 1 >= len(packet.entrypoint_args)
+                    or packet.entrypoint_args[index + 1].startswith("--")
+                ):
+                    raise WitnessPacketError(f"{flag} is missing its value")
+                values.append(packet.entrypoint_args[index + 1])
+        if len(values) != 1 or not values[0]:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet requires exactly one {flag} value"
+            )
+        return values[0]
+
+    def effective_kaggle_path(value: str) -> PurePosixPath:
+        declared = PurePosixPath(value)
+        rooted = (
+            declared
+            if declared.is_absolute()
+            else KAGGLE_KERNEL_WORKING_DIRECTORY / declared
+        )
+        normalized = os.path.normpath(str(rooted))
+        if normalized.startswith("//"):
+            normalized = f"/{normalized.lstrip('/')}"
+        return PurePosixPath(normalized)
+
+    output_dir = effective_kaggle_path(required_argument("--output-dir"))
+    work_dir = effective_kaggle_path(required_argument("--work-dir"))
+    if (
+        output_dir == work_dir
+        or output_dir in work_dir.parents
+        or work_dir in output_dir.parents
+    ):
+        raise WitnessPacketError(
+            "native image-to-GLB Kaggle output and work directories overlap: "
+            f"output={output_dir}, work={work_dir}"
         )
     return prepare_packet(packet)
 
