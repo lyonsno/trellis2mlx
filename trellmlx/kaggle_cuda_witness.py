@@ -1068,12 +1068,13 @@ def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
             raise WitnessPacketError(f"input must be relative inside capsule_dir: {relative_name}")
         source = packet.capsule_dir / relative_path
         if source.is_dir():
-            children = [path for path in sorted(source.rglob("*")) if path.is_file()]
-            if not children:
-                raise WitnessPacketError(f"empty input directory: {relative_name}")
-            for child in children:
-                sources[child.relative_to(packet.capsule_dir).as_posix()] = child
-            continue
+            raise WitnessPacketError(
+                f"directory input is not publishable with Kaggle dir-mode skip: {relative_name}"
+            )
+        if len(relative_path.parts) != 1:
+            raise WitnessPacketError(
+                f"nested input is not publishable with Kaggle dir-mode skip: {relative_name}"
+            )
         if not source.is_file():
             raise WitnessPacketError(f"missing input: {relative_name}")
         sources[relative_name] = source

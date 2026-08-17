@@ -1065,8 +1065,12 @@ def test_load_prepared_packet_rejects_unsafe_manifest_output(
         load_prepared_packet(packet.output_dir)
 
 
-def test_prepare_packet_expands_directory_inputs(tmp_path):
-    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+def test_prepare_packet_rejects_directory_inputs_omitted_by_kaggle_skip_mode(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+    )
 
     capsule = tmp_path / "capsule"
     source_tree = capsule / "source_tree"
@@ -1075,33 +1079,35 @@ def test_prepare_packet_expands_directory_inputs(tmp_path):
     (source_tree / "__init__.py").write_text("")
     (source_tree / "pkg" / "module.py").write_text("VALUE = 3\n")
 
-    packet = prepare_packet(
-        KaggleCudaWitnessPacket(
-            capsule_dir=capsule,
-            output_dir=tmp_path / "packet",
-            dataset_id="operator/source-tree-inputs",
-            kernel_id="operator/source-tree-cuda",
-            title="Source Tree CUDA",
-            entrypoint="cuda_probe.py",
-            inputs=("cuda_probe.py", "source_tree"),
+    with pytest.raises(WitnessPacketError, match="directory input.*dir-mode skip"):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/source-tree-inputs",
+                kernel_id="operator/source-tree-cuda",
+                title="Source Tree CUDA",
+                entrypoint="cuda_probe.py",
+                inputs=("cuda_probe.py", "source_tree"),
+            )
         )
-    )
 
-    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
-    dataset_metadata = json.loads((packet.dataset_dir / "dataset-metadata.json").read_text())
+    assert not (tmp_path / "packet").exists()
 
-    assert (packet.dataset_dir / "source_tree" / "pkg" / "module.py").read_text() == "VALUE = 3\n"
-    assert sorted(manifest["files"]) == [
-        "cuda_probe.py",
-        "source_tree/__init__.py",
-        "source_tree/pkg/module.py",
-    ]
-    assert sorted(resource["path"] for resource in dataset_metadata["resources"]) == [
-        "cuda_probe.py",
-        "source_tree/__init__.py",
-        "source_tree/pkg/module.py",
-        "witness-manifest.json",
-    ]
+    with pytest.raises(WitnessPacketError, match="nested input.*dir-mode skip"):
+        prepare_packet(
+            KaggleCudaWitnessPacket(
+                capsule_dir=capsule,
+                output_dir=tmp_path / "packet",
+                dataset_id="operator/source-tree-inputs",
+                kernel_id="operator/source-tree-cuda",
+                title="Source Tree CUDA",
+                entrypoint="cuda_probe.py",
+                inputs=("cuda_probe.py", "source_tree/pkg/module.py"),
+            )
+        )
+
+    assert not (tmp_path / "packet").exists()
 
 
 def test_prepare_packet_rejects_kernel_slug_title_mismatch(tmp_path):
