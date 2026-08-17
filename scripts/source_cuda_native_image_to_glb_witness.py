@@ -1544,6 +1544,17 @@ def validate_downloaded_native_image_to_glb_outputs(
     return {"downloaded_outputs": records, "report": report}
 
 
+def prepare_native_image_to_glb_packet(packet: Any) -> Any:
+    """Prepare one native image-to-GLB attempt with precommitted authority."""
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError, prepare_packet
+
+    if packet.run_id is None or packet.expected_image_sha256 is None:
+        raise WitnessPacketError(
+            "native image-to-GLB packet requires run identity and image identity"
+        )
+    return prepare_packet(packet)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, type=Path)

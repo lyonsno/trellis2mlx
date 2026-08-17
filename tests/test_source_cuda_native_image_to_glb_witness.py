@@ -233,7 +233,7 @@ def test_orientation_observer_does_not_mutate_native_extension_class():
 
 
 def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monkeypatch):
-    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
     from scripts import source_cuda_native_image_to_glb_witness as witness
 
     capsule = tmp_path / "capsule"
@@ -248,7 +248,7 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
         f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
         for index, stage in enumerate(EXPECTED_STAGES)
     )
-    packet = prepare_packet(
+    packet = witness.prepare_native_image_to_glb_packet(
         KaggleCudaWitnessPacket(
             capsule_dir=capsule,
             output_dir=tmp_path / "packet",
@@ -313,6 +313,62 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
     assert set(packet.expected_outputs).issuperset(expected_outputs)
     assert receipt["effective_command"].count("--run-id") == 1
     assert receipt["effective_command"][receipt["effective_command"].index("--run-id") + 1] == run_id
+
+
+def test_native_packet_rejects_missing_attempt_identities_before_output_mutation(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    image = capsule / "9_img.png"
+    image.write_bytes(b"native-packet-input")
+    output_dir = tmp_path / "packet"
+    output_dir.mkdir()
+    marker = output_dir / "must-survive-identity-rejection.txt"
+    marker.write_text("preserved")
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=output_dir,
+        dataset_id="operator/native-image-anchor-inputs",
+        kernel_id="operator/native-image-anchor-cuda",
+        title="Native Image Anchor CUDA",
+        entrypoint=entrypoint.name,
+        inputs=(entrypoint.name, image.name),
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=expected_outputs,
+        entrypoint_args=(
+            "--image",
+            image.name,
+            "--output-dir",
+            ".",
+            "--work-dir",
+            str(tmp_path / "runtime"),
+        ),
+    )
+    # On the reviewed parent there is no native constructor, so this exercises
+    # the actual generic route and records its mutation as the fail-first witness.
+    prepare_native = getattr(
+        witness,
+        "prepare_native_image_to_glb_packet",
+        prepare_packet,
+    )
+
+    with pytest.raises(WitnessPacketError, match="run identity.*image identity"):
+        prepare_native(packet)
+
+    assert marker.read_text() == "preserved"
 
 
 @pytest.mark.parametrize(
@@ -692,7 +748,6 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
     from trellmlx.kaggle_cuda_witness import (
         KaggleCudaWitnessPacket,
         WitnessPacketError,
-        prepare_packet,
         sha256_file,
     )
 
@@ -711,7 +766,7 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
     )
 
     def packet_for(run_id, name):
-        return prepare_packet(
+        return witness.prepare_native_image_to_glb_packet(
             KaggleCudaWitnessPacket(
                 capsule_dir=capsule,
                 output_dir=tmp_path / name,
