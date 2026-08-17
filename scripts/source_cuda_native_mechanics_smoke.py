@@ -717,6 +717,19 @@ def _validate_source_identities(report: dict[str, Any]) -> None:
                 f"source identity {phase.replace('_', ' ')} does not match the effective route"
             )
 
+    cleanup = report.get("source_build_products_removed")
+    if not isinstance(cleanup, dict) or set(cleanup) != {"nvdiffrast"}:
+        raise ValueError("build-product cleanup record is missing or malformed")
+    removed = cleanup["nvdiffrast"]
+    allowed = {"build", "nvdiffrast.egg-info"}
+    if (
+        not isinstance(removed, list)
+        or any(not isinstance(value, str) for value in removed)
+        or removed != sorted(set(removed))
+        or not set(removed).issubset(allowed)
+    ):
+        raise ValueError("build-product cleanup record is outside the admitted nvdiffrast set")
+
 
 def _validate_mesh_capture(path: Path, record: Any, *, run_id: str) -> None:
     if not isinstance(record, dict):

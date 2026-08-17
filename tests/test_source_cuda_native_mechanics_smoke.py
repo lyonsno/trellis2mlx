@@ -488,6 +488,9 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
     report["source_identities_after_build"] = json.loads(
         json.dumps(report["source_identities_before_build"])
     )
+    report["source_build_products_removed"] = {
+        "nvdiffrast": ["build", "nvdiffrast.egg-info"]
+    }
     report_path = root / "mechanics-report.json"
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
     return report_path
@@ -500,6 +503,8 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
         ("dirty_after", "source identity"),
         ("wrong_repository_before", "source identity"),
         ("wrong_path_after", "source identity"),
+        ("missing_build_product_record", "build-product cleanup"),
+        ("unknown_build_product_record", "build-product cleanup"),
     ],
 )
 def test_completed_report_rejects_unbound_source_checkout_identity(
@@ -520,6 +525,10 @@ def test_completed_report_rejects_unbound_source_checkout_identity(
         report["source_identities_after_build"]["flex_gemm"]["path"] = (
             "/tmp/not-the-imported-flex-root"
         )
+    elif mutation == "missing_build_product_record":
+        report.pop("source_build_products_removed")
+    elif mutation == "unknown_build_product_record":
+        report["source_build_products_removed"]["nvdiffrast"].append("unknown")
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
 
     with pytest.raises(ValueError, match=match):

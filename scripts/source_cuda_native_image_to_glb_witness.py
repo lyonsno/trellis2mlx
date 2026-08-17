@@ -422,6 +422,64 @@ def verify_admitted_inputs_before_use(
                 )
 
 
+def _remove_expected_build_products(
+    path: Path,
+    *,
+    allowed_roots: tuple[str, ...],
+) -> list[str]:
+    path = Path(path).resolve()
+    status = _run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+        cwd=path,
+    )["stdout"]
+    entries = [entry for entry in status.split("\0") if entry]
+    if not entries:
+        return []
+
+    allowed = set(allowed_roots)
+    if any(
+        not root or Path(root).is_absolute() or len(Path(root).parts) != 1
+        for root in allowed
+    ):
+        raise ValueError("allowed build-product roots must be relative top-level names")
+
+    observed_roots: set[str] = set()
+    rejected: list[str] = []
+    for entry in entries:
+        if not entry.startswith("?? "):
+            rejected.append(entry)
+            continue
+        relative = Path(entry[3:])
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            rejected.append(entry)
+            continue
+        root = relative.parts[0]
+        if root not in allowed:
+            rejected.append(entry)
+            continue
+        observed_roots.add(root)
+    if rejected:
+        raise RuntimeError(
+            f"unattributable post-build source changes at {path}: "
+            + "; ".join(rejected)
+        )
+
+    for root in sorted(observed_roots):
+        target = path / root
+        if target.is_symlink() or not target.is_dir():
+            raise RuntimeError(f"invalid expected build-product tree at {target}")
+    for root in sorted(observed_roots):
+        shutil.rmtree(path / root)
+
+    remaining = _run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=path,
+    )["stdout"]
+    if remaining:
+        raise RuntimeError(f"source checkout remains dirty after build cleanup at {path}: {remaining}")
+    return sorted(observed_roots)
+
+
 def _git_identity(path: Path, repository: str, commit: str) -> dict[str, Any]:
     head = _run(["git", "rev-parse", "HEAD"], cwd=path)["stdout"].strip()
     if head != commit:
@@ -563,6 +621,13 @@ def prepare_runtime(args: argparse.Namespace, report: dict[str, Any]) -> dict[st
                 ]
             )
         )
+
+    report["source_build_products_removed"] = {
+        "nvdiffrast": _remove_expected_build_products(
+            nvdiffrast_root,
+            allowed_roots=("build", "nvdiffrast.egg-info"),
+        )
+    }
 
     report["source_identities_after_build"] = {
         "trellis": _git_identity(source_root, TRELLIS_REPOSITORY, TRELLIS_COMMIT),

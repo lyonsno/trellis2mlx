@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import types
 
@@ -40,6 +41,81 @@ def _base_args(tmp_path: Path, image: Path) -> list[str]:
         "--work-dir",
         str(tmp_path / "runtime"),
     ]
+
+
+def _write_clean_git_checkout(root: Path) -> None:
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    (root / "setup.py").write_text("# pinned source\n")
+    subprocess.run(["git", "add", "setup.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "source"], cwd=root, check=True)
+
+
+def test_expected_post_build_products_are_recorded_removed_and_leave_clean_source(
+    tmp_path,
+):
+    from scripts.source_cuda_native_image_to_glb_witness import (
+        _remove_expected_build_products,
+    )
+
+    root = tmp_path / "nvdiffrast"
+    _write_clean_git_checkout(root)
+    (root / "build" / "temp.linux-test").mkdir(parents=True)
+    (root / "build" / "temp.linux-test" / "extension.o").write_bytes(b"object")
+    (root / "nvdiffrast.egg-info").mkdir()
+    (root / "nvdiffrast.egg-info" / "PKG-INFO").write_text("Name: nvdiffrast\n")
+
+    removed = _remove_expected_build_products(
+        root,
+        allowed_roots=("build", "nvdiffrast.egg-info"),
+    )
+
+    assert removed == ["build", "nvdiffrast.egg-info"]
+    assert not (root / "build").exists()
+    assert not (root / "nvdiffrast.egg-info").exists()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+
+@pytest.mark.parametrize("mutation", ["unknown_untracked", "tracked_modified"])
+def test_post_build_cleanup_rejects_unattributable_source_changes_without_deleting_them(
+    tmp_path, mutation
+):
+    from scripts.source_cuda_native_image_to_glb_witness import (
+        _remove_expected_build_products,
+    )
+
+    root = tmp_path / "nvdiffrast"
+    _write_clean_git_checkout(root)
+    (root / "build").mkdir()
+    (root / "build" / "extension.o").write_bytes(b"object")
+    if mutation == "unknown_untracked":
+        evidence = root / "unexpected.txt"
+        evidence.write_text("not a build product\n")
+    else:
+        evidence = root / "setup.py"
+        evidence.write_text("# source mutation\n")
+
+    with pytest.raises(RuntimeError, match="unattributable post-build source changes"):
+        _remove_expected_build_products(
+            root,
+            allowed_roots=("build", "nvdiffrast.egg-info"),
+        )
+
+    assert evidence.exists()
+    assert (root / "build" / "extension.o").exists()
 
 
 def test_parser_defaults_bind_the_authorized_native_route():
