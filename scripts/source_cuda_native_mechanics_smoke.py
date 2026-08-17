@@ -22,6 +22,15 @@ import numpy as np
 
 SCHEMA = "trellis2mlx.source_cuda_native_mechanics_smoke.v1"
 EXPECTED_TORCH_VERSION = "2.10.0+cu128"
+EXPECTED_XFORMERS_VERSION = "0.0.35"
+XFORMERS_WHEEL_FILENAME = "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+XFORMERS_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/a4/85/"
+    "6d71f9b16f2ac647877e66ed4af723b3fbd477806ab8b8a89d39a362b85f/"
+    "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+)
+XFORMERS_WHEEL_SHA256 = "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c"
+XFORMERS_WHEEL_SIZE_BYTES = 3264751
 EXPECTED_DEVICE_NAME = "Tesla T4"
 EXPECTED_CAPABILITY = (7, 5)
 TRELLIS_REPOSITORY = "https://github.com/microsoft/TRELLIS.2.git"
@@ -131,6 +140,21 @@ def _direct_url_source_path(payload: Any) -> Path | None:
     return Path(unquote(parsed.path)).resolve()
 
 
+def _direct_url_archive_sha256(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    archive_info = payload.get("archive_info")
+    if not isinstance(archive_info, dict):
+        return None
+    hashes = archive_info.get("hashes")
+    if isinstance(hashes, dict) and isinstance(hashes.get("sha256"), str):
+        return hashes["sha256"]
+    legacy = archive_info.get("hash")
+    if isinstance(legacy, str) and legacy.startswith("sha256="):
+        return legacy.removeprefix("sha256=")
+    return None
+
+
 def _distribution_provenance(
     module: Any,
     *,
@@ -230,6 +254,101 @@ def collect_build_import_provenance(
     }
 
 
+def read_xformers_build_identity(xformers: Any) -> dict[str, Any]:
+    version = str(getattr(xformers, "__version__", ""))
+    if version != EXPECTED_XFORMERS_VERSION:
+        raise RuntimeError(
+            f"xformers version drift: expected {EXPECTED_XFORMERS_VERSION}, got {version}"
+        )
+    module_path = _module_path(xformers, "xformers")
+    identity_path = module_path.parent / "cpp_lib.json"
+    if not identity_path.is_file():
+        raise RuntimeError(f"xformers build identity is missing: {identity_path}")
+    try:
+        payload = json.loads(identity_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"xformers build identity is invalid: {exc}") from exc
+    build_version = payload.get("version", {})
+    environment = payload.get("env", {})
+    torch_version = build_version.get("torch")
+    cuda_version = build_version.get("cuda")
+    arch_list = environment.get("TORCH_CUDA_ARCH_LIST")
+    package_from = environment.get("XFORMERS_PACKAGE_FROM")
+    if torch_version != EXPECTED_TORCH_VERSION:
+        raise RuntimeError(
+            f"xformers build Torch drift: expected {EXPECTED_TORCH_VERSION}, got {torch_version}"
+        )
+    if cuda_version != 1208:
+        raise RuntimeError(f"xformers build CUDA drift: expected 1208, got {cuda_version}")
+    if not isinstance(arch_list, str) or "7.5" not in arch_list.split():
+        raise RuntimeError(f"xformers build does not admit Tesla T4 SM75: {arch_list!r}")
+    if package_from != f"wheel-v{EXPECTED_XFORMERS_VERSION}":
+        raise RuntimeError(f"xformers package origin drift: {package_from!r}")
+    return {
+        "version": version,
+        "torch": torch_version,
+        "cuda": cuda_version,
+        "torch_cuda_arch_list": arch_list,
+        "package_from": package_from,
+    }
+
+
+def read_xformers_install_provenance(
+    xformers: Any,
+    xformers_ops: Any,
+    *,
+    wheel_path: Path,
+    expected_sha256: str = XFORMERS_WHEEL_SHA256,
+    distribution_loader: Callable[[str], Any] = importlib_metadata.distribution,
+) -> dict[str, Any]:
+    wheel_path = Path(wheel_path).resolve()
+    if not wheel_path.is_file() or _sha256_file(wheel_path) != expected_sha256:
+        raise RuntimeError("installed xformers wheel bytes no longer match the admitted digest")
+    try:
+        distribution = distribution_loader("xformers")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise RuntimeError("installed xformers distribution is missing") from exc
+    distribution_name = str(distribution.metadata.get("Name", ""))
+    if distribution_name.lower().replace("_", "-") != "xformers":
+        raise RuntimeError(f"xformers distribution ownership drift: {distribution_name!r}")
+    if str(distribution.version) != EXPECTED_XFORMERS_VERSION:
+        raise RuntimeError(f"xformers distribution version drift: {distribution.version!r}")
+    try:
+        direct_url = json.loads(distribution.read_text("direct_url.json") or "null")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"xformers direct-install provenance is invalid: {exc}") from exc
+    if _direct_url_source_path(direct_url) != wheel_path:
+        raise RuntimeError("xformers direct-install wheel path is disconnected")
+    if _direct_url_archive_sha256(direct_url) != expected_sha256:
+        raise RuntimeError("xformers direct-install wheel digest is disconnected")
+
+    distribution_root = Path(distribution.locate_file("")).resolve()
+    modules = {"xformers": xformers, "xformers.ops": xformers_ops}
+    module_paths = {name: _module_path(module, name) for name, module in modules.items()}
+    distribution_files: dict[str, str] = {}
+    for name, module_path in module_paths.items():
+        for relative_value in distribution.files or ():
+            relative = Path(str(relative_value))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            if Path(distribution.locate_file(relative_value)).resolve() == module_path:
+                distribution_files[name] = str(relative)
+                break
+        if name not in distribution_files:
+            raise RuntimeError(f"effective import {name} is not owned by xformers distribution")
+    return {
+        "mode": "pep610-local-wheel",
+        "wheel_path": str(wheel_path),
+        "wheel_sha256": expected_sha256,
+        "distribution_name": distribution_name,
+        "distribution_version": str(distribution.version),
+        "distribution_root": str(distribution_root),
+        "module_paths": {name: str(path) for name, path in module_paths.items()},
+        "distribution_files": distribution_files,
+        "direct_url": direct_url,
+    }
+
+
 def import_effective_runtime(roots: dict[str, Path]) -> tuple[Any, dict[str, Any]]:
     os.environ["ATTN_BACKEND"] = "xformers"
     os.environ["SPARSE_ATTN_BACKEND"] = "xformers"
@@ -244,6 +363,7 @@ def import_effective_runtime(roots: dict[str, Path]) -> tuple[Any, dict[str, Any
 
     import torch
     import xformers
+    import xformers.ops as xformers_ops
     import cumesh
     import flex_gemm
     import nvdiffrast.torch as nvdiffrast
@@ -253,6 +373,13 @@ def import_effective_runtime(roots: dict[str, Path]) -> tuple[Any, dict[str, Any
 
     imported = {
         "xformers": xformers,
+        "xformers_ops": xformers_ops,
+        "xformers_build_identity": read_xformers_build_identity(xformers),
+        "xformers_import_provenance": read_xformers_install_provenance(
+            xformers,
+            xformers_ops,
+            wheel_path=(source_root.parent / "pinned-wheels" / XFORMERS_WHEEL_FILENAME),
+        ),
         "cumesh": cumesh,
         "flex_gemm": flex_gemm,
         "nvdiffrast": nvdiffrast,
@@ -292,6 +419,8 @@ def validate_runtime_identity(
         raise RuntimeError(f"sparse convolution backend fallback: {sparse.CONV!r}")
 
     module_names = (
+        "xformers",
+        "xformers_ops",
         "cumesh",
         "flex_gemm",
         "o_voxel",
@@ -302,6 +431,12 @@ def validate_runtime_identity(
     provenance = imported.get("build_import_provenance")
     if not isinstance(provenance, dict):
         raise RuntimeError("effective build/import provenance is missing")
+    xformers_identity = imported.get("xformers_build_identity")
+    if not isinstance(xformers_identity, dict):
+        raise RuntimeError("effective xformers build identity is missing")
+    xformers_provenance = imported.get("xformers_import_provenance")
+    if not isinstance(xformers_provenance, dict):
+        raise RuntimeError("effective xformers import provenance is missing")
     return {
         "device_type": "cuda",
         "cuda_device_name": device_name,
@@ -309,6 +444,8 @@ def validate_runtime_identity(
         "cuda_runtime_version": str(torch.version.cuda),
         "torch_version": str(torch.__version__),
         "xformers_version": getattr(imported["xformers"], "__version__", None),
+        "xformers_build_identity": imported.get("xformers_build_identity"),
+        "xformers_import_provenance": xformers_provenance,
         "attention_backend": attention.BACKEND,
         "sparse_attention_backend": sparse.ATTN,
         "sparse_conv_backend": sparse.CONV,
@@ -317,6 +454,28 @@ def validate_runtime_identity(
             name: str(_module_path(imported[name], name)) for name in module_names
         },
         "build_import_provenance": provenance,
+    }
+
+
+def run_xformers_attention_probe(torch: Any, xformers_ops: Any) -> dict[str, Any]:
+    values = torch.arange(32, dtype=torch.float16, device="cuda").reshape(1, 4, 1, 8)
+    query = (values / 32).contiguous()
+    key = ((values + 1) / 31).contiguous()
+    value = ((values + 2) / 30).contiguous()
+    output = xformers_ops.memory_efficient_attention(query, key, value, p=0.0)
+    torch.cuda.synchronize()
+    finite = bool(torch.isfinite(output).all().item())
+    if not finite:
+        raise RuntimeError("xformers memory-efficient attention produced non-finite output")
+    device_type = str(output.device.type)
+    if device_type != "cuda":
+        raise RuntimeError(f"xformers attention executed on {device_type!r}, not CUDA")
+    return {
+        "executed": True,
+        "device_type": device_type,
+        "finite": True,
+        "shape": list(output.shape),
+        "dtype": str(output.dtype).removeprefix("torch."),
     }
 
 
@@ -404,6 +563,7 @@ def run_smoke(
     no_download: bool = False,
     prepare: Callable[[Any, dict[str, Any]], dict[str, Path]] = _prepare_runtime,
     importer: Callable[[dict[str, Path]], tuple[Any, dict[str, Any]]] = import_effective_runtime,
+    attention_probe: Callable[[Any, Any], dict[str, Any]] = run_xformers_attention_probe,
     orientation_probe: Callable[[Any, Any, Any, Path, str], dict[str, Any]] = run_orientation_probe,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -476,6 +636,21 @@ def run_smoke(
         torch, imported = importer(roots)
         report["effective_route"] = validate_runtime_identity(torch, imported, roots)
         report["last_trustworthy_phase"] = "runtime_identity_validated"
+        _atomic_write_json(output_json, report)
+
+        phase = "xformers_attention_probe"
+        xformers_probe = attention_probe(torch, imported["xformers_ops"])
+        expected_xformers_probe = {
+            "executed": True,
+            "device_type": "cuda",
+            "finite": True,
+            "shape": [1, 4, 1, 8],
+            "dtype": "float16",
+        }
+        if xformers_probe != expected_xformers_probe:
+            raise RuntimeError(f"xformers attention probe is incomplete: {xformers_probe!r}")
+        report["effective_route"]["xformers_attention_probe"] = xformers_probe
+        report["last_trustworthy_phase"] = "xformers_attention_executed"
         _atomic_write_json(output_json, report)
 
         phase = "orientation_probe"
@@ -636,7 +811,11 @@ def _validate_build_import_provenance(
             raise ValueError(f"{name} import provenance direct URL is disconnected")
 
 
-def _validate_effective_route(route: Any, requested_route: dict[str, Any]) -> None:
+def _validate_effective_route(
+    route: Any,
+    requested_route: dict[str, Any],
+    wheel_record: dict[str, Any],
+) -> None:
     if not isinstance(route, dict):
         raise ValueError("effective route is missing")
     expected = {
@@ -657,6 +836,32 @@ def _validate_effective_route(route: Any, requested_route: dict[str, Any]) -> No
         value = route.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"effective route {field} is missing or blank")
+    xformers_identity = route.get("xformers_build_identity")
+    expected_xformers_identity = {
+        "version": EXPECTED_XFORMERS_VERSION,
+        "torch": EXPECTED_TORCH_VERSION,
+        "cuda": 1208,
+        "package_from": f"wheel-v{EXPECTED_XFORMERS_VERSION}",
+    }
+    if not isinstance(xformers_identity, dict):
+        raise ValueError("effective xformers build identity is missing")
+    for field, expected_value in expected_xformers_identity.items():
+        if xformers_identity.get(field) != expected_value:
+            raise ValueError(
+                f"effective xformers build identity {field} must be {expected_value!r}"
+            )
+    arch_list = xformers_identity.get("torch_cuda_arch_list")
+    if not isinstance(arch_list, str) or "7.5" not in arch_list.split():
+        raise ValueError("effective xformers build identity does not include SM75")
+    expected_probe = {
+        "executed": True,
+        "device_type": "cuda",
+        "finite": True,
+        "shape": [1, 4, 1, 8],
+        "dtype": "float16",
+    }
+    if route.get("xformers_attention_probe") != expected_probe:
+        raise ValueError("effective xformers attention probe is missing or incomplete")
     roots = route.get("source_roots")
     if not isinstance(roots, dict) or set(roots) != {
         "source_root",
@@ -667,6 +872,8 @@ def _validate_effective_route(route: Any, requested_route: dict[str, Any]) -> No
         raise ValueError("effective route source roots are incomplete")
     module_paths = route.get("module_paths")
     if not isinstance(module_paths, dict) or set(module_paths) != {
+        "xformers",
+        "xformers_ops",
         "cumesh",
         "flex_gemm",
         "o_voxel",
@@ -680,6 +887,102 @@ def _validate_effective_route(route: Any, requested_route: dict[str, Any]) -> No
             if not isinstance(value, str) or not Path(value).is_absolute():
                 raise ValueError(f"effective route {label} {name} must be absolute")
     _validate_build_import_provenance(route, requested_route)
+    _validate_xformers_import_provenance(
+        route,
+        wheel_record,
+        effective_module_paths=module_paths,
+    )
+
+
+def _validate_xformers_wheel_record(report: dict[str, Any]) -> None:
+    record = report.get("xformers_wheel")
+    expected = {
+        "version": EXPECTED_XFORMERS_VERSION,
+        "url": XFORMERS_WHEEL_URL,
+        "sha256": XFORMERS_WHEEL_SHA256,
+        "size_bytes": XFORMERS_WHEEL_SIZE_BYTES,
+        "install_mode": "forced-local-wheel-no-deps",
+    }
+    if not isinstance(record, dict):
+        raise ValueError("xformers wheel identity is missing")
+    for field, expected_value in expected.items():
+        if record.get(field) != expected_value:
+            raise ValueError(
+                f"xformers wheel identity {field} must be {expected_value!r}"
+            )
+    path = record.get("path")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValueError("xformers wheel identity path must be absolute")
+    if Path(path).name != XFORMERS_WHEEL_FILENAME:
+        raise ValueError(
+            f"xformers wheel identity filename must be {XFORMERS_WHEEL_FILENAME!r}"
+        )
+    pip_version = record.get("pip_version")
+    if not isinstance(pip_version, str) or not pip_version.startswith("pip "):
+        raise ValueError("xformers wheel effective pip identity is missing")
+
+
+def _validate_xformers_import_provenance(
+    route: dict[str, Any],
+    wheel_record: dict[str, Any],
+    *,
+    effective_module_paths: dict[str, str],
+) -> None:
+    provenance = route.get("xformers_import_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("effective xformers import provenance is missing")
+    expected = {
+        "mode": "pep610-local-wheel",
+        "wheel_path": wheel_record["path"],
+        "wheel_sha256": wheel_record["sha256"],
+        "distribution_version": EXPECTED_XFORMERS_VERSION,
+    }
+    for field, expected_value in expected.items():
+        if provenance.get(field) != expected_value:
+            raise ValueError(
+                f"xformers import provenance {field} must be {expected_value!r}"
+            )
+    distribution_name = provenance.get("distribution_name")
+    if not isinstance(distribution_name, str) or distribution_name.lower().replace(
+        "_", "-"
+    ) != "xformers":
+        raise ValueError("xformers import provenance distribution name is invalid")
+    distribution_root_value = provenance.get("distribution_root")
+    if not isinstance(distribution_root_value, str) or not Path(
+        distribution_root_value
+    ).is_absolute():
+        raise ValueError("xformers import provenance distribution root is invalid")
+    distribution_root = Path(distribution_root_value).resolve()
+    module_paths = provenance.get("module_paths")
+    distribution_files = provenance.get("distribution_files")
+    expected_modules = {"xformers", "xformers.ops"}
+    if not isinstance(module_paths, dict) or set(module_paths) != expected_modules:
+        raise ValueError("xformers import provenance module paths are incomplete")
+    if not isinstance(distribution_files, dict) or set(distribution_files) != expected_modules:
+        raise ValueError("xformers import provenance distribution files are incomplete")
+    expected_effective = {
+        "xformers": effective_module_paths.get("xformers"),
+        "xformers.ops": effective_module_paths.get("xformers_ops"),
+    }
+    if module_paths != expected_effective:
+        raise ValueError("xformers import provenance module paths are disconnected")
+    for name in sorted(expected_modules):
+        module_value = module_paths[name]
+        relative_value = distribution_files[name]
+        if not isinstance(module_value, str) or not Path(module_value).is_absolute():
+            raise ValueError(f"xformers import provenance module path {name} is invalid")
+        if not isinstance(relative_value, str):
+            raise ValueError(f"xformers import provenance distribution file {name} is invalid")
+        relative = Path(relative_value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"xformers import provenance distribution file {name} is unsafe")
+        if (distribution_root / relative).resolve() != Path(module_value).resolve():
+            raise ValueError(f"xformers import provenance module {name} is not distribution-owned")
+    direct_url = provenance.get("direct_url")
+    if _direct_url_source_path(direct_url) != Path(wheel_record["path"]).resolve():
+        raise ValueError("xformers import provenance wheel path is disconnected")
+    if _direct_url_archive_sha256(direct_url) != wheel_record["sha256"]:
+        raise ValueError("xformers import provenance wheel digest is disconnected")
 
 
 def _validate_source_identities(report: dict[str, Any]) -> None:
@@ -801,7 +1104,12 @@ def validate_completed_mechanics_report(
         )
     requested_route = report.get("requested_route")
     _validate_requested_route(requested_route)
-    _validate_effective_route(report.get("effective_route"), requested_route)
+    _validate_xformers_wheel_record(report)
+    _validate_effective_route(
+        report.get("effective_route"),
+        requested_route,
+        report["xformers_wheel"],
+    )
     _validate_source_identities(report)
     probe = report.get("orientation_probe")
     if not isinstance(probe, dict):

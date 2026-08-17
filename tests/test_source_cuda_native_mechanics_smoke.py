@@ -18,6 +18,40 @@ EXPECTED_CAPTURE_ORDER = (
     "postprocess_stage11_pre_orientation",
     "postprocess_stage12_post_orientation",
 )
+XFORMERS_SHA256 = "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c"
+
+
+def xformers_wheel_path(runtime_root: Path) -> Path:
+    return (
+        runtime_root
+        / "pinned-wheels"
+        / "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+    ).resolve()
+
+
+def xformers_provenance(runtime_root: Path, site_root: Path) -> dict:
+    wheel_path = xformers_wheel_path(runtime_root)
+    module_paths = {
+        "xformers": (site_root / "xformers" / "__init__.py").resolve(),
+        "xformers.ops": (site_root / "xformers" / "ops" / "__init__.py").resolve(),
+    }
+    return {
+        "mode": "pep610-local-wheel",
+        "wheel_path": str(wheel_path),
+        "wheel_sha256": XFORMERS_SHA256,
+        "distribution_name": "xformers",
+        "distribution_version": "0.0.35",
+        "distribution_root": str(site_root.resolve()),
+        "module_paths": {name: str(path) for name, path in module_paths.items()},
+        "distribution_files": {
+            name: str(path.relative_to(site_root.resolve()))
+            for name, path in module_paths.items()
+        },
+        "direct_url": {
+            "url": wheel_path.as_uri(),
+            "archive_info": {"hashes": {"sha256": XFORMERS_SHA256}},
+        },
+    }
 
 
 def sha256(path: Path) -> str:
@@ -61,8 +95,11 @@ def fake_torch(*, version="2.10.0+cu128", name="Tesla T4", capability=(7, 5)):
 
 def fake_imports(roots: dict[str, Path]):
     source_root = Path(roots["source_root"]).resolve()
+    runtime_root = source_root.parent
     site_root = Path("/opt/native-mechanics/site-packages")
     module_paths = {
+        "xformers": site_root / "xformers" / "__init__.py",
+        "xformers_ops": site_root / "xformers" / "ops" / "__init__.py",
         "cumesh": site_root / "cumesh.so",
         "flex_gemm": site_root / "flex_gemm.so",
         "o_voxel": site_root / "o_voxel.py",
@@ -100,7 +137,23 @@ def fake_imports(roots: dict[str, Path]):
         "nvdiffrast": distribution_record("nvdiffrast", roots["nvdiffrast_root"]),
     }
     return {
-        "xformers": SimpleNamespace(__version__="0.0.35"),
+        "xformers": SimpleNamespace(
+            __name__="xformers",
+            __version__="0.0.35",
+            __file__=str(module_paths["xformers"]),
+        ),
+        "xformers_ops": SimpleNamespace(
+            __name__="xformers.ops",
+            __file__=str(module_paths["xformers_ops"]),
+        ),
+        "xformers_import_provenance": xformers_provenance(runtime_root, site_root),
+        "xformers_build_identity": {
+            "version": "0.0.35",
+            "torch": "2.10.0+cu128",
+            "cuda": 1208,
+            "torch_cuda_arch_list": "7.5 8.0+PTX 8.0 9.0a",
+            "package_from": "wheel-v0.0.35",
+        },
         "cumesh": SimpleNamespace(__name__="cumesh", __file__=str(module_paths["cumesh"])),
         "flex_gemm": SimpleNamespace(
             __name__="flex_gemm", __file__=str(module_paths["flex_gemm"])
@@ -198,6 +251,8 @@ def test_validate_runtime_identity_accepts_only_exact_effective_route():
     assert route["cuda_capability"] == [7, 5]
     assert route["attention_backend"] == "xformers"
     assert route["sparse_conv_backend"] == "flex_gemm"
+    assert route["xformers_build_identity"]["torch_cuda_arch_list"].split()[0] == "7.5"
+    assert route["xformers_import_provenance"]["distribution_name"] == "xformers"
 
     with pytest.raises(RuntimeError, match="Torch runtime drift"):
         module.validate_runtime_identity(fake_torch(version="2.9.0+cu128"), imported, roots)
@@ -208,6 +263,185 @@ def test_validate_runtime_identity_accepts_only_exact_effective_route():
     imported["sparse_config"] = SimpleNamespace(ATTN="xformers", CONV="spconv")
     with pytest.raises(RuntimeError, match="sparse convolution backend fallback"):
         module.validate_runtime_identity(fake_torch(), imported, roots)
+
+
+def test_xformers_build_identity_binds_exact_torch_cuda_and_sm75(tmp_path):
+    module = load_module()
+    package = tmp_path / "xformers"
+    package.mkdir()
+    module_path = package / "__init__.py"
+    module_path.write_text("")
+    (package / "cpp_lib.json").write_text(
+        json.dumps(
+            {
+                "version": {"torch": "2.10.0+cu128", "cuda": 1208},
+                "env": {
+                    "TORCH_CUDA_ARCH_LIST": "7.5 8.0+PTX 8.0 9.0a",
+                    "XFORMERS_PACKAGE_FROM": "wheel-v0.0.35",
+                },
+            }
+        )
+    )
+    xformers = SimpleNamespace(__version__="0.0.35", __file__=str(module_path))
+
+    record = module.read_xformers_build_identity(xformers)
+
+    assert record["torch"] == "2.10.0+cu128"
+    assert record["cuda"] == 1208
+    assert "7.5" in record["torch_cuda_arch_list"].split()
+
+    payload = json.loads((package / "cpp_lib.json").read_text())
+    payload["version"]["torch"] = "2.9.0+cu128"
+    (package / "cpp_lib.json").write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="xformers build Torch drift"):
+        module.read_xformers_build_identity(xformers)
+
+
+def test_xformers_import_provenance_joins_both_modules_to_exact_local_wheel(tmp_path):
+    module = load_module()
+    runtime_root = (tmp_path / "runtime").resolve()
+    site_root = (tmp_path / "site-packages").resolve()
+    wheel_path = xformers_wheel_path(runtime_root)
+    wheel_path.parent.mkdir(parents=True)
+    wheel_path.write_bytes(b"exact-wheel")
+    wheel_sha256 = sha256(wheel_path)
+    package = site_root / "xformers"
+    ops_package = package / "ops"
+    ops_package.mkdir(parents=True)
+    xformers_path = package / "__init__.py"
+    ops_path = ops_package / "__init__.py"
+    xformers_path.write_text("")
+    ops_path.write_text("")
+    xformers = SimpleNamespace(
+        __name__="xformers", __version__="0.0.35", __file__=str(xformers_path)
+    )
+    xformers_ops = SimpleNamespace(__name__="xformers.ops", __file__=str(ops_path))
+
+    class FakeDistribution:
+        version = "0.0.35"
+        files = [Path("xformers/__init__.py"), Path("xformers/ops/__init__.py")]
+        metadata = {"Name": "xformers"}
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": wheel_path.as_uri(),
+                    "archive_info": {"hashes": {"sha256": wheel_sha256}},
+                }
+            )
+
+        def locate_file(self, relative):
+            return site_root / relative
+
+    distribution = FakeDistribution()
+    record = module.read_xformers_install_provenance(
+        xformers,
+        xformers_ops,
+        wheel_path=wheel_path,
+        expected_sha256=wheel_sha256,
+        distribution_loader=lambda _name: distribution,
+    )
+
+    assert record["module_paths"] == {
+        "xformers": str(xformers_path),
+        "xformers.ops": str(ops_path),
+    }
+    assert record["distribution_files"] == {
+        "xformers": "xformers/__init__.py",
+        "xformers.ops": "xformers/ops/__init__.py",
+    }
+    assert record["direct_url"]["archive_info"]["hashes"]["sha256"] == wheel_sha256
+
+    xformers.__file__ = str(tmp_path / "foreign" / "xformers" / "__init__.py")
+    with pytest.raises(RuntimeError, match="not owned"):
+        module.read_xformers_install_provenance(
+            xformers,
+            xformers_ops,
+            wheel_path=wheel_path,
+            expected_sha256=wheel_sha256,
+            distribution_loader=lambda _name: distribution,
+        )
+
+    xformers.__file__ = str(xformers_path)
+    distribution.read_text = lambda _name: json.dumps(
+        {
+            "url": (tmp_path / "foreign.whl").resolve().as_uri(),
+            "archive_info": {"hashes": {"sha256": wheel_sha256}},
+        }
+    )
+    with pytest.raises(RuntimeError, match="wheel path"):
+        module.read_xformers_install_provenance(
+            xformers,
+            xformers_ops,
+            wheel_path=wheel_path,
+            expected_sha256=wheel_sha256,
+            distribution_loader=lambda _name: distribution,
+        )
+
+    distribution.read_text = lambda _name: json.dumps(
+        {
+            "url": wheel_path.as_uri(),
+            "archive_info": {"hashes": {"sha256": "0" * 64}},
+        }
+    )
+    with pytest.raises(RuntimeError, match="wheel digest"):
+        module.read_xformers_install_provenance(
+            xformers,
+            xformers_ops,
+            wheel_path=wheel_path,
+            expected_sha256=wheel_sha256,
+            distribution_loader=lambda _name: distribution,
+        )
+
+
+def test_run_smoke_requires_real_xformers_attention_probe_before_orientation(tmp_path):
+    module = load_module()
+    report_path = tmp_path / "mechanics-report.json"
+    roots = {
+        "source_root": tmp_path / "work" / "TRELLIS.2",
+        "cumesh_root": tmp_path / "work" / "CuMesh",
+        "flex_root": tmp_path / "work" / "FlexGEMM",
+        "nvdiffrast_root": tmp_path / "work" / "nvdiffrast",
+    }
+    native = SimpleNamespace(
+        TRELLIS_COMMIT="5565d240c4a494caaf9ece7a554542b76ffa36d3",
+        CUMESH_COMMIT="c4ad6125924fcedfd13f0bd61520ca2d24eb7a87",
+        FLEX_GEMM_COMMIT="6dd94a859c26ee8246888502eada3dd8ad85532e",
+        NVDIFFRAST_COMMIT="253ac4fcea7de5f396371124af597e6cc957bfae",
+    )
+    events = []
+
+    def attention_probe(_torch, _ops):
+        events.append("xformers")
+        return {
+            "executed": True,
+            "device_type": "cuda",
+            "finite": True,
+            "shape": [1, 4, 1, 8],
+            "dtype": "float16",
+        }
+
+    def orientation_probe(*_args):
+        events.append("orientation")
+        raise RuntimeError("stop after ordering witness")
+
+    with pytest.raises(RuntimeError, match="stop after ordering witness"):
+        module.run_smoke(
+            run_id=RUN_ID,
+            output_json=report_path,
+            work_dir=tmp_path / "work",
+            native_module=native,
+            prepare=lambda *_args: roots,
+            importer=lambda _roots: (fake_torch(), fake_imports(_roots)),
+            attention_probe=attention_probe,
+            orientation_probe=orientation_probe,
+        )
+
+    report = json.loads(report_path.read_text())
+    assert events == ["xformers", "orientation"]
+    assert report["effective_route"]["xformers_attention_probe"]["executed"] is True
+    assert report["last_trustworthy_phase"] == "xformers_attention_executed"
 
 
 def test_run_smoke_writes_failure_report_before_primary_output(tmp_path):
@@ -282,6 +516,13 @@ def test_run_smoke_rejects_partial_orientation_observation(tmp_path):
             native_module=native,
             prepare=prepare,
             importer=imports,
+            attention_probe=lambda *_args: {
+                "executed": True,
+                "device_type": "cuda",
+                "finite": True,
+                "shape": [1, 4, 1, 8],
+                "dtype": "float16",
+            },
             orientation_probe=partial_probe,
         )
 
@@ -380,6 +621,8 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
     module_paths = {
         name: str(Path(imported[name].__file__).resolve())
         for name in (
+            "xformers",
+            "xformers_ops",
             "cumesh",
             "flex_gemm",
             "o_voxel",
@@ -415,6 +658,23 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
         "failure_phase": None,
         "last_trustworthy_phase": "mechanics_artifacts_reopened_and_validated",
         "primary_output_status": "validated",
+        "xformers_wheel": {
+            "version": "0.0.35",
+            "url": (
+                "https://files.pythonhosted.org/packages/a4/85/"
+                "6d71f9b16f2ac647877e66ed4af723b3fbd477806ab8b8a89d39a362b85f/"
+                "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+            ),
+            "path": str(
+                runtime_root
+                / "pinned-wheels"
+                / "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+            ),
+            "sha256": "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c",
+            "size_bytes": 3264751,
+            "install_mode": "forced-local-wheel-no-deps",
+            "pip_version": "pip 25.1 from /run/site-packages/pip (python 3.12)",
+        },
         "requested_route": {
             "purpose": "native-runtime-mechanics-qualification-only",
             "work_dir": str(runtime_root),
@@ -440,6 +700,21 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
             "cuda_runtime_version": "12.8",
             "torch_version": "2.10.0+cu128",
             "xformers_version": "0.0.35",
+            "xformers_build_identity": {
+                "version": "0.0.35",
+                "torch": "2.10.0+cu128",
+                "cuda": 1208,
+                "torch_cuda_arch_list": "7.5 8.0+PTX 8.0 9.0a",
+                "package_from": "wheel-v0.0.35",
+            },
+            "xformers_import_provenance": imported["xformers_import_provenance"],
+            "xformers_attention_probe": {
+                "executed": True,
+                "device_type": "cuda",
+                "finite": True,
+                "shape": [1, 4, 1, 8],
+                "dtype": "float16",
+            },
             "attention_backend": "xformers",
             "sparse_attention_backend": "xformers",
             "sparse_conv_backend": "flex_gemm",
@@ -545,6 +820,15 @@ def test_completed_report_rejects_unbound_source_checkout_identity(
         ("unrelated_cumesh_import", "import provenance|module path"),
         ("unrelated_cumesh_direct_url", "direct URL"),
         ("missing_nvdiffrast_import", "module paths|nvdiffrast|import provenance"),
+        ("missing_xformers_build_identity", "xformers build identity"),
+        ("missing_xformers_probe", "xformers attention probe"),
+        ("missing_xformers_wheel", "xformers wheel"),
+        ("missing_xformers_pip_identity", "effective pip identity"),
+        ("missing_xformers_module_path", "module paths|xformers"),
+        ("missing_xformers_provenance", "xformers import provenance"),
+        ("foreign_xformers_module", "xformers import provenance|module"),
+        ("foreign_xformers_wheel_path", "xformers import provenance|wheel path"),
+        ("foreign_xformers_wheel_digest", "xformers import provenance|wheel digest"),
     ],
 )
 def test_completed_report_rejects_disconnected_build_and_import_provenance(
@@ -571,6 +855,30 @@ def test_completed_report_rejects_disconnected_build_and_import_provenance(
         ] = {"url": "file:///tmp/unrelated/CuMesh", "dir_info": {}}
     elif mutation == "missing_nvdiffrast_import":
         report["effective_route"]["module_paths"].pop("nvdiffrast", None)
+    elif mutation == "missing_xformers_build_identity":
+        report["effective_route"].pop("xformers_build_identity")
+    elif mutation == "missing_xformers_probe":
+        report["effective_route"].pop("xformers_attention_probe")
+    elif mutation == "missing_xformers_wheel":
+        report.pop("xformers_wheel")
+    elif mutation == "missing_xformers_pip_identity":
+        report["xformers_wheel"].pop("pip_version")
+    elif mutation == "missing_xformers_module_path":
+        report["effective_route"]["module_paths"].pop("xformers")
+    elif mutation == "missing_xformers_provenance":
+        report["effective_route"].pop("xformers_import_provenance")
+    elif mutation == "foreign_xformers_module":
+        report["effective_route"]["xformers_import_provenance"]["module_paths"][
+            "xformers"
+        ] = "/tmp/foreign/xformers/__init__.py"
+    elif mutation == "foreign_xformers_wheel_path":
+        report["effective_route"]["xformers_import_provenance"]["direct_url"]["url"] = (
+            "file:///tmp/foreign/xformers-0.0.35.whl"
+        )
+    elif mutation == "foreign_xformers_wheel_digest":
+        report["effective_route"]["xformers_import_provenance"]["direct_url"][
+            "archive_info"
+        ]["hashes"]["sha256"] = "0" * 64
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
 
     with pytest.raises(ValueError, match=match):
@@ -844,13 +1152,20 @@ def test_corrupt_orientation_capture_cannot_claim_semantic_validation(tmp_path):
             native_module=native,
             prepare=prepare,
             importer=imports,
+            attention_probe=lambda *_args: {
+                "executed": True,
+                "device_type": "cuda",
+                "finite": True,
+                "shape": [1, 4, 1, 8],
+                "dtype": "float16",
+            },
             orientation_probe=corrupt_probe,
         )
 
     report = json.loads(report_path.read_text())
     assert report["status"] == "failed"
     assert report["failure_phase"] == "orientation_probe"
-    assert report["last_trustworthy_phase"] == "runtime_identity_validated"
+    assert report["last_trustworthy_phase"] == "xformers_attention_executed"
     assert report["primary_output_status"] == "not_written"
 
 

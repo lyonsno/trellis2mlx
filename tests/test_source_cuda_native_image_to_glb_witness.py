@@ -1,9 +1,11 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import types
+import zipfile
 
 import numpy as np
 import pytest
@@ -57,6 +59,80 @@ def _write_clean_git_checkout(root: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "source"], cwd=root, check=True)
 
 
+def _write_minimal_wheel(
+    path: Path,
+    *,
+    distribution: str,
+    version: str,
+    package_files: dict[str, str],
+    requires: tuple[str, ...] = (),
+) -> None:
+    normalized = distribution.replace("-", "_")
+    dist_info = f"{normalized}-{version}.dist-info"
+    metadata = [
+        "Metadata-Version: 2.1",
+        f"Name: {distribution}",
+        f"Version: {version}",
+        *(f"Requires-Dist: {requirement}" for requirement in requires),
+        "",
+        "",
+    ]
+    files = {
+        **package_files,
+        f"{dist_info}/METADATA": "\n".join(metadata),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\n"
+            "Generator: trellis2mlx-conformance-test\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    record_path = f"{dist_info}/RECORD"
+    files[record_path] = "".join(f"{name},,\n" for name in (*files, record_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+
+
+def _create_test_venv(root: Path) -> Path:
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(root)],
+        check=True,
+    )
+    return root / "bin" / "python"
+
+
+def _pip_install(python: Path, wheel: Path, *, force: bool = False) -> None:
+    command = [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+    ]
+    if force:
+        command.append("--force-reinstall")
+    command.extend(["--no-deps", str(wheel)])
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def _venv_import_record(python: Path, repo_root: Path) -> dict[str, str]:
+    code = (
+        "import importlib.metadata as m, json, xformers, xformers.ops as ops; "
+        "print(json.dumps({'marker': xformers.MARKER, 'ops_marker': ops.MARKER, "
+        "'dependency_version': m.version('xformers-conformance-dependency')}))"
+    )
+    completed = subprocess.run(
+        [str(python), "-I", "-c", code],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
 def test_expected_post_build_products_are_recorded_removed_and_leave_clean_source(
     tmp_path,
 ):
@@ -87,6 +163,261 @@ def test_expected_post_build_products_are_recorded_removed_and_leave_clean_sourc
         text=True,
     )
     assert status.stdout == ""
+
+
+def test_pinned_xformers_install_forces_same_version_after_digest_verification(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    payload = b"exact-xformers-wheel"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    commands = []
+
+    def download(url, destination):
+        assert url == "https://example.invalid/xformers.whl"
+        Path(destination).write_bytes(payload)
+
+    def run(command, cwd=None):
+        stdout = "pip 25.1 from /test/site-packages/pip (python 3.12)\n" if command[-1] == "--version" else ""
+        receipt = {
+            "command": command,
+            "cwd": cwd,
+            "exit_code": 0,
+            "stdout": stdout,
+            "stderr": "",
+        }
+        commands.append(receipt)
+        return receipt
+
+    report = {"setup_commands": []}
+    record = witness._install_pinned_xformers(
+        python="/usr/bin/python3",
+        work_dir=tmp_path,
+        report=report,
+        wheel_url="https://example.invalid/xformers.whl",
+        expected_sha256=expected_sha256,
+        downloader=download,
+        runner=run,
+    )
+
+    wheel_path = (
+        tmp_path
+        / "pinned-wheels"
+        / "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+    )
+    assert record == {
+        "version": "0.0.35",
+        "url": "https://example.invalid/xformers.whl",
+        "path": str(wheel_path),
+        "sha256": expected_sha256,
+        "size_bytes": len(payload),
+        "install_mode": "forced-local-wheel-no-deps",
+        "pip_version": "pip 25.1 from /test/site-packages/pip (python 3.12)",
+    }
+    assert commands == [
+        {
+            "command": [
+                "/usr/bin/python3",
+                "-m",
+                "pip",
+                "--disable-pip-version-check",
+                "--version",
+            ],
+            "cwd": None,
+            "exit_code": 0,
+            "stdout": "pip 25.1 from /test/site-packages/pip (python 3.12)\n",
+            "stderr": "",
+        },
+        {
+            "command": [
+                "/usr/bin/python3",
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel_path),
+            ],
+            "cwd": None,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }
+    ]
+    assert report["setup_commands"] == commands
+
+
+def test_real_pip_replaces_same_version_and_joins_pep610_provenance(
+    tmp_path, monkeypatch
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    wheel_name = "xformers-0.0.35-py3-none-any.whl"
+    dependency_wheel = tmp_path / "wheels" / "dependency" / (
+        "xformers_conformance_dependency-1.0-py3-none-any.whl"
+    )
+    wheel_a = tmp_path / "wheels" / "a" / wheel_name
+    wheel_b = tmp_path / "wheels" / "b" / wheel_name
+    _write_minimal_wheel(
+        dependency_wheel,
+        distribution="xformers-conformance-dependency",
+        version="1.0",
+        package_files={"xformers_conformance_dependency/__init__.py": ""},
+    )
+    _write_minimal_wheel(
+        wheel_a,
+        distribution="xformers",
+        version="0.0.35",
+        package_files={
+            "xformers/__init__.py": "__version__ = '0.0.35'\nMARKER = 'wheel-a'\n",
+            "xformers/ops/__init__.py": "MARKER = 'ops-a'\n",
+        },
+        requires=("xformers-conformance-dependency==1.0",),
+    )
+    _write_minimal_wheel(
+        wheel_b,
+        distribution="xformers",
+        version="0.0.35",
+        package_files={
+            "xformers/__init__.py": "__version__ = '0.0.35'\nMARKER = 'wheel-b'\n",
+            "xformers/ops/__init__.py": "MARKER = 'ops-b'\n",
+        },
+        requires=("xformers-conformance-dependency==2.0",),
+    )
+
+    baseline_python = _create_test_venv(tmp_path / "baseline-venv")
+    _pip_install(baseline_python, dependency_wheel)
+    _pip_install(baseline_python, wheel_a)
+    _pip_install(baseline_python, wheel_b)
+    assert _venv_import_record(baseline_python, Path.cwd()) == {
+        "marker": "wheel-a",
+        "ops_marker": "ops-a",
+        "dependency_version": "1.0",
+    }
+
+    forced_python = _create_test_venv(tmp_path / "forced-venv")
+    _pip_install(forced_python, dependency_wheel)
+    _pip_install(forced_python, wheel_a)
+    monkeypatch.setattr(witness, "XFORMERS_WHEEL_FILENAME", wheel_name)
+    wheel_b_sha256 = _sha256(wheel_b)
+    report = {"setup_commands": []}
+    record = witness._install_pinned_xformers(
+        python=str(forced_python),
+        work_dir=tmp_path / "runtime",
+        report=report,
+        wheel_url=wheel_b.resolve().as_uri(),
+        expected_sha256=wheel_b_sha256,
+        downloader=lambda _url, destination: shutil.copyfile(wheel_b, destination),
+    )
+
+    assert record["pip_version"].startswith("pip ")
+    assert report["setup_commands"][0]["command"][-1] == "--version"
+    assert "--force-reinstall" in report["setup_commands"][1]["command"]
+    assert "--no-deps" in report["setup_commands"][1]["command"]
+    assert _venv_import_record(forced_python, Path.cwd()) == {
+        "marker": "wheel-b",
+        "ops_marker": "ops-b",
+        "dependency_version": "1.0",
+    }
+
+    repo_root = Path(__file__).resolve().parents[1]
+    provenance_code = (
+        "import json, sys; "
+        f"sys.path.insert(0, {str(repo_root)!r}); "
+        "from scripts import source_cuda_native_image_to_glb_witness as w; "
+        "import xformers, xformers.ops as ops; "
+        f"r=w.read_xformers_install_provenance(xformers, ops, wheel_path={record['path']!r}, "
+        f"expected_sha256={wheel_b_sha256!r}); "
+        "print(json.dumps(r, sort_keys=True))"
+    )
+    completed = subprocess.run(
+        [str(forced_python), "-I", "-c", provenance_code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    provenance = json.loads(completed.stdout)
+    assert provenance["wheel_path"] == record["path"]
+    assert provenance["wheel_sha256"] == wheel_b_sha256
+    assert provenance["distribution_name"] == "xformers"
+    assert provenance["distribution_version"] == "0.0.35"
+    assert provenance["distribution_files"] == {
+        "xformers": "xformers/__init__.py",
+        "xformers.ops": "xformers/ops/__init__.py",
+    }
+    assert provenance["direct_url"]["url"] == Path(record["path"]).resolve().as_uri()
+    assert witness._direct_url_archive_sha256(provenance["direct_url"]) == wheel_b_sha256
+
+
+def test_pinned_xformers_install_rejects_digest_before_pip(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    called = []
+
+    def download(_url, destination):
+        Path(destination).write_bytes(b"substituted-wheel")
+
+    with pytest.raises(RuntimeError, match="xformers wheel digest mismatch"):
+        witness._install_pinned_xformers(
+            python="/usr/bin/python3",
+            work_dir=tmp_path,
+            report={"setup_commands": []},
+            wheel_url="https://example.invalid/xformers.whl",
+            expected_sha256="0" * 64,
+            downloader=download,
+            runner=lambda *_args, **_kwargs: called.append(True),
+        )
+
+    assert called == []
+
+
+def test_native_image_xformers_provenance_owns_imports_from_exact_wheel(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    wheel_path = tmp_path / witness.XFORMERS_WHEEL_FILENAME
+    wheel_path.write_bytes(b"exact-wheel")
+    wheel_sha256 = _sha256(wheel_path)
+    site_root = tmp_path / "site-packages"
+    package = site_root / "xformers"
+    ops_package = package / "ops"
+    ops_package.mkdir(parents=True)
+    xformers_path = package / "__init__.py"
+    ops_path = ops_package / "__init__.py"
+    xformers_path.write_text("")
+    ops_path.write_text("")
+
+    class Distribution:
+        metadata = {"Name": "xformers"}
+        version = "0.0.35"
+        files = [Path("xformers/__init__.py"), Path("xformers/ops/__init__.py")]
+
+        def locate_file(self, relative):
+            return site_root / relative
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": wheel_path.resolve().as_uri(),
+                    "archive_info": {"hashes": {"sha256": wheel_sha256}},
+                }
+            )
+
+    record = witness.read_xformers_install_provenance(
+        types.SimpleNamespace(
+            __name__="xformers", __version__="0.0.35", __file__=str(xformers_path)
+        ),
+        types.SimpleNamespace(__name__="xformers.ops", __file__=str(ops_path)),
+        wheel_path=wheel_path,
+        expected_sha256=wheel_sha256,
+        distribution_loader=lambda _name: Distribution(),
+    )
+
+    assert record["wheel_sha256"] == wheel_sha256
+    assert record["module_paths"] == {
+        "xformers": str(xformers_path.resolve()),
+        "xformers.ops": str(ops_path.resolve()),
+    }
 
 
 @pytest.mark.parametrize("mutation", ["unknown_untracked", "tracked_modified"])
@@ -634,10 +965,67 @@ def _write_completed_fixture(
         "failure_phase": None,
         "last_trustworthy_phase": "consumer_glb_validated",
         "primary_output_status": "validated",
+        "xformers_wheel": {
+            "version": "0.0.35",
+            "url": (
+                "https://files.pythonhosted.org/packages/a4/85/"
+                "6d71f9b16f2ac647877e66ed4af723b3fbd477806ab8b8a89d39a362b85f/"
+                "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+            ),
+            "path": (
+                "/run/pinned-wheels/"
+                "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+            ),
+            "sha256": "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c",
+            "size_bytes": 3264751,
+            "install_mode": "forced-local-wheel-no-deps",
+            "pip_version": "pip 25.1 from /run/site-packages/pip (python 3.12)",
+        },
         "effective_route": {
             "device_type": "cuda",
             "cuda_device_name": "Tesla T4",
             "torch_version": "2.10.0+cu128",
+            "xformers_build_identity": {
+                "version": "0.0.35",
+                "torch": "2.10.0+cu128",
+                "cuda": 1208,
+                "torch_cuda_arch_list": "7.5 8.0+PTX 8.0 9.0a",
+                "package_from": "wheel-v0.0.35",
+            },
+            "xformers_import_provenance": {
+                "mode": "pep610-local-wheel",
+                "wheel_path": (
+                    "/run/pinned-wheels/"
+                    "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+                ),
+                "wheel_sha256": (
+                    "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c"
+                ),
+                "distribution_name": "xformers",
+                "distribution_version": "0.0.35",
+                "distribution_root": "/run/site-packages",
+                "module_paths": {
+                    "xformers": "/run/site-packages/xformers/__init__.py",
+                    "xformers.ops": "/run/site-packages/xformers/ops/__init__.py",
+                },
+                "distribution_files": {
+                    "xformers": "xformers/__init__.py",
+                    "xformers.ops": "xformers/ops/__init__.py",
+                },
+                "direct_url": {
+                    "url": (
+                        "file:///run/pinned-wheels/"
+                        "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
+                    ),
+                    "archive_info": {
+                        "hashes": {
+                            "sha256": (
+                                "ccc73c7db9890224ab05f5fb60e2034f9e6c8672a10be0cf00e95cbbae3eda7c"
+                            )
+                        }
+                    },
+                },
+            },
             "attention_backend": "xformers",
             "sparse_attention_backend": "xformers",
             "sparse_conv_backend": "flex_gemm",
@@ -944,6 +1332,12 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
         ("missing_model_assets", "model assets"),
         ("wrong_effective_image", "effective image"),
         ("missing_run_id", "run identity"),
+        ("missing_xformers_wheel", "xformers wheel"),
+        ("missing_xformers_pip_identity", "effective pip identity"),
+        ("missing_xformers_provenance", "xformers import provenance"),
+        ("foreign_xformers_module", "xformers import provenance|module"),
+        ("foreign_xformers_wheel_path", "xformers import provenance|wheel path"),
+        ("foreign_xformers_wheel_digest", "xformers import provenance|wheel digest"),
     ],
 )
 def test_completed_report_rejects_missing_or_wrong_authority(tmp_path, mutation, match):
@@ -960,6 +1354,24 @@ def test_completed_report_rejects_missing_or_wrong_authority(tmp_path, mutation,
         }
     elif mutation == "missing_run_id":
         report.pop("run_id", None)
+    elif mutation == "missing_xformers_wheel":
+        report.pop("xformers_wheel", None)
+    elif mutation == "missing_xformers_pip_identity":
+        report["xformers_wheel"].pop("pip_version", None)
+    elif mutation == "missing_xformers_provenance":
+        report["effective_route"].pop("xformers_import_provenance", None)
+    elif mutation == "foreign_xformers_module":
+        report["effective_route"]["xformers_import_provenance"]["module_paths"][
+            "xformers"
+        ] = "/tmp/foreign/xformers/__init__.py"
+    elif mutation == "foreign_xformers_wheel_path":
+        report["effective_route"]["xformers_import_provenance"]["direct_url"]["url"] = (
+            "file:///tmp/foreign/xformers-0.0.35.whl"
+        )
+    elif mutation == "foreign_xformers_wheel_digest":
+        report["effective_route"]["xformers_import_provenance"]["direct_url"][
+            "archive_info"
+        ]["hashes"]["sha256"] = "0" * 64
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
 
     with pytest.raises(ValueError, match=match):
