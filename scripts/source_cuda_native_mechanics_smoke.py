@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -100,30 +102,166 @@ def _prepare_runtime(native: Any, report: dict[str, Any]) -> dict[str, Path]:
     return native.prepare_runtime(args, report)
 
 
+def _canonical_source_roots(work_dir: Path) -> dict[str, Path]:
+    work_dir = Path(work_dir).resolve()
+    return {
+        "source_root": work_dir / "TRELLIS.2",
+        "cumesh_root": work_dir / "CuMesh",
+        "flex_root": work_dir / "FlexGEMM",
+        "nvdiffrast_root": work_dir / "nvdiffrast",
+    }
+
+
+def _module_path(module: Any, name: str) -> Path:
+    value = getattr(module, "__file__", None)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"effective import {name} has no module file")
+    return Path(value).resolve()
+
+
+def _direct_url_source_path(payload: Any) -> Path | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("url")
+    if not isinstance(value, str):
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        return None
+    return Path(unquote(parsed.path)).resolve()
+
+
+def _distribution_provenance(
+    module: Any,
+    *,
+    label: str,
+    source_root: Path,
+) -> dict[str, Any]:
+    module_path = _module_path(module, label)
+    top_level = str(getattr(module, "__name__", label)).split(".", 1)[0]
+    preferred_names = importlib_metadata.packages_distributions().get(top_level, ())
+    distributions: list[Any] = []
+    seen: set[str] = set()
+    for name in preferred_names:
+        try:
+            distribution = importlib_metadata.distribution(name)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+        key = str(distribution.metadata.get("Name", name)).lower()
+        if key not in seen:
+            seen.add(key)
+            distributions.append(distribution)
+    for distribution in importlib_metadata.distributions():
+        key = str(distribution.metadata.get("Name", "")).lower()
+        if key and key not in seen:
+            seen.add(key)
+            distributions.append(distribution)
+
+    expected_source = Path(source_root).resolve()
+    for distribution in distributions:
+        try:
+            direct_url = json.loads(distribution.read_text("direct_url.json") or "null")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if _direct_url_source_path(direct_url) != expected_source:
+            continue
+        distribution_root = Path(distribution.locate_file("")).resolve()
+        matched_file = None
+        for relative in distribution.files or ():
+            if Path(distribution.locate_file(relative)).resolve() == module_path:
+                matched_file = str(relative)
+                break
+        if matched_file is None:
+            continue
+        return {
+            "mode": "pep610-direct-url",
+            "source_root": str(expected_source),
+            "import_name": str(getattr(module, "__name__", top_level)),
+            "module_path": str(module_path),
+            "distribution_name": str(distribution.metadata.get("Name", "")),
+            "distribution_version": str(distribution.version),
+            "distribution_root": str(distribution_root),
+            "distribution_file": matched_file,
+            "direct_url": direct_url,
+        }
+    raise RuntimeError(
+        f"effective import {label} is not owned by a distribution installed from {expected_source}"
+    )
+
+
+def collect_build_import_provenance(
+    imported: dict[str, Any],
+    roots: dict[str, Path],
+) -> dict[str, Any]:
+    source_root = Path(roots["source_root"]).resolve()
+    trellis_paths = {
+        name: str(_module_path(imported[name], name))
+        for name in ("attention_config", "sparse_config")
+    }
+    for name, value in trellis_paths.items():
+        if source_root not in Path(value).parents:
+            raise RuntimeError(
+                f"effective TRELLIS import {name} is outside pinned source root {source_root}: {value}"
+            )
+    return {
+        "trellis": {
+            "mode": "source-tree",
+            "source_root": str(source_root),
+            "module_paths": trellis_paths,
+        },
+        "cumesh": _distribution_provenance(
+            imported["cumesh"], label="cumesh", source_root=roots["cumesh_root"]
+        ),
+        "flex_gemm": _distribution_provenance(
+            imported["flex_gemm"],
+            label="flex_gemm",
+            source_root=roots["flex_root"],
+        ),
+        "o_voxel": _distribution_provenance(
+            imported["o_voxel"],
+            label="o_voxel",
+            source_root=source_root / "o-voxel",
+        ),
+        "nvdiffrast": _distribution_provenance(
+            imported["nvdiffrast"],
+            label="nvdiffrast",
+            source_root=roots["nvdiffrast_root"],
+        ),
+    }
+
+
 def import_effective_runtime(roots: dict[str, Path]) -> tuple[Any, dict[str, Any]]:
     os.environ["ATTN_BACKEND"] = "xformers"
     os.environ["SPARSE_ATTN_BACKEND"] = "xformers"
     os.environ["SPARSE_CONV_BACKEND"] = "flex_gemm"
     source_root = Path(roots["source_root"]).resolve()
-    if str(source_root) not in sys.path:
-        sys.path.insert(0, str(source_root))
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if not entry or Path(entry).resolve() != source_root
+    ]
+    sys.path.insert(0, str(source_root))
 
     import torch
     import xformers
     import cumesh
     import flex_gemm
+    import nvdiffrast.torch as nvdiffrast
     import o_voxel
     from trellis2.modules.attention import config as attention_config
     from trellis2.modules.sparse import config as sparse_config
 
-    return torch, {
+    imported = {
         "xformers": xformers,
         "cumesh": cumesh,
         "flex_gemm": flex_gemm,
+        "nvdiffrast": nvdiffrast,
         "o_voxel": o_voxel,
         "attention_config": attention_config,
         "sparse_config": sparse_config,
     }
+    imported["build_import_provenance"] = collect_build_import_provenance(imported, roots)
+    return torch, imported
 
 
 def validate_runtime_identity(
@@ -153,6 +291,17 @@ def validate_runtime_identity(
     if sparse.CONV != "flex_gemm":
         raise RuntimeError(f"sparse convolution backend fallback: {sparse.CONV!r}")
 
+    module_names = (
+        "cumesh",
+        "flex_gemm",
+        "o_voxel",
+        "nvdiffrast",
+        "attention_config",
+        "sparse_config",
+    )
+    provenance = imported.get("build_import_provenance")
+    if not isinstance(provenance, dict):
+        raise RuntimeError("effective build/import provenance is missing")
     return {
         "device_type": "cuda",
         "cuda_device_name": device_name,
@@ -165,9 +314,9 @@ def validate_runtime_identity(
         "sparse_conv_backend": sparse.CONV,
         "source_roots": {name: str(Path(path).resolve()) for name, path in roots.items()},
         "module_paths": {
-            name: str(Path(imported[name].__file__).resolve())
-            for name in ("cumesh", "flex_gemm", "o_voxel")
+            name: str(_module_path(imported[name], name)) for name in module_names
         },
+        "build_import_provenance": provenance,
     }
 
 
@@ -414,7 +563,80 @@ def _validate_requested_route(route: Any) -> None:
         raise ValueError("requested route work_dir must be absolute")
 
 
-def _validate_effective_route(route: Any) -> None:
+def _validate_build_import_provenance(
+    route: dict[str, Any],
+    requested_route: dict[str, Any],
+) -> None:
+    work_dir = Path(requested_route["work_dir"]).resolve()
+    roots = _canonical_source_roots(work_dir)
+    effective_roots = route["source_roots"]
+    expected_root_strings = {name: str(path) for name, path in roots.items()}
+    if effective_roots != expected_root_strings:
+        raise ValueError(
+            "effective source roots do not match the exact requested work directory layout"
+        )
+
+    provenance = route.get("build_import_provenance")
+    expected_keys = {"trellis", "cumesh", "flex_gemm", "o_voxel", "nvdiffrast"}
+    if not isinstance(provenance, dict) or set(provenance) != expected_keys:
+        raise ValueError("effective build/import provenance is incomplete")
+    module_paths = route["module_paths"]
+
+    trellis = provenance["trellis"]
+    expected_trellis_paths = {
+        "attention_config": module_paths["attention_config"],
+        "sparse_config": module_paths["sparse_config"],
+    }
+    if not isinstance(trellis, dict) or trellis.get("mode") != "source-tree":
+        raise ValueError("TRELLIS import provenance mode is invalid")
+    if trellis.get("source_root") != str(roots["source_root"]):
+        raise ValueError("TRELLIS import provenance source root is disconnected")
+    if trellis.get("module_paths") != expected_trellis_paths:
+        raise ValueError("TRELLIS import provenance module paths are disconnected")
+    for name, value in expected_trellis_paths.items():
+        path = Path(value)
+        if roots["source_root"] not in path.parents:
+            raise ValueError(
+                f"TRELLIS module path {name} is outside the requested source root"
+            )
+
+    dependency_sources = {
+        "cumesh": roots["cumesh_root"],
+        "flex_gemm": roots["flex_root"],
+        "o_voxel": roots["source_root"] / "o-voxel",
+        "nvdiffrast": roots["nvdiffrast_root"],
+    }
+    for name, source_root in dependency_sources.items():
+        record = provenance[name]
+        if not isinstance(record, dict) or record.get("mode") != "pep610-direct-url":
+            raise ValueError(f"{name} import provenance mode is invalid")
+        if record.get("source_root") != str(source_root):
+            raise ValueError(f"{name} import provenance source root is disconnected")
+        if record.get("module_path") != module_paths[name]:
+            raise ValueError(f"{name} import provenance module path is disconnected")
+        for field in ("import_name", "distribution_name", "distribution_version"):
+            value = record.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} import provenance {field} is missing or blank")
+        distribution_root_value = record.get("distribution_root")
+        distribution_file_value = record.get("distribution_file")
+        if not isinstance(distribution_root_value, str) or not Path(
+            distribution_root_value
+        ).is_absolute():
+            raise ValueError(f"{name} import provenance distribution root is invalid")
+        if not isinstance(distribution_file_value, str):
+            raise ValueError(f"{name} import provenance distribution file is missing")
+        distribution_file = Path(distribution_file_value)
+        if distribution_file.is_absolute() or ".." in distribution_file.parts:
+            raise ValueError(f"{name} import provenance distribution file is unsafe")
+        owned_module = (Path(distribution_root_value) / distribution_file).resolve()
+        if owned_module != Path(module_paths[name]).resolve():
+            raise ValueError(f"{name} module path is not owned by the recorded distribution")
+        if _direct_url_source_path(record.get("direct_url")) != source_root:
+            raise ValueError(f"{name} import provenance direct URL is disconnected")
+
+
+def _validate_effective_route(route: Any, requested_route: dict[str, Any]) -> None:
     if not isinstance(route, dict):
         raise ValueError("effective route is missing")
     expected = {
@@ -448,12 +670,16 @@ def _validate_effective_route(route: Any) -> None:
         "cumesh",
         "flex_gemm",
         "o_voxel",
+        "nvdiffrast",
+        "attention_config",
+        "sparse_config",
     }:
         raise ValueError("effective route module paths are incomplete")
     for label, paths in (("source root", roots), ("module path", module_paths)):
         for name, value in paths.items():
             if not isinstance(value, str) or not Path(value).is_absolute():
                 raise ValueError(f"effective route {label} {name} must be absolute")
+    _validate_build_import_provenance(route, requested_route)
 
 
 def _validate_source_identities(report: dict[str, Any]) -> None:
@@ -560,8 +786,9 @@ def validate_completed_mechanics_report(
         raise ValueError(
             f"mechanics run identity mismatch: expected {expected_run_id}, got {run_id}"
         )
-    _validate_requested_route(report.get("requested_route"))
-    _validate_effective_route(report.get("effective_route"))
+    requested_route = report.get("requested_route")
+    _validate_requested_route(requested_route)
+    _validate_effective_route(report.get("effective_route"), requested_route)
     _validate_source_identities(report)
     probe = report.get("orientation_probe")
     if not isinstance(probe, dict):
@@ -599,6 +826,10 @@ def prepare_native_mechanics_packet(packet: Any) -> Any:
         raise WitnessPacketError("native mechanics packet requires run identity")
     if packet.expected_image_sha256 is not None:
         raise WitnessPacketError("native mechanics packet must not claim image identity")
+    if packet.enable_internet is not True:
+        raise WitnessPacketError("native mechanics packet requires internet for pinned source builds")
+    if packet.accelerator != "NvidiaTeslaT4":
+        raise WitnessPacketError("native mechanics packet requires exact Nvidia Tesla T4 route")
     expected_outputs = tuple(EXPECTED_ARTIFACT_FILENAMES.values())
     if packet.output_json != "mechanics-report.json" or packet.output_npz is not None:
         raise WitnessPacketError("native mechanics packet output roles are not canonical")
@@ -618,6 +849,8 @@ def validate_downloaded_native_mechanics_outputs(
 
     if packet.run_id is None:
         raise WitnessPacketError("native mechanics packet is missing its run identity")
+    if packet.enable_internet is not True or packet.accelerator != "NvidiaTeslaT4":
+        raise WitnessPacketError("native mechanics packet effective route is not executable")
     expected_outputs = tuple(EXPECTED_ARTIFACT_FILENAMES.values())
     if packet.output_json != "mechanics-report.json" or packet.output_npz is not None:
         raise WitnessPacketError("native mechanics packet output roles are not canonical")

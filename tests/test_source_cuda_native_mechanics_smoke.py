@@ -59,6 +59,129 @@ def fake_torch(*, version="2.10.0+cu128", name="Tesla T4", capability=(7, 5)):
     )
 
 
+def fake_imports(roots: dict[str, Path]):
+    source_root = Path(roots["source_root"]).resolve()
+    site_root = Path("/opt/native-mechanics/site-packages")
+    module_paths = {
+        "cumesh": site_root / "cumesh.so",
+        "flex_gemm": site_root / "flex_gemm.so",
+        "o_voxel": site_root / "o_voxel.py",
+        "nvdiffrast": site_root / "nvdiffrast" / "torch" / "__init__.py",
+        "attention_config": source_root / "trellis2" / "modules" / "attention" / "config.py",
+        "sparse_config": source_root / "trellis2" / "modules" / "sparse" / "config.py",
+    }
+
+    def distribution_record(name: str, source: Path):
+        module_path = module_paths[name]
+        return {
+            "mode": "pep610-direct-url",
+            "source_root": str(Path(source).resolve()),
+            "import_name": name,
+            "module_path": str(module_path),
+            "distribution_name": name.replace("_", "-"),
+            "distribution_version": "0.0.test",
+            "distribution_root": str(site_root),
+            "distribution_file": str(module_path.relative_to(site_root)),
+            "direct_url": {"url": Path(source).resolve().as_uri(), "dir_info": {}},
+        }
+
+    provenance = {
+        "trellis": {
+            "mode": "source-tree",
+            "source_root": str(source_root),
+            "module_paths": {
+                "attention_config": str(module_paths["attention_config"]),
+                "sparse_config": str(module_paths["sparse_config"]),
+            },
+        },
+        "cumesh": distribution_record("cumesh", roots["cumesh_root"]),
+        "flex_gemm": distribution_record("flex_gemm", roots["flex_root"]),
+        "o_voxel": distribution_record("o_voxel", source_root / "o-voxel"),
+        "nvdiffrast": distribution_record("nvdiffrast", roots["nvdiffrast_root"]),
+    }
+    return {
+        "xformers": SimpleNamespace(__version__="0.0.35"),
+        "cumesh": SimpleNamespace(__name__="cumesh", __file__=str(module_paths["cumesh"])),
+        "flex_gemm": SimpleNamespace(
+            __name__="flex_gemm", __file__=str(module_paths["flex_gemm"])
+        ),
+        "o_voxel": SimpleNamespace(
+            __name__="o_voxel", __file__=str(module_paths["o_voxel"])
+        ),
+        "nvdiffrast": SimpleNamespace(
+            __name__="nvdiffrast.torch", __file__=str(module_paths["nvdiffrast"])
+        ),
+        "attention_config": SimpleNamespace(
+            __name__="trellis2.modules.attention.config",
+            __file__=str(module_paths["attention_config"]),
+            BACKEND="xformers",
+        ),
+        "sparse_config": SimpleNamespace(
+            __name__="trellis2.modules.sparse.config",
+            __file__=str(module_paths["sparse_config"]),
+            ATTN="xformers",
+            CONV="flex_gemm",
+        ),
+        "build_import_provenance": provenance,
+    }
+
+
+def test_distribution_provenance_binds_imported_file_to_exact_pep610_source(
+    tmp_path, monkeypatch
+):
+    module = load_module()
+    source_root = (tmp_path / "CuMesh").resolve()
+    distribution_root = (tmp_path / "site-packages").resolve()
+    distribution_file = Path("cumesh") / "_C.cpython-test.so"
+    module_path = distribution_root / distribution_file
+    imported = SimpleNamespace(__name__="cumesh", __file__=str(module_path))
+
+    class FakeDistribution:
+        version = "0.0.test"
+        files = [distribution_file]
+        metadata = {"Name": "cumesh"}
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return json.dumps({"url": source_root.as_uri(), "dir_info": {}})
+
+        def locate_file(self, relative):
+            return distribution_root / relative
+
+    distribution = FakeDistribution()
+    monkeypatch.setattr(
+        module.importlib_metadata,
+        "packages_distributions",
+        lambda: {"cumesh": ["cumesh"]},
+    )
+    monkeypatch.setattr(
+        module.importlib_metadata,
+        "distribution",
+        lambda _name: distribution,
+    )
+    monkeypatch.setattr(
+        module.importlib_metadata,
+        "distributions",
+        lambda: [distribution],
+    )
+
+    record = module._distribution_provenance(
+        imported,
+        label="cumesh",
+        source_root=source_root,
+    )
+
+    assert record["module_path"] == str(module_path)
+    assert record["distribution_file"] == str(distribution_file)
+    assert record["direct_url"]["url"] == source_root.as_uri()
+    with pytest.raises(RuntimeError, match="not owned"):
+        module._distribution_provenance(
+            imported,
+            label="cumesh",
+            source_root=tmp_path / "unrelated-source",
+        )
+
+
 def test_validate_runtime_identity_accepts_only_exact_effective_route():
     module = load_module()
     roots = {
@@ -67,14 +190,7 @@ def test_validate_runtime_identity_accepts_only_exact_effective_route():
         "flex_root": Path("/tmp/FlexGEMM"),
         "nvdiffrast_root": Path("/tmp/nvdiffrast"),
     }
-    imported = {
-        "xformers": SimpleNamespace(__version__="0.0.35"),
-        "cumesh": SimpleNamespace(__file__="/tmp/cumesh.so"),
-        "flex_gemm": SimpleNamespace(__file__="/tmp/flex_gemm.so"),
-        "o_voxel": SimpleNamespace(__file__="/tmp/o_voxel.py"),
-        "attention_config": SimpleNamespace(BACKEND="xformers"),
-        "sparse_config": SimpleNamespace(ATTN="xformers", CONV="flex_gemm"),
-    }
+    imported = fake_imports(roots)
 
     route = module.validate_runtime_identity(fake_torch(), imported, roots)
 
@@ -145,14 +261,7 @@ def test_run_smoke_rejects_partial_orientation_observation(tmp_path):
         }
 
     def imports(_roots):
-        return fake_torch(), {
-            "xformers": SimpleNamespace(__version__="0.0.35"),
-            "cumesh": SimpleNamespace(__file__="/tmp/cumesh.so"),
-            "flex_gemm": SimpleNamespace(__file__="/tmp/flex_gemm.so"),
-            "o_voxel": SimpleNamespace(__file__="/tmp/o_voxel.py"),
-            "attention_config": SimpleNamespace(BACKEND="xformers"),
-            "sparse_config": SimpleNamespace(ATTN="xformers", CONV="flex_gemm"),
-        }
+        return fake_torch(), fake_imports(_roots)
 
     def partial_probe(*_args, **_kwargs):
         return {
@@ -260,6 +369,25 @@ def test_cli_rejects_noncanonical_run_identity_with_durable_report(
 def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
     module = load_module()
     root.mkdir(parents=True, exist_ok=True)
+    runtime_root = (root / "runtime").resolve()
+    roots = {
+        "source_root": runtime_root / "TRELLIS.2",
+        "cumesh_root": runtime_root / "CuMesh",
+        "flex_root": runtime_root / "FlexGEMM",
+        "nvdiffrast_root": runtime_root / "nvdiffrast",
+    }
+    imported = fake_imports(roots)
+    module_paths = {
+        name: str(Path(imported[name].__file__).resolve())
+        for name in (
+            "cumesh",
+            "flex_gemm",
+            "o_voxel",
+            "nvdiffrast",
+            "attention_config",
+            "sparse_config",
+        )
+    }
     vertices = np.asarray(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32
     )
@@ -289,7 +417,7 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
         "primary_output_status": "validated",
         "requested_route": {
             "purpose": "native-runtime-mechanics-qualification-only",
-            "work_dir": str((root / "runtime").resolve()),
+            "work_dir": str(runtime_root),
             "torch_version": "2.10.0+cu128",
             "cuda_device_name": "Tesla T4",
             "cuda_capability": [7, 5],
@@ -316,16 +444,10 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
             "sparse_attention_backend": "xformers",
             "sparse_conv_backend": "flex_gemm",
             "source_roots": {
-                "source_root": "/tmp/TRELLIS.2",
-                "cumesh_root": "/tmp/CuMesh",
-                "flex_root": "/tmp/FlexGEMM",
-                "nvdiffrast_root": "/tmp/nvdiffrast",
+                name: str(path) for name, path in roots.items()
             },
-            "module_paths": {
-                "cumesh": "/tmp/cumesh.so",
-                "flex_gemm": "/tmp/flex_gemm.so",
-                "o_voxel": "/tmp/o_voxel.py",
-            },
+            "module_paths": module_paths,
+            "build_import_provenance": imported["build_import_provenance"],
         },
         "orientation_probe": {
             "state": dict(module.EXPECTED_ORIENTATION_STATE),
@@ -334,25 +456,25 @@ def write_valid_mechanics_bundle(root: Path, *, run_id: str) -> Path:
         },
         "source_identities_before_build": {
             "trellis": {
-                "path": "/tmp/TRELLIS.2",
+                "path": str(roots["source_root"]),
                 "repository": "https://github.com/microsoft/TRELLIS.2.git",
                 "commit": "5565d240c4a494caaf9ece7a554542b76ffa36d3",
                 "clean": True,
             },
             "cumesh": {
-                "path": "/tmp/CuMesh",
+                "path": str(roots["cumesh_root"]),
                 "repository": "https://github.com/JeffreyXiang/CuMesh.git",
                 "commit": "c4ad6125924fcedfd13f0bd61520ca2d24eb7a87",
                 "clean": True,
             },
             "flex_gemm": {
-                "path": "/tmp/FlexGEMM",
+                "path": str(roots["flex_root"]),
                 "repository": "https://github.com/JeffreyXiang/FlexGEMM.git",
                 "commit": "6dd94a859c26ee8246888502eada3dd8ad85532e",
                 "clean": True,
             },
             "nvdiffrast": {
-                "path": "/tmp/nvdiffrast",
+                "path": str(roots["nvdiffrast_root"]),
                 "repository": "https://github.com/NVlabs/nvdiffrast.git",
                 "commit": "253ac4fcea7de5f396371124af597e6cc957bfae",
                 "clean": True,
@@ -398,6 +520,48 @@ def test_completed_report_rejects_unbound_source_checkout_identity(
         report["source_identities_after_build"]["flex_gemm"]["path"] = (
             "/tmp/not-the-imported-flex-root"
         )
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=match):
+        module.validate_completed_mechanics_report(
+            report_path,
+            expected_run_id=RUN_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("disconnected_root", "requested work directory|source root"),
+        ("unrelated_cumesh_import", "import provenance|module path"),
+        ("unrelated_cumesh_direct_url", "direct URL"),
+        ("missing_nvdiffrast_import", "module paths|nvdiffrast|import provenance"),
+    ],
+)
+def test_completed_report_rejects_disconnected_build_and_import_provenance(
+    tmp_path, mutation, match
+):
+    module = load_module()
+    report_path = write_valid_mechanics_bundle(tmp_path, run_id=RUN_ID)
+    report = json.loads(report_path.read_text())
+    if mutation == "disconnected_root":
+        report["effective_route"]["source_roots"]["cumesh_root"] = (
+            "/tmp/clean-but-disconnected/CuMesh"
+        )
+        for phase in ("before_build", "after_build"):
+            report[f"source_identities_{phase}"]["cumesh"]["path"] = (
+                "/tmp/clean-but-disconnected/CuMesh"
+            )
+    elif mutation == "unrelated_cumesh_import":
+        report["effective_route"]["module_paths"]["cumesh"] = (
+            "/tmp/unrelated-site-packages/cumesh.so"
+        )
+    elif mutation == "unrelated_cumesh_direct_url":
+        report["effective_route"]["build_import_provenance"]["cumesh"][
+            "direct_url"
+        ] = {"url": "file:///tmp/unrelated/CuMesh", "dir_info": {}}
+    elif mutation == "missing_nvdiffrast_import":
+        report["effective_route"]["module_paths"].pop("nvdiffrast", None)
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
 
     with pytest.raises(ValueError, match=match):
@@ -456,7 +620,13 @@ def test_completed_report_rejects_semantically_invalid_mechanics(
 
 
 def prepare_mechanics_packet(
-    tmp_path: Path, *, run_id: str, name: str, no_download: bool = False
+    tmp_path: Path,
+    *,
+    run_id: str,
+    name: str,
+    no_download: bool = False,
+    enable_internet: bool = True,
+    accelerator: str = "NvidiaTeslaT4",
 ):
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
 
@@ -481,6 +651,8 @@ def prepare_mechanics_packet(
             entrypoint=smoke.name,
             inputs=(smoke.name, witness.name),
             run_id=run_id,
+            enable_internet=enable_internet,
+            accelerator=accelerator,
             output_json="mechanics-report.json",
             output_npz=None,
             expected_outputs=tuple(
@@ -496,6 +668,64 @@ def prepare_mechanics_packet(
             ),
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("enable_internet", "accelerator", "match"),
+    [
+        (False, "NvidiaTeslaT4", "internet"),
+        (True, "NvidiaTeslaP100", "Tesla T4"),
+    ],
+)
+def test_mechanics_packet_rejects_non_executable_route_before_output_mutation(
+    tmp_path, enable_internet, accelerator, match
+):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, WitnessPacketError
+
+    module = load_module()
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    smoke = capsule / "source_cuda_native_mechanics_smoke.py"
+    witness = capsule / "source_cuda_native_image_to_glb_witness.py"
+    smoke.write_text(SCRIPT.read_text())
+    witness.write_text(
+        Path(__file__).parents[1]
+        .joinpath("scripts/source_cuda_native_image_to_glb_witness.py")
+        .read_text()
+    )
+    output_dir = tmp_path / "packet"
+    output_dir.mkdir()
+    marker = output_dir / "must-survive-route-rejection.txt"
+    marker.write_text("preserved")
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=output_dir,
+        dataset_id="operator/native-mechanics-inputs",
+        kernel_id="operator/native-mechanics-cuda",
+        title="Native Mechanics CUDA",
+        entrypoint=smoke.name,
+        inputs=(smoke.name, witness.name),
+        run_id=RUN_ID,
+        enable_internet=enable_internet,
+        accelerator=accelerator,
+        output_json="mechanics-report.json",
+        output_npz=None,
+        expected_outputs=tuple(
+            f"{index:02d}-{stage}.npz"
+            for index, stage in enumerate(EXPECTED_CAPTURE_ORDER)
+        ),
+        entrypoint_args=(
+            "--run-id",
+            RUN_ID,
+            "--work-dir",
+            "/kaggle/working/native-mechanics-runtime",
+        ),
+    )
+
+    with pytest.raises(WitnessPacketError, match=match):
+        module.prepare_native_mechanics_packet(packet)
+
+    assert marker.read_text() == "preserved"
 
 
 def test_mechanics_packet_rejects_missing_run_identity_before_output_mutation(tmp_path):
@@ -570,14 +800,7 @@ def test_corrupt_orientation_capture_cannot_claim_semantic_validation(tmp_path):
         }
 
     def imports(_roots):
-        return fake_torch(), {
-            "xformers": SimpleNamespace(__version__="0.0.35"),
-            "cumesh": SimpleNamespace(__file__="/tmp/cumesh.so"),
-            "flex_gemm": SimpleNamespace(__file__="/tmp/flex_gemm.so"),
-            "o_voxel": SimpleNamespace(__file__="/tmp/o_voxel.py"),
-            "attention_config": SimpleNamespace(BACKEND="xformers"),
-            "sparse_config": SimpleNamespace(ATTN="xformers", CONV="flex_gemm"),
-        }
+        return fake_torch(), fake_imports(_roots)
 
     def corrupt_probe(_native, _cumesh, _torch, output_dir, run_id):
         artifacts = {}
@@ -699,6 +922,13 @@ def test_actual_generated_runner_binds_mechanics_run_identity(tmp_path, monkeypa
     assert runner_text.count(RUN_ID) >= 1
     manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
     assert manifest["run_id"] == RUN_ID
+    assert manifest["enable_internet"] is True
+    assert manifest["accelerator"] == "NvidiaTeslaT4"
+    reloaded = __import__(
+        "trellmlx.kaggle_cuda_witness", fromlist=["load_prepared_packet"]
+    ).load_prepared_packet(packet.output_dir)
+    assert reloaded.enable_internet is True
+    assert reloaded.accelerator == "NvidiaTeslaT4"
     assert manifest["entrypoint_args"].count("--run-id") == 1
     assert manifest["entrypoint_args"][
         manifest["entrypoint_args"].index("--run-id") + 1
