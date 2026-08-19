@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import sys
 import types
 
 import pytest
@@ -270,6 +271,141 @@ def test_preparer_rolls_back_spec_drift_after_pair_installation(
     assert report["spec"]["sha256"] != report["final_spec"]["sha256"]
     assert output_marker.read_text() == "prior output"
     assert capsule_marker.read_text() == "prior capsule"
+
+
+def _prepare_synthetic_attempt_packet(tmp_path, entrypoint_source):
+    from trellmlx.kaggle_cuda_witness import prepare_packet
+    from trellmlx.native_image_to_glb_attempt import (
+        build_attempt_packet,
+        load_attempt_spec,
+    )
+
+    spec_path = _write_valid_spec(tmp_path)
+    payload = json.loads(spec_path.read_text())
+    entrypoint = Path(payload["entrypoint"]["source"])
+    entrypoint.write_text(entrypoint_source)
+    entrypoint_bytes = entrypoint.read_bytes()
+    payload["entrypoint"]["sha256"] = hashlib.sha256(entrypoint_bytes).hexdigest()
+    payload["entrypoint"]["size_bytes"] = len(entrypoint_bytes)
+    spec_path.write_text(json.dumps(payload))
+    return prepare_packet(build_attempt_packet(load_attempt_spec(spec_path)))
+
+
+def _run_synthetic_attempt_packet(packet, work, monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work.mkdir(exist_ok=True)
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text().replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+    rc = namespace["main"]()
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    return rc, receipt
+
+
+def test_structured_runner_bridges_attempt_outputs_to_kaggle_publication(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepare_synthetic_attempt_packet(
+        tmp_path,
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-dir', required=True)\n"
+        "a, _ = p.parse_known_args()\n"
+        "output_dir = Path(a.output_dir)\n"
+        "output_dir.mkdir(parents=True, exist_ok=True)\n"
+        "Path(a.output_json).write_text('{\"status\": \"completed\"}\\n')\n"
+        "(output_dir / '12-consumer_glb.glb').write_bytes(b'glb')\n",
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "report.json").write_text('{"status": "stale"}\n')
+    (work / "12-consumer_glb.glb").write_bytes(b"stale")
+
+    rc, receipt = _run_synthetic_attempt_packet(packet, work, monkeypatch)
+
+    command = receipt["effective_command"]
+    assert rc == 0
+    assert command[command.index("--output-json") + 1] == "outputs/report.json"
+    assert (work / "outputs" / "report.json").is_file()
+    assert (work / "outputs" / "12-consumer_glb.glb").is_file()
+    assert json.loads((work / "report.json").read_text())["status"] == "completed"
+    assert (work / "12-consumer_glb.glb").read_bytes() == b"glb"
+    assert receipt["status"] == "done"
+    assert set(receipt["outputs"]) == set(packet.outputs)
+
+
+def test_structured_runner_publishes_failure_report_from_attempt_coordinate(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepare_synthetic_attempt_packet(
+        tmp_path,
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-dir', required=True)\n"
+        "a, _ = p.parse_known_args()\n"
+        "Path(a.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "Path(a.output_json).write_text('{\"status\": \"failed\"}\\n')\n"
+        "raise SystemExit(9)\n",
+    )
+    work = tmp_path / "work"
+
+    rc, receipt = _run_synthetic_attempt_packet(packet, work, monkeypatch)
+
+    command = receipt["effective_command"]
+    assert rc == 9
+    assert command[command.index("--output-json") + 1] == "outputs/report.json"
+    assert json.loads((work / "report.json").read_text())["status"] == "failed"
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "execution"
+    assert receipt["outputs"]["report.json"]["exists"] is True
+    assert receipt["outputs"]["12-consumer_glb.glb"]["exists"] is False
+
+
+def test_structured_runner_preserves_nested_report_when_publication_fails(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepare_synthetic_attempt_packet(
+        tmp_path,
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-dir', required=True)\n"
+        "a, _ = p.parse_known_args()\n"
+        "Path(a.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "Path(a.output_json).write_text('{\"status\": \"failed\"}\\n')\n"
+        "Path('report.json').mkdir()\n"
+        "raise SystemExit(9)\n",
+    )
+    work = tmp_path / "work"
+
+    rc, receipt = _run_synthetic_attempt_packet(packet, work, monkeypatch)
+
+    fallback = work / "kaggle_cuda_witness_child_report.json"
+    assert rc == 8
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "output_publication"
+    assert receipt["execution_outputs"]["report.json"]["exists"] is True
+    assert receipt["child_report_fallback"]["exists"] is True
+    assert json.loads(fallback.read_text())["status"] == "failed"
 
 
 @pytest.mark.parametrize("spec_kind", ("malformed", "wrong_schema"))

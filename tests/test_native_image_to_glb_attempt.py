@@ -1,3 +1,4 @@
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -34,6 +35,70 @@ def _dinov3_assets(sources: Path) -> dict[str, AttemptAsset]:
             "preprocessor_config.json",
         )
     }
+
+
+def _review_attempt_spec(tmp_path: Path) -> NativeImageToGLBAttemptSpec:
+    sources = tmp_path / "review-sources"
+    sources.mkdir()
+    return NativeImageToGLBAttemptSpec(
+        run_id="31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        dataset_id="operator/native-image-review-inputs",
+        kernel_id="operator/native-image-review-cuda",
+        title="Native Image Review CUDA",
+        capsule_dir=tmp_path / "review-capsule",
+        output_dir=tmp_path / "review-packet",
+        entrypoint=_asset(sources / "entrypoint.py", "entrypoint.py", b"entry"),
+        authority_helper=_asset(
+            sources / "authority.py", "witness_authority.py", b"authority"
+        ),
+        image=_asset(sources / "image.png", "image.png", b"image"),
+        dinov3_files=_dinov3_assets(sources),
+        rembg_files={
+            name: _asset(
+                sources / f"rembg-{name}",
+                f"rembg-{name}",
+                name.encode(),
+            )
+            for name in (
+                "model.safetensors",
+                "config.json",
+                "birefnet.py",
+                "BiRefNet_config.py",
+            )
+        },
+        expected_outputs=("12-consumer_glb.glb",),
+    )
+
+
+def test_structured_attempt_rejects_escaping_output_coordinate_before_mutation(
+    tmp_path,
+):
+    spec = replace(_review_attempt_spec(tmp_path), output_coordinate="../escape")
+    spec.capsule_dir.mkdir()
+    marker = spec.capsule_dir / "preserve-me.txt"
+    marker.write_text("preserved")
+
+    with pytest.raises(AttemptSpecError, match="output coordinate"):
+        build_attempt_packet(spec)
+
+    assert marker.read_text() == "preserved"
+
+
+def test_structured_attempt_rejects_output_publication_alias_graph_before_mutation(
+    tmp_path,
+):
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=("outputs/a.bin", "a.bin"),
+    )
+    spec.capsule_dir.mkdir()
+    marker = spec.capsule_dir / "preserve-me.txt"
+    marker.write_text("preserved")
+
+    with pytest.raises(AttemptSpecError, match="expected output"):
+        build_attempt_packet(spec)
+
+    assert marker.read_text() == "preserved"
 
 
 def test_structured_attempt_requires_hash_bound_dinov3_model_path(tmp_path):

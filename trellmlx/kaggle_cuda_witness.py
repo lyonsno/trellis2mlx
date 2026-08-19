@@ -468,6 +468,8 @@ def build_kernel_status_command(packet: KaggleCudaWitnessPacket) -> list[str]:
 
 def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Path) -> list[str]:
     output_names = (*packet.outputs, "kaggle_cuda_witness_receipt.json")
+    if packet.attempt_manifest is not None:
+        output_names += ("kaggle_cuda_witness_child_report.json",)
     file_pattern = r"\A(?:" + "|".join(re.escape(name) for name in output_names) + r")\Z"
     return [
         "kaggle",
@@ -1004,6 +1006,45 @@ def _validate_packet_argument_identity(
         )
 
 
+def _validate_flat_attempt_coordinate(value: str, *, role: str) -> str:
+    coordinate = PurePosixPath(value)
+    if (
+        coordinate.is_absolute()
+        or len(coordinate.parts) != 1
+        or coordinate.name in {"", ".", ".."}
+        or coordinate.as_posix() != value
+    ):
+        raise WitnessPacketError(
+            f"attempt-bearing packet {role} must be canonical, flat, and relative"
+        )
+    return value
+
+
+def _validate_attempt_output_graph(packet: KaggleCudaWitnessPacket) -> None:
+    output_coordinate = _validate_flat_attempt_coordinate(
+        _entrypoint_argument(packet, "--output-dir"),
+        role="output coordinate",
+    )
+    work_coordinate = _validate_flat_attempt_coordinate(
+        _entrypoint_argument(packet, "--work-dir"),
+        role="work coordinate",
+    )
+    if output_coordinate == work_coordinate:
+        raise WitnessPacketError(
+            "attempt-bearing packet output and work coordinates must be distinct"
+        )
+    for output in packet.outputs:
+        _validate_flat_attempt_coordinate(output, role="published output")
+    if {output_coordinate, work_coordinate} & set(packet.outputs):
+        raise WitnessPacketError(
+            "attempt-bearing packet output/work coordinates collide with a published output"
+        )
+    if {output_coordinate, work_coordinate} & set(packet.inputs):
+        raise WitnessPacketError(
+            "attempt-bearing packet output/work coordinates collide with a staged input"
+        )
+
+
 def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
     for field, value in (("dataset_id", packet.dataset_id), ("kernel_id", packet.kernel_id)):
         if len(value.split("/")) != 2 or not all(value.split("/")):
@@ -1047,6 +1088,8 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         )
     if packet.attempt_manifest is not None and packet.attempt_manifest not in packet.inputs:
         raise WitnessPacketError("attempt_manifest must be one of the staged inputs")
+    if packet.attempt_manifest is not None:
+        _validate_attempt_output_graph(packet)
     if (
         packet.sparse_flow_noise_sample_sha256 is not None
         and re.fullmatch(r"[0-9a-f]{64}", packet.sparse_flow_noise_sample_sha256) is None
@@ -1057,8 +1100,14 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
     canonical_outputs = tuple(_canonical_output_name(output) for output in packet.outputs)
     if len(set(canonical_outputs)) != len(canonical_outputs):
         raise WitnessPacketError("declared outputs must be canonically unique")
-    if "kaggle_cuda_witness_receipt.json" in canonical_outputs:
-        raise WitnessPacketError("declared output collides with the witness receipt")
+    reserved_outputs = {"kaggle_cuda_witness_receipt.json": "witness receipt"}
+    if packet.attempt_manifest is not None:
+        reserved_outputs["kaggle_cuda_witness_child_report.json"] = (
+            "child report fallback"
+        )
+    for output, role in reserved_outputs.items():
+        if output in canonical_outputs:
+            raise WitnessPacketError(f"declared output collides with the {role}")
 
 
 def _validate_inputs(packet: KaggleCudaWitnessPacket) -> dict[str, Path]:
@@ -1138,6 +1187,14 @@ def _kernel_metadata(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
 
 def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
     manifest_path = packet.dataset_dir / "witness-manifest.json"
+    attempt_contract = (
+        _native_attempt_contract(
+            packet,
+            json.loads(manifest_path.read_text()),
+        )
+        if packet.attempt_manifest is not None
+        else None
+    )
     config = {
         "schema": "trellis2mlx.kaggle_cuda_witness.runner_config.v1",
         "dataset_id": packet.dataset_id,
@@ -1164,12 +1221,10 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
             if packet.attempt_manifest is not None
             else None
         ),
-        "attempt_contract": (
-            _native_attempt_contract(
-                packet,
-                json.loads(manifest_path.read_text()),
-            )
-            if packet.attempt_manifest is not None
+        "attempt_contract": attempt_contract,
+        "execution_output_coordinate": (
+            attempt_contract["output_coordinate"]
+            if attempt_contract is not None
             else None
         ),
         "manifest_sha256": sha256_file(manifest_path),
@@ -1189,11 +1244,13 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 CONFIG = json.loads({json.dumps(json.dumps(config, sort_keys=True))})
 RECEIPT = Path("kaggle_cuda_witness_receipt.json")
+CHILD_REPORT_FALLBACK = Path("kaggle_cuda_witness_child_report.json")
 
 
 def sha256_file(path: Path) -> str:
@@ -1279,6 +1336,208 @@ def output_snapshot() -> dict:
             "size_bytes": path.stat().st_size,
         }}
     return records
+
+
+def execution_output_path(name: str) -> Path:
+    coordinate = CONFIG["execution_output_coordinate"]
+    return Path(coordinate) / name if coordinate is not None else Path(name)
+
+
+def confined_output_path(path: Path, *, label: str) -> Path:
+    working_root = Path.cwd().resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(working_root):
+        raise RuntimeError(
+            f"{{label}} escapes the kernel working directory: {{path}} -> {{resolved}}"
+        )
+    return resolved
+
+
+def validated_output_graph() -> dict:
+    graph = {{}}
+    nodes = []
+    for name in CONFIG["outputs"]:
+        source = execution_output_path(name)
+        destination = Path(name)
+        source_resolved = confined_output_path(
+            source,
+            label=f"execution output {{name}}",
+        )
+        destination_resolved = confined_output_path(
+            destination,
+            label=f"publication output {{name}}",
+        )
+        graph[name] = {{
+            "source": source,
+            "source_resolved": source_resolved,
+            "destination": destination,
+            "destination_resolved": destination_resolved,
+        }}
+        nodes.extend(
+            (
+                (f"execution output {{name}}", source_resolved),
+                (f"publication output {{name}}", destination_resolved),
+            )
+        )
+    for index, (left_label, left) in enumerate(nodes):
+        for right_label, right in nodes[index + 1 :]:
+            if left == right or left in right.parents or right in left.parents:
+                raise RuntimeError(
+                    "attempt output graph aliases or overlaps: "
+                    f"{{left_label}}={{left}}, {{right_label}}={{right}}"
+                )
+    return graph
+
+
+def initialize_attempt_outputs() -> None:
+    if CONFIG["execution_output_coordinate"] is None:
+        return
+    graph = validated_output_graph()
+    paths = {{
+        path
+        for record in graph.values()
+        for path in (record["source"], record["destination"])
+    }}
+    confined_output_path(CHILD_REPORT_FALLBACK, label="child report fallback")
+    paths.add(CHILD_REPORT_FALLBACK)
+    for path in paths:
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"declared output target is not a file: {{path}}")
+        path.unlink()
+
+
+def execution_output_snapshot() -> dict:
+    if CONFIG["execution_output_coordinate"] is None:
+        return {{}}
+    try:
+        graph = validated_output_graph()
+    except Exception as exc:
+        return {{
+            "graph_error": f"{{type(exc).__name__}}: {{exc}}",
+        }}
+    records = {{}}
+    for name, paths in graph.items():
+        source = paths["source"]
+        if not source.is_file():
+            records[name] = {{
+                "path": str(source),
+                "exists": False,
+                "sha256": None,
+                "size_bytes": None,
+            }}
+            continue
+        records[name] = {{
+            "path": str(source),
+            "exists": True,
+            "sha256": sha256_file(source),
+            "size_bytes": source.stat().st_size,
+        }}
+    return records
+
+
+def publish_attempt_outputs() -> dict | None:
+    coordinate = CONFIG["execution_output_coordinate"]
+    if coordinate is None:
+        return None
+    records = {{}}
+    staging_root = None
+    try:
+        graph = validated_output_graph()
+        staging_root = Path(
+            tempfile.mkdtemp(prefix=".kaggle-output-publication-", dir=Path.cwd())
+        )
+        for name, paths in graph.items():
+            source = paths["source"]
+            staged = staging_root / name
+            record = {{
+                "source": str(source),
+                "destination": str(paths["destination"]),
+                "staged": False,
+                "published": False,
+            }}
+            if source.is_file():
+                shutil.copy2(source, staged)
+                record.update(
+                    staged=True,
+                    source_sha256=sha256_file(source),
+                    staged_sha256=sha256_file(staged),
+                    size_bytes=staged.stat().st_size,
+                )
+                if record["source_sha256"] != record["staged_sha256"]:
+                    raise RuntimeError(f"staged output digest mismatch for {{name}}")
+            records[name] = record
+        for name, paths in graph.items():
+            record = records[name]
+            if not record["staged"]:
+                continue
+            staged = staging_root / name
+            destination = paths["destination"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{{destination.name}}.publishing")
+            temporary.unlink(missing_ok=True)
+            try:
+                shutil.copy2(staged, temporary)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            destination_sha256 = sha256_file(destination)
+            if destination_sha256 != record["staged_sha256"]:
+                raise RuntimeError(f"published output digest mismatch for {{name}}")
+            record.update(
+                published=True,
+                destination_sha256=destination_sha256,
+            )
+        return {{
+            "status": "done",
+            "mode": "attempt-publication",
+            "coordinate": coordinate,
+            "outputs": records,
+        }}
+    except Exception as exc:
+        return {{
+            "status": "failed",
+            "mode": "attempt-publication",
+            "coordinate": coordinate,
+            "error": f"{{type(exc).__name__}}: {{exc}}",
+            "outputs": records,
+        }}
+    finally:
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def preserve_child_report_fallback() -> dict:
+    record = {{
+        "path": str(CHILD_REPORT_FALLBACK),
+        "exists": False,
+        "sha256": None,
+        "size_bytes": None,
+    }}
+    try:
+        source = execution_output_path(CONFIG["output_json"])
+        confined_output_path(source, label="child report source")
+        confined_output_path(CHILD_REPORT_FALLBACK, label="child report fallback")
+        if not source.is_file():
+            return record
+        temporary = CHILD_REPORT_FALLBACK.with_name(
+            f".{{CHILD_REPORT_FALLBACK.name}}.publishing"
+        )
+        temporary.unlink(missing_ok=True)
+        try:
+            shutil.copy2(source, temporary)
+            temporary.replace(CHILD_REPORT_FALLBACK)
+        finally:
+            temporary.unlink(missing_ok=True)
+        record.update(
+            exists=True,
+            sha256=sha256_file(CHILD_REPORT_FALLBACK),
+            size_bytes=CHILD_REPORT_FALLBACK.stat().st_size,
+        )
+    except Exception as exc:
+        record["error"] = f"{{type(exc).__name__}}: {{exc}}"
+    return record
 
 
 def main() -> int:
@@ -1401,24 +1660,82 @@ def main() -> int:
             )
             return 7
 
-    command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["output_json"]]
+    try:
+        initialize_attempt_outputs()
+    except Exception as exc:
+        write_receipt(
+            "failed",
+            phase="output_initialization",
+            message=f"attempt output initialization failed: {{type(exc).__name__}}: {{exc}}",
+            extra={{"inputs": copied, "outputs": output_snapshot()}},
+        )
+        return 8
+
+    command = [
+        sys.executable,
+        CONFIG["entrypoint"],
+        "--output-json",
+        str(execution_output_path(CONFIG["output_json"])),
+    ]
     if CONFIG["output_npz"]:
-        command += ["--output-npz", CONFIG["output_npz"]]
+        if CONFIG["execution_output_coordinate"] is None:
+            command += ["--output-npz", CONFIG["output_npz"]]
+        else:
+            command += ["--output-npz", str(execution_output_path(CONFIG["output_npz"]))]
     command += CONFIG.get("entrypoint_args", [])
     if CONFIG["output_ply"]:
-        command += ["--output-ply", CONFIG["output_ply"]]
+        if CONFIG["execution_output_coordinate"] is None:
+            command += ["--output-ply", CONFIG["output_ply"]]
+        else:
+            command += ["--output-ply", str(execution_output_path(CONFIG["output_ply"]))]
     if CONFIG["output_mesh_state"]:
-        command += ["--output-mesh-state", CONFIG["output_mesh_state"]]
+        if CONFIG["execution_output_coordinate"] is None:
+            command += ["--output-mesh-state", CONFIG["output_mesh_state"]]
+        else:
+            command += ["--output-mesh-state", str(execution_output_path(CONFIG["output_mesh_state"]))]
     if CONFIG["output_shape_slat"]:
-        command += ["--output-shape-slat", CONFIG["output_shape_slat"]]
+        if CONFIG["execution_output_coordinate"] is None:
+            command += ["--output-shape-slat", CONFIG["output_shape_slat"]]
+        else:
+            command += ["--output-shape-slat", str(execution_output_path(CONFIG["output_shape_slat"]))]
     if CONFIG["output_shape_flow_step"]:
-        command += ["--output-shape-flow-step", CONFIG["output_shape_flow_step"]]
+        if CONFIG["execution_output_coordinate"] is None:
+            command += ["--output-shape-flow-step", CONFIG["output_shape_flow_step"]]
+        else:
+            command += ["--output-shape-flow-step", str(execution_output_path(CONFIG["output_shape_flow_step"]))]
     if CONFIG["shape_flow_noise_sample"]:
         command += ["--shape-flow-noise-sample", CONFIG["shape_flow_noise_sample"]]
     if CONFIG["sparse_flow_noise_sample"]:
         command += ["--sparse-flow-noise-sample", CONFIG["sparse_flow_noise_sample"]]
         command += ["--sparse-flow-noise-sample-sha256", CONFIG["sparse_flow_noise_sample_sha256"]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    output_publication = publish_attempt_outputs()
+    execution_outputs = execution_output_snapshot()
+    if (
+        output_publication is not None
+        and output_publication.get("status") != "done"
+    ):
+        child_report_fallback = preserve_child_report_fallback()
+        write_receipt(
+            "failed",
+            phase="output_publication",
+            message=(
+                "attempt output publication failed: "
+                f"{{output_publication.get('error')}}"
+            ),
+            extra={{
+                "effective_command": command,
+                "inputs": copied,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "exit_code": completed.returncode,
+                "output_publication": output_publication,
+                "execution_outputs": execution_outputs,
+                "child_report_fallback": child_report_fallback,
+                "outputs": output_snapshot(),
+            }},
+        )
+        return 8
     extra = {{
         "effective_dataset_dir": str(dataset_dir),
         "effective_command": command,
@@ -1433,6 +1750,9 @@ def main() -> int:
         "outputs": output_snapshot(),
         "mounted_input_snapshot": mounted_input_snapshot(),
     }}
+    if output_publication is not None:
+        extra["output_publication"] = output_publication
+        extra["execution_outputs"] = execution_outputs
     if completed.returncode != 0:
         write_receipt("failed", phase="execution", message="probe exited non-zero", extra=extra)
         return completed.returncode

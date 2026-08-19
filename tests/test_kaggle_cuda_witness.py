@@ -1021,6 +1021,34 @@ def test_prepare_packet_rejects_normalized_output_aliases(tmp_path):
         )
 
 
+def test_generic_packet_preserves_child_report_filename_admission(tmp_path):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/generic-child-report-inputs",
+            kernel_id="operator/generic-child-report-cuda",
+            title="Generic Child Report CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            output_json="kaggle_cuda_witness_child_report.json",
+            output_npz=None,
+        )
+    )
+
+    assert packet.attempt_manifest is None
+    assert packet.outputs == ("kaggle_cuda_witness_child_report.json",)
+
+
 @pytest.mark.parametrize("unsafe_output", ("../outside.json", "/tmp/outside.json"))
 def test_load_prepared_packet_rejects_unsafe_manifest_output(
     tmp_path,

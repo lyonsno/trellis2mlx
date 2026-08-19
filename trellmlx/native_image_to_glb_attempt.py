@@ -210,6 +210,65 @@ def _validate_asset(asset: AttemptAsset, *, role: str) -> None:
         )
 
 
+def _validate_flat_relative_coordinate(value: str, *, role: str) -> None:
+    coordinate = PurePosixPath(value)
+    if (
+        coordinate.is_absolute()
+        or len(coordinate.parts) != 1
+        or coordinate.name in {"", ".", ".."}
+        or coordinate.as_posix() != value
+    ):
+        raise AttemptSpecError(f"attempt {role} must be canonical, flat, and relative")
+
+
+def _validate_execution_coordinates(spec: NativeImageToGLBAttemptSpec) -> None:
+    _validate_flat_relative_coordinate(
+        spec.output_coordinate,
+        role="output coordinate",
+    )
+    _validate_flat_relative_coordinate(
+        spec.work_coordinate,
+        role="work coordinate",
+    )
+    if spec.output_coordinate == spec.work_coordinate:
+        raise AttemptSpecError("attempt output and work coordinates must be distinct")
+
+    published_outputs = ("report.json", *spec.expected_outputs)
+    if len(set(published_outputs)) != len(published_outputs):
+        raise AttemptSpecError("attempt expected outputs collide with the report output")
+    for output in published_outputs:
+        _validate_flat_relative_coordinate(output, role="expected output")
+    reserved_wrapper_outputs = {
+        "kaggle_cuda_witness_receipt.json",
+        "kaggle_cuda_witness_child_report.json",
+    }
+    if reserved_wrapper_outputs & set(published_outputs):
+        raise AttemptSpecError(
+            "attempt expected outputs collide with a witness wrapper output"
+        )
+
+    asset_coordinates = {
+        spec.entrypoint.coordinate,
+        spec.authority_helper.coordinate,
+        spec.image.coordinate,
+        *(asset.coordinate for asset in spec.dinov3_files.values()),
+        *(asset.coordinate for asset in spec.rembg_files.values()),
+        ATTEMPT_MANIFEST,
+    }
+    reserved = {
+        spec.output_coordinate,
+        spec.work_coordinate,
+    }
+    if reserved & set(published_outputs):
+        raise AttemptSpecError(
+            "attempt output/work coordinates collide with a published output"
+        )
+    if reserved & asset_coordinates:
+        raise AttemptSpecError(
+            "attempt output/work coordinates collide with a staged input"
+        )
+
+
 def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
     return {
         "schema": ATTEMPT_MANIFEST_SCHEMA,
@@ -381,6 +440,7 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         spec.expected_outputs
     ):
         raise AttemptSpecError("attempt expected outputs are missing or duplicated")
+    _validate_execution_coordinates(spec)
     validate_attempt_topology(spec)
 
     ordered_assets: dict[str, AttemptAsset] = {
