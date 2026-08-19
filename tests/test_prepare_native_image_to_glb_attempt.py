@@ -25,7 +25,7 @@ def _write_valid_spec(tmp_path: Path, *, spec_path: Path | None = None) -> Path:
         }
 
     payload = {
-        "schema": "trellis2mlx.native_image_to_glb_attempt_spec.v1",
+        "schema": "trellis2mlx.native_image_to_glb_attempt_spec.v2",
         "run_id": "31fce6b7-853b-4a0f-b99d-518be23ebabc",
         "dataset_id": "operator/topology-inputs",
         "kernel_id": "operator/topology-cuda",
@@ -35,6 +35,14 @@ def _write_valid_spec(tmp_path: Path, *, spec_path: Path | None = None) -> Path:
         "entrypoint": asset("entrypoint.py", "entrypoint.py"),
         "authority_helper": asset("authority.py", "witness_authority.py"),
         "image": asset("image.png", "image.png"),
+        "dinov3_files": {
+            name: asset(f"dinov3-{name}", name)
+            for name in (
+                "model.safetensors",
+                "config.json",
+                "preprocessor_config.json",
+            )
+        },
         "rembg_files": {
             name: asset(name, f"rembg-{name}")
             for name in (
@@ -113,6 +121,9 @@ def test_preparer_rejects_spec_and_report_aliases_before_managed_mutation(
         "entrypoint",
         "authority_helper",
         "image",
+        "dinov3:model.safetensors",
+        "dinov3:config.json",
+        "dinov3:preprocessor_config.json",
         "rembg:model.safetensors",
         "rembg:config.json",
         "rembg:birefnet.py",
@@ -127,6 +138,8 @@ def test_preparer_rejects_report_alias_with_every_protected_asset(
     payload = json.loads(spec_path.read_text())
     if asset_role.startswith("rembg:"):
         asset = payload["rembg_files"][asset_role.split(":", 1)[1]]
+    elif asset_role.startswith("dinov3:"):
+        asset = payload["dinov3_files"][asset_role.split(":", 1)[1]]
     else:
         asset = payload[asset_role]
     report_path = Path(asset["source"])

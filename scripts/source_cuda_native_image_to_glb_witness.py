@@ -2338,6 +2338,45 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             "native image-to-GLB packet RMBG coordinates must be distinct"
         )
 
+    if packet.attempt_manifest is not None:
+        if any(
+            argument.startswith("--dinov3-model-path=")
+            for argument in packet.entrypoint_args
+        ):
+            raise WitnessPacketError(
+                "native image-to-GLB packet DINOv3 model coordinate must use separate-token form"
+            )
+        if required_argument("--dinov3-model-path") != ".":
+            raise WitnessPacketError(
+                "native image-to-GLB packet DINOv3 model coordinate must be '.'"
+            )
+        dinov3_sources: dict[str, Path] = {}
+        for role, expected in DINOV3_FILES.items():
+            if packet.inputs.count(role) != 1:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet requires exactly one DINOv3 {role} input"
+                )
+            source = (capsule_root / role).resolve()
+            if source.parent != capsule_root:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet DINOv3 source escapes packet custody for {role}"
+                )
+            if not source.is_file() or source.stat().st_size <= 0:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet DINOv3 source is missing or blank for {role}: {source}"
+                )
+            actual = sha256_file(source)
+            if actual != expected:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet DINOv3 {role} SHA256 mismatch: "
+                    f"expected {expected}, got {actual}"
+                )
+            dinov3_sources[role] = source
+        if len(set(dinov3_sources.values())) != len(DINOV3_FILES):
+            raise WitnessPacketError(
+                "native image-to-GLB packet DINOv3 source identities must be distinct"
+            )
+
     output_dir = effective_kaggle_path(required_argument("--output-dir"))
     work_dir = effective_kaggle_path(required_argument("--work-dir"))
     if (
@@ -2448,6 +2487,30 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
                 raise WitnessPacketError(
                     f"native image-to-GLB packet manifest RMBG digest or size mismatch for {role}"
                 )
+        if packet.attempt_manifest is not None:
+            for role, expected in DINOV3_FILES.items():
+                admitted = candidate_packet.dataset_dir / role
+                record = manifest_files.get(role)
+                if not admitted.is_file() or admitted.stat().st_size <= 0:
+                    raise WitnessPacketError(
+                        f"native image-to-GLB packet admitted DINOv3 file is missing or blank for {role}"
+                    )
+                actual_sha256 = sha256_file(admitted)
+                actual_size = admitted.stat().st_size
+                if actual_sha256 != expected:
+                    raise WitnessPacketError(
+                        f"native image-to-GLB packet admitted DINOv3 {role} SHA256 mismatch: "
+                        f"expected {expected}, got {actual_sha256}"
+                    )
+                if (
+                    not isinstance(record, dict)
+                    or record.get("sha256") != actual_sha256
+                    or type(record.get("size_bytes")) is not int
+                    or record["size_bytes"] != actual_size
+                ):
+                    raise WitnessPacketError(
+                        f"native image-to-GLB packet manifest DINOv3 digest or size mismatch for {role}"
+                    )
 
         if packet.attempt_manifest is not None and (
             (capsule_root / packet.attempt_manifest).read_bytes() != attempt_bytes

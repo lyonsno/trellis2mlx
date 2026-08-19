@@ -39,6 +39,7 @@ class NativeImageToGLBAttemptSpec:
     entrypoint: AttemptAsset
     authority_helper: AttemptAsset
     image: AttemptAsset
+    dinov3_files: Mapping[str, AttemptAsset]
     rembg_files: Mapping[str, AttemptAsset]
     expected_outputs: tuple[str, ...]
     output_coordinate: str = "outputs"
@@ -53,8 +54,15 @@ REMBG_ARGUMENTS = {
     "birefnet.py": "--rembg-birefnet-file",
     "BiRefNet_config.py": "--rembg-birefnet-config-file",
 }
+DINOV3_FILENAMES = (
+    "model.safetensors",
+    "config.json",
+    "preprocessor_config.json",
+)
+DINOV3_MODEL_COORDINATE = "."
 ATTEMPT_MANIFEST = "native-image-to-glb-attempt.json"
-ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v1"
+ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v2"
+ATTEMPT_MANIFEST_SCHEMA = "trellis2mlx.native_image_to_glb_attempt.v2"
 
 
 def load_attempt_spec_bytes(
@@ -78,6 +86,7 @@ def load_attempt_spec_bytes(
         "entrypoint",
         "authority_helper",
         "image",
+        "dinov3_files",
         "rembg_files",
         "expected_outputs",
         "output_coordinate",
@@ -111,6 +120,9 @@ def load_attempt_spec_bytes(
             size_bytes=value["size_bytes"],
         )
 
+    dinov3_payload = payload["dinov3_files"]
+    if not isinstance(dinov3_payload, dict):
+        raise AttemptSpecError("attempt DINOv3 file map is invalid")
     rembg_payload = payload["rembg_files"]
     if not isinstance(rembg_payload, dict):
         raise AttemptSpecError("attempt RMBG file map is invalid")
@@ -142,6 +154,10 @@ def load_attempt_spec_bytes(
         entrypoint=asset(payload["entrypoint"], "entrypoint"),
         authority_helper=asset(payload["authority_helper"], "authority helper"),
         image=asset(payload["image"], "image"),
+        dinov3_files={
+            role: asset(value, f"DINOv3 {role}")
+            for role, value in dinov3_payload.items()
+        },
         rembg_files={
             role: asset(value, f"RMBG {role}")
             for role, value in rembg_payload.items()
@@ -196,7 +212,7 @@ def _validate_asset(asset: AttemptAsset, *, role: str) -> None:
 
 def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
     return {
-        "schema": "trellis2mlx.native_image_to_glb_attempt.v1",
+        "schema": ATTEMPT_MANIFEST_SCHEMA,
         "run_id": spec.run_id,
         "dataset_id": spec.dataset_id,
         "kernel_id": spec.kernel_id,
@@ -234,6 +250,7 @@ def validate_attempt_topology(spec: NativeImageToGLBAttemptSpec) -> None:
         spec.entrypoint,
         spec.authority_helper,
         spec.image,
+        *spec.dinov3_files.values(),
         *spec.rembg_files.values(),
     )
     for asset in assets:
@@ -264,7 +281,7 @@ def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
     }
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt manifest field set is invalid")
-    if payload.get("schema") != "trellis2mlx.native_image_to_glb_attempt.v1":
+    if payload.get("schema") != ATTEMPT_MANIFEST_SCHEMA:
         raise AttemptSpecError("attempt manifest schema is invalid")
     return payload
 
@@ -311,6 +328,8 @@ def validate_attempt_manifest(
         raise AttemptSpecError("attempt manifest output coordinate mismatch")
     if payload.get("work_coordinate") != argument("--work-dir"):
         raise AttemptSpecError("attempt manifest work coordinate mismatch")
+    if argument("--dinov3-model-path") != DINOV3_MODEL_COORDINATE:
+        raise AttemptSpecError("attempt manifest DINOv3 model coordinate mismatch")
     assets = payload.get("assets")
     if not isinstance(assets, dict):
         raise AttemptSpecError("attempt manifest assets are missing")
@@ -318,6 +337,7 @@ def validate_attempt_manifest(
         "entrypoint": packet.entrypoint,
         "authority_helper": "witness_authority.py",
         "image": argument("--image"),
+        **{f"dinov3:{role}": role for role in DINOV3_FILENAMES},
         **{
             f"rembg:{role}": argument(flag)
             for role, flag in REMBG_ARGUMENTS.items()
@@ -353,6 +373,8 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         raise AttemptSpecError("attempt run identity is missing or invalid") from exc
     if str(parsed_run_id) != spec.run_id:
         raise AttemptSpecError("attempt run identity is not canonical")
+    if set(spec.dinov3_files) != set(DINOV3_FILENAMES):
+        raise AttemptSpecError("attempt DINOv3 role set is incomplete")
     if set(spec.rembg_files) != set(REMBG_ARGUMENTS):
         raise AttemptSpecError("attempt RMBG role set is incomplete")
     if not spec.expected_outputs or len(set(spec.expected_outputs)) != len(
@@ -365,8 +387,20 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         "entrypoint": spec.entrypoint,
         "authority_helper": spec.authority_helper,
         "image": spec.image,
+        **{f"dinov3:{role}": spec.dinov3_files[role] for role in DINOV3_FILENAMES},
         **{f"rembg:{role}": spec.rembg_files[role] for role in REMBG_ARGUMENTS},
     }
+    for role in DINOV3_FILENAMES:
+        if spec.dinov3_files[role].coordinate != role:
+            raise AttemptSpecError(
+                f"DINOv3 {role} coordinate must equal its canonical filename"
+            )
+    dinov3_sources = [
+        Path(spec.dinov3_files[role].source).resolve()
+        for role in DINOV3_FILENAMES
+    ]
+    if len(set(dinov3_sources)) != len(DINOV3_FILENAMES):
+        raise AttemptSpecError("attempt DINOv3 source identities must be distinct")
     coordinates = [asset.coordinate for asset in ordered_assets.values()]
     if ATTEMPT_MANIFEST in coordinates or len(set(coordinates)) != len(coordinates):
         raise AttemptSpecError("attempt asset coordinates must be distinct")
@@ -433,6 +467,7 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
             spec.entrypoint.coordinate,
             spec.authority_helper.coordinate,
             spec.image.coordinate,
+            *(spec.dinov3_files[role].coordinate for role in DINOV3_FILENAMES),
             *(spec.rembg_files[role].coordinate for role in REMBG_ARGUMENTS),
             ATTEMPT_MANIFEST,
         ),
@@ -447,6 +482,8 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
             spec.output_coordinate,
             "--work-dir",
             spec.work_coordinate,
+            "--dinov3-model-path",
+            DINOV3_MODEL_COORDINATE,
             *rembg_arguments,
         ),
         run_id=spec.run_id,

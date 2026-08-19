@@ -107,6 +107,7 @@ def prepare_attempt_from_path(
             spec.entrypoint,
             spec.authority_helper,
             spec.image,
+            *spec.dinov3_files.values(),
             *spec.rembg_files.values(),
         )
         protected = (spec_path, *(Path(asset.source).resolve() for asset in assets))

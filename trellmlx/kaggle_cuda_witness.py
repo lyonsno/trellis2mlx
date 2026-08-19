@@ -1522,10 +1522,18 @@ def _native_attempt_contract(
     files = outer_manifest.get("files")
     if not isinstance(files, dict):
         raise WitnessPacketError("attempt-bearing packet outer file records are missing")
+    dinov3_model_coordinate = _entrypoint_argument(packet, "--dinov3-model-path")
+    if dinov3_model_coordinate != ".":
+        raise WitnessPacketError(
+            "attempt-bearing packet DINOv3 model coordinate must be '.'"
+        )
     role_coordinates = {
         "entrypoint": packet.entrypoint,
         "authority_helper": "witness_authority.py",
         "image": _entrypoint_argument(packet, "--image"),
+        "dinov3:model.safetensors": "model.safetensors",
+        "dinov3:config.json": "config.json",
+        "dinov3:preprocessor_config.json": "preprocessor_config.json",
         "rembg:model.safetensors": _entrypoint_argument(
             packet, "--rembg-model-file"
         ),
@@ -1548,7 +1556,7 @@ def _native_attempt_contract(
             "size_bytes": record.get("size_bytes"),
         }
     return {
-        "schema": "trellis2mlx.native_image_to_glb_attempt.v1",
+        "schema": "trellis2mlx.native_image_to_glb_attempt.v2",
         "run_id": packet.run_id,
         "dataset_id": packet.dataset_id,
         "kernel_id": packet.kernel_id,
