@@ -55,6 +55,7 @@ class KaggleCudaWitnessPacket:
     shape_flow_noise_sample: str | None = None
     sparse_flow_noise_sample: str | None = None
     sparse_flow_noise_sample_sha256: str | None = None
+    attempt_manifest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -126,6 +127,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
             "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+            "attempt_manifest": packet.attempt_manifest,
         },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
@@ -237,6 +239,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         shape_flow_noise_sample=input_roles.get("shape_flow_noise_sample"),
         sparse_flow_noise_sample=input_roles.get("sparse_flow_noise_sample"),
         sparse_flow_noise_sample_sha256=input_roles.get("sparse_flow_noise_sample_sha256"),
+        attempt_manifest=input_roles.get("attempt_manifest"),
     )
     _validate_refs(packet)
     return packet
@@ -941,6 +944,7 @@ def _prepared_summary(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
             "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+            "attempt_manifest": packet.attempt_manifest,
         },
         "outputs": list(packet.outputs),
         "dataset_dir": str(packet.dataset_dir),
@@ -1041,6 +1045,8 @@ def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
         raise WitnessPacketError(
             "sparse_flow_noise_sample and its expected SHA256 must be provided together"
         )
+    if packet.attempt_manifest is not None and packet.attempt_manifest not in packet.inputs:
+        raise WitnessPacketError("attempt_manifest must be one of the staged inputs")
     if (
         packet.sparse_flow_noise_sample_sha256 is not None
         and re.fullmatch(r"[0-9a-f]{64}", packet.sparse_flow_noise_sample_sha256) is None
@@ -1152,6 +1158,20 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "shape_flow_noise_sample": packet.shape_flow_noise_sample,
         "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
         "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+        "attempt_manifest_name": packet.attempt_manifest,
+        "attempt_manifest": (
+            json.loads((packet.capsule_dir / packet.attempt_manifest).read_text())
+            if packet.attempt_manifest is not None
+            else None
+        ),
+        "attempt_contract": (
+            _native_attempt_contract(
+                packet,
+                json.loads(manifest_path.read_text()),
+            )
+            if packet.attempt_manifest is not None
+            else None
+        ),
         "manifest_sha256": sha256_file(manifest_path),
         "manifest_identity": _manifest_identity(packet),
         "source_identity": {
@@ -1345,6 +1365,42 @@ def main() -> int:
         shutil.copy2(source, destination)
         copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
 
+    if CONFIG["attempt_manifest_name"] is not None:
+        attempt_path = Path(CONFIG["attempt_manifest_name"])
+        try:
+            attempt = json.loads(attempt_path.read_text())
+        except Exception as exc:
+            write_receipt(
+                "failed",
+                phase="attempt_manifest",
+                message=f"attempt manifest is unreadable: {{type(exc).__name__}}: {{exc}}",
+                extra={{"inputs": copied}},
+            )
+            return 7
+        if attempt != CONFIG["attempt_manifest"]:
+            write_receipt(
+                "failed",
+                phase="attempt_manifest",
+                message="attempt manifest semantic payload mismatch",
+                extra={{
+                    "expected_attempt_manifest": CONFIG["attempt_manifest"],
+                    "actual_attempt_manifest": attempt,
+                    "inputs": copied,
+                }},
+            )
+            return 7
+        if attempt != CONFIG["attempt_contract"]:
+            write_receipt(
+                "failed",
+                phase="attempt_manifest",
+                message="attempt manifest does not reconcile to effective runner config",
+                extra={{
+                    "expected_attempt_contract": CONFIG["attempt_contract"],
+                    "attempt_manifest": attempt,
+                }},
+            )
+            return 7
+
     command = [sys.executable, CONFIG["entrypoint"], "--output-json", CONFIG["output_json"]]
     if CONFIG["output_npz"]:
         command += ["--output-npz", CONFIG["output_npz"]]
@@ -1431,6 +1487,7 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
             "sparse_flow_noise_sample_sha256": packet.sparse_flow_noise_sample_sha256,
+            "attempt_manifest": packet.attempt_manifest,
         },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
@@ -1444,6 +1501,64 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
             "shape_flow_step": packet.output_shape_flow_step,
             "expected": list(packet.expected_outputs),
         },
+    }
+
+
+def _entrypoint_argument(packet: KaggleCudaWitnessPacket, flag: str) -> str:
+    positions = [
+        index for index, value in enumerate(packet.entrypoint_args) if value == flag
+    ]
+    if len(positions) != 1 or positions[0] + 1 >= len(packet.entrypoint_args):
+        raise WitnessPacketError(
+            f"attempt-bearing packet requires exactly one {flag} value"
+        )
+    return packet.entrypoint_args[positions[0] + 1]
+
+
+def _native_attempt_contract(
+    packet: KaggleCudaWitnessPacket,
+    outer_manifest: dict[str, object],
+) -> dict[str, object]:
+    files = outer_manifest.get("files")
+    if not isinstance(files, dict):
+        raise WitnessPacketError("attempt-bearing packet outer file records are missing")
+    role_coordinates = {
+        "entrypoint": packet.entrypoint,
+        "authority_helper": "witness_authority.py",
+        "image": _entrypoint_argument(packet, "--image"),
+        "rembg:model.safetensors": _entrypoint_argument(
+            packet, "--rembg-model-file"
+        ),
+        "rembg:config.json": _entrypoint_argument(packet, "--rembg-config-file"),
+        "rembg:birefnet.py": _entrypoint_argument(packet, "--rembg-birefnet-file"),
+        "rembg:BiRefNet_config.py": _entrypoint_argument(
+            packet, "--rembg-birefnet-config-file"
+        ),
+    }
+    assets = {}
+    for role, coordinate in role_coordinates.items():
+        record = files.get(coordinate)
+        if not isinstance(record, dict):
+            raise WitnessPacketError(
+                f"attempt-bearing packet file record is missing for {role}"
+            )
+        assets[role] = {
+            "coordinate": coordinate,
+            "sha256": record.get("sha256"),
+            "size_bytes": record.get("size_bytes"),
+        }
+    return {
+        "schema": "trellis2mlx.native_image_to_glb_attempt.v1",
+        "run_id": packet.run_id,
+        "dataset_id": packet.dataset_id,
+        "kernel_id": packet.kernel_id,
+        "title": packet.title,
+        "accelerator": packet.accelerator,
+        "enable_internet": packet.enable_internet,
+        "output_coordinate": _entrypoint_argument(packet, "--output-dir"),
+        "work_coordinate": _entrypoint_argument(packet, "--work-dir"),
+        "expected_outputs": list(packet.expected_outputs),
+        "assets": assets,
     }
 
 

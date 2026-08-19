@@ -1,6 +1,9 @@
+import ast
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +46,131 @@ def _base_args(tmp_path: Path, image: Path) -> list[str]:
         "--work-dir",
         str(tmp_path / "runtime"),
     ]
+
+
+def _stage_packet_rembg(capsule: Path, witness, monkeypatch):
+    payloads = {
+        "model.safetensors": b"packet-rembg-model",
+        "config.json": b"packet-rembg-config",
+        "birefnet.py": b"packet-rembg-implementation",
+        "BiRefNet_config.py": b"packet-rembg-configuration",
+    }
+    coordinates = {
+        "model.safetensors": "rembg-model.safetensors",
+        "config.json": "rembg-config.json",
+        "birefnet.py": "rembg-birefnet.py",
+        "BiRefNet_config.py": "rembg-BiRefNet-config.py",
+    }
+    expected = {}
+    for role, payload in payloads.items():
+        path = capsule / coordinates[role]
+        path.write_bytes(payload)
+        expected[role] = _sha256(path)
+    monkeypatch.setattr(witness, "REMBG_FILES", expected)
+    arguments = tuple(
+        item
+        for role, attribute in witness.REMBG_FILE_ARGUMENTS.items()
+        for item in (f"--{attribute.replace('_', '-')}", coordinates[role])
+    )
+    return coordinates, arguments, expected
+
+
+def _stage_authority_helper(capsule: Path) -> str:
+    import trellmlx.witness_authority as authority
+
+    coordinate = "witness_authority.py"
+    shutil.copy2(authority.__file__, capsule / coordinate)
+    return coordinate
+
+
+def _native_packet_contract(tmp_path: Path, monkeypatch):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
+    entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
+    image = capsule / "9_img.png"
+    image.write_bytes(b"native-packet-input")
+    coordinates, rembg_arguments, expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
+    run_id = "31fce6b7-853b-4a0f-b99d-518be23ebabc"
+    image_sha256 = _sha256(image)
+    expected_outputs = tuple(
+        f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
+        for index, stage in enumerate(EXPECTED_STAGES)
+    )
+    packet = KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=tmp_path / "packet",
+        dataset_id="operator/native-image-anchor-inputs",
+        kernel_id="operator/native-image-anchor-cuda",
+        title="Native Image Anchor CUDA",
+        entrypoint=entrypoint.name,
+        inputs=(entrypoint.name, authority_helper, image.name, *coordinates.values()),
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=expected_outputs,
+        run_id=run_id,
+        expected_image_sha256=image_sha256,
+        entrypoint_args=(
+            "--image",
+            image.name,
+            "--expected-image-sha256",
+            image_sha256,
+            "--run-id",
+            run_id,
+            "--output-dir",
+            "outputs",
+            "--work-dir",
+            "runtime",
+            *rembg_arguments,
+        ),
+    )
+    return witness, packet, coordinates, expected_rembg
+
+
+def _write_download_receipt(packet, bundle_dir: Path) -> None:
+    from trellmlx.kaggle_cuda_witness import sha256_file
+
+    receipt_outputs = {
+        name: {
+            "exists": True,
+            "sha256": sha256_file(bundle_dir / name),
+            "size_bytes": (bundle_dir / name).stat().st_size,
+        }
+        for name in packet.outputs
+    }
+    manifest = packet.dataset_dir / "witness-manifest.json"
+    receipt = {
+        "schema": "trellis2mlx.kaggle_cuda_witness.receipt.v1",
+        "status": "done",
+        "failure_phase": None,
+        "requested_dataset_id": packet.dataset_id,
+        "requested_kernel_id": packet.kernel_id,
+        "requested_accelerator": packet.accelerator,
+        "source_identity": {
+            "dataset_sources": [packet.dataset_id],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+        },
+        "run_id": packet.run_id,
+        "expected_image_sha256": packet.expected_image_sha256,
+        "cuda_available": True,
+        "cuda_device": "Tesla T4",
+        "input_manifest": {
+            "sha256": sha256_file(manifest),
+            "size_bytes": manifest.stat().st_size,
+        },
+        "outputs": receipt_outputs,
+    }
+    (bundle_dir / "kaggle_cuda_witness_receipt.json").write_text(
+        json.dumps(receipt, sort_keys=True) + "\n"
+    )
 
 
 def _write_clean_git_checkout(root: Path) -> None:
@@ -458,6 +586,7 @@ def test_parser_defaults_bind_the_authorized_native_route():
         MODEL_REVISION,
         NVDIFFRAST_COMMIT,
         REMBG_REVISION,
+        REMBG_FILES,
         SPARSE_DECODER_REVISION,
         TRELLIS_COMMIT,
         TRELLIS_REPOSITORY,
@@ -487,6 +616,12 @@ def test_parser_defaults_bind_the_authorized_native_route():
     assert SPARSE_DECODER_REVISION == "25e0d31ffbebe4b5a97464dd851910efc3002d96"
     assert DINOV3_REVISION == "ea8dc2863c51be0a264bab82070e3e8836b02d51"
     assert REMBG_REVISION == "5df4c9c76d8170882c34f6986e848ee07fd0ba43"
+    assert REMBG_FILES == {
+        "model.safetensors": "566ed80c3d95f87ada6864d4cbe2290a1c5eb1c7bb0b123e984f60f76b02c3a7",
+        "config.json": "c97ea21569daf66b205491a4635147dd3bc42c7c168b89d7d75b53f67ef548ae",
+        "birefnet.py": "e499d75224b8819e985e68fb78b7a8e8c99316840474e74e16b5529f03ca2860",
+        "BiRefNet_config.py": "e7b8c2a74f6cea6a59553d517f71d47f2c1d90e670a13416af17c25fe2f3dc52",
+    }
     assert NVDIFFRAST_COMMIT == "253ac4fcea7de5f396371124af597e6cc957bfae"
     assert args.pipeline_type == "512"
     assert args.seed == 42
@@ -495,6 +630,107 @@ def test_parser_defaults_bind_the_authorized_native_route():
     assert args.texture_size == 1024
     assert args.attention_backend == "xformers"
     assert args.sparse_conv_backend == "flex_gemm"
+
+
+@pytest.mark.parametrize(
+    "provided_flags",
+    [
+        ("--rembg-model-file",),
+        ("--rembg-model-file", "--rembg-config-file"),
+        (
+            "--rembg-model-file",
+            "--rembg-config-file",
+            "--rembg-birefnet-file",
+        ),
+    ],
+)
+def test_request_rejects_partial_local_rembg_group(tmp_path, provided_flags):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"authorized-image")
+    arguments = _base_args(tmp_path, image) + ["--no-download"]
+    for flag in provided_flags:
+        arguments.extend([flag, str(tmp_path / flag.removeprefix("--"))])
+    args = witness.build_parser().parse_args(arguments)
+    args.run_id = "11111111-1111-4111-8111-111111111111"
+
+    with pytest.raises(ValueError, match="complete local RMBG file group"):
+        witness._validate_request(args)
+
+
+def test_request_rejects_substituted_local_rembg_file(tmp_path, monkeypatch):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"authorized-image")
+    rembg_payloads = {
+        "model.safetensors": b"model",
+        "config.json": b"config",
+        "birefnet.py": b"implementation",
+        "BiRefNet_config.py": b"configuration",
+    }
+    rembg_paths = {}
+    for name, payload in rembg_payloads.items():
+        path = tmp_path / name
+        path.write_bytes(payload)
+        rembg_paths[name] = path
+    expected = {name: _sha256(path) for name, path in rembg_paths.items()}
+    expected["birefnet.py"] = "0" * 64
+    monkeypatch.setattr(witness, "REMBG_FILES", expected)
+    arguments = _base_args(tmp_path, image) + ["--no-download"]
+    for name, attribute in witness.REMBG_FILE_ARGUMENTS.items():
+        arguments.extend(
+            [f"--{attribute.replace('_', '-')}", str(rembg_paths[name])]
+        )
+    args = witness.build_parser().parse_args(arguments)
+    args.run_id = "11111111-1111-4111-8111-111111111111"
+
+    with pytest.raises(ValueError, match="RMBG birefnet.py SHA256 mismatch"):
+        witness._validate_request(args)
+
+
+def test_failed_rembg_admission_removes_partial_run_custody(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image-authority")
+    dino = tmp_path / "dino"
+    dino.mkdir()
+    (dino / "config.json").write_bytes(b"dino")
+    rembg = tmp_path / "rembg"
+    rembg.mkdir()
+    for name in witness.REMBG_FILES:
+        (rembg / name).write_bytes(name.encode())
+    args = types.SimpleNamespace(
+        image=image,
+        expected_image_sha256=_sha256(image),
+        dinov3_model_path=dino,
+        **{
+            attribute: rembg / name
+            for name, attribute in witness.REMBG_FILE_ARGUMENTS.items()
+        },
+        work_dir=tmp_path / "runtime",
+        run_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    with pytest.raises(RuntimeError, match="authority changed while admitting"):
+        witness.admit_run_inputs(
+            args,
+            {},
+            expected_dinov3_files={"config.json": _sha256(dino / "config.json")},
+            expected_rembg_files={
+                name: (_sha256(rembg / name) if name != "birefnet.py" else "0" * 64)
+                for name in witness.REMBG_FILES
+            },
+        )
+
+    assert not (
+        tmp_path
+        / "runtime"
+        / "admitted-inputs"
+        / "11111111-1111-4111-8111-111111111111"
+    ).exists()
 
 
 def test_wrong_image_digest_fails_before_touching_existing_output(tmp_path):
@@ -647,8 +883,19 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
     capsule.mkdir()
     entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
     entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
     image = capsule / "9_img.png"
     image.write_bytes(b"synthetic-transport-contract-image")
+    rembg_coordinates, rembg_arguments, expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
+    entrypoint.write_text(
+        entrypoint.read_text().replace(
+            "REMBG_FILE_ARGUMENTS = {",
+            f"REMBG_FILES = {expected_rembg!r}\nREMBG_FILE_ARGUMENTS = {{",
+            1,
+        )
+    )
     run_id = "22222222-2222-4222-8222-222222222222"
     image_sha256 = _sha256(image)
     expected_outputs = tuple(
@@ -663,7 +910,7 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
             kernel_id="operator/native-image-anchor-cuda",
             title="Native Image Anchor CUDA",
             entrypoint=entrypoint.name,
-            inputs=(entrypoint.name, image.name),
+            inputs=(entrypoint.name, authority_helper, image.name, *rembg_coordinates.values()),
             run_id=run_id,
             expected_image_sha256=image_sha256,
             output_json="report.json",
@@ -680,6 +927,7 @@ def test_actual_kaggle_runner_reaches_witness_request_validation(tmp_path, monke
                 ".",
                 "--work-dir",
                 str(tmp_path / "runtime"),
+                *rembg_arguments,
                 "--no-download",
             ),
         )
@@ -778,6 +1026,33 @@ def test_native_packet_rejects_missing_attempt_identities_before_output_mutation
     assert marker.read_text() == "preserved"
 
 
+def test_native_packet_rejects_missing_authority_helper_before_output_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    witness, packet, _coordinates, _expected = _native_packet_contract(
+        tmp_path, monkeypatch
+    )
+    packet = replace(
+        packet,
+        inputs=tuple(
+            coordinate
+            for coordinate in packet.inputs
+            if coordinate != "witness_authority.py"
+        ),
+    )
+    packet.output_dir.mkdir()
+    marker = packet.output_dir / "must-survive-helper-rejection.txt"
+    marker.write_text("preserved")
+
+    with pytest.raises(WitnessPacketError, match="authority helper"):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+    assert marker.read_text() == "preserved"
+
+
 @pytest.mark.parametrize(
     ("declared_output_dir", "declared_work_dir", "assignment_form"),
     (
@@ -794,6 +1069,7 @@ def test_native_packet_rejects_remote_output_work_overlap_before_output_mutation
     declared_output_dir,
     declared_work_dir,
     assignment_form,
+    monkeypatch,
 ):
     from scripts import source_cuda_native_image_to_glb_witness as witness
     from trellmlx.kaggle_cuda_witness import (
@@ -805,8 +1081,12 @@ def test_native_packet_rejects_remote_output_work_overlap_before_output_mutation
     capsule.mkdir()
     entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
     entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
     image = capsule / "9_img.png"
     image.write_bytes(b"native-packet-input")
+    rembg_coordinates, rembg_arguments, _expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
     image_sha256 = _sha256(image)
     output_dir = tmp_path / "packet"
     expected_outputs = tuple(
@@ -833,7 +1113,7 @@ def test_native_packet_rejects_remote_output_work_overlap_before_output_mutation
         kernel_id="operator/native-image-anchor-cuda",
         title="Native Image Anchor CUDA",
         entrypoint=entrypoint.name,
-        inputs=(entrypoint.name, image.name),
+        inputs=(entrypoint.name, authority_helper, image.name, *rembg_coordinates.values()),
         output_json="report.json",
         output_npz=None,
         expected_outputs=expected_outputs,
@@ -847,6 +1127,7 @@ def test_native_packet_rejects_remote_output_work_overlap_before_output_mutation
             "--run-id",
             "31fce6b7-853b-4a0f-b99d-518be23ebabc",
             *path_arguments,
+            *rembg_arguments,
         ),
     )
 
@@ -864,6 +1145,7 @@ def test_native_packet_accepts_disjoint_assignment_form_paths(
     tmp_path,
     declared_output_dir,
     declared_work_dir,
+    monkeypatch,
 ):
     from scripts import source_cuda_native_image_to_glb_witness as witness
     from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
@@ -872,8 +1154,12 @@ def test_native_packet_accepts_disjoint_assignment_form_paths(
     capsule.mkdir()
     entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
     entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
     image = capsule / "9_img.png"
     image.write_bytes(b"native-packet-input")
+    rembg_coordinates, rembg_arguments, _expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
     image_sha256 = _sha256(image)
     output_dir = tmp_path / "packet"
     expected_outputs = tuple(
@@ -887,7 +1173,7 @@ def test_native_packet_accepts_disjoint_assignment_form_paths(
         kernel_id="operator/native-image-anchor-cuda",
         title="Native Image Anchor CUDA",
         entrypoint=entrypoint.name,
-        inputs=(entrypoint.name, image.name),
+        inputs=(entrypoint.name, authority_helper, image.name, *rembg_coordinates.values()),
         output_json="report.json",
         output_npz=None,
         expected_outputs=expected_outputs,
@@ -902,6 +1188,7 @@ def test_native_packet_accepts_disjoint_assignment_form_paths(
             "31fce6b7-853b-4a0f-b99d-518be23ebabc",
             f"--output-dir={declared_output_dir}",
             f"--work-dir={declared_work_dir}",
+            *rembg_arguments,
         ),
     )
 
@@ -927,6 +1214,7 @@ def test_native_packet_accepts_disjoint_assignment_form_paths(
 def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
     tmp_path,
     path_arguments,
+    monkeypatch,
 ):
     from scripts import source_cuda_native_image_to_glb_witness as witness
     from trellmlx.kaggle_cuda_witness import (
@@ -938,8 +1226,12 @@ def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
     capsule.mkdir()
     entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
     entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
     image = capsule / "9_img.png"
     image.write_bytes(b"native-packet-input")
+    rembg_coordinates, rembg_arguments, _expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
     image_sha256 = _sha256(image)
     output_dir = tmp_path / "packet"
     output_dir.mkdir()
@@ -956,7 +1248,7 @@ def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
         kernel_id="operator/native-image-anchor-cuda",
         title="Native Image Anchor CUDA",
         entrypoint=entrypoint.name,
-        inputs=(entrypoint.name, image.name),
+        inputs=(entrypoint.name, authority_helper, image.name, *rembg_coordinates.values()),
         output_json="report.json",
         output_npz=None,
         expected_outputs=expected_outputs,
@@ -970,6 +1262,7 @@ def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
             "--run-id",
             "31fce6b7-853b-4a0f-b99d-518be23ebabc",
             *path_arguments,
+            *rembg_arguments,
         ),
     )
 
@@ -980,8 +1273,160 @@ def test_native_packet_rejects_malformed_path_arguments_before_output_mutation(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    (
+        "all_omitted",
+        "partial_1",
+        "partial_2",
+        "partial_3",
+        "duplicate_flag",
+        "duplicate_coordinate",
+        "coordinate_absent_from_inputs",
+        "nested_coordinate",
+        "escaping_coordinate",
+        "missing_source",
+        "wrong_digest:model.safetensors",
+        "wrong_digest:config.json",
+        "wrong_digest:birefnet.py",
+        "wrong_digest:BiRefNet_config.py",
+    ),
+)
+def test_native_packet_rejects_invalid_rembg_custody_before_output_mutation(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    witness, packet, coordinates, _expected = _native_packet_contract(
+        tmp_path, monkeypatch
+    )
+    arguments = list(packet.entrypoint_args)
+    inputs = list(packet.inputs)
+    rembg_pairs = [
+        (f"--{attribute.replace('_', '-')}", coordinates[role])
+        for role, attribute in witness.REMBG_FILE_ARGUMENTS.items()
+    ]
+
+    if mutation == "all_omitted":
+        for flag, coordinate in rembg_pairs:
+            arguments[arguments.index(flag) : arguments.index(flag) + 2] = []
+    elif mutation.startswith("partial_"):
+        keep = int(mutation.rsplit("_", 1)[1])
+        for flag, coordinate in rembg_pairs[keep:]:
+            arguments[arguments.index(flag) : arguments.index(flag) + 2] = []
+    elif mutation == "duplicate_flag":
+        arguments.extend(rembg_pairs[0])
+    elif mutation == "duplicate_coordinate":
+        second_flag, _second_coordinate = rembg_pairs[1]
+        arguments[arguments.index(second_flag) + 1] = rembg_pairs[0][1]
+    elif mutation == "coordinate_absent_from_inputs":
+        inputs.remove(rembg_pairs[0][1])
+    elif mutation == "nested_coordinate":
+        flag, coordinate = rembg_pairs[0]
+        nested = f"nested/{coordinate}"
+        nested_path = packet.capsule_dir / nested
+        nested_path.parent.mkdir()
+        nested_path.write_bytes((packet.capsule_dir / coordinate).read_bytes())
+        arguments[arguments.index(flag) + 1] = nested
+        inputs[inputs.index(coordinate)] = nested
+    elif mutation == "escaping_coordinate":
+        flag, coordinate = rembg_pairs[0]
+        escaping = f"../{coordinate}"
+        (packet.capsule_dir.parent / coordinate).write_bytes(
+            (packet.capsule_dir / coordinate).read_bytes()
+        )
+        arguments[arguments.index(flag) + 1] = escaping
+        inputs[inputs.index(coordinate)] = escaping
+    elif mutation == "missing_source":
+        (packet.capsule_dir / rembg_pairs[0][1]).unlink()
+    elif mutation.startswith("wrong_digest:"):
+        role = mutation.split(":", 1)[1]
+        (packet.capsule_dir / coordinates[role]).write_bytes(b"substituted")
+    else:
+        raise AssertionError(f"unhandled mutation: {mutation}")
+
+    packet = replace(
+        packet,
+        entrypoint_args=tuple(arguments),
+        inputs=tuple(inputs),
+    )
+    packet.output_dir.mkdir()
+    marker = packet.output_dir / "must-survive-rembg-rejection.txt"
+    marker.write_text("preserved")
+
+    with pytest.raises(WitnessPacketError, match="RMBG|rembg"):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+    assert marker.read_text() == "preserved"
+
+
+def test_native_packet_manifest_binds_exact_rembg_inputs_and_runner_coordinates(
+    tmp_path,
+    monkeypatch,
+):
+    witness, packet, coordinates, expected = _native_packet_contract(
+        tmp_path, monkeypatch
+    )
+
+    admitted = witness.prepare_native_image_to_glb_packet(packet)
+
+    manifest = json.loads((admitted.dataset_dir / "witness-manifest.json").read_text())
+    runner = (admitted.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    config_match = re.search(r"^CONFIG = json\.loads\((.+)\)$", runner, re.MULTILINE)
+    assert config_match is not None
+    runner_config = json.loads(ast.literal_eval(config_match.group(1)))
+    for role, attribute in witness.REMBG_FILE_ARGUMENTS.items():
+        coordinate = coordinates[role]
+        assert manifest["files"][coordinate]["sha256"] == expected[role]
+        assert manifest["entrypoint_args"].count(
+            f"--{attribute.replace('_', '-')}"
+        ) == 1
+        assert manifest["entrypoint_args"].count(coordinate) == 1
+        assert runner_config["entrypoint_args"].count(coordinate) == 1
+
+
+def test_native_packet_rejects_rembg_substitution_between_precheck_and_copy(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx import kaggle_cuda_witness
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    witness, packet, coordinates, _expected = _native_packet_contract(
+        tmp_path, monkeypatch
+    )
+    real_prepare = kaggle_cuda_witness.prepare_packet
+
+    def substitute_then_prepare(candidate):
+        (candidate.capsule_dir / coordinates["config.json"]).write_bytes(
+            b"post-precheck-substitution"
+        )
+        return real_prepare(candidate)
+
+    monkeypatch.setattr(kaggle_cuda_witness, "prepare_packet", substitute_then_prepare)
+    packet.output_dir.mkdir()
+    marker = packet.output_dir / "must-survive-copy-race.txt"
+    marker.write_text("preserved")
+
+    with pytest.raises(WitnessPacketError, match="RMBG.*SHA256|RMBG.*digest"):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+    assert marker.read_text() == "preserved"
+
+
+@pytest.mark.parametrize(
     "mutated_role",
-    ("image", "model.safetensors", "config.json", "preprocessor_config.json"),
+    (
+        "image",
+        "dinov3:model.safetensors",
+        "dinov3:config.json",
+        "dinov3:preprocessor_config.json",
+        "rembg:model.safetensors",
+        "rembg:config.json",
+        "rembg:birefnet.py",
+        "rembg:BiRefNet_config.py",
+    ),
 )
 def test_admitted_inputs_reject_requested_path_substitution_before_use(
     tmp_path,
@@ -1003,10 +1448,27 @@ def test_admitted_inputs_reject_requested_path_substitution_before_use(
     }
     for name, payload in dino_files.items():
         (dino / name).write_bytes(payload)
+    rembg = tmp_path / "rembg"
+    rembg.mkdir()
+    rembg_files = {
+        "model.safetensors": b"rembg-model-authority",
+        "config.json": b"rembg-config-authority",
+        "birefnet.py": b"rembg-code-authority",
+        "BiRefNet_config.py": b"rembg-config-code-authority",
+    }
+    rembg_args = {
+        "model.safetensors": "rembg_model_file",
+        "config.json": "rembg_config_file",
+        "birefnet.py": "rembg_birefnet_file",
+        "BiRefNet_config.py": "rembg_birefnet_config_file",
+    }
+    for name, payload in rembg_files.items():
+        (rembg / name).write_bytes(payload)
     args = types.SimpleNamespace(
         image=image,
         expected_image_sha256=_sha256(image),
         dinov3_model_path=dino,
+        **{attribute: rembg / name for name, attribute in rembg_args.items()},
         work_dir=tmp_path / "runtime",
         run_id="11111111-1111-4111-8111-111111111111",
     )
@@ -1015,20 +1477,90 @@ def test_admitted_inputs_reject_requested_path_substitution_before_use(
         args,
         report,
         expected_dinov3_files={name: _sha256(dino / name) for name in dino_files},
+        expected_rembg_files={name: _sha256(rembg / name) for name in rembg_files},
     )
-    requested = image if mutated_role == "image" else dino / mutated_role
+    if mutated_role == "image":
+        requested = image
+    else:
+        family, name = mutated_role.split(":", 1)
+        requested = (dino if family == "dinov3" else rembg) / name
     requested.write_bytes(b"substituted-after-admission")
 
-    with pytest.raises(RuntimeError, match=mutated_role):
+    with pytest.raises(RuntimeError, match=mutated_role.split(":")[-1]):
         verify_admitted_inputs_before_use(
             admitted,
             report,
             expected_dinov3_files={name: _sha256(admitted.dinov3_model_path / name) for name in dino_files},
+            expected_rembg_files={name: _sha256(admitted.rembg_model_path / name) for name in rembg_files},
         )
 
     assert Path(admitted.image).read_bytes() == b"image-authority"
     for name, payload in dino_files.items():
         assert (Path(admitted.dinov3_model_path) / name).read_bytes() == payload
+    for name, payload in rembg_files.items():
+        assert (Path(admitted.rembg_model_path) / name).read_bytes() == payload
+
+
+def test_prepare_model_view_uses_admitted_rembg_without_remote_fetch(tmp_path, monkeypatch):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    trellis = tmp_path / "trellis"
+    trellis.mkdir()
+    pipeline = {
+        "args": {
+            "models": {
+                "shape": "ckpts/shape",
+                "decoder": f"{witness.SPARSE_DECODER_REPOSITORY}/decoder",
+            },
+            "image_cond_model": {"args": {"model_name": "remote-dino"}},
+            "rembg_model": {"args": {"model_name": "remote-rembg"}},
+        }
+    }
+    pipeline_path = trellis / "pipeline.json"
+    pipeline_path.write_text(json.dumps(pipeline, sort_keys=True))
+    decoder = tmp_path / "decoder"
+    decoder.mkdir()
+    dino = tmp_path / "admitted-dino"
+    dino.mkdir()
+    rembg = tmp_path / "admitted-rembg"
+    rembg.mkdir()
+    calls = []
+
+    def snapshot_download(*, repo_id, revision, cache_dir):
+        calls.append((repo_id, revision, Path(cache_dir)))
+        if repo_id == witness.MODEL_REPOSITORY:
+            return trellis
+        if repo_id == witness.SPARSE_DECODER_REPOSITORY:
+            return decoder
+        raise AssertionError(f"unexpected remote model fetch: {repo_id}")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=snapshot_download),
+    )
+    monkeypatch.setattr(witness, "MODEL_PIPELINE_SHA256", _sha256(pipeline_path))
+    monkeypatch.setattr(witness, "verify_admitted_inputs_before_use", lambda *_args: None)
+    args = types.SimpleNamespace(
+        work_dir=tmp_path / "runtime",
+        dinov3_model_path=dino,
+        rembg_model_path=rembg,
+    )
+    report = {}
+
+    model_view = witness.prepare_model_view(args, report)
+
+    rewritten = json.loads((model_view / "pipeline.json").read_text())
+    assert rewritten["args"]["rembg_model"]["args"]["model_name"] == str(rembg.resolve())
+    assert report["model_assets"]["rembg"]["snapshot_path"] == str(rembg.resolve())
+    assert calls == [
+        (witness.MODEL_REPOSITORY, witness.MODEL_REVISION, tmp_path / "runtime" / "huggingface"),
+        (
+            witness.SPARSE_DECODER_REPOSITORY,
+            witness.SPARSE_DECODER_REVISION,
+            tmp_path / "runtime" / "huggingface",
+        ),
+    ]
 
 
 def _write_completed_fixture(
@@ -1052,6 +1584,7 @@ def _write_completed_fixture(
         NVDIFFRAST_REPOSITORY,
         REMBG_REPOSITORY,
         REMBG_REVISION,
+        REMBG_FILES,
         SPARSE_DECODER_REPOSITORY,
         SPARSE_DECODER_REVISION,
         TRELLIS_COMMIT,
@@ -1248,7 +1781,29 @@ def _write_completed_fixture(
             "observation_only_instrumentation": True,
             "run_id": run_id,
         },
-        "requested_route": {"run_id": run_id, "image_sha256": image_sha256},
+        "requested_route": {
+            "run_id": run_id,
+            "image_sha256": image_sha256,
+            "rembg_repository": REMBG_REPOSITORY,
+            "rembg_revision": REMBG_REVISION,
+            "rembg_files": {
+                name: f"/request/rembg/{name}" for name in REMBG_FILES
+            },
+        },
+        "requested_inputs": {
+            "rembg": {
+                "repository": REMBG_REPOSITORY,
+                "revision": REMBG_REVISION,
+                "files": {
+                    name: {
+                        "path": f"/request/rembg/{name}",
+                        "sha256": digest,
+                        "size_bytes": 100,
+                    }
+                    for name, digest in REMBG_FILES.items()
+                },
+            },
+        },
         "effective_inputs": {
             "run_id": run_id,
             "image": {"path": "/run/image.png", "sha256": image_sha256, "size_bytes": 100},
@@ -1257,6 +1812,19 @@ def _write_completed_fixture(
                 "files": {
                     name: {"path": f"/run/dinov3/{name}", "sha256": digest, "size_bytes": 100}
                     for name, digest in DINOV3_FILES.items()
+                },
+            },
+            "rembg": {
+                "path": f"/run/admitted-inputs/{run_id}/rembg",
+                "repository": REMBG_REPOSITORY,
+                "revision": REMBG_REVISION,
+                "files": {
+                    name: {
+                        "path": f"/run/admitted-inputs/{run_id}/rembg/{name}",
+                        "sha256": digest,
+                        "size_bytes": 100,
+                    }
+                    for name, digest in REMBG_FILES.items()
                 },
             },
         },
@@ -1275,7 +1843,13 @@ def _write_completed_fixture(
                 "revision": DINOV3_REVISION,
                 "files": dict(DINOV3_FILES),
             },
-            "rembg": {"repository": REMBG_REPOSITORY, "revision": REMBG_REVISION},
+            "rembg": {
+                "repository": REMBG_REPOSITORY,
+                "revision": REMBG_REVISION,
+                "files": dict(REMBG_FILES),
+                "source": "admitted-local-files",
+                "snapshot_path": f"/run/admitted-inputs/{run_id}/rembg",
+            },
             "path_rewrite_only": True,
         },
         "source_identities_after_build": {
@@ -1408,7 +1982,10 @@ def test_completed_report_rejects_stale_bundle_from_another_run(tmp_path):
         )
 
 
-def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path):
+def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(
+    tmp_path,
+    monkeypatch,
+):
     from scripts import source_cuda_native_image_to_glb_witness as witness
     from trellmlx.kaggle_cuda_witness import (
         KaggleCudaWitnessPacket,
@@ -1422,8 +1999,12 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
     capsule.mkdir()
     entrypoint = capsule / "source_cuda_native_image_to_glb_witness.py"
     entrypoint.write_text(Path(witness.__file__).read_text())
+    authority_helper = _stage_authority_helper(capsule)
     image = capsule / "9_img.png"
     image.write_bytes(b"packet-owned-image-authority")
+    rembg_coordinates, rembg_arguments, _expected_rembg = _stage_packet_rembg(
+        capsule, witness, monkeypatch
+    )
     image_sha256 = _sha256(image)
     expected_outputs = tuple(
         f"{index:02d}-{stage}{'.png' if stage == 'preprocessed_image' else '.glb' if stage == 'consumer_glb' else '.npz'}"
@@ -1439,7 +2020,7 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
                 kernel_id="operator/native-image-anchor-cuda",
                 title="Native Image Anchor CUDA",
                 entrypoint=entrypoint.name,
-                inputs=(entrypoint.name, image.name),
+                inputs=(entrypoint.name, authority_helper, image.name, *rembg_coordinates.values()),
                 run_id=run_id,
                 expected_image_sha256=image_sha256,
                 output_json="report.json",
@@ -1456,6 +2037,7 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
                     ".",
                     "--work-dir",
                     str(tmp_path / f"runtime-{name}"),
+                    *rembg_arguments,
                 ),
             )
         )
@@ -1529,8 +2111,176 @@ def test_current_packet_consumer_rejects_complete_prior_attempt_bundle(tmp_path)
 
 @pytest.mark.parametrize(
     ("mutation", "match"),
+    (
+        ("missing_requested_inputs", "requested inputs|requested RMBG"),
+        ("canonical_alias", "requested RMBG"),
+        ("size_disagreement", "requested RMBG|effective RMBG"),
+        ("missing_model_view_path", "model assets RMBG"),
+    ),
+)
+def test_downloaded_consumer_rejects_incoherent_rembg_authority(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    match,
+):
+    witness, packet, _coordinates, _expected = _native_packet_contract(
+        tmp_path, monkeypatch
+    )
+    packet = witness.prepare_native_image_to_glb_packet(packet)
+    report_path = _write_completed_fixture(
+        tmp_path / "downloaded-bundle",
+        run_id=packet.run_id,
+        image_sha256=packet.expected_image_sha256,
+    )
+    report = json.loads(report_path.read_text())
+    if mutation == "missing_requested_inputs":
+        report.pop("requested_inputs")
+    elif mutation == "canonical_alias":
+        alias = "/request/rembg/./model.safetensors"
+        report["requested_route"]["rembg_files"]["config.json"] = alias
+        report["requested_inputs"]["rembg"]["files"]["config.json"]["path"] = alias
+    elif mutation == "size_disagreement":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "size_bytes"
+        ] += 1
+    elif mutation == "missing_model_view_path":
+        report["model_assets"]["rembg"].pop("snapshot_path")
+    else:
+        raise AssertionError(f"unhandled mutation: {mutation}")
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+    _write_download_receipt(packet, report_path.parent)
+
+    with pytest.raises(ValueError, match=match):
+        witness.validate_downloaded_native_image_to_glb_outputs(
+            packet,
+            report_path.parent,
+        )
+
+
+@pytest.mark.parametrize("consumer", ("direct", "downloaded"))
+@pytest.mark.parametrize(
+    "raw_alias",
+    (
+        "/run/admitted-inputs/{run_id}/./rembg",
+        "/run/admitted-inputs/{run_id}/sibling/../rembg",
+    ),
+)
+def test_rembg_effective_root_rejects_raw_aliases(
+    tmp_path,
+    monkeypatch,
+    consumer,
+    raw_alias,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    if consumer == "downloaded":
+        witness, packet, _coordinates, _expected = _native_packet_contract(
+            tmp_path, monkeypatch
+        )
+        packet = witness.prepare_native_image_to_glb_packet(packet)
+        report_path = _write_completed_fixture(
+            tmp_path / "downloaded-alias-bundle",
+            run_id=packet.run_id,
+            image_sha256=packet.expected_image_sha256,
+        )
+    else:
+        packet = None
+        report_path = _write_completed_fixture(tmp_path / "direct-alias-bundle")
+    report = json.loads(report_path.read_text())
+    report["effective_inputs"]["rembg"]["path"] = raw_alias.format(
+        run_id=report["run_id"]
+    )
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="effective RMBG|canonical|declared"):
+        if consumer == "downloaded":
+            _write_download_receipt(packet, report_path.parent)
+            witness.validate_downloaded_native_image_to_glb_outputs(
+                packet,
+                report_path.parent,
+            )
+        else:
+            witness.validate_completed_report(report_path)
+
+
+@pytest.mark.parametrize(
+    "alias_kind",
+    ("dot", "parent", "repeated_separator", "double_leading_slash"),
+)
+def test_producer_rejects_raw_rembg_alias_before_input_admission(
+    tmp_path,
+    monkeypatch,
+    alias_kind,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    rembg = tmp_path / "rembg"
+    rembg.mkdir()
+    files = {}
+    for name in witness.REMBG_FILES:
+        path = rembg / name
+        path.write_bytes(name.encode())
+        files[name] = path
+    monkeypatch.setattr(
+        witness,
+        "REMBG_FILES",
+        {name: _sha256(path) for name, path in files.items()},
+    )
+    target = str(files["config.json"])
+    aliases = {
+        "dot": f"{rembg}/./config.json",
+        "parent": f"{rembg}/sibling/../config.json",
+        "repeated_separator": f"{rembg}//config.json",
+        "double_leading_slash": f"/{target}",
+    }
+    files["config.json"] = aliases[alias_kind]
+    arguments = [
+        *_base_args(tmp_path, image),
+        "--run-id",
+        "31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        *(
+            item
+            for name, attribute in witness.REMBG_FILE_ARGUMENTS.items()
+            for item in (f"--{attribute.replace('_', '-')}", str(files[name]))
+        ),
+        "--no-download",
+    ]
+
+    assert witness.main(arguments) == 1
+    report = json.loads((tmp_path / "outputs" / "report.json").read_text())
+    assert report["failure_phase"] == "request_validation"
+    assert "canonical" in report["error"] or "declared" in report["error"]
+    assert not (tmp_path / "runtime" / "admitted-inputs").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
     [
         ("missing_model_assets", "model assets"),
+        ("missing_requested_inputs", "requested inputs|requested RMBG"),
+        ("missing_requested_rembg", "requested RMBG"),
+        ("wrong_requested_repository", "requested RMBG"),
+        ("wrong_requested_revision", "requested RMBG"),
+        ("missing_requested_route_coordinate", "requested RMBG"),
+        ("null_requested_route_coordinate", "requested RMBG"),
+        ("duplicate_requested_route_coordinate", "requested RMBG"),
+        ("renamed_requested_route_coordinate", "requested RMBG"),
+        ("requested_path_mismatch", "requested RMBG"),
+        ("dot_alias_requested_coordinate", "requested RMBG"),
+        ("repeated_separator_requested_coordinate", "requested RMBG"),
+        ("parent_alias_requested_coordinate", "requested RMBG"),
+        ("wrong_requested_digest", "requested RMBG"),
+        ("nonpositive_requested_size", "requested RMBG"),
+        ("requested_effective_size_disagreement", "requested RMBG|effective RMBG"),
+        ("requested_effective_digest_disagreement", "requested RMBG|effective RMBG"),
+        ("missing_effective_rembg", "effective RMBG"),
+        ("wrong_effective_rembg_digest", "effective RMBG"),
+        ("missing_model_asset_rembg_files", "model assets RMBG"),
+        ("missing_model_asset_rembg_snapshot", "model assets RMBG"),
+        ("wrong_model_asset_rembg_snapshot", "model assets RMBG"),
         ("wrong_effective_image", "effective image"),
         ("missing_run_id", "run identity"),
         ("missing_xformers_wheel", "xformers wheel"),
@@ -1548,6 +2298,69 @@ def test_completed_report_rejects_missing_or_wrong_authority(tmp_path, mutation,
     report = json.loads(report_path.read_text())
     if mutation == "missing_model_assets":
         report.pop("model_assets", None)
+    elif mutation == "missing_requested_inputs":
+        report.pop("requested_inputs", None)
+    elif mutation == "missing_requested_rembg":
+        report["requested_inputs"].pop("rembg")
+    elif mutation == "wrong_requested_repository":
+        report["requested_route"]["rembg_repository"] = "substituted/RMBG"
+    elif mutation == "wrong_requested_revision":
+        report["requested_inputs"]["rembg"]["revision"] = "0" * 40
+    elif mutation == "missing_requested_route_coordinate":
+        report["requested_route"]["rembg_files"].pop("config.json")
+    elif mutation == "null_requested_route_coordinate":
+        report["requested_route"]["rembg_files"]["config.json"] = None
+    elif mutation == "duplicate_requested_route_coordinate":
+        report["requested_route"]["rembg_files"]["config.json"] = report[
+            "requested_route"
+        ]["rembg_files"]["model.safetensors"]
+    elif mutation == "renamed_requested_route_coordinate":
+        value = report["requested_route"]["rembg_files"].pop("config.json")
+        report["requested_route"]["rembg_files"]["configuration.json"] = value
+    elif mutation == "requested_path_mismatch":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "path"
+        ] = "/request/rembg/other-config.json"
+    elif mutation == "dot_alias_requested_coordinate":
+        alias = "/request/rembg/./model.safetensors"
+        report["requested_route"]["rembg_files"]["config.json"] = alias
+        report["requested_inputs"]["rembg"]["files"]["config.json"]["path"] = alias
+    elif mutation == "repeated_separator_requested_coordinate":
+        alias = "/request/rembg//model.safetensors"
+        report["requested_route"]["rembg_files"]["config.json"] = alias
+        report["requested_inputs"]["rembg"]["files"]["config.json"]["path"] = alias
+    elif mutation == "parent_alias_requested_coordinate":
+        alias = "/request/rembg/subdir/../model.safetensors"
+        report["requested_route"]["rembg_files"]["config.json"] = alias
+        report["requested_inputs"]["rembg"]["files"]["config.json"]["path"] = alias
+    elif mutation == "wrong_requested_digest":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "sha256"
+        ] = "0" * 64
+    elif mutation == "nonpositive_requested_size":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "size_bytes"
+        ] = 0
+    elif mutation == "requested_effective_size_disagreement":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "size_bytes"
+        ] += 1
+    elif mutation == "requested_effective_digest_disagreement":
+        report["requested_inputs"]["rembg"]["files"]["config.json"][
+            "sha256"
+        ] = "0" * 64
+    elif mutation == "missing_effective_rembg":
+        report["effective_inputs"].pop("rembg")
+    elif mutation == "wrong_effective_rembg_digest":
+        report["effective_inputs"]["rembg"]["files"]["model.safetensors"][
+            "sha256"
+        ] = "0" * 64
+    elif mutation == "missing_model_asset_rembg_files":
+        report["model_assets"]["rembg"].pop("files")
+    elif mutation == "missing_model_asset_rembg_snapshot":
+        report["model_assets"]["rembg"].pop("snapshot_path")
+    elif mutation == "wrong_model_asset_rembg_snapshot":
+        report["model_assets"]["rembg"]["snapshot_path"] = "/run/foreign/rembg"
     elif mutation == "wrong_effective_image":
         report.setdefault("effective_inputs", {})["image"] = {
             "sha256": "0" * 64,

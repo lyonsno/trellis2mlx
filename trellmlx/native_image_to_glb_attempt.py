@@ -1,0 +1,460 @@
+"""Structured native image-to-GLB CUDA attempt construction."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+from pathlib import PurePosixPath
+import shutil
+import tempfile
+from typing import Any, Mapping
+import uuid
+
+from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
+
+
+class AttemptSpecError(ValueError):
+    """Raised when structured attempt data cannot be admitted."""
+
+
+@dataclass(frozen=True)
+class AttemptAsset:
+    source: Path
+    coordinate: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class NativeImageToGLBAttemptSpec:
+    run_id: str
+    dataset_id: str
+    kernel_id: str
+    title: str
+    capsule_dir: Path
+    output_dir: Path
+    entrypoint: AttemptAsset
+    authority_helper: AttemptAsset
+    image: AttemptAsset
+    rembg_files: Mapping[str, AttemptAsset]
+    expected_outputs: tuple[str, ...]
+    output_coordinate: str = "outputs"
+    work_coordinate: str = "runtime"
+    accelerator: str = "NvidiaTeslaT4"
+    enable_internet: bool = True
+
+
+REMBG_ARGUMENTS = {
+    "model.safetensors": "--rembg-model-file",
+    "config.json": "--rembg-config-file",
+    "birefnet.py": "--rembg-birefnet-file",
+    "BiRefNet_config.py": "--rembg-birefnet-config-file",
+}
+ATTEMPT_MANIFEST = "native-image-to-glb-attempt.json"
+ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v1"
+
+
+def load_attempt_spec_bytes(
+    data: bytes,
+    *,
+    source_path: Path,
+) -> NativeImageToGLBAttemptSpec:
+    path = Path(source_path).resolve()
+    try:
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AttemptSpecError(f"attempt spec is missing or invalid: {path}") from exc
+    expected_fields = {
+        "schema",
+        "run_id",
+        "dataset_id",
+        "kernel_id",
+        "title",
+        "capsule_dir",
+        "output_dir",
+        "entrypoint",
+        "authority_helper",
+        "image",
+        "rembg_files",
+        "expected_outputs",
+        "output_coordinate",
+        "work_coordinate",
+        "accelerator",
+        "enable_internet",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise AttemptSpecError("attempt spec field set is incomplete or contains unknown fields")
+    if payload.get("schema") != ATTEMPT_SPEC_SCHEMA:
+        raise AttemptSpecError(f"unexpected attempt spec schema: {payload.get('schema')!r}")
+
+    def resolved_path(value: object, label: str) -> Path:
+        if not isinstance(value, str) or not value:
+            raise AttemptSpecError(f"{label} path is missing")
+        candidate = Path(value)
+        return (path.parent / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+    def asset(value: object, label: str) -> AttemptAsset:
+        if not isinstance(value, dict) or set(value) != {
+            "source",
+            "coordinate",
+            "sha256",
+            "size_bytes",
+        }:
+            raise AttemptSpecError(f"{label} asset field set is invalid")
+        return AttemptAsset(
+            source=resolved_path(value["source"], f"{label} source"),
+            coordinate=value["coordinate"],
+            sha256=value["sha256"],
+            size_bytes=value["size_bytes"],
+        )
+
+    rembg_payload = payload["rembg_files"]
+    if not isinstance(rembg_payload, dict):
+        raise AttemptSpecError("attempt RMBG file map is invalid")
+    expected_outputs = payload["expected_outputs"]
+    if not isinstance(expected_outputs, list) or not all(
+        isinstance(value, str) and value for value in expected_outputs
+    ):
+        raise AttemptSpecError("attempt expected output list is invalid")
+    if type(payload["enable_internet"]) is not bool:
+        raise AttemptSpecError("attempt enable_internet must be boolean")
+    scalar_fields = (
+        "run_id",
+        "dataset_id",
+        "kernel_id",
+        "title",
+        "output_coordinate",
+        "work_coordinate",
+        "accelerator",
+    )
+    if any(not isinstance(payload[field], str) or not payload[field] for field in scalar_fields):
+        raise AttemptSpecError("attempt scalar identity field is missing")
+    return NativeImageToGLBAttemptSpec(
+        run_id=payload["run_id"],
+        dataset_id=payload["dataset_id"],
+        kernel_id=payload["kernel_id"],
+        title=payload["title"],
+        capsule_dir=resolved_path(payload["capsule_dir"], "capsule"),
+        output_dir=resolved_path(payload["output_dir"], "output"),
+        entrypoint=asset(payload["entrypoint"], "entrypoint"),
+        authority_helper=asset(payload["authority_helper"], "authority helper"),
+        image=asset(payload["image"], "image"),
+        rembg_files={
+            role: asset(value, f"RMBG {role}")
+            for role, value in rembg_payload.items()
+        },
+        expected_outputs=tuple(expected_outputs),
+        output_coordinate=payload["output_coordinate"],
+        work_coordinate=payload["work_coordinate"],
+        accelerator=payload["accelerator"],
+        enable_internet=payload["enable_internet"],
+    )
+
+
+def load_attempt_spec(path: Path) -> NativeImageToGLBAttemptSpec:
+    path = Path(path).resolve()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise AttemptSpecError(f"attempt spec is missing or invalid: {path}") from exc
+    return load_attempt_spec_bytes(data, source_path=path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_asset(asset: AttemptAsset, *, role: str) -> None:
+    source = Path(asset.source)
+    coordinate = PurePosixPath(asset.coordinate)
+    if (
+        coordinate.is_absolute()
+        or len(coordinate.parts) != 1
+        or coordinate.name in {"", ".", ".."}
+        or coordinate.as_posix() != asset.coordinate
+    ):
+        raise AttemptSpecError(f"{role} coordinate must be canonical, flat, and relative")
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise AttemptSpecError(f"{role} source is missing or blank: {source}")
+    if type(asset.size_bytes) is not int or asset.size_bytes <= 0:
+        raise AttemptSpecError(f"{role} declared size is invalid")
+    actual_size = source.stat().st_size
+    actual_sha256 = _sha256_file(source)
+    if actual_size != asset.size_bytes or actual_sha256 != asset.sha256:
+        raise AttemptSpecError(
+            f"{role} source digest or size drift: "
+            f"sha256={actual_sha256}, size={actual_size}"
+        )
+
+
+def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
+    return {
+        "schema": "trellis2mlx.native_image_to_glb_attempt.v1",
+        "run_id": spec.run_id,
+        "dataset_id": spec.dataset_id,
+        "kernel_id": spec.kernel_id,
+        "title": spec.title,
+        "accelerator": spec.accelerator,
+        "enable_internet": spec.enable_internet,
+        "output_coordinate": spec.output_coordinate,
+        "work_coordinate": spec.work_coordinate,
+        "expected_outputs": list(spec.expected_outputs),
+        "assets": {
+            role: {
+                "coordinate": asset.coordinate,
+                "sha256": asset.sha256,
+                "size_bytes": asset.size_bytes,
+            }
+            for role, asset in assets.items()
+        },
+    }
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left = Path(left).resolve()
+    right = Path(right).resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
+def validate_attempt_topology(spec: NativeImageToGLBAttemptSpec) -> None:
+    capsule = Path(spec.capsule_dir).resolve()
+    output = Path(spec.output_dir).resolve()
+    if _paths_overlap(capsule, output):
+        raise AttemptSpecError(
+            f"attempt managed path topology overlaps: capsule={capsule}, output={output}"
+        )
+    assets = (
+        spec.entrypoint,
+        spec.authority_helper,
+        spec.image,
+        *spec.rembg_files.values(),
+    )
+    for asset in assets:
+        source = Path(asset.source).resolve()
+        if _paths_overlap(source, capsule) or _paths_overlap(source, output):
+            raise AttemptSpecError(
+                f"attempt source is inside or overlaps a managed path: {source}"
+            )
+
+
+def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AttemptSpecError("attempt manifest is missing or invalid") from exc
+    expected_fields = {
+        "schema",
+        "run_id",
+        "dataset_id",
+        "kernel_id",
+        "title",
+        "accelerator",
+        "enable_internet",
+        "output_coordinate",
+        "work_coordinate",
+        "expected_outputs",
+        "assets",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise AttemptSpecError("attempt manifest field set is invalid")
+    if payload.get("schema") != "trellis2mlx.native_image_to_glb_attempt.v1":
+        raise AttemptSpecError("attempt manifest schema is invalid")
+    return payload
+
+
+def load_attempt_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise AttemptSpecError("attempt manifest is missing or invalid") from exc
+    return load_attempt_manifest_bytes(data)
+
+
+def validate_attempt_manifest(
+    packet: KaggleCudaWitnessPacket,
+    payload: Mapping[str, Any],
+    *,
+    file_records: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    expected_identity = {
+        "run_id": packet.run_id,
+        "dataset_id": packet.dataset_id,
+        "kernel_id": packet.kernel_id,
+        "title": packet.title,
+        "accelerator": packet.accelerator,
+        "enable_internet": packet.enable_internet,
+        "expected_outputs": list(packet.expected_outputs),
+    }
+    for field, expected in expected_identity.items():
+        if payload.get(field) != expected:
+            raise AttemptSpecError(
+                f"attempt manifest {field} or run identity mismatch: "
+                f"expected {expected!r}, got {payload.get(field)!r}"
+            )
+
+    def argument(flag: str) -> str:
+        positions = [
+            index for index, value in enumerate(packet.entrypoint_args) if value == flag
+        ]
+        if len(positions) != 1 or positions[0] + 1 >= len(packet.entrypoint_args):
+            raise AttemptSpecError(f"attempt packet is missing exactly one {flag}")
+        return packet.entrypoint_args[positions[0] + 1]
+
+    if payload.get("output_coordinate") != argument("--output-dir"):
+        raise AttemptSpecError("attempt manifest output coordinate mismatch")
+    if payload.get("work_coordinate") != argument("--work-dir"):
+        raise AttemptSpecError("attempt manifest work coordinate mismatch")
+    assets = payload.get("assets")
+    if not isinstance(assets, dict):
+        raise AttemptSpecError("attempt manifest assets are missing")
+    expected_roles = {
+        "entrypoint": packet.entrypoint,
+        "authority_helper": "witness_authority.py",
+        "image": argument("--image"),
+        **{
+            f"rembg:{role}": argument(flag)
+            for role, flag in REMBG_ARGUMENTS.items()
+        },
+    }
+    if set(assets) != set(expected_roles):
+        raise AttemptSpecError("attempt manifest asset role set mismatch")
+    for role, coordinate in expected_roles.items():
+        record = assets[role]
+        if not isinstance(record, dict) or set(record) != {
+            "coordinate",
+            "sha256",
+            "size_bytes",
+        }:
+            raise AttemptSpecError(f"attempt manifest asset record is invalid for {role}")
+        if record.get("coordinate") != coordinate or coordinate not in packet.inputs:
+            raise AttemptSpecError(f"attempt manifest asset coordinate mismatch for {role}")
+        if file_records is not None:
+            outer = file_records.get(coordinate)
+            if not isinstance(outer, Mapping) or any(
+                outer.get(field) != record.get(field)
+                for field in ("sha256", "size_bytes")
+            ):
+                raise AttemptSpecError(
+                    f"attempt manifest asset digest or size mismatch for {role}"
+                )
+
+
+def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
+    try:
+        parsed_run_id = uuid.UUID(spec.run_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise AttemptSpecError("attempt run identity is missing or invalid") from exc
+    if str(parsed_run_id) != spec.run_id:
+        raise AttemptSpecError("attempt run identity is not canonical")
+    if set(spec.rembg_files) != set(REMBG_ARGUMENTS):
+        raise AttemptSpecError("attempt RMBG role set is incomplete")
+    if not spec.expected_outputs or len(set(spec.expected_outputs)) != len(
+        spec.expected_outputs
+    ):
+        raise AttemptSpecError("attempt expected outputs are missing or duplicated")
+    validate_attempt_topology(spec)
+
+    ordered_assets: dict[str, AttemptAsset] = {
+        "entrypoint": spec.entrypoint,
+        "authority_helper": spec.authority_helper,
+        "image": spec.image,
+        **{f"rembg:{role}": spec.rembg_files[role] for role in REMBG_ARGUMENTS},
+    }
+    coordinates = [asset.coordinate for asset in ordered_assets.values()]
+    if ATTEMPT_MANIFEST in coordinates or len(set(coordinates)) != len(coordinates):
+        raise AttemptSpecError("attempt asset coordinates must be distinct")
+    for role, asset in ordered_assets.items():
+        _validate_asset(asset, role=role)
+
+    capsule = Path(spec.capsule_dir).resolve()
+    capsule.parent.mkdir(parents=True, exist_ok=True)
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=f".{capsule.name}.candidate-",
+            dir=capsule.parent,
+        )
+    )
+    backup: Path | None = None
+    try:
+        for role, asset in ordered_assets.items():
+            destination = candidate / asset.coordinate
+            shutil.copy2(asset.source, destination)
+            _validate_asset(
+                AttemptAsset(
+                    source=destination,
+                    coordinate=asset.coordinate,
+                    sha256=asset.sha256,
+                    size_bytes=asset.size_bytes,
+                ),
+                role=f"staged {role}",
+            )
+        (candidate / ATTEMPT_MANIFEST).write_text(
+            json.dumps(_manifest(spec, ordered_assets), indent=2, sort_keys=True)
+            + "\n"
+        )
+        if capsule.exists():
+            backup = capsule.with_name(f".{capsule.name}.backup-{uuid.uuid4().hex}")
+            os.replace(capsule, backup)
+        try:
+            os.replace(candidate, capsule)
+        except BaseException:
+            if backup is not None:
+                os.replace(backup, capsule)
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+            backup = None
+    finally:
+        shutil.rmtree(candidate, ignore_errors=True)
+        if backup is not None and not capsule.exists():
+            os.replace(backup, capsule)
+
+    rembg_arguments = tuple(
+        item
+        for role, flag in REMBG_ARGUMENTS.items()
+        for item in (flag, spec.rembg_files[role].coordinate)
+    )
+    return KaggleCudaWitnessPacket(
+        capsule_dir=capsule,
+        output_dir=spec.output_dir,
+        dataset_id=spec.dataset_id,
+        kernel_id=spec.kernel_id,
+        title=spec.title,
+        entrypoint=spec.entrypoint.coordinate,
+        inputs=(
+            spec.entrypoint.coordinate,
+            spec.authority_helper.coordinate,
+            spec.image.coordinate,
+            *(spec.rembg_files[role].coordinate for role in REMBG_ARGUMENTS),
+            ATTEMPT_MANIFEST,
+        ),
+        entrypoint_args=(
+            "--image",
+            spec.image.coordinate,
+            "--expected-image-sha256",
+            spec.image.sha256,
+            "--run-id",
+            spec.run_id,
+            "--output-dir",
+            spec.output_coordinate,
+            "--work-dir",
+            spec.work_coordinate,
+            *rembg_arguments,
+        ),
+        run_id=spec.run_id,
+        expected_image_sha256=spec.image.sha256,
+        accelerator=spec.accelerator,
+        enable_internet=spec.enable_internet,
+        output_json="report.json",
+        output_npz=None,
+        expected_outputs=spec.expected_outputs,
+        attempt_manifest=ATTEMPT_MANIFEST,
+    )

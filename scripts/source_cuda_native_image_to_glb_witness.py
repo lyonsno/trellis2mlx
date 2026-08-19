@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr
+from dataclasses import replace
 import hashlib
 from importlib import metadata as importlib_metadata
 import io
@@ -23,6 +24,16 @@ from urllib.parse import unquote, urlparse
 from urllib.request import urlretrieve
 
 import numpy as np
+
+try:
+    import trellmlx.witness_authority as witness_authority_module
+except ModuleNotFoundError as exc:
+    if exc.name != "trellmlx":
+        raise
+    import witness_authority as witness_authority_module
+
+AuthorityCoordinate = witness_authority_module.AuthorityCoordinate
+AuthorityCoordinateError = witness_authority_module.AuthorityCoordinateError
 
 
 SCHEMA = "trellis2mlx.source_cuda_native_image_to_glb.v1"
@@ -48,6 +59,18 @@ DINOV3_FILES = {
 }
 REMBG_REPOSITORY = "briaai/RMBG-2.0"
 REMBG_REVISION = "5df4c9c76d8170882c34f6986e848ee07fd0ba43"
+REMBG_FILES = {
+    "model.safetensors": "566ed80c3d95f87ada6864d4cbe2290a1c5eb1c7bb0b123e984f60f76b02c3a7",
+    "config.json": "c97ea21569daf66b205491a4635147dd3bc42c7c168b89d7d75b53f67ef548ae",
+    "birefnet.py": "e499d75224b8819e985e68fb78b7a8e8c99316840474e74e16b5529f03ca2860",
+    "BiRefNet_config.py": "e7b8c2a74f6cea6a59553d517f71d47f2c1d90e670a13416af17c25fe2f3dc52",
+}
+REMBG_FILE_ARGUMENTS = {
+    "model.safetensors": "rembg_model_file",
+    "config.json": "rembg_config_file",
+    "birefnet.py": "rembg_birefnet_file",
+    "BiRefNet_config.py": "rembg_birefnet_config_file",
+}
 EXPECTED_TORCH_VERSION = "2.10.0+cu128"
 EXPECTED_XFORMERS_VERSION = "0.0.35"
 XFORMERS_WHEEL_FILENAME = "xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl"
@@ -211,6 +234,22 @@ def _requested_route(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "rembg_repository": REMBG_REPOSITORY,
         "rembg_revision": REMBG_REVISION,
+        "rembg_files": {
+            name: (
+                str(Path(getattr(args, attribute)).resolve())
+                if getattr(args, attribute) is not None
+                else None
+            )
+            for name, attribute in REMBG_FILE_ARGUMENTS.items()
+        },
+        "rembg_declared_files": {
+            name: (
+                str(getattr(args, attribute))
+                if getattr(args, attribute) is not None
+                else None
+            )
+            for name, attribute in REMBG_FILE_ARGUMENTS.items()
+        },
         "torch_version": EXPECTED_TORCH_VERSION,
         "image": str(Path(args.image).resolve()),
         "image_sha256": args.expected_image_sha256,
@@ -296,6 +335,35 @@ def _validate_request(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"DINOv3 {name} SHA256 mismatch: expected {expected}, got {actual}"
                 )
+    rembg_paths = {
+        name: getattr(args, attribute)
+        for name, attribute in REMBG_FILE_ARGUMENTS.items()
+    }
+    supplied_rembg = {name for name, path in rembg_paths.items() if path is not None}
+    if supplied_rembg and supplied_rembg != set(REMBG_FILES):
+        missing = sorted(set(REMBG_FILES) - supplied_rembg)
+        raise ValueError(
+            "local RMBG inputs must be a complete local RMBG file group; "
+            f"missing {missing}"
+        )
+    if not args.no_download and supplied_rembg != set(REMBG_FILES):
+        raise ValueError("live native background removal requires a complete local RMBG file group")
+    for name, expected in REMBG_FILES.items():
+        if name not in supplied_rembg:
+            continue
+        try:
+            coordinate = AuthorityCoordinate.bind_path(
+                rembg_paths[name],
+                label=f"requested RMBG coordinate for {name}",
+            )
+        except AuthorityCoordinateError as exc:
+            raise ValueError(str(exc)) from exc
+        path = coordinate.resolved
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ValueError(f"RMBG model file is missing or blank: {path}")
+        actual = sha256_file(path)
+        if actual != expected:
+            raise ValueError(f"RMBG {name} SHA256 mismatch: expected {expected}, got {actual}")
     if output_dir == output_dir.parent or work_dir == work_dir.parent:
         raise ValueError("output and work directories must not be filesystem roots")
     if report_path != output_dir / "report.json":
@@ -348,9 +416,21 @@ def admit_run_inputs(
     report: dict[str, Any],
     *,
     expected_dinov3_files: dict[str, str] = DINOV3_FILES,
+    expected_rembg_files: dict[str, str] = REMBG_FILES,
 ) -> argparse.Namespace:
     requested_image = Path(args.image).resolve()
     requested_dino = Path(args.dinov3_model_path).resolve()
+    requested_rembg = {
+        name: AuthorityCoordinate.bind_path(
+            (
+                str(getattr(args, REMBG_FILE_ARGUMENTS[name]))
+                if isinstance(getattr(args, REMBG_FILE_ARGUMENTS[name]), Path)
+                else getattr(args, REMBG_FILE_ARGUMENTS[name])
+            ),
+            label=f"requested RMBG coordinate for {name}",
+        )
+        for name in expected_rembg_files
+    }
     custody_root = Path(args.work_dir).resolve() / "admitted-inputs" / args.run_id
     if custody_root.exists():
         raise RuntimeError(f"run input custody already exists: {custody_root}")
@@ -373,29 +453,64 @@ def admit_run_inputs(
                 for name, expected in expected_dinov3_files.items()
             },
         },
-    }
-    admitted_image = custody_root / "image" / requested_image.name
-    image_record = _copy_admitted_file(
-        requested_image, admitted_image, args.expected_image_sha256
-    )
-    admitted_dino = custody_root / "dinov3"
-    dino_records = {
-        name: _copy_admitted_file(requested_dino / name, admitted_dino / name, expected)
-        for name, expected in expected_dinov3_files.items()
-    }
-    report["requested_inputs"] = requested
-    report["effective_inputs"] = {
-        "run_id": args.run_id,
-        "image": image_record,
-        "dinov3": {
-            "path": str(admitted_dino),
-            "files": dino_records,
+        "rembg": {
+            "repository": REMBG_REPOSITORY,
+            "revision": REMBG_REVISION,
+            "files": {
+                name: {
+                    "path": str(requested_rembg[name].resolved),
+                    "declared_path": requested_rembg[name].raw,
+                    "sha256": expected,
+                    "size_bytes": requested_rembg[name].resolved.stat().st_size,
+                }
+                for name, expected in expected_rembg_files.items()
+            },
         },
     }
-    admitted_args = argparse.Namespace(**vars(args))
-    admitted_args.image = admitted_image
-    admitted_args.dinov3_model_path = admitted_dino
-    return admitted_args
+    try:
+        admitted_image = custody_root / "image" / requested_image.name
+        image_record = _copy_admitted_file(
+            requested_image, admitted_image, args.expected_image_sha256
+        )
+        admitted_dino = custody_root / "dinov3"
+        dino_records = {
+            name: _copy_admitted_file(
+                requested_dino / name, admitted_dino / name, expected
+            )
+            for name, expected in expected_dinov3_files.items()
+        }
+        admitted_rembg = custody_root / "rembg"
+        rembg_records = {
+            name: _copy_admitted_file(
+                requested_rembg[name].resolved, admitted_rembg / name, expected
+            )
+            for name, expected in expected_rembg_files.items()
+        }
+        report["requested_inputs"] = requested
+        report["effective_inputs"] = {
+            "run_id": args.run_id,
+            "image": image_record,
+            "dinov3": {
+                "path": str(admitted_dino),
+                "files": dino_records,
+            },
+            "rembg": {
+                "path": str(admitted_rembg),
+                "repository": REMBG_REPOSITORY,
+                "revision": REMBG_REVISION,
+                "files": rembg_records,
+            },
+        }
+        admitted_args = argparse.Namespace(**vars(args))
+        admitted_args.image = admitted_image
+        admitted_args.dinov3_model_path = admitted_dino
+        admitted_args.rembg_model_path = admitted_rembg
+        for name, attribute in REMBG_FILE_ARGUMENTS.items():
+            setattr(admitted_args, attribute, admitted_rembg / name)
+        return admitted_args
+    except BaseException:
+        shutil.rmtree(custody_root, ignore_errors=True)
+        raise
 
 
 def verify_admitted_inputs_before_use(
@@ -403,6 +518,7 @@ def verify_admitted_inputs_before_use(
     report: dict[str, Any],
     *,
     expected_dinov3_files: dict[str, str] = DINOV3_FILES,
+    expected_rembg_files: dict[str, str] = REMBG_FILES,
 ) -> None:
     requested = report.get("requested_inputs", {})
     effective = report.get("effective_inputs", {})
@@ -423,6 +539,15 @@ def verify_admitted_inputs_before_use(
                 name,
                 Path(requested.get("dinov3", {}).get("files", {}).get(name, {}).get("path", "")),
                 Path(args.dinov3_model_path) / name,
+                expected,
+            )
+        )
+    for name, expected in expected_rembg_files.items():
+        checks.append(
+            (
+                name,
+                Path(requested.get("rembg", {}).get("files", {}).get(name, {}).get("path", "")),
+                Path(args.rembg_model_path) / name,
                 expected,
             )
         )
@@ -877,13 +1002,7 @@ def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path
                 cache_dir=hf_cache,
             )
         ).resolve(),
-        "rembg": Path(
-            snapshot_download(
-                repo_id=REMBG_REPOSITORY,
-                revision=REMBG_REVISION,
-                cache_dir=hf_cache,
-            )
-        ).resolve(),
+        "rembg": Path(args.rembg_model_path).resolve(),
         "dinov3": Path(args.dinov3_model_path).resolve(),
     }
     pipeline_path = snapshots["trellis"] / "pipeline.json"
@@ -931,6 +1050,8 @@ def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path
             "repository": REMBG_REPOSITORY,
             "revision": REMBG_REVISION,
             "snapshot_path": str(snapshots["rembg"]),
+            "files": dict(REMBG_FILES),
+            "source": "admitted-local-files",
         },
         "path_rewrite_only": True,
         "rewritten_pipeline_json": str(rewritten_path),
@@ -1622,6 +1743,46 @@ def _validate_authority(report: dict[str, Any], *, expected_run_id: str | None, 
     requested_image = requested_route.get("image_sha256")
     if expected_image_sha256 is not None and requested_image != expected_image_sha256:
         raise ValueError("requested image identity does not match external admission")
+    if (
+        requested_route.get("rembg_repository") != REMBG_REPOSITORY
+        or requested_route.get("rembg_revision") != REMBG_REVISION
+    ):
+        raise ValueError("requested RMBG route repository or revision identity mismatch")
+    requested_route_files = requested_route.get("rembg_files")
+    if not isinstance(requested_route_files, dict) or set(requested_route_files) != set(REMBG_FILES):
+        raise ValueError("requested RMBG route coordinate set is incomplete")
+
+    def canonical_requested_rembg_path(value: Any, name: str) -> PurePosixPath:
+        try:
+            return AuthorityCoordinate.bind_absolute(
+                value,
+                label=f"requested RMBG route coordinate for {name}",
+            ).lexical
+        except AuthorityCoordinateError as exc:
+            raise ValueError(str(exc)) from exc
+
+    canonical_requested_route_files = {
+        name: canonical_requested_rembg_path(path, name)
+        for name, path in requested_route_files.items()
+    }
+    if len(set(canonical_requested_route_files.values())) != len(REMBG_FILES):
+        raise ValueError("requested RMBG route coordinates must be distinct")
+
+    requested_inputs = report.get("requested_inputs")
+    if not isinstance(requested_inputs, dict):
+        raise ValueError("requested inputs authority is missing")
+    requested_rembg = requested_inputs.get("rembg")
+    if not isinstance(requested_rembg, dict):
+        raise ValueError("requested RMBG input authority is missing")
+    if (
+        requested_rembg.get("repository") != REMBG_REPOSITORY
+        or requested_rembg.get("revision") != REMBG_REVISION
+    ):
+        raise ValueError("requested RMBG repository or revision identity mismatch")
+    requested_rembg_files = requested_rembg.get("files")
+    if not isinstance(requested_rembg_files, dict) or set(requested_rembg_files) != set(REMBG_FILES):
+        raise ValueError("requested RMBG identity set is incomplete")
+
     effective_inputs = report.get("effective_inputs", {})
     image = effective_inputs.get("image", {})
     if image.get("sha256") != requested_image or not isinstance(image.get("size_bytes"), int) or image["size_bytes"] <= 0:
@@ -1635,6 +1796,76 @@ def _validate_authority(report: dict[str, Any], *, expected_run_id: str | None, 
         record = dino[name]
         if record.get("sha256") != expected or not isinstance(record.get("size_bytes"), int) or record["size_bytes"] <= 0:
             raise ValueError(f"effective DINOv3 identity mismatch for {name}")
+    rembg = effective_inputs.get("rembg", {})
+    if (
+        rembg.get("repository") != REMBG_REPOSITORY
+        or rembg.get("revision") != REMBG_REVISION
+    ):
+        raise ValueError("effective RMBG repository or revision identity mismatch")
+    rembg_files = rembg.get("files", {})
+    if set(rembg_files) != set(REMBG_FILES):
+        raise ValueError("effective RMBG identity set is incomplete")
+    rembg_file_coordinates: dict[str, AuthorityCoordinate] = {}
+    for name in REMBG_FILES:
+        record = rembg_files[name]
+        try:
+            rembg_file_coordinates[name] = AuthorityCoordinate.bind_absolute(
+                record.get("path") if isinstance(record, dict) else None,
+                label=f"effective RMBG file coordinate for {name}",
+            )
+        except AuthorityCoordinateError as exc:
+            raise ValueError(str(exc)) from exc
+    declared_roots = {
+        coordinate.lexical.parent.as_posix()
+        for coordinate in rembg_file_coordinates.values()
+    }
+    if len(declared_roots) != 1:
+        raise ValueError("effective RMBG files do not declare one canonical root")
+    declared_root = declared_roots.pop()
+    try:
+        rembg_coordinate = AuthorityCoordinate.bind_absolute(
+            rembg.get("path"),
+            label="effective RMBG run-custody path",
+            expected_raw=declared_root,
+        )
+    except AuthorityCoordinateError as exc:
+        raise ValueError(str(exc)) from exc
+    rembg_root = rembg_coordinate.lexical
+    if (
+        not rembg_root.is_absolute()
+        or rembg_root.name != "rembg"
+        or rembg_root.parent.name != run_id
+        or rembg_root.parent.parent.name != "admitted-inputs"
+    ):
+        raise ValueError("effective RMBG path is not under canonical run custody")
+    for name, expected in REMBG_FILES.items():
+        requested_record = requested_rembg_files[name]
+        if not isinstance(requested_record, dict):
+            raise ValueError(f"requested RMBG identity record is invalid for {name}")
+        requested_path = requested_record.get("path")
+        if (
+            not isinstance(requested_path, str)
+            or not requested_path
+            or requested_path != requested_route_files[name]
+        ):
+            raise ValueError(f"requested RMBG path identity mismatch for {name}")
+        canonical_requested_rembg_path(requested_path, name)
+        if (
+            requested_record.get("sha256") != expected
+            or type(requested_record.get("size_bytes")) is not int
+            or requested_record["size_bytes"] <= 0
+        ):
+            raise ValueError(f"requested RMBG identity mismatch for {name}")
+        record = rembg_files[name]
+        if (
+            record.get("sha256") != expected
+            or record.get("sha256") != requested_record.get("sha256")
+            or type(record.get("size_bytes")) is not int
+            or record["size_bytes"] <= 0
+            or record["size_bytes"] != requested_record["size_bytes"]
+            or rembg_file_coordinates[name].raw != (rembg_root / name).as_posix()
+        ):
+            raise ValueError(f"effective RMBG identity mismatch for {name}")
 
     model_assets = report.get("model_assets")
     if not isinstance(model_assets, dict):
@@ -1653,6 +1884,12 @@ def _validate_authority(report: dict[str, Any], *, expected_run_id: str | None, 
         raise ValueError("model assets pipeline identity mismatch")
     if model_assets["dinov3"].get("files") != DINOV3_FILES:
         raise ValueError("model assets DINOv3 file identity mismatch")
+    if model_assets["rembg"].get("files") != REMBG_FILES:
+        raise ValueError("model assets RMBG file identity mismatch")
+    if model_assets["rembg"].get("source") != "admitted-local-files":
+        raise ValueError("model assets RMBG source identity mismatch")
+    if model_assets["rembg"].get("snapshot_path") != rembg_coordinate.raw:
+        raise ValueError("model assets RMBG snapshot path identity mismatch")
     if model_assets.get("path_rewrite_only") is not True:
         raise ValueError("model assets path rewrite identity is missing")
 
@@ -1948,6 +2185,53 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             "native image-to-GLB packet requires run identity and image identity"
         )
 
+    capsule_root = Path(packet.capsule_dir).resolve()
+    requested_output = Path(packet.output_dir).resolve()
+    if (
+        capsule_root == requested_output
+        or capsule_root in requested_output.parents
+        or requested_output in capsule_root.parents
+    ):
+        raise WitnessPacketError(
+            "native image-to-GLB packet capsule and output topology overlaps"
+        )
+
+    attempt_payload = None
+    attempt_bytes: bytes | None = None
+    attempt_sha256: str | None = None
+    if packet.attempt_manifest is not None:
+        from trellmlx.native_image_to_glb_attempt import (
+            AttemptSpecError,
+            load_attempt_manifest_bytes,
+            validate_attempt_manifest,
+        )
+
+        attempt_path = capsule_root / packet.attempt_manifest
+        try:
+            attempt_bytes = attempt_path.read_bytes()
+            attempt_sha256 = hashlib.sha256(attempt_bytes).hexdigest()
+            attempt_payload = load_attempt_manifest_bytes(attempt_bytes)
+            validate_attempt_manifest(packet, attempt_payload)
+        except (OSError, AttemptSpecError) as exc:
+            raise WitnessPacketError(f"native attempt manifest rejected: {exc}") from exc
+
+    authority_helper_name = "witness_authority.py"
+    if packet.inputs.count(authority_helper_name) != 1:
+        raise WitnessPacketError(
+            "native image-to-GLB packet requires exactly one authority helper input"
+        )
+    authority_helper = (capsule_root / authority_helper_name).resolve()
+    expected_authority_helper = Path(witness_authority_module.__file__).resolve()
+    if (
+        authority_helper.parent != capsule_root
+        or not authority_helper.is_file()
+        or authority_helper.stat().st_size <= 0
+        or sha256_file(authority_helper) != sha256_file(expected_authority_helper)
+    ):
+        raise WitnessPacketError(
+            "native image-to-GLB packet authority helper is missing or does not match the reviewed implementation"
+        )
+
     try:
         with redirect_stderr(io.StringIO()):
             build_parser().parse_args(packet.entrypoint_args)
@@ -1986,6 +2270,74 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             normalized = f"/{normalized.lstrip('/')}"
         return PurePosixPath(normalized)
 
+    def required_flat_packet_input(flag: str, role: str) -> str:
+        if any(argument.startswith(f"{flag}=") for argument in packet.entrypoint_args):
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG coordinate {flag} must use separate-token form"
+            )
+        positions = [
+            index
+            for index, argument in enumerate(packet.entrypoint_args)
+            if argument == flag
+        ]
+        if len(positions) != 1:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet requires exactly one RMBG coordinate {flag}"
+            )
+        index = positions[0]
+        if (
+            index + 1 >= len(packet.entrypoint_args)
+            or not packet.entrypoint_args[index + 1]
+            or packet.entrypoint_args[index + 1].startswith("-")
+        ):
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG coordinate {flag} is missing its value"
+            )
+        value = packet.entrypoint_args[index + 1]
+        coordinate = PurePosixPath(value)
+        if (
+            coordinate.is_absolute()
+            or len(coordinate.parts) != 1
+            or coordinate.name in {"", ".", ".."}
+            or str(coordinate) != value
+        ):
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG coordinate for {role} must be flat and relative"
+            )
+        if value not in packet.inputs:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG coordinate for {role} is not a staged input"
+            )
+        capsule_root = Path(packet.capsule_dir).resolve()
+        source = (capsule_root / value).resolve()
+        if source.parent != capsule_root:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG coordinate for {role} escapes packet custody"
+            )
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG source is missing or blank for {role}: {source}"
+            )
+        actual = sha256_file(source)
+        expected = REMBG_FILES[role]
+        if actual != expected:
+            raise WitnessPacketError(
+                f"native image-to-GLB packet RMBG {role} SHA256 mismatch: "
+                f"expected {expected}, got {actual}"
+            )
+        return value
+
+    rembg_coordinates = {
+        role: required_flat_packet_input(
+            f"--{attribute.replace('_', '-')}", role
+        )
+        for role, attribute in REMBG_FILE_ARGUMENTS.items()
+    }
+    if len(set(rembg_coordinates.values())) != len(REMBG_FILES):
+        raise WitnessPacketError(
+            "native image-to-GLB packet RMBG coordinates must be distinct"
+        )
+
     output_dir = effective_kaggle_path(required_argument("--output-dir"))
     work_dir = effective_kaggle_path(required_argument("--work-dir"))
     if (
@@ -1997,7 +2349,133 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             "native image-to-GLB Kaggle output and work directories overlap: "
             f"output={output_dir}, work={work_dir}"
         )
-    return prepare_packet(packet)
+
+    requested_output.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_capsule = Path(
+        tempfile.mkdtemp(
+            prefix=f".{capsule_root.name}.admitted-",
+            dir=capsule_root.parent,
+        )
+    )
+    try:
+        for relative_name in packet.inputs:
+            relative = Path(relative_name)
+            if (
+                relative.is_absolute()
+                or len(relative.parts) != 1
+                or ".." in relative.parts
+            ):
+                raise WitnessPacketError(
+                    f"native packet input is not flat capsule custody: {relative_name}"
+                )
+            source = capsule_root / relative
+            destination = snapshot_capsule / relative
+            if packet.attempt_manifest == relative_name and attempt_bytes is not None:
+                destination.write_bytes(attempt_bytes)
+            else:
+                shutil.copy2(source, destination)
+    except BaseException:
+        shutil.rmtree(snapshot_capsule, ignore_errors=True)
+        raise
+    candidate_output = Path(
+        tempfile.mkdtemp(
+            prefix=f".{requested_output.name}.candidate-",
+            dir=requested_output.parent,
+        )
+    )
+    candidate_packet = replace(
+        packet,
+        capsule_dir=snapshot_capsule,
+        output_dir=candidate_output,
+    )
+    backup_output: Path | None = None
+    try:
+        prepare_packet(candidate_packet)
+        manifest_path = candidate_packet.dataset_dir / "witness-manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WitnessPacketError(
+                "native image-to-GLB packet candidate manifest is missing or invalid"
+            ) from exc
+        manifest_files = manifest.get("files")
+        if not isinstance(manifest_files, dict):
+            raise WitnessPacketError(
+                "native image-to-GLB packet candidate manifest file authority is missing"
+            )
+        if attempt_payload is not None:
+            try:
+                copied_attempt = candidate_packet.dataset_dir / packet.attempt_manifest
+                copied_bytes = copied_attempt.read_bytes()
+                copied_payload = load_attempt_manifest_bytes(copied_bytes)
+                if (
+                    copied_bytes != attempt_bytes
+                    or hashlib.sha256(copied_bytes).hexdigest() != attempt_sha256
+                    or copied_payload != attempt_payload
+                ):
+                    raise AttemptSpecError(
+                        "copied attempt manifest differs from admitted byte snapshot"
+                    )
+                validate_attempt_manifest(
+                    candidate_packet,
+                    copied_payload,
+                    file_records=manifest_files,
+                )
+            except AttemptSpecError as exc:
+                raise WitnessPacketError(
+                    f"native attempt manifest does not reconcile to packet manifest: {exc}"
+                ) from exc
+        for role, coordinate in rembg_coordinates.items():
+            admitted = candidate_packet.dataset_dir / coordinate
+            record = manifest_files.get(coordinate)
+            if not admitted.is_file() or admitted.stat().st_size <= 0:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet admitted RMBG file is missing or blank for {role}"
+                )
+            actual_sha256 = sha256_file(admitted)
+            actual_size = admitted.stat().st_size
+            if actual_sha256 != REMBG_FILES[role]:
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet admitted RMBG {role} SHA256 mismatch: "
+                    f"expected {REMBG_FILES[role]}, got {actual_sha256}"
+                )
+            if (
+                not isinstance(record, dict)
+                or record.get("sha256") != actual_sha256
+                or type(record.get("size_bytes")) is not int
+                or record["size_bytes"] != actual_size
+            ):
+                raise WitnessPacketError(
+                    f"native image-to-GLB packet manifest RMBG digest or size mismatch for {role}"
+                )
+
+        if packet.attempt_manifest is not None and (
+            (capsule_root / packet.attempt_manifest).read_bytes() != attempt_bytes
+        ):
+            raise WitnessPacketError(
+                "native attempt manifest authority changed during packet preparation"
+            )
+        if requested_output.exists():
+            backup_output = requested_output.with_name(
+                f".{requested_output.name}.backup-{uuid.uuid4().hex}"
+            )
+            os.replace(requested_output, backup_output)
+        try:
+            os.replace(candidate_output, requested_output)
+        except BaseException:
+            if backup_output is not None:
+                os.replace(backup_output, requested_output)
+                backup_output = None
+            raise
+        if backup_output is not None:
+            shutil.rmtree(backup_output)
+            backup_output = None
+    finally:
+        shutil.rmtree(candidate_output, ignore_errors=True)
+        shutil.rmtree(snapshot_capsule, ignore_errors=True)
+        if backup_output is not None and not requested_output.exists():
+            os.replace(backup_output, requested_output)
+    return packet
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2010,6 +2488,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id")
     parser.add_argument("--model-repository", default=MODEL_REPOSITORY)
     parser.add_argument("--dinov3-model-path", type=Path)
+    parser.add_argument("--rembg-model-file")
+    parser.add_argument("--rembg-config-file")
+    parser.add_argument("--rembg-birefnet-file")
+    parser.add_argument("--rembg-birefnet-config-file")
     parser.add_argument("--pipeline-type", default="512")
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--steps", default=8, type=int)
