@@ -30,6 +30,13 @@ EXPECTED_STAGES = (
     "consumer_glb",
 )
 
+FINAL_CONSUMER_STAGES = (
+    "decoder_raw_mesh",
+    "postprocess_stage11_pre_orientation",
+    "postprocess_stage12_post_orientation",
+    "consumer_glb",
+)
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -171,6 +178,220 @@ def _write_download_receipt(packet, bundle_dir: Path) -> None:
     (bundle_dir / "kaggle_cuda_witness_receipt.json").write_text(
         json.dumps(receipt, sort_keys=True) + "\n"
     )
+
+
+def test_native_packet_preparation_binds_final_consumer_profile(tmp_path, monkeypatch):
+    witness, packet, _coordinates, _expected = _native_packet_contract(
+        tmp_path,
+        monkeypatch,
+    )
+    packet = replace(
+        packet,
+        expected_outputs=tuple(
+            witness.EXPECTED_ARTIFACT_FILENAMES[stage]
+            for stage in FINAL_CONSUMER_STAGES
+        ),
+        entrypoint_args=(
+            *packet.entrypoint_args,
+            "--capture-profile",
+            "final-consumer",
+        ),
+    )
+
+    admitted = witness.prepare_native_image_to_glb_packet(packet)
+
+    manifest = json.loads(
+        (admitted.dataset_dir / "witness-manifest.json").read_text()
+    )
+    assert manifest["output_roles"]["expected"] == list(packet.expected_outputs)
+    assert manifest["entrypoint_args"][-2:] == [
+        "--capture-profile",
+        "final-consumer",
+    ]
+
+
+def _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+    from trellmlx.native_image_to_glb_attempt import (
+        AttemptAsset,
+        CAPTURE_PROFILE_OUTPUTS,
+        NativeImageToGLBAttemptSpec,
+        build_attempt_packet,
+    )
+
+    sources = tmp_path / "attempt-sources"
+    sources.mkdir()
+
+    entrypoint = sources / "synthetic-native-entrypoint.py"
+    entrypoint.write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-dir', required=True)\n"
+        "p.add_argument('--capture-profile', required=True)\n"
+        "args, _ = p.parse_known_args()\n"
+        "Path('entrypoint-invoked.json').write_text(json.dumps({'capture_profile': args.capture_profile}))\n"
+        "output = Path(args.output_dir)\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "for name in ('07-decoder_raw_mesh.npz', '10-postprocess_stage11_pre_orientation.npz', '11-postprocess_stage12_post_orientation.npz'):\n"
+        "    (output / name).write_bytes(b'synthetic-npz')\n"
+        "(output / '12-consumer_glb.glb').write_bytes(b'synthetic-glb')\n"
+        "Path(args.output_json).write_text(json.dumps({'status': 'completed'}))\n"
+    )
+    authority_source = Path(witness.witness_authority_module.__file__).resolve()
+    image = sources / "9_img.png"
+    image.write_bytes(b"final-consumer-image")
+
+    def asset(source: Path, coordinate: str) -> AttemptAsset:
+        return AttemptAsset(
+            source=source,
+            coordinate=coordinate,
+            sha256=_sha256(source),
+            size_bytes=source.stat().st_size,
+        )
+
+    dinov3_files = {}
+    for name in ("model.safetensors", "config.json", "preprocessor_config.json"):
+        source = sources / f"dinov3-{name}"
+        source.write_bytes(f"dinov3-{name}".encode())
+        dinov3_files[name] = asset(source, name)
+    monkeypatch.setattr(
+        witness,
+        "DINOV3_FILES",
+        {name: attempt_asset.sha256 for name, attempt_asset in dinov3_files.items()},
+    )
+    rembg_files = {}
+    for name in ("model.safetensors", "config.json", "birefnet.py", "BiRefNet_config.py"):
+        source = sources / f"rembg-{name}"
+        source.write_bytes(f"rembg-{name}".encode())
+        rembg_files[name] = asset(source, f"rembg-{name}")
+    monkeypatch.setattr(
+        witness,
+        "REMBG_FILES",
+        {name: attempt_asset.sha256 for name, attempt_asset in rembg_files.items()},
+    )
+
+    spec = NativeImageToGLBAttemptSpec(
+        run_id="31fce6b7-853b-4a0f-b99d-518be23ebabc",
+        dataset_id="operator/final-consumer-inputs",
+        kernel_id="operator/final-consumer-cuda",
+        title="Final Consumer CUDA",
+        capsule_dir=tmp_path / "attempt-capsule",
+        output_dir=tmp_path / "attempt-packet",
+        entrypoint=asset(entrypoint, "synthetic-native-entrypoint.py"),
+        authority_helper=asset(authority_source, "witness_authority.py"),
+        image=asset(image, "9_img.png"),
+        dinov3_files=dinov3_files,
+        rembg_files=rembg_files,
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["final-consumer"],
+        capture_profile="final-consumer",
+    )
+    return witness.prepare_native_image_to_glb_packet(build_attempt_packet(spec))
+
+
+def _execute_prepared_runner(packet, tmp_path, monkeypatch, *, corrupt_contract=False):
+    fake_torch = types.SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work = tmp_path / "runner-work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text().replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+    if corrupt_contract:
+        namespace["CONFIG"]["attempt_contract"]["schema"] = (
+            "trellis2mlx.native_image_to_glb_attempt.v2"
+        )
+        namespace["CONFIG"]["attempt_contract"].pop("capture_profile", None)
+    return namespace["main"](), work
+
+
+def test_generated_runner_executes_final_consumer_v3_attempt(tmp_path, monkeypatch):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(packet, tmp_path, monkeypatch)
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    invocation = json.loads((work / "entrypoint-invoked.json").read_text())
+    assert rc == 0
+    assert invocation == {"capture_profile": "final-consumer"}
+    assert receipt["status"] == "done"
+    assert receipt["failure_phase"] is None
+    assert set(receipt["outputs"]) == set(packet.outputs)
+    assert all(record["exists"] for record in receipt["outputs"].values())
+    assert not (work / "00-preprocessed_image.png").exists()
+    assert not (work / "08-texture_voxels.npz").exists()
+
+
+def test_generated_runner_rejects_final_consumer_contract_mismatch_before_entrypoint(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        corrupt_contract=True,
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 7
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "attempt_manifest"
+    assert not (work / "entrypoint-invoked.json").exists()
+
+
+def test_native_packet_rejects_final_consumer_outputs_without_profile(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    witness, packet, _coordinates, _expected = _native_packet_contract(
+        tmp_path,
+        monkeypatch,
+    )
+    packet = replace(
+        packet,
+        expected_outputs=tuple(
+            witness.EXPECTED_ARTIFACT_FILENAMES[stage]
+            for stage in FINAL_CONSUMER_STAGES
+        ),
+    )
+
+    with pytest.raises(WitnessPacketError, match="outputs do not match capture profile"):
+        witness.prepare_native_image_to_glb_packet(packet)
+
+
+def test_native_packet_rejects_ambiguous_capture_profile_via_packet_error(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    witness, packet, _coordinates, _expected = _native_packet_contract(
+        tmp_path,
+        monkeypatch,
+    )
+    packet = replace(
+        packet,
+        entrypoint_args=(*packet.entrypoint_args, "--capture-profile"),
+    )
+
+    with pytest.raises(WitnessPacketError, match="capture profile is ambiguous"):
+        witness.prepare_native_image_to_glb_packet(packet)
 
 
 def _write_clean_git_checkout(root: Path) -> None:
@@ -790,6 +1011,43 @@ def test_no_download_preflight_records_exact_route_without_primary_artifacts(tmp
     }
     assert report["expected_capture_order"] == list(EXPECTED_STAGES)
     assert list(output_dir.iterdir()) == [output_dir / "report.json"]
+
+
+def test_no_download_final_consumer_profile_records_bounded_capture_contract(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import main
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"authorized-image-fixture")
+
+    rc = main(
+        _base_args(tmp_path, image)
+        + ["--capture-profile", "final-consumer", "--no-download"]
+    )
+
+    report = json.loads((tmp_path / "outputs" / "report.json").read_text())
+    assert rc == 0
+    assert report["capture_profile"] == "final-consumer"
+    assert report["expected_capture_order"] == list(FINAL_CONSUMER_STAGES)
+    assert report["capture_order"] == []
+
+
+def test_final_consumer_recorder_preserves_global_stage_coordinates(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import ArtifactRecorder
+
+    recorder = ArtifactRecorder(
+        tmp_path / "outputs",
+        expected_capture_order=FINAL_CONSUMER_STAGES,
+    )
+    path = recorder.save_npz(
+        "decoder_raw_mesh",
+        {
+            "vertices": np.zeros((3, 3), dtype=np.float32),
+            "faces": np.asarray([[0, 1, 2]], dtype=np.int32),
+        },
+    )
+
+    assert path.name == "07-decoder_raw_mesh.npz"
+    assert recorder.capture_order == ["decoder_raw_mesh"]
 
 
 def test_recorder_publishes_each_boundary_to_progress_report(tmp_path):
@@ -1699,6 +1957,8 @@ def _write_completed_fixture(
         "failure_phase": None,
         "last_trustworthy_phase": "consumer_glb_validated",
         "primary_output_status": "validated",
+        "capture_profile": "full",
+        "expected_capture_order": list(EXPECTED_STAGES),
         "xformers_wheel": {
             "version": "0.0.35",
             "url": (
@@ -1883,6 +2143,29 @@ def test_completed_report_admission_reopens_every_boundary(tmp_path):
     assert admitted["status"] == "completed"
     assert admitted["primary_output_status"] == "validated"
     assert admitted["capture_order"] == list(EXPECTED_STAGES)
+
+
+def test_completed_report_admits_final_consumer_profile_without_dense_intermediates(
+    tmp_path,
+):
+    from scripts.source_cuda_native_image_to_glb_witness import (
+        validate_completed_report,
+    )
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    for stage in set(EXPECTED_STAGES) - set(FINAL_CONSUMER_STAGES):
+        (report_path.parent / report["artifacts"][stage]["path"]).unlink()
+        report["artifacts"].pop(stage)
+    report["capture_profile"] = "final-consumer"
+    report["expected_capture_order"] = list(FINAL_CONSUMER_STAGES)
+    report["capture_order"] = list(FINAL_CONSUMER_STAGES)
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+
+    admitted = validate_completed_report(report_path)
+
+    assert admitted["capture_profile"] == "final-consumer"
+    assert set(admitted["artifacts"]) == set(FINAL_CONSUMER_STAGES)
 
 
 def test_completed_report_rejects_plaintext_npz_and_glb_bytes(tmp_path):

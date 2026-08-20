@@ -86,6 +86,72 @@ def test_preparation_receipt_rejects_spec_mutation_after_single_read(tmp_path):
     assert report["final_spec"]["sha256"] != report["spec"]["sha256"]
 
 
+def test_v3_final_consumer_spec_binds_profile_to_runner_and_outputs(tmp_path):
+    from trellmlx.native_image_to_glb_attempt import (
+        build_attempt_packet,
+        load_attempt_spec,
+    )
+
+    spec_path = _write_valid_spec(tmp_path)
+    payload = json.loads(spec_path.read_text())
+    payload["schema"] = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
+    payload["capture_profile"] = "final-consumer"
+    payload["expected_outputs"] = [
+        "07-decoder_raw_mesh.npz",
+        "10-postprocess_stage11_pre_orientation.npz",
+        "11-postprocess_stage12_post_orientation.npz",
+        "12-consumer_glb.glb",
+    ]
+    spec_path.write_text(json.dumps(payload))
+
+    packet = build_attempt_packet(load_attempt_spec(spec_path))
+
+    assert packet.expected_outputs == tuple(payload["expected_outputs"])
+    profile_index = packet.entrypoint_args.index("--capture-profile")
+    assert packet.entrypoint_args[profile_index + 1] == "final-consumer"
+    attempt = json.loads(
+        (packet.capsule_dir / "native-image-to-glb-attempt.json").read_text()
+    )
+    assert attempt["schema"] == "trellis2mlx.native_image_to_glb_attempt.v3"
+    assert attempt["capture_profile"] == "final-consumer"
+
+
+def test_v3_final_consumer_spec_rejects_mismatched_output_set(tmp_path):
+    from trellmlx.native_image_to_glb_attempt import (
+        AttemptSpecError,
+        build_attempt_packet,
+        load_attempt_spec,
+    )
+
+    spec_path = _write_valid_spec(tmp_path)
+    payload = json.loads(spec_path.read_text())
+    payload["schema"] = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
+    payload["capture_profile"] = "final-consumer"
+    spec_path.write_text(json.dumps(payload))
+
+    with pytest.raises(AttemptSpecError, match="outputs do not match capture profile"):
+        build_attempt_packet(load_attempt_spec(spec_path))
+
+
+def test_v3_spec_rejects_explicit_full_profile_before_packet_build(tmp_path):
+    from trellmlx.native_image_to_glb_attempt import AttemptSpecError, load_attempt_spec
+
+    spec_path = _write_valid_spec(tmp_path)
+    payload = json.loads(spec_path.read_text())
+    payload["schema"] = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
+    payload["capture_profile"] = "full"
+    payload["expected_outputs"] = [
+        "07-decoder_raw_mesh.npz",
+        "10-postprocess_stage11_pre_orientation.npz",
+        "11-postprocess_stage12_post_orientation.npz",
+        "12-consumer_glb.glb",
+    ]
+    spec_path.write_text(json.dumps(payload))
+
+    with pytest.raises(AttemptSpecError, match="explicit full capture profile"):
+        load_attempt_spec(spec_path)
+
+
 @pytest.mark.parametrize("alias", ("report_in_output", "spec_in_output", "same_file"))
 def test_preparer_rejects_spec_and_report_aliases_before_managed_mutation(
     tmp_path,

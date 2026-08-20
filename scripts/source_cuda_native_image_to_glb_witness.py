@@ -104,6 +104,23 @@ EXPECTED_ARTIFACT_FILENAMES = {
     for index, stage in enumerate(EXPECTED_CAPTURE_ORDER)
 }
 
+CAPTURE_PROFILES = {
+    "full": EXPECTED_CAPTURE_ORDER,
+    "final-consumer": (
+        "decoder_raw_mesh",
+        "postprocess_stage11_pre_orientation",
+        "postprocess_stage12_post_orientation",
+        "consumer_glb",
+    ),
+}
+
+
+def capture_order_for_profile(profile: str) -> tuple[str, ...]:
+    try:
+        return CAPTURE_PROFILES[profile]
+    except KeyError as exc:
+        raise ValueError(f"unsupported capture profile: {profile}") from exc
+
 NPZ_STAGE_SCHEMAS: dict[str, dict[str, dict[str, Any]]] = {
     "conditioning_512": {
         "cond": {"dtype": "float32", "ndim": 3},
@@ -1086,6 +1103,7 @@ class ArtifactRecorder:
         self,
         output_dir: Path,
         *,
+        expected_capture_order: tuple[str, ...] = EXPECTED_CAPTURE_ORDER,
         run_id: str | None = None,
         on_capture: Callable[["ArtifactRecorder"], None] | None = None,
     ):
@@ -1093,16 +1111,20 @@ class ArtifactRecorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts: dict[str, dict[str, Any]] = {}
         self.capture_order: list[str] = []
+        self.expected_capture_order = tuple(expected_capture_order)
         self.run_id = run_id
         self.on_capture = on_capture
 
     def _next_path(self, stage: str, suffix: str) -> Path:
         if stage in self.artifacts:
             raise RuntimeError(f"stage captured more than once: {stage}")
-        expected = EXPECTED_CAPTURE_ORDER[len(self.capture_order)]
+        expected = self.expected_capture_order[len(self.capture_order)]
         if stage != expected:
             raise RuntimeError(f"capture order mismatch: expected {expected}, got {stage}")
-        return self.output_dir / f"{len(self.capture_order):02d}-{stage}{suffix}"
+        expected_name = EXPECTED_ARTIFACT_FILENAMES[stage]
+        if Path(expected_name).suffix != suffix:
+            raise RuntimeError(f"artifact suffix mismatch for {stage}: {suffix}")
+        return self.output_dir / expected_name
 
     def _register(self, stage: str, path: Path, metadata: dict[str, Any] | None = None) -> None:
         if not path.is_file() or path.stat().st_size <= 0:
@@ -1192,11 +1214,20 @@ def _flow_arrays(noise: Any, result: Any) -> dict[str, np.ndarray]:
 
 
 class SamplerObserver:
-    def __init__(self, delegate: Any, stage: str, recorder: ArtifactRecorder, steps: int):
+    def __init__(
+        self,
+        delegate: Any,
+        stage: str,
+        recorder: ArtifactRecorder,
+        steps: int,
+        *,
+        capture: bool,
+    ):
         self.delegate = delegate
         self.stage = stage
         self.recorder = recorder
         self.steps = steps
+        self.capture = capture
         self.call_count = 0
 
     def __getattr__(self, name: str) -> Any:
@@ -1207,6 +1238,8 @@ class SamplerObserver:
         if self.call_count != 1:
             raise RuntimeError(f"{self.stage} sampler called more than once")
         result = self.delegate.sample(model, noise, *args, **kwargs)
+        if not self.capture:
+            return result
         arrays = _flow_arrays(noise, result)
         if arrays["sample_next"].shape[0] != self.steps:
             raise RuntimeError(
@@ -1229,12 +1262,27 @@ def install_pipeline_observers(
     *,
     steps: int,
 ) -> dict[str, Any]:
+    capture_stages = set(recorder.expected_capture_order)
     sparse_observer = SamplerObserver(
-        pipeline.sparse_structure_sampler, "sparse_flow", recorder, steps
+        pipeline.sparse_structure_sampler,
+        "sparse_flow",
+        recorder,
+        steps,
+        capture="sparse_flow" in capture_stages,
     )
-    shape_observer = SamplerObserver(pipeline.shape_slat_sampler, "shape_flow", recorder, steps)
+    shape_observer = SamplerObserver(
+        pipeline.shape_slat_sampler,
+        "shape_flow",
+        recorder,
+        steps,
+        capture="shape_flow" in capture_stages,
+    )
     texture_observer = SamplerObserver(
-        pipeline.tex_slat_sampler, "texture_flow", recorder, steps
+        pipeline.tex_slat_sampler,
+        "texture_flow",
+        recorder,
+        steps,
+        capture="texture_flow" in capture_stages,
     )
     pipeline.sparse_structure_sampler = sparse_observer
     pipeline.shape_slat_sampler = shape_observer
@@ -1244,7 +1292,8 @@ def install_pipeline_observers(
 
     def preprocess(self: Any, image: Any) -> Any:
         output = original_preprocess(image)
-        recorder.save_image("preprocessed_image", output)
+        if "preprocessed_image" in capture_stages:
+            recorder.save_image("preprocessed_image", output)
         return output
 
     _bind_method(pipeline, "preprocess_image", preprocess)
@@ -1255,10 +1304,11 @@ def install_pipeline_observers(
         output = original_get_cond(image, resolution, include_neg_cond)
         if resolution != 512:
             raise RuntimeError(f"unexpected conditioning resolution on 512 route: {resolution}")
-        recorder.save_npz(
-            "conditioning_512",
-            {key: _as_numpy(value) for key, value in output.items()},
-        )
+        if "conditioning_512" in capture_stages:
+            recorder.save_npz(
+                "conditioning_512",
+                {key: _as_numpy(value) for key, value in output.items()},
+            )
         return output
 
     _bind_method(pipeline, "get_cond", get_cond)
@@ -1267,7 +1317,8 @@ def install_pipeline_observers(
 
     def sample_sparse(self: Any, *args: Any, **kwargs: Any) -> Any:
         coords = original_sparse(*args, **kwargs)
-        recorder.save_npz("sparse_support", {"coords": coords})
+        if "sparse_support" in capture_stages:
+            recorder.save_npz("sparse_support", {"coords": coords})
         return coords
 
     _bind_method(pipeline, "sample_sparse_structure", sample_sparse)
@@ -1276,7 +1327,8 @@ def install_pipeline_observers(
 
     def sample_shape(self: Any, *args: Any, **kwargs: Any) -> Any:
         slat = original_shape(*args, **kwargs)
-        recorder.save_npz("shape_slat", _sparse_arrays("shape_slat", slat))
+        if "shape_slat" in capture_stages:
+            recorder.save_npz("shape_slat", _sparse_arrays("shape_slat", slat))
         return slat
 
     _bind_method(pipeline, "sample_shape_slat", sample_shape)
@@ -1288,10 +1340,11 @@ def install_pipeline_observers(
         if len(meshes) != 1:
             raise RuntimeError(f"expected one decoded mesh, got {len(meshes)}")
         mesh = meshes[0]
-        recorder.save_npz(
-            "decoder_raw_mesh",
-            {"vertices": mesh.vertices, "faces": mesh.faces},
-        )
+        if "decoder_raw_mesh" in capture_stages:
+            recorder.save_npz(
+                "decoder_raw_mesh",
+                {"vertices": mesh.vertices, "faces": mesh.faces},
+            )
         return meshes, subs
 
     _bind_method(pipeline, "decode_shape_slat", decode_shape)
@@ -1300,7 +1353,8 @@ def install_pipeline_observers(
 
     def decode_tex(self: Any, *args: Any, **kwargs: Any) -> Any:
         voxels = original_decode_tex(*args, **kwargs)
-        recorder.save_npz("texture_voxels", _sparse_arrays("texture_voxels", voxels))
+        if "texture_voxels" in capture_stages:
+            recorder.save_npz("texture_voxels", _sparse_arrays("texture_voxels", voxels))
         return voxels
 
     _bind_method(pipeline, "decode_tex_slat", decode_tex)
@@ -1312,15 +1366,16 @@ def install_pipeline_observers(
         if len(meshes) != 1:
             raise RuntimeError(f"expected one pipeline mesh, got {len(meshes)}")
         mesh = meshes[0]
-        recorder.save_npz(
-            "pipeline_filled_mesh",
-            {
-                "vertices": mesh.vertices,
-                "faces": mesh.faces,
-                "texture_coords": mesh.coords,
-                "texture_attrs": mesh.attrs,
-            },
-        )
+        if "pipeline_filled_mesh" in capture_stages:
+            recorder.save_npz(
+                "pipeline_filled_mesh",
+                {
+                    "vertices": mesh.vertices,
+                    "faces": mesh.faces,
+                    "texture_coords": mesh.coords,
+                    "texture_attrs": mesh.attrs,
+                },
+            )
         return meshes
 
     _bind_method(pipeline, "decode_latent", decode_latent)
@@ -1392,6 +1447,7 @@ def _cleanup_stale_outputs(output_dir: Path) -> None:
 
 def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     output_dir = Path(args.output_dir).resolve()
+    expected_capture_order = capture_order_for_profile(args.capture_profile)
     verify_admitted_inputs_before_use(args, report)
     phase_started = time.perf_counter()
     report["phase"] = "prepare_runtime"
@@ -1490,7 +1546,12 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
         report["last_trustworthy_phase"] = f"{current.capture_order[-1]}_captured"
         _atomic_write_json(output_dir / "report.json", report)
 
-    recorder = ArtifactRecorder(output_dir, run_id=args.run_id, on_capture=publish_capture)
+    recorder = ArtifactRecorder(
+        output_dir,
+        expected_capture_order=expected_capture_order,
+        run_id=args.run_id,
+        on_capture=publish_capture,
+    )
     sampler_observers = install_pipeline_observers(pipeline, recorder, steps=args.steps)
     verify_admitted_inputs_before_use(args, report)
     image = Image.open(args.image)
@@ -1546,7 +1607,7 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     if report["orientation_observer"] != expected_orientation:
         raise RuntimeError(f"orientation observer incomplete: {report['orientation_observer']}")
 
-    glb_path = output_dir / f"{len(recorder.capture_order):02d}-consumer_glb.glb"
+    glb_path = output_dir / EXPECTED_ARTIFACT_FILENAMES["consumer_glb"]
     tmp_glb = glb_path.with_name(f".{glb_path.name}.tmp.glb")
     tmp_glb.unlink(missing_ok=True)
     glb.export(tmp_glb, extension_webp=True)
@@ -1557,9 +1618,9 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     torch.cuda.synchronize()
     report["phase_timings"]["official_to_glb"] = time.perf_counter() - phase_started
 
-    if tuple(recorder.capture_order) != EXPECTED_CAPTURE_ORDER:
+    if tuple(recorder.capture_order) != expected_capture_order:
         raise RuntimeError(
-            f"capture order mismatch: expected {EXPECTED_CAPTURE_ORDER}, got {recorder.capture_order}"
+            f"capture order mismatch: expected {expected_capture_order}, got {recorder.capture_order}"
         )
     report["capture_order"] = recorder.capture_order
     report["artifacts"] = recorder.artifacts
@@ -2065,9 +2126,13 @@ def _validate_completed_bundle(
     arch_list = xformers_identity.get("torch_cuda_arch_list")
     if not isinstance(arch_list, str) or "7.5" not in arch_list.split():
         raise ValueError("effective route xformers build identity does not include SM75")
-    if report.get("capture_order") != list(EXPECTED_CAPTURE_ORDER):
+    capture_profile = report.get("capture_profile", "full")
+    expected_capture_order = capture_order_for_profile(capture_profile)
+    if report.get("expected_capture_order") != list(expected_capture_order):
+        raise ValueError("report expected capture order does not match capture profile")
+    if report.get("capture_order") != list(expected_capture_order):
         raise ValueError(
-            f"capture order must be {list(EXPECTED_CAPTURE_ORDER)!r}, "
+            f"capture order must be {list(expected_capture_order)!r}, "
             f"got {report.get('capture_order')!r}"
         )
     orientation = report.get("orientation_observer", {})
@@ -2080,13 +2145,16 @@ def _validate_completed_bundle(
     if orientation != required_orientation:
         raise ValueError(f"orientation observer is incomplete: {orientation!r}")
     artifacts = report.get("artifacts", {})
-    if set(artifacts) != set(EXPECTED_CAPTURE_ORDER):
+    if set(artifacts) != set(expected_capture_order):
         raise ValueError("artifact set does not match capture order")
-    recorded_paths = [Path(artifacts[stage].get("path", "")).as_posix() for stage in EXPECTED_CAPTURE_ORDER]
+    recorded_paths = [
+        Path(artifacts[stage].get("path", "")).as_posix()
+        for stage in expected_capture_order
+    ]
     if len(set(recorded_paths)) != len(recorded_paths):
         raise ValueError("artifact paths must be distinct; duplicate stage path recorded")
     resolved_paths: set[Path] = set()
-    for stage in EXPECTED_CAPTURE_ORDER:
+    for stage in expected_capture_order:
         record = artifacts[stage]
         recorded = Path(record.get("path", ""))
         expected_name = EXPECTED_ARTIFACT_FILENAMES[stage]
@@ -2147,6 +2215,30 @@ def validate_completed_report(
     return report
 
 
+def _packet_capture_profile(packet: Any) -> str:
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    positions = [
+        index
+        for index, argument in enumerate(packet.entrypoint_args)
+        if argument == "--capture-profile"
+    ]
+    if not positions:
+        return "full"
+    if len(positions) != 1 or positions[0] + 1 >= len(packet.entrypoint_args):
+        raise WitnessPacketError(
+            "native image-to-GLB packet capture profile is ambiguous"
+        )
+    profile = packet.entrypoint_args[positions[0] + 1]
+    try:
+        capture_order_for_profile(profile)
+    except ValueError as exc:
+        raise WitnessPacketError(
+            f"native image-to-GLB packet capture profile is invalid: {profile!r}"
+        ) from exc
+    return profile
+
+
 def validate_downloaded_native_image_to_glb_outputs(
     packet: Any,
     output_dir: Path,
@@ -2160,8 +2252,10 @@ def validate_downloaded_native_image_to_glb_outputs(
         raise WitnessPacketError("native image-to-GLB packet is missing its run identity")
     if packet.expected_image_sha256 is None:
         raise WitnessPacketError("native image-to-GLB packet is missing its image identity")
+    capture_profile = _packet_capture_profile(packet)
     expected_stage_outputs = tuple(
-        EXPECTED_ARTIFACT_FILENAMES[stage] for stage in EXPECTED_CAPTURE_ORDER
+        EXPECTED_ARTIFACT_FILENAMES[stage]
+        for stage in capture_order_for_profile(capture_profile)
     )
     if packet.output_json != "report.json" or packet.output_npz is not None:
         raise WitnessPacketError("native image-to-GLB packet output roles are not canonical")
@@ -2173,6 +2267,8 @@ def validate_downloaded_native_image_to_glb_outputs(
         expected_run_id=packet.run_id,
         expected_image_sha256=packet.expected_image_sha256,
     )
+    if report.get("capture_profile", "full") != capture_profile:
+        raise WitnessPacketError("downloaded report capture profile mismatch")
     return {"downloaded_outputs": records, "report": report}
 
 
@@ -2184,6 +2280,12 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
         raise WitnessPacketError(
             "native image-to-GLB packet requires run identity and image identity"
         )
+
+    capture_profile = _packet_capture_profile(packet)
+    expected_stage_outputs = tuple(
+        EXPECTED_ARTIFACT_FILENAMES[stage]
+        for stage in capture_order_for_profile(capture_profile)
+    )
 
     capsule_root = Path(packet.capsule_dir).resolve()
     requested_output = Path(packet.output_dir).resolve()
@@ -2199,8 +2301,10 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
     attempt_payload = None
     attempt_bytes: bytes | None = None
     attempt_sha256: str | None = None
+    legacy_v2_declared_outputs = False
     if packet.attempt_manifest is not None:
         from trellmlx.native_image_to_glb_attempt import (
+            ATTEMPT_MANIFEST_SCHEMA_V2,
             AttemptSpecError,
             load_attempt_manifest_bytes,
             validate_attempt_manifest,
@@ -2212,8 +2316,16 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             attempt_sha256 = hashlib.sha256(attempt_bytes).hexdigest()
             attempt_payload = load_attempt_manifest_bytes(attempt_bytes)
             validate_attempt_manifest(packet, attempt_payload)
+            legacy_v2_declared_outputs = (
+                attempt_payload.get("schema") == ATTEMPT_MANIFEST_SCHEMA_V2
+            )
         except (OSError, AttemptSpecError) as exc:
             raise WitnessPacketError(f"native attempt manifest rejected: {exc}") from exc
+
+    if not legacy_v2_declared_outputs and packet.expected_outputs != expected_stage_outputs:
+        raise WitnessPacketError(
+            "native image-to-GLB packet outputs do not match capture profile"
+        )
 
     authority_helper_name = "witness_authority.py"
     if packet.inputs.count(authority_helper_name) != 1:
@@ -2562,6 +2674,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--texture-size", default=1024, type=int)
     parser.add_argument("--attention-backend", default="xformers")
     parser.add_argument("--sparse-conv-backend", default="flex_gemm")
+    parser.add_argument(
+        "--capture-profile",
+        choices=tuple(CAPTURE_PROFILES),
+        default="full",
+    )
     parser.add_argument("--no-download", action="store_true")
     return parser
 
@@ -2587,7 +2704,8 @@ def main(argv: list[str] | None = None) -> int:
         "primary_output_status": "not_attempted",
         "requested_route": _requested_route(args),
         "effective_route": {},
-        "expected_capture_order": list(EXPECTED_CAPTURE_ORDER),
+        "capture_profile": args.capture_profile,
+        "expected_capture_order": list(capture_order_for_profile(args.capture_profile)),
         "capture_order": [],
         "artifacts": {},
     }

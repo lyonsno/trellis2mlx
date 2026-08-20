@@ -42,6 +42,7 @@ class NativeImageToGLBAttemptSpec:
     dinov3_files: Mapping[str, AttemptAsset]
     rembg_files: Mapping[str, AttemptAsset]
     expected_outputs: tuple[str, ...]
+    capture_profile: str = "full"
     output_coordinate: str = "outputs"
     work_coordinate: str = "runtime"
     accelerator: str = "NvidiaTeslaT4"
@@ -61,8 +62,33 @@ DINOV3_FILENAMES = (
 )
 DINOV3_MODEL_COORDINATE = "."
 ATTEMPT_MANIFEST = "native-image-to-glb-attempt.json"
-ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v2"
-ATTEMPT_MANIFEST_SCHEMA = "trellis2mlx.native_image_to_glb_attempt.v2"
+ATTEMPT_SPEC_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt_spec.v2"
+ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
+ATTEMPT_MANIFEST_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt.v2"
+ATTEMPT_MANIFEST_SCHEMA = "trellis2mlx.native_image_to_glb_attempt.v3"
+CAPTURE_PROFILE_OUTPUTS = {
+    "full": (
+        "00-preprocessed_image.png",
+        "01-conditioning_512.npz",
+        "02-sparse_flow.npz",
+        "03-sparse_support.npz",
+        "04-shape_flow.npz",
+        "05-shape_slat.npz",
+        "06-texture_flow.npz",
+        "07-decoder_raw_mesh.npz",
+        "08-texture_voxels.npz",
+        "09-pipeline_filled_mesh.npz",
+        "10-postprocess_stage11_pre_orientation.npz",
+        "11-postprocess_stage12_post_orientation.npz",
+        "12-consumer_glb.glb",
+    ),
+    "final-consumer": (
+        "07-decoder_raw_mesh.npz",
+        "10-postprocess_stage11_pre_orientation.npz",
+        "11-postprocess_stage12_post_orientation.npz",
+        "12-consumer_glb.glb",
+    ),
+}
 
 
 def load_attempt_spec_bytes(
@@ -94,10 +120,17 @@ def load_attempt_spec_bytes(
         "accelerator",
         "enable_internet",
     }
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    if schema == ATTEMPT_SPEC_SCHEMA:
+        expected_fields.add("capture_profile")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt spec field set is incomplete or contains unknown fields")
-    if payload.get("schema") != ATTEMPT_SPEC_SCHEMA:
+    if schema not in {ATTEMPT_SPEC_SCHEMA_V2, ATTEMPT_SPEC_SCHEMA}:
         raise AttemptSpecError(f"unexpected attempt spec schema: {payload.get('schema')!r}")
+    if schema == ATTEMPT_SPEC_SCHEMA and payload["capture_profile"] == "full":
+        raise AttemptSpecError(
+            "v3 attempt spec cannot declare an explicit full capture profile"
+        )
 
     def resolved_path(value: object, label: str) -> Path:
         if not isinstance(value, str) or not value:
@@ -163,6 +196,7 @@ def load_attempt_spec_bytes(
             for role, value in rembg_payload.items()
         },
         expected_outputs=tuple(expected_outputs),
+        capture_profile=payload.get("capture_profile", "full"),
         output_coordinate=payload["output_coordinate"],
         work_coordinate=payload["work_coordinate"],
         accelerator=payload["accelerator"],
@@ -270,8 +304,12 @@ def _validate_execution_coordinates(spec: NativeImageToGLBAttemptSpec) -> None:
 
 
 def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
-    return {
-        "schema": ATTEMPT_MANIFEST_SCHEMA,
+    payload = {
+        "schema": (
+            ATTEMPT_MANIFEST_SCHEMA
+            if spec.capture_profile != "full"
+            else ATTEMPT_MANIFEST_SCHEMA_V2
+        ),
         "run_id": spec.run_id,
         "dataset_id": spec.dataset_id,
         "kernel_id": spec.kernel_id,
@@ -290,6 +328,9 @@ def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAss
             for role, asset in assets.items()
         },
     }
+    if spec.capture_profile != "full":
+        payload["capture_profile"] = spec.capture_profile
+    return payload
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -338,10 +379,17 @@ def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
         "expected_outputs",
         "assets",
     }
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    if schema == ATTEMPT_MANIFEST_SCHEMA:
+        expected_fields.add("capture_profile")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt manifest field set is invalid")
-    if payload.get("schema") != ATTEMPT_MANIFEST_SCHEMA:
+    if schema not in {ATTEMPT_MANIFEST_SCHEMA_V2, ATTEMPT_MANIFEST_SCHEMA}:
         raise AttemptSpecError("attempt manifest schema is invalid")
+    if schema == ATTEMPT_MANIFEST_SCHEMA and payload["capture_profile"] == "full":
+        raise AttemptSpecError(
+            "v3 attempt manifest cannot declare an explicit full capture profile"
+        )
     return payload
 
 
@@ -374,6 +422,14 @@ def validate_attempt_manifest(
                 f"attempt manifest {field} or run identity mismatch: "
                 f"expected {expected!r}, got {payload.get(field)!r}"
             )
+    capture_profile = payload.get("capture_profile", "full")
+    if capture_profile not in CAPTURE_PROFILE_OUTPUTS:
+        raise AttemptSpecError("attempt manifest capture profile is invalid")
+    if (
+        capture_profile != "full"
+        and tuple(packet.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[capture_profile]
+    ):
+        raise AttemptSpecError("attempt manifest capture profile output set mismatch")
 
     def argument(flag: str) -> str:
         positions = [
@@ -382,6 +438,17 @@ def validate_attempt_manifest(
         if len(positions) != 1 or positions[0] + 1 >= len(packet.entrypoint_args):
             raise AttemptSpecError(f"attempt packet is missing exactly one {flag}")
         return packet.entrypoint_args[positions[0] + 1]
+
+    capture_positions = [
+        index
+        for index, value in enumerate(packet.entrypoint_args)
+        if value == "--capture-profile"
+    ]
+    if capture_profile == "full":
+        if capture_positions:
+            raise AttemptSpecError("full attempt manifest must use the implicit capture profile")
+    elif argument("--capture-profile") != capture_profile:
+        raise AttemptSpecError("attempt manifest capture profile argument mismatch")
 
     if payload.get("output_coordinate") != argument("--output-dir"):
         raise AttemptSpecError("attempt manifest output coordinate mismatch")
@@ -440,6 +507,13 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         spec.expected_outputs
     ):
         raise AttemptSpecError("attempt expected outputs are missing or duplicated")
+    if spec.capture_profile not in CAPTURE_PROFILE_OUTPUTS:
+        raise AttemptSpecError("attempt capture profile is invalid")
+    if (
+        spec.capture_profile != "full"
+        and tuple(spec.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[spec.capture_profile]
+    ):
+        raise AttemptSpecError("attempt expected outputs do not match capture profile")
     _validate_execution_coordinates(spec)
     validate_attempt_topology(spec)
 
@@ -542,6 +616,11 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
             spec.output_coordinate,
             "--work-dir",
             spec.work_coordinate,
+            *(
+                ("--capture-profile", spec.capture_profile)
+                if spec.capture_profile != "full"
+                else ()
+            ),
             "--dinov3-model-path",
             DINOV3_MODEL_COORDINATE,
             *rembg_arguments,

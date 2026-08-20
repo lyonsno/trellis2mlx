@@ -1839,9 +1839,47 @@ def _native_attempt_contract(
     packet: KaggleCudaWitnessPacket,
     outer_manifest: dict[str, object],
 ) -> dict[str, object]:
+    from trellmlx.native_image_to_glb_attempt import (
+        ATTEMPT_MANIFEST_SCHEMA,
+        ATTEMPT_MANIFEST_SCHEMA_V2,
+        CAPTURE_PROFILE_OUTPUTS,
+    )
+
     files = outer_manifest.get("files")
     if not isinstance(files, dict):
         raise WitnessPacketError("attempt-bearing packet outer file records are missing")
+    capture_positions = [
+        index
+        for index, value in enumerate(packet.entrypoint_args)
+        if value == "--capture-profile"
+    ]
+    if not capture_positions:
+        capture_profile = "full"
+    elif (
+        len(capture_positions) != 1
+        or capture_positions[0] + 1 >= len(packet.entrypoint_args)
+        or packet.entrypoint_args[capture_positions[0] + 1].startswith("--")
+    ):
+        raise WitnessPacketError(
+            "attempt-bearing packet capture profile is missing or ambiguous"
+        )
+    else:
+        capture_profile = packet.entrypoint_args[capture_positions[0] + 1]
+    if capture_profile not in CAPTURE_PROFILE_OUTPUTS:
+        raise WitnessPacketError(
+            f"attempt-bearing packet capture profile is invalid: {capture_profile!r}"
+        )
+    if capture_profile == "full" and capture_positions:
+        raise WitnessPacketError(
+            "attempt-bearing full capture profile must remain implicit"
+        )
+    if (
+        capture_profile != "full"
+        and tuple(packet.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[capture_profile]
+    ):
+        raise WitnessPacketError(
+            "attempt-bearing packet expected outputs do not match capture profile"
+        )
     dinov3_model_coordinate = _entrypoint_argument(packet, "--dinov3-model-path")
     if dinov3_model_coordinate != ".":
         raise WitnessPacketError(
@@ -1875,8 +1913,12 @@ def _native_attempt_contract(
             "sha256": record.get("sha256"),
             "size_bytes": record.get("size_bytes"),
         }
-    return {
-        "schema": "trellis2mlx.native_image_to_glb_attempt.v2",
+    contract = {
+        "schema": (
+            ATTEMPT_MANIFEST_SCHEMA_V2
+            if capture_profile == "full"
+            else ATTEMPT_MANIFEST_SCHEMA
+        ),
         "run_id": packet.run_id,
         "dataset_id": packet.dataset_id,
         "kernel_id": packet.kernel_id,
@@ -1888,6 +1930,9 @@ def _native_attempt_contract(
         "expected_outputs": list(packet.expected_outputs),
         "assets": assets,
     }
+    if capture_profile != "full":
+        contract["capture_profile"] = capture_profile
+    return contract
 
 
 def _legacy_output_by_suffix(outputs: Sequence[str], suffix: str) -> str | None:
