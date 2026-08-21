@@ -1297,6 +1297,7 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
         "source_identity": CONFIG["source_identity"],
         "run_id": CONFIG["run_id"],
         "expected_image_sha256": CONFIG["expected_image_sha256"],
+        "input_staging_mode": CONFIG["input_staging_mode"],
         **CUDA,
         "timestamp": time.time(),
     }}

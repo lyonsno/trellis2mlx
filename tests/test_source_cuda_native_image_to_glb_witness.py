@@ -297,6 +297,7 @@ def _execute_prepared_runner(
     monkeypatch,
     *,
     corrupt_contract=False,
+    cuda_available=True,
     forbid_input_copy=False,
     forbid_output_copy=False,
     sha256_failures=(),
@@ -307,7 +308,7 @@ def _execute_prepared_runner(
     fake_torch = types.SimpleNamespace(
         __version__="2.10.0+cu128",
         cuda=types.SimpleNamespace(
-            is_available=lambda: True,
+            is_available=lambda: cuda_available,
             get_device_name=lambda _index: "Tesla T4",
         ),
     )
@@ -473,6 +474,26 @@ def test_generated_runner_stages_immutable_mount_without_copying_inputs(
         for record in receipt["inputs"].values()
     )
     assert all((work / name).is_symlink() for name in packet.inputs)
+
+
+def test_attempt_runner_receipts_staging_mode_before_staging_initialization(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        cuda_available=False,
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 6
+    assert receipt["failure_phase"] == "cuda_route"
+    assert receipt["input_staging_mode"] == "immutable-mount-symlink"
+    assert "input_staging" not in receipt
 
 
 @pytest.mark.parametrize(

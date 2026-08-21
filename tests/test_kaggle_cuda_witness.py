@@ -390,6 +390,64 @@ def test_prepared_runner_rejects_substituted_mounted_manifest_identity(
     assert not (work / "cuda_result.json").exists()
 
 
+def test_prepared_runner_rejects_substituted_input_staging_mode(
+    tmp_path,
+    monkeypatch,
+):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("raise AssertionError('must not execute')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/mode-substitution-inputs",
+            kernel_id="operator/mode-substitution-cuda",
+            title="Mode Substitution CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+        )
+    )
+    manifest_path = packet.dataset_dir / "witness-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["input_staging_mode"] = "immutable-mount-symlink"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    fake_torch = types.SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work = tmp_path / "work-mode-substitution"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text().replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+    namespace["CONFIG"]["manifest_sha256"] = namespace["sha256_file"](
+        manifest_path
+    )
+
+    rc = namespace["main"]()
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 3
+    assert receipt["failure_phase"] == "input_manifest_identity"
+    assert receipt["input_staging_mode"] == "working-copy"
+    assert receipt["expected_manifest_identity"]["input_staging_mode"] == "working-copy"
+    assert (
+        receipt["actual_manifest_identity"]["input_staging_mode"]
+        == "immutable-mount-symlink"
+    )
+
+
 def test_prepared_runner_rejects_missing_effective_cuda_before_probe(
     tmp_path,
     monkeypatch,
@@ -441,6 +499,7 @@ def test_prepared_runner_rejects_missing_effective_cuda_before_probe(
     assert receipt["cuda_available"] is False
     assert receipt["cuda_device"] is None
     assert receipt["input_manifest"]["sha256"]
+    assert receipt["input_staging_mode"] == "working-copy"
     assert not (work / "probe-executed").exists()
 
 
