@@ -406,11 +406,18 @@ def test_structured_runner_bridges_attempt_outputs_to_kaggle_publication(
     command = receipt["effective_command"]
     assert rc == 0
     assert command[command.index("--output-json") + 1] == "outputs/report.json"
-    assert (work / "outputs" / "report.json").is_file()
-    assert (work / "outputs" / "12-consumer_glb.glb").is_file()
+    assert not (work / "outputs" / "report.json").exists()
+    assert not (work / "outputs" / "12-consumer_glb.glb").exists()
     assert json.loads((work / "report.json").read_text())["status"] == "completed"
     assert (work / "12-consumer_glb.glb").read_bytes() == b"glb"
     assert receipt["status"] == "done"
+    assert receipt["output_publication"]["mode"] == "same-filesystem-replace"
+    assert all(
+        record["validated"]
+        and record["published"]
+        and record["source_removed"]
+        for record in receipt["output_publication"]["outputs"].values()
+    )
     assert set(receipt["outputs"]) == set(packet.outputs)
 
 

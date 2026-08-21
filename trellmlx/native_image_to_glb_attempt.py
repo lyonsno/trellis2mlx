@@ -10,7 +10,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import shutil
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import uuid
 
 from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket
@@ -91,6 +91,132 @@ CAPTURE_PROFILE_OUTPUTS = {
 }
 
 
+@dataclass(frozen=True)
+class CaptureContract:
+    capture_profile: str
+    expected_outputs: tuple[str, ...]
+    manifest_schema: str
+    profile_is_explicit: bool
+    profile_binds_outputs: bool
+
+
+def resolve_capture_contract(
+    *,
+    capture_profile: object,
+    expected_outputs: object,
+    profile_is_explicit: bool,
+    context: str,
+) -> CaptureContract:
+    if not isinstance(expected_outputs, (list, tuple)) or not all(
+        isinstance(value, str) and value for value in expected_outputs
+    ):
+        raise AttemptSpecError(f"{context} expected output list is invalid")
+    outputs = tuple(expected_outputs)
+    if not outputs or len(set(outputs)) != len(outputs):
+        raise AttemptSpecError(f"{context} expected outputs are missing or duplicated")
+
+    if not profile_is_explicit:
+        if capture_profile not in {None, "full"}:
+            raise AttemptSpecError(f"{context} implicit capture profile is invalid")
+        return CaptureContract(
+            capture_profile="full",
+            expected_outputs=outputs,
+            manifest_schema=ATTEMPT_MANIFEST_SCHEMA_V2,
+            profile_is_explicit=False,
+            profile_binds_outputs=False,
+        )
+
+    if capture_profile == "full":
+        raise AttemptSpecError(
+            f"{context} cannot declare an explicit full capture profile"
+        )
+    if capture_profile not in CAPTURE_PROFILE_OUTPUTS:
+        raise AttemptSpecError(f"{context} capture profile is invalid")
+    if outputs != CAPTURE_PROFILE_OUTPUTS[capture_profile]:
+        raise AttemptSpecError(
+            f"{context} expected outputs do not match capture profile"
+        )
+    return CaptureContract(
+        capture_profile=capture_profile,
+        expected_outputs=outputs,
+        manifest_schema=ATTEMPT_MANIFEST_SCHEMA,
+        profile_is_explicit=True,
+        profile_binds_outputs=True,
+    )
+
+
+def capture_contract_from_spec_payload(payload: Mapping[str, Any]) -> CaptureContract:
+    schema = payload.get("schema")
+    return resolve_capture_contract(
+        capture_profile=payload.get("capture_profile"),
+        expected_outputs=payload.get("expected_outputs"),
+        profile_is_explicit=schema == ATTEMPT_SPEC_SCHEMA,
+        context="attempt spec",
+    )
+
+
+def capture_contract_from_manifest(payload: Mapping[str, Any]) -> CaptureContract:
+    schema = payload.get("schema")
+    return resolve_capture_contract(
+        capture_profile=payload.get("capture_profile"),
+        expected_outputs=payload.get("expected_outputs"),
+        profile_is_explicit=schema == ATTEMPT_MANIFEST_SCHEMA,
+        context="attempt manifest",
+    )
+
+
+def capture_contract_from_profile(
+    capture_profile: str,
+    expected_outputs: tuple[str, ...],
+    *,
+    context: str,
+) -> CaptureContract:
+    return resolve_capture_contract(
+        capture_profile=capture_profile,
+        expected_outputs=expected_outputs,
+        profile_is_explicit=capture_profile != "full",
+        context=context,
+    )
+
+
+def capture_contract_from_entrypoint_args(
+    entrypoint_args: Sequence[str],
+    expected_outputs: Sequence[str],
+    *,
+    context: str,
+) -> CaptureContract:
+    declarations: list[str] = []
+    malformed_declaration = False
+    for index, argument in enumerate(entrypoint_args):
+        if argument == "--capture-profile":
+            if (
+                index + 1 >= len(entrypoint_args)
+                or entrypoint_args[index + 1].startswith("--")
+            ):
+                malformed_declaration = True
+            else:
+                declarations.append(entrypoint_args[index + 1])
+        elif argument.startswith("--capture-profile="):
+            capture_profile = argument.removeprefix("--capture-profile=")
+            if capture_profile:
+                declarations.append(capture_profile)
+            else:
+                malformed_declaration = True
+
+    if malformed_declaration or len(declarations) > 1:
+        raise AttemptSpecError(f"{context} capture profile is ambiguous")
+    if not declarations:
+        capture_profile = "full"
+    else:
+        capture_profile = declarations[0]
+    return resolve_capture_contract(
+        capture_profile=capture_profile,
+        expected_outputs=expected_outputs,
+        profile_is_explicit=bool(declarations),
+        context=context,
+    )
+
+
 def load_attempt_spec_bytes(
     data: bytes,
     *,
@@ -127,10 +253,6 @@ def load_attempt_spec_bytes(
         raise AttemptSpecError("attempt spec field set is incomplete or contains unknown fields")
     if schema not in {ATTEMPT_SPEC_SCHEMA_V2, ATTEMPT_SPEC_SCHEMA}:
         raise AttemptSpecError(f"unexpected attempt spec schema: {payload.get('schema')!r}")
-    if schema == ATTEMPT_SPEC_SCHEMA and payload["capture_profile"] == "full":
-        raise AttemptSpecError(
-            "v3 attempt spec cannot declare an explicit full capture profile"
-        )
 
     def resolved_path(value: object, label: str) -> Path:
         if not isinstance(value, str) or not value:
@@ -159,11 +281,7 @@ def load_attempt_spec_bytes(
     rembg_payload = payload["rembg_files"]
     if not isinstance(rembg_payload, dict):
         raise AttemptSpecError("attempt RMBG file map is invalid")
-    expected_outputs = payload["expected_outputs"]
-    if not isinstance(expected_outputs, list) or not all(
-        isinstance(value, str) and value for value in expected_outputs
-    ):
-        raise AttemptSpecError("attempt expected output list is invalid")
+    capture_contract = capture_contract_from_spec_payload(payload)
     if type(payload["enable_internet"]) is not bool:
         raise AttemptSpecError("attempt enable_internet must be boolean")
     scalar_fields = (
@@ -195,8 +313,8 @@ def load_attempt_spec_bytes(
             role: asset(value, f"RMBG {role}")
             for role, value in rembg_payload.items()
         },
-        expected_outputs=tuple(expected_outputs),
-        capture_profile=payload.get("capture_profile", "full"),
+        expected_outputs=capture_contract.expected_outputs,
+        capture_profile=capture_contract.capture_profile,
         output_coordinate=payload["output_coordinate"],
         work_coordinate=payload["work_coordinate"],
         accelerator=payload["accelerator"],
@@ -304,12 +422,13 @@ def _validate_execution_coordinates(spec: NativeImageToGLBAttemptSpec) -> None:
 
 
 def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
+    capture_contract = capture_contract_from_profile(
+        spec.capture_profile,
+        spec.expected_outputs,
+        context="attempt",
+    )
     payload = {
-        "schema": (
-            ATTEMPT_MANIFEST_SCHEMA
-            if spec.capture_profile != "full"
-            else ATTEMPT_MANIFEST_SCHEMA_V2
-        ),
+        "schema": capture_contract.manifest_schema,
         "run_id": spec.run_id,
         "dataset_id": spec.dataset_id,
         "kernel_id": spec.kernel_id,
@@ -318,7 +437,7 @@ def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAss
         "enable_internet": spec.enable_internet,
         "output_coordinate": spec.output_coordinate,
         "work_coordinate": spec.work_coordinate,
-        "expected_outputs": list(spec.expected_outputs),
+        "expected_outputs": list(capture_contract.expected_outputs),
         "assets": {
             role: {
                 "coordinate": asset.coordinate,
@@ -328,8 +447,8 @@ def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAss
             for role, asset in assets.items()
         },
     }
-    if spec.capture_profile != "full":
-        payload["capture_profile"] = spec.capture_profile
+    if capture_contract.profile_is_explicit:
+        payload["capture_profile"] = capture_contract.capture_profile
     return payload
 
 
@@ -386,10 +505,7 @@ def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
         raise AttemptSpecError("attempt manifest field set is invalid")
     if schema not in {ATTEMPT_MANIFEST_SCHEMA_V2, ATTEMPT_MANIFEST_SCHEMA}:
         raise AttemptSpecError("attempt manifest schema is invalid")
-    if schema == ATTEMPT_MANIFEST_SCHEMA and payload["capture_profile"] == "full":
-        raise AttemptSpecError(
-            "v3 attempt manifest cannot declare an explicit full capture profile"
-        )
+    capture_contract_from_manifest(payload)
     return payload
 
 
@@ -422,14 +538,7 @@ def validate_attempt_manifest(
                 f"attempt manifest {field} or run identity mismatch: "
                 f"expected {expected!r}, got {payload.get(field)!r}"
             )
-    capture_profile = payload.get("capture_profile", "full")
-    if capture_profile not in CAPTURE_PROFILE_OUTPUTS:
-        raise AttemptSpecError("attempt manifest capture profile is invalid")
-    if (
-        capture_profile != "full"
-        and tuple(packet.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[capture_profile]
-    ):
-        raise AttemptSpecError("attempt manifest capture profile output set mismatch")
+    capture_contract = capture_contract_from_manifest(payload)
 
     def argument(flag: str) -> str:
         positions = [
@@ -439,15 +548,16 @@ def validate_attempt_manifest(
             raise AttemptSpecError(f"attempt packet is missing exactly one {flag}")
         return packet.entrypoint_args[positions[0] + 1]
 
-    capture_positions = [
-        index
-        for index, value in enumerate(packet.entrypoint_args)
-        if value == "--capture-profile"
-    ]
-    if capture_profile == "full":
-        if capture_positions:
-            raise AttemptSpecError("full attempt manifest must use the implicit capture profile")
-    elif argument("--capture-profile") != capture_profile:
+    packet_capture_contract = capture_contract_from_entrypoint_args(
+        packet.entrypoint_args,
+        packet.expected_outputs,
+        context="attempt packet",
+    )
+    if (
+        packet_capture_contract.capture_profile != capture_contract.capture_profile
+        or packet_capture_contract.profile_is_explicit
+        != capture_contract.profile_is_explicit
+    ):
         raise AttemptSpecError("attempt manifest capture profile argument mismatch")
 
     if payload.get("output_coordinate") != argument("--output-dir"):
@@ -503,17 +613,11 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         raise AttemptSpecError("attempt DINOv3 role set is incomplete")
     if set(spec.rembg_files) != set(REMBG_ARGUMENTS):
         raise AttemptSpecError("attempt RMBG role set is incomplete")
-    if not spec.expected_outputs or len(set(spec.expected_outputs)) != len(
-        spec.expected_outputs
-    ):
-        raise AttemptSpecError("attempt expected outputs are missing or duplicated")
-    if spec.capture_profile not in CAPTURE_PROFILE_OUTPUTS:
-        raise AttemptSpecError("attempt capture profile is invalid")
-    if (
-        spec.capture_profile != "full"
-        and tuple(spec.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[spec.capture_profile]
-    ):
-        raise AttemptSpecError("attempt expected outputs do not match capture profile")
+    capture_contract = capture_contract_from_profile(
+        spec.capture_profile,
+        spec.expected_outputs,
+        context="attempt",
+    )
     _validate_execution_coordinates(spec)
     validate_attempt_topology(spec)
 
@@ -617,8 +721,8 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
             "--work-dir",
             spec.work_coordinate,
             *(
-                ("--capture-profile", spec.capture_profile)
-                if spec.capture_profile != "full"
+                ("--capture-profile", capture_contract.capture_profile)
+                if capture_contract.profile_is_explicit
                 else ()
             ),
             "--dinov3-model-path",
@@ -631,6 +735,6 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         enable_internet=spec.enable_internet,
         output_json="report.json",
         output_npz=None,
-        expected_outputs=spec.expected_outputs,
+        expected_outputs=capture_contract.expected_outputs,
         attempt_manifest=ATTEMPT_MANIFEST,
     )

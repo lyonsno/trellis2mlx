@@ -2215,28 +2215,25 @@ def validate_completed_report(
     return report
 
 
-def _packet_capture_profile(packet: Any) -> str:
+def _packet_capture_contract(packet: Any) -> Any:
     from trellmlx.kaggle_cuda_witness import WitnessPacketError
+    from trellmlx.native_image_to_glb_attempt import (
+        AttemptSpecError,
+        capture_contract_from_entrypoint_args,
+    )
 
-    positions = [
-        index
-        for index, argument in enumerate(packet.entrypoint_args)
-        if argument == "--capture-profile"
-    ]
-    if not positions:
-        return "full"
-    if len(positions) != 1 or positions[0] + 1 >= len(packet.entrypoint_args):
-        raise WitnessPacketError(
-            "native image-to-GLB packet capture profile is ambiguous"
-        )
-    profile = packet.entrypoint_args[positions[0] + 1]
     try:
-        capture_order_for_profile(profile)
-    except ValueError as exc:
-        raise WitnessPacketError(
-            f"native image-to-GLB packet capture profile is invalid: {profile!r}"
-        ) from exc
-    return profile
+        return capture_contract_from_entrypoint_args(
+            packet.entrypoint_args,
+            packet.expected_outputs,
+            context="native image-to-GLB packet",
+        )
+    except AttemptSpecError as exc:
+        raise WitnessPacketError(str(exc)) from exc
+
+
+def _packet_capture_profile(packet: Any) -> str:
+    return _packet_capture_contract(packet).capture_profile
 
 
 def validate_downloaded_native_image_to_glb_outputs(
@@ -2252,7 +2249,8 @@ def validate_downloaded_native_image_to_glb_outputs(
         raise WitnessPacketError("native image-to-GLB packet is missing its run identity")
     if packet.expected_image_sha256 is None:
         raise WitnessPacketError("native image-to-GLB packet is missing its image identity")
-    capture_profile = _packet_capture_profile(packet)
+    capture_contract = _packet_capture_contract(packet)
+    capture_profile = capture_contract.capture_profile
     expected_stage_outputs = tuple(
         EXPECTED_ARTIFACT_FILENAMES[stage]
         for stage in capture_order_for_profile(capture_profile)
@@ -2281,7 +2279,8 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             "native image-to-GLB packet requires run identity and image identity"
         )
 
-    capture_profile = _packet_capture_profile(packet)
+    capture_contract = _packet_capture_contract(packet)
+    capture_profile = capture_contract.capture_profile
     expected_stage_outputs = tuple(
         EXPECTED_ARTIFACT_FILENAMES[stage]
         for stage in capture_order_for_profile(capture_profile)
@@ -2301,11 +2300,11 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
     attempt_payload = None
     attempt_bytes: bytes | None = None
     attempt_sha256: str | None = None
-    legacy_v2_declared_outputs = False
+    manifest_declares_outputs = False
     if packet.attempt_manifest is not None:
         from trellmlx.native_image_to_glb_attempt import (
-            ATTEMPT_MANIFEST_SCHEMA_V2,
             AttemptSpecError,
+            capture_contract_from_manifest,
             load_attempt_manifest_bytes,
             validate_attempt_manifest,
         )
@@ -2316,13 +2315,13 @@ def prepare_native_image_to_glb_packet(packet: Any) -> Any:
             attempt_sha256 = hashlib.sha256(attempt_bytes).hexdigest()
             attempt_payload = load_attempt_manifest_bytes(attempt_bytes)
             validate_attempt_manifest(packet, attempt_payload)
-            legacy_v2_declared_outputs = (
-                attempt_payload.get("schema") == ATTEMPT_MANIFEST_SCHEMA_V2
-            )
+            manifest_declares_outputs = not capture_contract_from_manifest(
+                attempt_payload
+            ).profile_binds_outputs
         except (OSError, AttemptSpecError) as exc:
             raise WitnessPacketError(f"native attempt manifest rejected: {exc}") from exc
 
-    if not legacy_v2_declared_outputs and packet.expected_outputs != expected_stage_outputs:
+    if not manifest_declares_outputs and packet.expected_outputs != expected_stage_outputs:
         raise WitnessPacketError(
             "native image-to-GLB packet outputs do not match capture profile"
         )

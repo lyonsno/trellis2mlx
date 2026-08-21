@@ -1244,7 +1244,6 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -1324,18 +1323,37 @@ def find_manifest() -> Path | None:
 
 
 def output_snapshot() -> dict:
-    records = {{}}
-    for name in CONFIG["outputs"]:
-        path = Path(name)
+    return {{name: file_snapshot(Path(name)) for name in CONFIG["outputs"]}}
+
+
+def file_snapshot(path: Path, *, include_path: bool = False) -> dict:
+    record = {{
+        "exists": False,
+        "sha256": None,
+        "size_bytes": None,
+    }}
+    if include_path:
+        record["path"] = str(path)
+    try:
         if not path.is_file():
-            records[name] = {{"exists": False, "sha256": None, "size_bytes": None}}
-            continue
-        records[name] = {{
-            "exists": True,
-            "sha256": sha256_file(path),
-            "size_bytes": path.stat().st_size,
-        }}
-    return records
+            return record
+        record["exists"] = True
+        record["size_bytes"] = path.stat().st_size
+        record["sha256"] = sha256_file(path)
+    except Exception as exc:
+        record["inspection_error"] = f"{{type(exc).__name__}}: {{exc}}"
+    return record
+
+
+def safe_path_probe(path: Path, *, probe: str) -> tuple[bool | None, str | None]:
+    try:
+        if probe == "exists":
+            return path.exists(), None
+        if probe == "is_file":
+            return path.is_file(), None
+        raise ValueError(f"unsupported path probe: {{probe}}")
+    except Exception as exc:
+        return None, f"{{type(exc).__name__}}: {{exc}}"
 
 
 def execution_output_path(name: str) -> Path:
@@ -1419,21 +1437,7 @@ def execution_output_snapshot() -> dict:
         }}
     records = {{}}
     for name, paths in graph.items():
-        source = paths["source"]
-        if not source.is_file():
-            records[name] = {{
-                "path": str(source),
-                "exists": False,
-                "sha256": None,
-                "size_bytes": None,
-            }}
-            continue
-        records[name] = {{
-            "path": str(source),
-            "exists": True,
-            "sha256": sha256_file(source),
-            "size_bytes": source.stat().st_size,
-        }}
+        records[name] = file_snapshot(paths["source"], include_path=True)
     return records
 
 
@@ -1442,70 +1446,119 @@ def publish_attempt_outputs() -> dict | None:
     if coordinate is None:
         return None
     records = {{}}
-    staging_root = None
+    active_output = None
     try:
         graph = validated_output_graph()
-        staging_root = Path(
-            tempfile.mkdtemp(prefix=".kaggle-output-publication-", dir=Path.cwd())
-        )
         for name, paths in graph.items():
-            source = paths["source"]
-            staged = staging_root / name
-            record = {{
-                "source": str(source),
+            records[name] = {{
+                "source": str(paths["source"]),
                 "destination": str(paths["destination"]),
-                "staged": False,
+                "present": False,
+                "validated": False,
+                "filesystem_validated": False,
+                "moved": False,
+                "source_removed": None,
+                "destination_exists": None,
+                "destination_verified": False,
                 "published": False,
+                "phase": "not_inspected",
+                "publication_method": "same-filesystem-replace",
             }}
-            if source.is_file():
-                shutil.copy2(source, staged)
-                record.update(
-                    staged=True,
-                    source_sha256=sha256_file(source),
-                    staged_sha256=sha256_file(staged),
-                    size_bytes=staged.stat().st_size,
-                )
-                if record["source_sha256"] != record["staged_sha256"]:
-                    raise RuntimeError(f"staged output digest mismatch for {{name}}")
-            records[name] = record
         for name, paths in graph.items():
-            record = records[name]
-            if not record["staged"]:
-                continue
-            staged = staging_root / name
+            active_output = name
+            source = paths["source"]
             destination = paths["destination"]
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{{destination.name}}.publishing")
-            temporary.unlink(missing_ok=True)
-            try:
-                shutil.copy2(staged, temporary)
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
+            record = records[name]
+            record["phase"] = "source_inspection"
+            if source.is_file():
+                record["present"] = True
+                source_stat = source.stat()
+                record["size_bytes"] = source_stat.st_size
+                record["phase"] = "source_digest"
+                record["source_sha256"] = sha256_file(source)
+                record["phase"] = "filesystem_validation"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if source_stat.st_dev != destination.parent.stat().st_dev:
+                    raise RuntimeError(
+                        f"execution and publication outputs span filesystems for {{name}}"
+                    )
+                record["filesystem_validated"] = True
+                record["validated"] = True
+                record["phase"] = "validated"
+            else:
+                record["phase"] = "missing"
+        for name, paths in graph.items():
+            active_output = name
+            record = records[name]
+            if not record["validated"]:
+                continue
+            source = paths["source"]
+            destination = paths["destination"]
+            record["phase"] = "replacement"
+            source.replace(destination)
+            record["moved"] = True
+            record["phase"] = "destination_inspection"
+            source_exists, source_error = safe_path_probe(source, probe="exists")
+            if source_error is not None:
+                record["source_inspection_error"] = source_error
+            else:
+                record["source_removed"] = not source_exists
+            destination_exists, destination_error = safe_path_probe(
+                destination,
+                probe="is_file",
+            )
+            if destination_error is not None:
+                record["destination_inspection_error"] = destination_error
+            else:
+                record["destination_exists"] = destination_exists
+            if source_error is not None or destination_error is not None:
+                raise RuntimeError(f"post-move output inspection failed for {{name}}")
+            if not record["source_removed"] or not record["destination_exists"]:
+                raise RuntimeError(f"post-move output state is invalid for {{name}}")
+            record["phase"] = "destination_digest"
             destination_sha256 = sha256_file(destination)
-            if destination_sha256 != record["staged_sha256"]:
+            record["destination_sha256"] = destination_sha256
+            if destination_sha256 != record["source_sha256"]:
                 raise RuntimeError(f"published output digest mismatch for {{name}}")
             record.update(
+                phase="complete",
+                destination_verified=True,
                 published=True,
-                destination_sha256=destination_sha256,
             )
         return {{
             "status": "done",
-            "mode": "attempt-publication",
+            "mode": "same-filesystem-replace",
             "coordinate": coordinate,
             "outputs": records,
         }}
     except Exception as exc:
+        error = f"{{type(exc).__name__}}: {{exc}}"
+        if active_output in records:
+            record = records[active_output]
+            record["failure_phase"] = record["phase"]
+            record["error"] = error
+            source = Path(record["source"])
+            destination = Path(record["destination"])
+            source_exists, source_error = safe_path_probe(source, probe="exists")
+            if source_error is not None:
+                record.setdefault("source_inspection_error", source_error)
+            elif record["source_removed"] is None:
+                record["source_removed"] = not source_exists
+            destination_exists, destination_error = safe_path_probe(
+                destination,
+                probe="is_file",
+            )
+            if destination_error is not None:
+                record.setdefault("destination_inspection_error", destination_error)
+            elif record["destination_exists"] is None:
+                record["destination_exists"] = destination_exists
         return {{
             "status": "failed",
-            "mode": "attempt-publication",
+            "mode": "same-filesystem-replace",
             "coordinate": coordinate,
-            "error": f"{{type(exc).__name__}}: {{exc}}",
+            "error": error,
             "outputs": records,
         }}
-    finally:
-        if staging_root is not None:
-            shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def preserve_child_report_fallback() -> dict:
@@ -1516,25 +1569,35 @@ def preserve_child_report_fallback() -> dict:
         "size_bytes": None,
     }}
     try:
-        source = execution_output_path(CONFIG["output_json"])
-        confined_output_path(source, label="child report source")
+        graph = validated_output_graph()
+        report_paths = graph[CONFIG["output_json"]]
+        candidates = (report_paths["source"], report_paths["destination"])
+        for candidate in candidates:
+            confined_output_path(candidate, label="child report source")
         confined_output_path(CHILD_REPORT_FALLBACK, label="child report fallback")
-        if not source.is_file():
-            return record
-        temporary = CHILD_REPORT_FALLBACK.with_name(
-            f".{{CHILD_REPORT_FALLBACK.name}}.publishing"
-        )
-        temporary.unlink(missing_ok=True)
-        try:
-            shutil.copy2(source, temporary)
-            temporary.replace(CHILD_REPORT_FALLBACK)
-        finally:
+        candidate_errors = {{}}
+        for source in candidates:
+            temporary = CHILD_REPORT_FALLBACK.with_name(
+                f".{{CHILD_REPORT_FALLBACK.name}}.publishing"
+            )
             temporary.unlink(missing_ok=True)
-        record.update(
-            exists=True,
-            sha256=sha256_file(CHILD_REPORT_FALLBACK),
-            size_bytes=CHILD_REPORT_FALLBACK.stat().st_size,
-        )
+            try:
+                shutil.copy2(source, temporary)
+                temporary.replace(CHILD_REPORT_FALLBACK)
+                record.update(
+                    exists=True,
+                    source=str(source),
+                    sha256=sha256_file(CHILD_REPORT_FALLBACK),
+                    size_bytes=CHILD_REPORT_FALLBACK.stat().st_size,
+                )
+                if candidate_errors:
+                    record["candidate_errors"] = candidate_errors
+                return record
+            except Exception as exc:
+                candidate_errors[str(source)] = f"{{type(exc).__name__}}: {{exc}}"
+            finally:
+                temporary.unlink(missing_ok=True)
+        record["candidate_errors"] = candidate_errors
     except Exception as exc:
         record["error"] = f"{{type(exc).__name__}}: {{exc}}"
     return record
@@ -1840,46 +1903,21 @@ def _native_attempt_contract(
     outer_manifest: dict[str, object],
 ) -> dict[str, object]:
     from trellmlx.native_image_to_glb_attempt import (
-        ATTEMPT_MANIFEST_SCHEMA,
-        ATTEMPT_MANIFEST_SCHEMA_V2,
-        CAPTURE_PROFILE_OUTPUTS,
+        AttemptSpecError,
+        capture_contract_from_entrypoint_args,
     )
 
     files = outer_manifest.get("files")
     if not isinstance(files, dict):
         raise WitnessPacketError("attempt-bearing packet outer file records are missing")
-    capture_positions = [
-        index
-        for index, value in enumerate(packet.entrypoint_args)
-        if value == "--capture-profile"
-    ]
-    if not capture_positions:
-        capture_profile = "full"
-    elif (
-        len(capture_positions) != 1
-        or capture_positions[0] + 1 >= len(packet.entrypoint_args)
-        or packet.entrypoint_args[capture_positions[0] + 1].startswith("--")
-    ):
-        raise WitnessPacketError(
-            "attempt-bearing packet capture profile is missing or ambiguous"
+    try:
+        capture_contract = capture_contract_from_entrypoint_args(
+            packet.entrypoint_args,
+            packet.expected_outputs,
+            context="attempt-bearing packet",
         )
-    else:
-        capture_profile = packet.entrypoint_args[capture_positions[0] + 1]
-    if capture_profile not in CAPTURE_PROFILE_OUTPUTS:
-        raise WitnessPacketError(
-            f"attempt-bearing packet capture profile is invalid: {capture_profile!r}"
-        )
-    if capture_profile == "full" and capture_positions:
-        raise WitnessPacketError(
-            "attempt-bearing full capture profile must remain implicit"
-        )
-    if (
-        capture_profile != "full"
-        and tuple(packet.expected_outputs) != CAPTURE_PROFILE_OUTPUTS[capture_profile]
-    ):
-        raise WitnessPacketError(
-            "attempt-bearing packet expected outputs do not match capture profile"
-        )
+    except AttemptSpecError as exc:
+        raise WitnessPacketError(str(exc)) from exc
     dinov3_model_coordinate = _entrypoint_argument(packet, "--dinov3-model-path")
     if dinov3_model_coordinate != ".":
         raise WitnessPacketError(
@@ -1914,11 +1952,7 @@ def _native_attempt_contract(
             "size_bytes": record.get("size_bytes"),
         }
     contract = {
-        "schema": (
-            ATTEMPT_MANIFEST_SCHEMA_V2
-            if capture_profile == "full"
-            else ATTEMPT_MANIFEST_SCHEMA
-        ),
+        "schema": capture_contract.manifest_schema,
         "run_id": packet.run_id,
         "dataset_id": packet.dataset_id,
         "kernel_id": packet.kernel_id,
@@ -1927,11 +1961,11 @@ def _native_attempt_contract(
         "enable_internet": packet.enable_internet,
         "output_coordinate": _entrypoint_argument(packet, "--output-dir"),
         "work_coordinate": _entrypoint_argument(packet, "--work-dir"),
-        "expected_outputs": list(packet.expected_outputs),
+        "expected_outputs": list(capture_contract.expected_outputs),
         "assets": assets,
     }
-    if capture_profile != "full":
-        contract["capture_profile"] = capture_profile
+    if capture_contract.profile_is_explicit:
+        contract["capture_profile"] = capture_contract.capture_profile
     return contract
 
 

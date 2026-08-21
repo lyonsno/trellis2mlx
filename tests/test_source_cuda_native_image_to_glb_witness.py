@@ -1,4 +1,5 @@
 import ast
+import errno
 import hashlib
 import json
 from dataclasses import replace
@@ -290,7 +291,16 @@ def _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch):
     return witness.prepare_native_image_to_glb_packet(build_attempt_packet(spec))
 
 
-def _execute_prepared_runner(packet, tmp_path, monkeypatch, *, corrupt_contract=False):
+def _execute_prepared_runner(
+    packet,
+    tmp_path,
+    monkeypatch,
+    *,
+    corrupt_contract=False,
+    forbid_output_copy=False,
+    sha256_failures=(),
+    stat_failures=(),
+):
     fake_torch = types.SimpleNamespace(
         __version__="2.10.0+cu128",
         cuda=types.SimpleNamespace(
@@ -313,6 +323,52 @@ def _execute_prepared_runner(packet, tmp_path, monkeypatch, *, corrupt_contract=
             "trellis2mlx.native_image_to_glb_attempt.v2"
         )
         namespace["CONFIG"]["attempt_contract"].pop("capture_profile", None)
+    if forbid_output_copy:
+        original_copy2 = namespace["shutil"].copy2
+        execution_output_root = (work / "outputs").resolve()
+
+        def reject_execution_output_copy(source, destination, *args, **kwargs):
+            resolved_source = Path(source).resolve()
+            if (
+                resolved_source == execution_output_root
+                or execution_output_root in resolved_source.parents
+            ):
+                raise OSError(errno.ENOSPC, "synthetic output-copy budget exhausted")
+            return original_copy2(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(namespace["shutil"], "copy2", reject_execution_output_copy)
+    if sha256_failures:
+        original_sha256_file = namespace["sha256_file"]
+        rejected_paths = {(work / path).resolve() for path in sha256_failures}
+
+        def reject_selected_digest(path):
+            if Path(path).resolve() in rejected_paths:
+                raise OSError(errno.EIO, "synthetic output digest failure")
+            return original_sha256_file(path)
+
+        namespace["sha256_file"] = reject_selected_digest
+    if stat_failures:
+        original_stat = namespace["Path"].stat
+        original_run = namespace["subprocess"].run
+        rejected_paths = {
+            str((work / path).absolute()) for path in stat_failures
+        }
+
+        def reject_selected_stat(path, *args, **kwargs):
+            if str(path.absolute()) in rejected_paths:
+                raise OSError(errno.EIO, "synthetic persistent output stat failure")
+            return original_stat(path, *args, **kwargs)
+
+        def run_then_reject_selected_stat(*args, **kwargs):
+            completed = original_run(*args, **kwargs)
+            monkeypatch.setattr(namespace["Path"], "stat", reject_selected_stat)
+            return completed
+
+        monkeypatch.setattr(
+            namespace["subprocess"],
+            "run",
+            run_then_reject_selected_stat,
+        )
     return namespace["main"](), work
 
 
@@ -331,6 +387,136 @@ def test_generated_runner_executes_final_consumer_v3_attempt(tmp_path, monkeypat
     assert all(record["exists"] for record in receipt["outputs"].values())
     assert not (work / "00-preprocessed_image.png").exists()
     assert not (work / "08-texture_voxels.npz").exists()
+
+
+def test_generated_runner_publishes_attempt_outputs_without_copying_bundle(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        forbid_output_copy=True,
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 0
+    assert receipt["status"] == "done"
+    assert receipt["output_publication"]["mode"] == "same-filesystem-replace"
+    assert all((work / name).is_file() for name in packet.outputs)
+    assert all(not (work / "outputs" / name).exists() for name in packet.outputs)
+
+
+def test_generated_runner_receipts_source_digest_failure_before_any_move(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+    failed_output = packet.expected_outputs[0]
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        sha256_failures=(f"outputs/{failed_output}",),
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    publication = receipt["output_publication"]
+    assert rc == 8
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "output_publication"
+    assert set(publication["outputs"]) == set(packet.outputs)
+    assert publication["outputs"][failed_output]["failure_phase"] == "source_digest"
+    assert all(not (work / name).exists() for name in packet.outputs)
+    assert receipt["execution_outputs"][failed_output]["inspection_error"].startswith(
+        "OSError:"
+    )
+
+
+def test_generated_runner_receipts_destination_digest_failure_after_report_move(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        sha256_failures=("report.json",),
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    publication = receipt["output_publication"]
+    report_publication = publication["outputs"]["report.json"]
+    assert rc == 8
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "output_publication"
+    assert report_publication["moved"] is True
+    assert report_publication["destination_verified"] is False
+    assert report_publication["failure_phase"] == "destination_digest"
+    assert receipt["outputs"]["report.json"]["inspection_error"].startswith(
+        "OSError:"
+    )
+    assert receipt["child_report_fallback"]["exists"] is True
+    assert (work / "kaggle_cuda_witness_child_report.json").is_file()
+
+
+def test_generated_runner_receipts_persistent_source_stat_failure(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+    failed_output = packet.expected_outputs[0]
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        stat_failures=(f"outputs/{failed_output}",),
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    publication = receipt["output_publication"]
+    failed_record = publication["outputs"][failed_output]
+    assert rc == 8
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "output_publication"
+    assert set(publication["outputs"]) == set(packet.outputs)
+    assert failed_record["failure_phase"] == "source_inspection"
+    assert failed_record["source_inspection_error"].startswith("OSError:")
+    assert failed_record["moved"] is False
+    assert all(not (work / name).exists() for name in packet.outputs)
+
+
+def test_generated_runner_receipts_persistent_destination_stat_after_report_move(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        stat_failures=("report.json",),
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    report_publication = receipt["output_publication"]["outputs"]["report.json"]
+    assert rc == 8
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "output_publication"
+    assert report_publication["moved"] is True
+    assert report_publication["destination_verified"] is False
+    assert report_publication["failure_phase"] == "destination_inspection"
+    assert report_publication["destination_inspection_error"].startswith("OSError:")
+    assert receipt["child_report_fallback"]["exists"] is True
+    assert (work / "kaggle_cuda_witness_child_report.json").is_file()
 
 
 def test_generated_runner_rejects_final_consumer_contract_mismatch_before_entrypoint(

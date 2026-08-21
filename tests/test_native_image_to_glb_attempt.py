@@ -10,8 +10,10 @@ import pytest
 from trellmlx.native_image_to_glb_attempt import (
     AttemptAsset,
     AttemptSpecError,
+    CAPTURE_PROFILE_OUTPUTS,
     NativeImageToGLBAttemptSpec,
     build_attempt_packet,
+    capture_contract_from_entrypoint_args,
     load_attempt_spec,
 )
 
@@ -68,6 +70,50 @@ def _review_attempt_spec(tmp_path: Path) -> NativeImageToGLBAttemptSpec:
         },
         expected_outputs=("12-consumer_glb.glb",),
     )
+
+
+def test_joined_explicit_full_capture_profile_does_not_downgrade_to_v2():
+    with pytest.raises(AttemptSpecError, match="explicit full capture profile"):
+        capture_contract_from_entrypoint_args(
+            ("--capture-profile=full",),
+            ("legacy.glb",),
+            context="attempt packet",
+        )
+
+
+def test_joined_final_consumer_capture_profile_is_explicit_and_bound():
+    contract = capture_contract_from_entrypoint_args(
+        ("--capture-profile=final-consumer",),
+        CAPTURE_PROFILE_OUTPUTS["final-consumer"],
+        context="attempt packet",
+    )
+
+    assert contract.capture_profile == "final-consumer"
+    assert contract.profile_is_explicit is True
+    assert contract.profile_binds_outputs is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (
+            "--capture-profile=final-consumer",
+            "--capture-profile",
+            "final-consumer",
+        ),
+        (
+            "--capture-profile=final-consumer",
+            "--capture-profile=final-consumer",
+        ),
+    ),
+)
+def test_mixed_or_duplicate_capture_profile_declarations_are_ambiguous(arguments):
+    with pytest.raises(AttemptSpecError, match="capture profile is ambiguous"):
+        capture_contract_from_entrypoint_args(
+            arguments,
+            CAPTURE_PROFILE_OUTPUTS["final-consumer"],
+            context="attempt packet",
+        )
 
 
 def test_structured_attempt_rejects_escaping_output_coordinate_before_mutation(
