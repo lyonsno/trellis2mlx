@@ -1664,12 +1664,23 @@ def main() -> int:
         )
         return 6
     copied = {{}}
+    input_staging = {{
+        "mode": "immutable-mount-symlink",
+        "copied_bytes": 0,
+        "linked_files": 0,
+        "source_bytes": 0,
+    }}
     for relative_name, record in manifest["files"].items():
         if relative_name == "witness-manifest.json":
             continue
         source = dataset_dir / relative_name
         if not source.exists():
-            extra = {{"manifest": manifest, "missing_input": str(source)}}
+            extra = {{
+                "manifest": manifest,
+                "missing_input": str(source),
+                "inputs": copied,
+                "input_staging": input_staging,
+            }}
             extra.update(mounted_input_snapshot())
             write_receipt("failed", phase="input_mount", message=f"missing input {{source}}", extra=extra)
             return 3
@@ -1679,13 +1690,51 @@ def main() -> int:
                 "failed",
                 phase="input_digest",
                 message=f"sha256 mismatch for {{relative_name}}",
-                extra={{"expected_sha256": record["sha256"], "actual_sha256": actual_sha, "manifest": manifest}},
+                extra={{
+                    "expected_sha256": record["sha256"],
+                    "actual_sha256": actual_sha,
+                    "manifest": manifest,
+                    "inputs": copied,
+                    "input_staging": input_staging,
+                }},
             )
             return 4
         destination = Path(relative_name)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        copied[relative_name] = {{"sha256": actual_sha, "size_bytes": destination.stat().st_size}}
+        try:
+            source_resolved = source.resolve(strict=True)
+            destination.symlink_to(source_resolved)
+            destination_resolved = destination.resolve(strict=True)
+            if not destination.is_symlink() or destination_resolved != source_resolved:
+                raise RuntimeError(
+                    f"mounted input link identity mismatch for {{relative_name}}"
+                )
+        except Exception as exc:
+            write_receipt(
+                "failed",
+                phase="input_staging",
+                message=(
+                    f"immutable mounted input staging failed for {{relative_name}}: "
+                    f"{{type(exc).__name__}}: {{exc}}"
+                ),
+                extra={{
+                    "inputs": copied,
+                    "input_staging": input_staging,
+                    "mounted_input_snapshot": mounted_input_snapshot(),
+                }},
+            )
+            return 9
+        size_bytes = source_resolved.stat().st_size
+        input_staging["linked_files"] += 1
+        input_staging["source_bytes"] += size_bytes
+        copied[relative_name] = {{
+            "sha256": actual_sha,
+            "size_bytes": size_bytes,
+            "source_path": str(source_resolved),
+            "destination_path": str(destination),
+            "resolved_destination_path": str(destination_resolved),
+            "staging_method": "immutable-mount-symlink",
+        }}
 
     if CONFIG["attempt_manifest_name"] is not None:
         attempt_path = Path(CONFIG["attempt_manifest_name"])
@@ -1696,7 +1745,7 @@ def main() -> int:
                 "failed",
                 phase="attempt_manifest",
                 message=f"attempt manifest is unreadable: {{type(exc).__name__}}: {{exc}}",
-                extra={{"inputs": copied}},
+                extra={{"inputs": copied, "input_staging": input_staging}},
             )
             return 7
         if attempt != CONFIG["attempt_manifest"]:
@@ -1708,6 +1757,7 @@ def main() -> int:
                     "expected_attempt_manifest": CONFIG["attempt_manifest"],
                     "actual_attempt_manifest": attempt,
                     "inputs": copied,
+                    "input_staging": input_staging,
                 }},
             )
             return 7
@@ -1730,7 +1780,11 @@ def main() -> int:
             "failed",
             phase="output_initialization",
             message=f"attempt output initialization failed: {{type(exc).__name__}}: {{exc}}",
-            extra={{"inputs": copied, "outputs": output_snapshot()}},
+            extra={{
+                "inputs": copied,
+                "input_staging": input_staging,
+                "outputs": output_snapshot(),
+            }},
         )
         return 8
 
@@ -1789,6 +1843,7 @@ def main() -> int:
             extra={{
                 "effective_command": command,
                 "inputs": copied,
+                "input_staging": input_staging,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
                 "exit_code": completed.returncode,
@@ -1807,6 +1862,7 @@ def main() -> int:
             "size_bytes": manifest_path.stat().st_size,
         }},
         "inputs": copied,
+        "input_staging": input_staging,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "exit_code": completed.returncode,

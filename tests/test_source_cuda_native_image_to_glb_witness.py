@@ -297,6 +297,7 @@ def _execute_prepared_runner(
     monkeypatch,
     *,
     corrupt_contract=False,
+    forbid_input_copy=False,
     forbid_output_copy=False,
     sha256_failures=(),
     stat_failures=(),
@@ -323,6 +324,20 @@ def _execute_prepared_runner(
             "trellis2mlx.native_image_to_glb_attempt.v2"
         )
         namespace["CONFIG"]["attempt_contract"].pop("capture_profile", None)
+    if forbid_input_copy:
+        original_copy2 = namespace["shutil"].copy2
+        mounted_root = packet.dataset_dir.resolve()
+
+        def reject_mounted_input_copy(source, destination, *args, **kwargs):
+            resolved_source = Path(source).resolve()
+            if resolved_source == mounted_root or mounted_root in resolved_source.parents:
+                raise OSError(
+                    errno.ENOSPC,
+                    "synthetic mounted-input copy budget exhausted",
+                )
+            return original_copy2(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(namespace["shutil"], "copy2", reject_mounted_input_copy)
     if forbid_output_copy:
         original_copy2 = namespace["shutil"].copy2
         execution_output_root = (work / "outputs").resolve()
@@ -387,6 +402,32 @@ def test_generated_runner_executes_final_consumer_v3_attempt(tmp_path, monkeypat
     assert all(record["exists"] for record in receipt["outputs"].values())
     assert not (work / "00-preprocessed_image.png").exists()
     assert not (work / "08-texture_voxels.npz").exists()
+
+
+def test_generated_runner_stages_immutable_mount_without_copying_inputs(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        forbid_input_copy=True,
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 0
+    assert receipt["status"] == "done"
+    assert receipt["input_staging"]["mode"] == "immutable-mount-symlink"
+    assert receipt["input_staging"]["copied_bytes"] == 0
+    assert receipt["input_staging"]["linked_files"] == len(packet.inputs)
+    assert all(
+        record["staging_method"] == "immutable-mount-symlink"
+        for record in receipt["inputs"].values()
+    )
+    assert all((work / name).is_symlink() for name in packet.inputs)
 
 
 def test_generated_runner_publishes_attempt_outputs_without_copying_bundle(

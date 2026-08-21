@@ -1445,14 +1445,37 @@ def _cleanup_stale_outputs(output_dir: Path) -> None:
                 shutil.rmtree(path)
 
 
+def _record_storage_snapshot(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    work_dir = Path(args.work_dir).resolve()
+    usage = shutil.disk_usage(work_dir)
+    report.setdefault("storage_snapshots", []).append(
+        {
+            "label": label,
+            "path": str(work_dir),
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "observed_at": time.time(),
+        }
+    )
+
+
 def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
     output_dir = Path(args.output_dir).resolve()
     expected_capture_order = capture_order_for_profile(args.capture_profile)
     verify_admitted_inputs_before_use(args, report)
     phase_started = time.perf_counter()
     report["phase"] = "prepare_runtime"
+    _record_storage_snapshot(args, report, label="before_prepare_runtime")
+    _atomic_write_json(output_dir / "report.json", report)
     roots = prepare_runtime(args, report)
     report.setdefault("phase_timings", {})["prepare_runtime"] = time.perf_counter() - phase_started
+    _record_storage_snapshot(args, report, label="after_prepare_runtime")
     _atomic_write_json(output_dir / "report.json", report)
 
     os.environ["ATTN_BACKEND"] = args.attention_backend
@@ -1531,11 +1554,16 @@ def run_live(args: argparse.Namespace, report: dict[str, Any]) -> None:
         "flex_gemm_module_path": str(Path(flex_gemm.__file__).resolve()),
         "o_voxel_module_path": str(Path(o_voxel.__file__).resolve()),
     }
+    _record_storage_snapshot(args, report, label="after_runtime_identity")
     _atomic_write_json(output_dir / "report.json", report)
 
     report["phase"] = "load_pipeline"
     phase_started = time.perf_counter()
+    _record_storage_snapshot(args, report, label="before_model_view")
+    _atomic_write_json(output_dir / "report.json", report)
     model_view = prepare_model_view(args, report)
+    _record_storage_snapshot(args, report, label="after_model_view")
+    _atomic_write_json(output_dir / "report.json", report)
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(str(model_view))
     pipeline.cuda()
     report["phase_timings"]["load_pipeline"] = time.perf_counter() - phase_started
