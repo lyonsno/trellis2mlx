@@ -123,6 +123,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         "entrypoint_args": list(packet.entrypoint_args),
         "run_id": packet.run_id,
         "expected_image_sha256": packet.expected_image_sha256,
+        "input_staging_mode": _input_staging_mode(packet),
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
@@ -1205,6 +1206,7 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
         "entrypoint_args": list(packet.entrypoint_args),
         "run_id": packet.run_id,
         "expected_image_sha256": packet.expected_image_sha256,
+        "input_staging_mode": _input_staging_mode(packet),
         "outputs": list(packet.outputs),
         "output_json": packet.output_json,
         "output_npz": packet.output_npz,
@@ -1305,11 +1307,21 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
 
 def mounted_input_snapshot() -> dict:
     root = Path("/kaggle/input")
-    if not root.exists():
-        return {{"mounted_input_root_exists": False, "mounted_input_dirs": [], "mounted_input_files": []}}
-    dirs = [str(path) for path in sorted(root.rglob("*")) if path.is_dir()]
-    files = [str(path) for path in sorted(root.rglob("*")) if path.is_file()]
-    return {{"mounted_input_root_exists": True, "mounted_input_dirs": dirs, "mounted_input_files": files}}
+    snapshot = {{
+        "mounted_input_root_exists": None,
+        "mounted_input_dirs": [],
+        "mounted_input_files": [],
+    }}
+    try:
+        snapshot["mounted_input_root_exists"] = root.exists()
+        if not snapshot["mounted_input_root_exists"]:
+            return snapshot
+        paths = sorted(root.rglob("*"))
+        snapshot["mounted_input_dirs"] = [str(path) for path in paths if path.is_dir()]
+        snapshot["mounted_input_files"] = [str(path) for path in paths if path.is_file()]
+    except Exception as exc:
+        snapshot["inspection_error"] = f"{{type(exc).__name__}}: {{exc}}"
+    return snapshot
 
 
 def find_manifest() -> Path | None:
@@ -1665,10 +1677,12 @@ def main() -> int:
         return 6
     copied = {{}}
     input_staging = {{
-        "mode": "immutable-mount-symlink",
+        "mode": CONFIG["input_staging_mode"],
         "copied_bytes": 0,
+        "copied_files": 0,
         "linked_files": 0,
         "source_bytes": 0,
+        "active_coordinate": None,
     }}
     for relative_name, record in manifest["files"].items():
         if relative_name == "witness-manifest.json":
@@ -1700,21 +1714,68 @@ def main() -> int:
             )
             return 4
         destination = Path(relative_name)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging_method = CONFIG["input_staging_mode"]
+        input_record = {{
+            "sha256": actual_sha,
+            "size_bytes": None,
+            "source_path": str(source),
+            "resolved_source_path": None,
+            "destination_path": str(destination),
+            "resolved_destination_path": None,
+            "staging_method": staging_method,
+            "status": "pending",
+            "failure_phase": "destination_parent",
+        }}
+        copied[relative_name] = input_record
+        input_staging["active_coordinate"] = relative_name
         try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            input_record["failure_phase"] = "source_resolution"
             source_resolved = source.resolve(strict=True)
-            destination.symlink_to(source_resolved)
+            input_record["resolved_source_path"] = str(source_resolved)
+            if staging_method == "immutable-mount-symlink":
+                input_record["failure_phase"] = "symlink_creation"
+                destination.symlink_to(source_resolved)
+            elif staging_method == "working-copy":
+                input_record["failure_phase"] = "working_copy"
+                shutil.copy2(source_resolved, destination)
+            else:
+                raise RuntimeError(f"unsupported input staging mode: {{staging_method}}")
+            input_record["failure_phase"] = "destination_resolution"
             destination_resolved = destination.resolve(strict=True)
-            if not destination.is_symlink() or destination_resolved != source_resolved:
-                raise RuntimeError(
-                    f"mounted input link identity mismatch for {{relative_name}}"
-                )
+            input_record["resolved_destination_path"] = str(destination_resolved)
+            if staging_method == "immutable-mount-symlink":
+                if not destination.is_symlink() or destination_resolved != source_resolved:
+                    raise RuntimeError(
+                        f"mounted input link identity mismatch for {{relative_name}}"
+                    )
+            elif destination.is_symlink() or not destination.is_file():
+                raise RuntimeError(f"working input copy is not a regular file: {{relative_name}}")
+            input_record["failure_phase"] = "source_size"
+            size_bytes = source_resolved.stat().st_size
+            input_record["size_bytes"] = size_bytes
+            if staging_method == "working-copy":
+                input_record["failure_phase"] = "destination_digest"
+                destination_sha = sha256_file(destination)
+                if destination_sha != actual_sha:
+                    raise RuntimeError(f"working input copy digest mismatch for {{relative_name}}")
+            input_record["status"] = "done"
+            input_record["failure_phase"] = None
+            input_staging["source_bytes"] += size_bytes
+            if staging_method == "immutable-mount-symlink":
+                input_staging["linked_files"] += 1
+            else:
+                input_staging["copied_files"] += 1
+                input_staging["copied_bytes"] += size_bytes
+            input_staging["active_coordinate"] = None
         except Exception as exc:
+            input_record["status"] = "failed"
+            input_record["error"] = f"{{type(exc).__name__}}: {{exc}}"
             write_receipt(
                 "failed",
                 phase="input_staging",
                 message=(
-                    f"immutable mounted input staging failed for {{relative_name}}: "
+                    f"{{staging_method}} input staging failed for {{relative_name}}: "
                     f"{{type(exc).__name__}}: {{exc}}"
                 ),
                 extra={{
@@ -1724,17 +1785,6 @@ def main() -> int:
                 }},
             )
             return 9
-        size_bytes = source_resolved.stat().st_size
-        input_staging["linked_files"] += 1
-        input_staging["source_bytes"] += size_bytes
-        copied[relative_name] = {{
-            "sha256": actual_sha,
-            "size_bytes": size_bytes,
-            "source_path": str(source_resolved),
-            "destination_path": str(destination),
-            "resolved_destination_path": str(destination_resolved),
-            "staging_method": "immutable-mount-symlink",
-        }}
 
     if CONFIG["attempt_manifest_name"] is not None:
         attempt_path = Path(CONFIG["attempt_manifest_name"])
@@ -1922,6 +1972,7 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "entrypoint_args": list(packet.entrypoint_args),
         "run_id": packet.run_id,
         "expected_image_sha256": packet.expected_image_sha256,
+        "input_staging_mode": _input_staging_mode(packet),
         "input_roles": {
             "shape_flow_noise_sample": packet.shape_flow_noise_sample,
             "sparse_flow_noise_sample": packet.sparse_flow_noise_sample,
@@ -1941,6 +1992,10 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
             "expected": list(packet.expected_outputs),
         },
     }
+
+
+def _input_staging_mode(packet: KaggleCudaWitnessPacket) -> str:
+    return "immutable-mount-symlink" if packet.attempt_manifest is not None else "working-copy"
 
 
 def _entrypoint_argument(packet: KaggleCudaWitnessPacket, flag: str) -> str:

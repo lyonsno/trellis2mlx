@@ -300,6 +300,8 @@ def _execute_prepared_runner(
     forbid_input_copy=False,
     forbid_output_copy=False,
     sha256_failures=(),
+    staging_failure=None,
+    snapshot_failure=False,
     stat_failures=(),
 ):
     fake_torch = types.SimpleNamespace(
@@ -352,6 +354,49 @@ def _execute_prepared_runner(
             return original_copy2(source, destination, *args, **kwargs)
 
         monkeypatch.setattr(namespace["shutil"], "copy2", reject_execution_output_copy)
+    if staging_failure is not None:
+        operation, relative_name = staging_failure
+        destination = (work / relative_name).absolute()
+        source = (packet.dataset_dir / relative_name).resolve()
+        if operation == "symlink":
+            original_symlink_to = namespace["Path"].symlink_to
+
+            def reject_selected_symlink(path, target, *args, **kwargs):
+                if path.absolute() == destination:
+                    raise OSError(errno.EIO, "synthetic symlink failure")
+                return original_symlink_to(path, target, *args, **kwargs)
+
+            monkeypatch.setattr(namespace["Path"], "symlink_to", reject_selected_symlink)
+        elif operation == "destination_resolve":
+            original_resolve = namespace["Path"].resolve
+
+            def reject_selected_resolve(path, *args, **kwargs):
+                if path.absolute() == destination and path.is_symlink():
+                    raise OSError(errno.EIO, "synthetic destination resolve failure")
+                return original_resolve(path, *args, **kwargs)
+
+            monkeypatch.setattr(namespace["Path"], "resolve", reject_selected_resolve)
+        elif operation == "source_stat":
+            original_stat = namespace["Path"].stat
+
+            def reject_selected_source_stat(path, *args, **kwargs):
+                if path.absolute() == source and destination.is_symlink():
+                    raise OSError(errno.EIO, "synthetic source stat failure")
+                return original_stat(path, *args, **kwargs)
+
+            monkeypatch.setattr(namespace["Path"], "stat", reject_selected_source_stat)
+        else:
+            raise AssertionError(f"unsupported staging failure: {operation}")
+    if snapshot_failure:
+        original_rglob = namespace["Path"].rglob
+        mounted_root = packet.dataset_dir.resolve()
+
+        def reject_mounted_snapshot(path, pattern):
+            if path.resolve() == mounted_root and (work / packet.inputs[0]).exists():
+                raise OSError(errno.EIO, "synthetic mounted snapshot failure")
+            return original_rglob(path, pattern)
+
+        monkeypatch.setattr(namespace["Path"], "rglob", reject_mounted_snapshot)
     if sha256_failures:
         original_sha256_file = namespace["sha256_file"]
         rejected_paths = {(work / path).resolve() for path in sha256_failures}
@@ -428,6 +473,67 @@ def test_generated_runner_stages_immutable_mount_without_copying_inputs(
         for record in receipt["inputs"].values()
     )
     assert all((work / name).is_symlink() for name in packet.inputs)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("symlink", "destination_resolve", "source_stat"),
+)
+def test_generated_runner_receipts_complete_active_input_staging_failure(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    staged_names = [
+        name for name in manifest["files"] if name != "witness-manifest.json"
+    ]
+    failed_name = staged_names[1]
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        staging_failure=(operation, failed_name),
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    active = receipt["inputs"][failed_name]
+    assert rc == 9
+    assert receipt["status"] == "failed"
+    assert receipt["failure_phase"] == "input_staging"
+    assert receipt["input_staging"]["active_coordinate"] == failed_name
+    assert receipt["input_staging"]["linked_files"] == 1
+    assert active["status"] == "failed"
+    assert active["failure_phase"]
+    assert active["source_path"]
+    assert active["destination_path"] == failed_name
+    assert active["staging_method"] == "immutable-mount-symlink"
+    assert active["error"].startswith("OSError:")
+
+
+def test_generated_runner_preserves_staging_error_when_mount_snapshot_fails(
+    tmp_path,
+    monkeypatch,
+):
+    packet = _prepared_final_consumer_attempt_packet(tmp_path, monkeypatch)
+    failed_name = packet.inputs[1]
+
+    rc, work = _execute_prepared_runner(
+        packet,
+        tmp_path,
+        monkeypatch,
+        staging_failure=("symlink", failed_name),
+        snapshot_failure=True,
+    )
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    assert rc == 9
+    assert receipt["inputs"][failed_name]["error"].startswith("OSError:")
+    assert receipt["mounted_input_snapshot"]["inspection_error"].startswith(
+        "OSError:"
+    )
 
 
 def test_generated_runner_publishes_attempt_outputs_without_copying_bundle(

@@ -272,6 +272,68 @@ def test_prepared_runner_records_uncapped_mount_and_exact_source_identity(tmp_pa
     assert '"mounted_input_snapshot": mounted_input_snapshot()' in runner
 
 
+def test_generic_runner_retains_writable_working_input_copies(tmp_path, monkeypatch):
+    from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--output-json', required=True)\n"
+        "p.add_argument('--output-npz', required=True)\n"
+        "a=p.parse_args()\n"
+        "Path(a.output_json).write_text('{\"status\":\"done\"}\\n')\n"
+        "Path(a.output_npz).write_bytes(b'npz')\n"
+    )
+    (capsule / "mutable-input.bin").write_bytes(b"mounted-authority")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/generic-working-copy-inputs",
+            kernel_id="operator/generic-working-copy-cuda",
+            title="Generic Working Copy CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py", "mutable-input.bin"),
+        )
+    )
+    fake_torch = types.SimpleNamespace(
+        __version__="2.10.0+cu128",
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "Tesla T4",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text().replace(
+        'Path("/kaggle/input")',
+        f"Path({str(packet.dataset_dir)!r})",
+    )
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    rc = namespace["main"]()
+
+    receipt = json.loads((work / "kaggle_cuda_witness_receipt.json").read_text())
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    assert rc == 0
+    assert namespace["CONFIG"]["input_staging_mode"] == "working-copy"
+    assert manifest["input_staging_mode"] == "working-copy"
+    assert receipt["input_staging"]["mode"] == "working-copy"
+    assert receipt["input_staging"]["copied_files"] == len(packet.inputs)
+    assert receipt["input_staging"]["copied_bytes"] > 0
+    assert all(not (work / name).is_symlink() for name in packet.inputs)
+    assert all(
+        record["staging_method"] == "working-copy"
+        for record in receipt["inputs"].values()
+    )
+
+
 def test_prepared_runner_rejects_substituted_mounted_manifest_identity(
     tmp_path,
     monkeypatch,
