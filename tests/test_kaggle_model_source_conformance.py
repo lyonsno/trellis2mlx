@@ -32,6 +32,10 @@ from scripts.run_kaggle_model_source_conformance_lifecycle import (
 
 
 OBJECT_ROOT = Path(__file__).resolve().parents[1]
+PUBLISHED_SOURCE_KERNEL = (
+    "noahboo/t2mlx-r11-source-efc27489eab645f199405e0e983064c3"
+)
+STALE_R10_SOURCE_KERNEL = "noahboo/t2mlx-native-pixal9-t4-f6446f9-r10"
 
 
 def _blob(relative_path: str, payload: bytes) -> ModelSourceBlob:
@@ -152,7 +156,7 @@ def test_real_packet_uses_exact_r11_model_manifest(tmp_path):
     packet = build_packet(
         output_dir=tmp_path / "real-packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
 
@@ -166,6 +170,18 @@ def test_real_packet_uses_exact_r11_model_manifest(tmp_path):
         "222c359ab1ed9bc6735a640a34f95d47f8681b9bc4aaa101bfb80274676253c6"
     )
     validate_r11_authority(packet)
+
+
+def test_real_packet_rejects_stale_r10_source_authority(tmp_path):
+    packet = build_packet(
+        output_dir=tmp_path / "stale-packet",
+        kernel_id="noahboo/t2mlx-model-source-conformance-r11",
+        source_kernel=STALE_R10_SOURCE_KERNEL,
+        title="t2mlx-model-source-conformance-r11",
+    )
+
+    with pytest.raises(ModelSourceConformanceError, match="source_kernel"):
+        validate_r11_authority(packet)
 
 
 def _mutate_real_packet_authority(
@@ -218,7 +234,7 @@ def test_lifecycle_rejects_self_consistent_authority_substitution_before_push(
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     packet = _mutate_real_packet_authority(packet, mutation)
@@ -268,7 +284,7 @@ def test_lifecycle_consumes_each_prepared_attempt_before_push(tmp_path, monkeypa
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
@@ -321,7 +337,7 @@ def test_lifecycle_rejects_self_consistent_runner_substitution_before_push(
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
@@ -380,7 +396,7 @@ def test_lifecycle_rejects_manifest_consistent_crlf_runner_before_claim_or_push(
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
@@ -451,7 +467,7 @@ def test_lifecycle_rejects_packet_local_attempt_registry_before_push(
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
@@ -534,7 +550,7 @@ def test_lifecycle_attempt_claim_survives_packet_duplication(
     packet = build_packet(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
-        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        source_kernel=PUBLISHED_SOURCE_KERNEL,
         title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)

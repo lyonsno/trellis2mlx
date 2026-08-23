@@ -33,7 +33,7 @@ from trellmlx.kaggle_model_source_conformance import (
 )
 
 
-R11_SOURCE_KERNEL = "noahboo/t2mlx-native-pixal9-t4-f6446f9-r10"
+R11_SOURCE_KERNEL = "noahboo/t2mlx-r11-source-efc27489eab645f199405e0e983064c3"
 
 
 def canonical_blobs() -> tuple[ModelSourceBlob, ...]:
