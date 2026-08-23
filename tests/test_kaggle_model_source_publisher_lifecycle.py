@@ -253,16 +253,24 @@ def test_dual_sink_rejection_reports_both_failures(
     packet = build_packet(output_dir=tmp_path / "packet", attempt_id="a" * 32)
     prepare_publisher_packet(packet)
     argv = _argv(tmp_path, packet)
+    lifecycle_path = Path(argv[argv.index("--lifecycle-report") + 1]).resolve()
+    real_write_json = lifecycle.write_json
 
-    def reject_both_sinks(path, _payload):
+    def reject_both_sinks(path, payload):
+        if path == lifecycle_path and payload["status"] == "running":
+            real_write_json(path, payload)
+            return
         raise OSError(f"rejected {Path(path).name}")
 
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
     monkeypatch.setattr(lifecycle, "write_json", reject_both_sinks)
     monkeypatch.setattr(sys, "argv", argv)
 
     assert lifecycle.main() == 1
     stderr = capsys.readouterr().err
     assert "neither durable sink accepted the terminal report" in stderr
+    assert "primary_phase=preflight" in stderr
+    assert "primary=RuntimeError: KAGGLE_API_TOKEN is absent" in stderr
     assert "lifecycle_sink=OSError: rejected lifecycle-one.json" in stderr
     assert "failure_sink=OSError: rejected failure-one.json" in stderr
 

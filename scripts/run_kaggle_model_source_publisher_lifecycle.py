@@ -229,6 +229,9 @@ def write_terminal_failure_reports(
     print(
         "publisher lifecycle failed and neither durable sink accepted the "
         "terminal report: "
+        f"primary_phase={lifecycle.get('failure_phase')}; "
+        f"primary={lifecycle.get('error_type')}: "
+        f"{lifecycle.get('error_message')}; "
         f"lifecycle_sink={format_error_record(lifecycle_error)}; "
         f"failure_sink={format_error_record(failure_error)}",
         file=sys.stderr,
