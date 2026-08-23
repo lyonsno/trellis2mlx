@@ -427,7 +427,10 @@ def test_lifecycle_rejects_manifest_consistent_crlf_runner_before_claim_or_push(
     assert list(registry_root.rglob("*.json")) == []
 
 
-@pytest.mark.parametrize("registry_mode", ("equal", "nested", "symlink"))
+@pytest.mark.parametrize(
+    "registry_mode",
+    ("equal", "nested", "root-symlink", "derived-owner-symlink"),
+)
 @pytest.mark.parametrize("duplicate_mode", ("copy", "reprepare"))
 def test_lifecycle_rejects_packet_local_attempt_registry_before_push(
     tmp_path,
@@ -465,10 +468,17 @@ def test_lifecycle_rejects_packet_local_attempt_registry_before_push(
         target = packet_dir / "attempt-registry"
         if registry_mode == "nested":
             return target
-        target.mkdir(parents=True, exist_ok=True)
-        alias = tmp_path / f"external-looking-{suffix}"
-        alias.symlink_to(target, target_is_directory=True)
-        return alias
+        registry_root = tmp_path / f"external-looking-{suffix}"
+        if registry_mode == "root-symlink":
+            target.mkdir(parents=True, exist_ok=True)
+            registry_root.symlink_to(target, target_is_directory=True)
+            return registry_root
+        registry_root.mkdir()
+        (registry_root / "noahboo").symlink_to(
+            packet_dir,
+            target_is_directory=True,
+        )
+        return registry_root
 
     def run(packet_dir: Path, suffix: str) -> int:
         registry_root = registry_for(packet_dir, suffix)
