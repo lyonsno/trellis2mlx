@@ -164,6 +164,77 @@ def claim_prepared_attempt(
     return {**claim, "path": str(claim_path)}
 
 
+def error_record(exc: BaseException) -> dict[str, str]:
+    return {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+
+
+def format_error_record(record: dict[str, str] | None) -> str:
+    if record is None:
+        return "none"
+    return f"{record['error_type']}: {record['error_message']}"
+
+
+def write_terminal_failure_reports(
+    lifecycle: dict[str, object],
+    *,
+    lifecycle_path: Path | None,
+    failure_path: Path | None,
+    unavailable_sink_errors: dict[str, dict[str, str]],
+    initial_lifecycle_write_succeeded: bool,
+) -> None:
+    lifecycle_error = unavailable_sink_errors.get("lifecycle")
+    lifecycle_accepted = False
+    if lifecycle_path is not None:
+        try:
+            write_json(lifecycle_path, lifecycle)
+        except BaseException as exc:
+            lifecycle_error = error_record(exc)
+            lifecycle["lifecycle_sink_error"] = lifecycle_error
+        else:
+            lifecycle_accepted = True
+
+    failure_error = unavailable_sink_errors.get("failure")
+    failure_accepted = False
+    if failure_path is not None:
+        try:
+            write_json(failure_path, lifecycle)
+        except BaseException as exc:
+            failure_error = error_record(exc)
+        else:
+            failure_accepted = True
+
+    if lifecycle_accepted and failure_accepted:
+        return
+    if lifecycle_accepted:
+        print(
+            "publisher lifecycle failed; failure sink rejected terminal report: "
+            f"failure_sink={format_error_record(failure_error)}; "
+            f"durable_lifecycle_report={lifecycle_path}; "
+            "initial_lifecycle_write_accepted="
+            f"{str(initial_lifecycle_write_succeeded).lower()}",
+            file=sys.stderr,
+        )
+        return
+    if failure_accepted:
+        print(
+            "publisher lifecycle failed; lifecycle sink rejected terminal report: "
+            f"lifecycle_sink={format_error_record(lifecycle_error)}; "
+            f"durable_failure_report={failure_path}",
+            file=sys.stderr,
+        )
+        return
+    print(
+        "publisher lifecycle failed and neither durable sink accepted the "
+        "terminal report: "
+        f"lifecycle_sink={format_error_record(lifecycle_error)}; "
+        f"failure_sink={format_error_record(failure_error)}",
+        file=sys.stderr,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packet-dir", type=Path, required=True)
@@ -179,12 +250,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    packet_dir = args.packet_dir.resolve()
-    download_dir = args.download_dir.resolve()
-    lifecycle_path = args.lifecycle_report.resolve()
-    failure_path = args.failure_report.resolve()
-    object_root = args.object_root.resolve()
-    registry_root = args.attempt_registry_root.resolve()
+    packet_dir = Path(args.packet_dir)
+    download_dir = Path(args.download_dir)
+    object_root = Path(args.object_root)
+    registry_root = Path(args.attempt_registry_root)
+    raw_lifecycle_path = Path(args.lifecycle_report)
+    raw_failure_path = Path(args.failure_report)
+    lifecycle_path: Path | None = None
+    failure_path: Path | None = None
+    unavailable_sink_errors: dict[str, dict[str, str]] = {}
     started_epoch = time.time()
     lifecycle: dict[str, object] = {
         "schema": "trellis2mlx.kaggle_model_source_publisher.lifecycle.v1",
@@ -206,8 +280,41 @@ def main() -> int:
         "kernel_status_observations": [],
     }
     active_event: dict[str, object] | None = None
+    initial_lifecycle_write_succeeded = False
     try:
+        resolution_error: BaseException | None = None
+        try:
+            lifecycle_path = raw_lifecycle_path.resolve()
+        except BaseException as exc:
+            unavailable_sink_errors["lifecycle"] = error_record(exc)
+            resolution_error = exc
+        try:
+            failure_path = raw_failure_path.resolve()
+        except BaseException as exc:
+            unavailable_sink_errors["failure"] = error_record(exc)
+            if resolution_error is None:
+                resolution_error = exc
+        if unavailable_sink_errors:
+            lifecycle["report_resolution_errors"] = unavailable_sink_errors
+            assert resolution_error is not None
+            raise resolution_error
+
+        packet_dir = packet_dir.resolve()
+        download_dir = download_dir.resolve()
+        object_root = object_root.resolve()
+        registry_root = registry_root.resolve()
+        lifecycle.update(
+            {
+                "packet_dir": str(packet_dir),
+                "download_dir": str(download_dir),
+                "object_root": str(object_root),
+                "attempt_registry_root": str(registry_root),
+            }
+        )
+        assert lifecycle_path is not None
+        assert failure_path is not None
         write_json(lifecycle_path, lifecycle)
+        initial_lifecycle_write_succeeded = True
         active_event = begin_phase(lifecycle, lifecycle_path, "preflight")
         if not lifecycle["kaggle_token_present"]:
             raise RuntimeError("KAGGLE_API_TOKEN is absent")
@@ -390,10 +497,9 @@ def main() -> int:
                     status="failed",
                 )
             except BaseException as lifecycle_sink_exc:
-                lifecycle["lifecycle_sink_error"] = {
-                    "error_type": type(lifecycle_sink_exc).__name__,
-                    "error_message": str(lifecycle_sink_exc),
-                }
+                lifecycle["phase_finalization_sink_error"] = error_record(
+                    lifecycle_sink_exc
+                )
         ended_epoch = time.time()
         failure_phase, error_type, error_message = select_failure_identity(
             lifecycle, exc
@@ -410,27 +516,13 @@ def main() -> int:
                 "traceback": traceback.format_exc(),
             }
         )
-        lifecycle_write_error = None
-        try:
-            write_json(lifecycle_path, lifecycle)
-        except BaseException as lifecycle_sink_exc:
-            lifecycle_write_error = {
-                "error_type": type(lifecycle_sink_exc).__name__,
-                "error_message": str(lifecycle_sink_exc),
-            }
-            lifecycle["lifecycle_sink_error"] = lifecycle_write_error
-        try:
-            write_json(failure_path, lifecycle)
-        except BaseException as failure_sink_exc:
-            print(
-                "publisher lifecycle failed and neither durable sink accepted "
-                "the terminal report: "
-                f"primary={type(exc).__name__}: {exc}; "
-                f"lifecycle_sink={lifecycle_write_error}; "
-                f"failure_sink={type(failure_sink_exc).__name__}: "
-                f"{failure_sink_exc}",
-                file=sys.stderr,
-            )
+        write_terminal_failure_reports(
+            lifecycle,
+            lifecycle_path=lifecycle_path,
+            failure_path=failure_path,
+            unavailable_sink_errors=unavailable_sink_errors,
+            initial_lifecycle_write_succeeded=initial_lifecycle_write_succeeded,
+        )
         return 1
 
 

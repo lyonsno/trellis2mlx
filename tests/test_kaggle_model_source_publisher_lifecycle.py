@@ -157,6 +157,116 @@ def test_lifecycle_bootstrap_failure_uses_distinct_failure_sink(
     assert failure["error_message"]
 
 
+def test_lifecycle_report_resolution_failure_uses_failure_sink(
+    tmp_path,
+    monkeypatch,
+):
+    packet = build_packet(output_dir=tmp_path / "packet", attempt_id="7" * 32)
+    prepare_publisher_packet(packet)
+    argv = _argv(tmp_path, packet)
+    lifecycle_path = Path(argv[argv.index("--lifecycle-report") + 1])
+    failure_path = Path(argv[argv.index("--failure-report") + 1])
+    original_resolve = Path.resolve
+
+    def fail_lifecycle_resolution(path, *args, **kwargs):
+        if path == lifecycle_path:
+            raise OSError("lifecycle coordinate cannot resolve")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_lifecycle_resolution)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert lifecycle.main() == 1
+    failure = json.loads(failure_path.read_text())
+    assert failure["status"] == "failed"
+    assert failure["current_phase"] == "lifecycle_initialization"
+    assert failure["failure_phase"] == "lifecycle_initialization"
+    assert failure["last_trustworthy_phase"] is None
+    assert failure["error_type"] == "OSError"
+    assert failure["error_message"] == "lifecycle coordinate cannot resolve"
+
+
+def test_failure_report_resolution_failure_uses_lifecycle_sink(
+    tmp_path,
+    monkeypatch,
+):
+    packet = build_packet(output_dir=tmp_path / "packet", attempt_id="8" * 32)
+    prepare_publisher_packet(packet)
+    argv = _argv(tmp_path, packet)
+    lifecycle_path = Path(argv[argv.index("--lifecycle-report") + 1])
+    failure_path = Path(argv[argv.index("--failure-report") + 1])
+    original_resolve = Path.resolve
+
+    def fail_failure_resolution(path, *args, **kwargs):
+        if path == failure_path:
+            raise OSError("failure coordinate cannot resolve")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_failure_resolution)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert lifecycle.main() == 1
+    report = json.loads(lifecycle_path.read_text())
+    assert report["status"] == "failed"
+    assert report["current_phase"] == "lifecycle_initialization"
+    assert report["failure_phase"] == "lifecycle_initialization"
+    assert report["last_trustworthy_phase"] is None
+    assert report["error_type"] == "OSError"
+    assert report["error_message"] == "failure coordinate cannot resolve"
+
+
+def test_failure_sink_rejection_reports_surviving_lifecycle_sink(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    packet = build_packet(output_dir=tmp_path / "packet", attempt_id="9" * 32)
+    prepare_publisher_packet(packet)
+    argv = _argv(tmp_path, packet)
+    lifecycle_path = Path(argv[argv.index("--lifecycle-report") + 1]).resolve()
+    failure_path = Path(argv[argv.index("--failure-report") + 1]).resolve()
+    real_write_json = lifecycle.write_json
+
+    def reject_failure_sink(path, payload):
+        if path == failure_path:
+            raise OSError("failure sink rejected")
+        real_write_json(path, payload)
+
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+    monkeypatch.setattr(lifecycle, "write_json", reject_failure_sink)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert lifecycle.main() == 1
+    report = json.loads(lifecycle_path.read_text())
+    assert report["status"] == "failed"
+    stderr = capsys.readouterr().err
+    assert "failure sink rejected terminal report" in stderr
+    assert str(lifecycle_path) in stderr
+    assert "neither durable sink" not in stderr
+
+
+def test_dual_sink_rejection_reports_both_failures(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    packet = build_packet(output_dir=tmp_path / "packet", attempt_id="a" * 32)
+    prepare_publisher_packet(packet)
+    argv = _argv(tmp_path, packet)
+
+    def reject_both_sinks(path, _payload):
+        raise OSError(f"rejected {Path(path).name}")
+
+    monkeypatch.setattr(lifecycle, "write_json", reject_both_sinks)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert lifecycle.main() == 1
+    stderr = capsys.readouterr().err
+    assert "neither durable sink accepted the terminal report" in stderr
+    assert "lifecycle_sink=OSError: rejected lifecycle-one.json" in stderr
+    assert "failure_sink=OSError: rejected failure-one.json" in stderr
+
+
 def test_lifecycle_rejects_registry_owner_symlink_into_packet(tmp_path, monkeypatch):
     packet = build_packet(output_dir=tmp_path / "packet", attempt_id="4" * 32)
     prepare_publisher_packet(packet)
