@@ -328,8 +328,11 @@ def _validate_packet(packet: ModelSourceConformancePacket) -> None:
         raise ModelSourceConformanceError("kernel_id must be an owner/slug reference")
     if not _REF_PATTERN.fullmatch(packet.source_kernel):
         raise ModelSourceConformanceError("source_kernel must be an owner/slug reference")
-    if not packet.title.strip():
-        raise ModelSourceConformanceError("title must be nonblank")
+    kernel_slug = packet.kernel_id.split("/", 1)[1]
+    if packet.title != kernel_slug:
+        raise ModelSourceConformanceError(
+            "title must equal the exact kernel slug so Kaggle preserves route identity"
+        )
     if not re.fullmatch(r"[0-9a-f]{32}", packet.attempt_id):
         raise ModelSourceConformanceError("attempt_id must be 32 lowercase hex characters")
     if PurePosixPath(packet.code_file).name != packet.code_file:

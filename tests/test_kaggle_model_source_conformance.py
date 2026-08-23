@@ -54,7 +54,7 @@ def _packet(tmp_path: Path) -> tuple[ModelSourceConformancePacket, dict[str, byt
         ModelSourceConformancePacket(
             output_dir=tmp_path / "packet",
             kernel_id="operator/source-mount-conformance",
-            title="Source Mount Conformance",
+            title="source-mount-conformance",
             source_kernel="operator/pinned-model-output",
             marker="runtime/huggingface/models--microsoft--TRELLIS.2-4B/blobs/marker",
             marker_sha256=blobs[0].sha256,
@@ -138,12 +138,22 @@ def test_prepare_packet_binds_cpu_private_kernel_source(tmp_path):
     ]
 
 
+def test_prepare_packet_rejects_title_that_differs_from_kernel_slug(tmp_path):
+    packet, _payloads = _packet(tmp_path)
+    packet = replace(packet, title="Human Friendly Title")
+
+    with pytest.raises(ModelSourceConformanceError, match="exact kernel slug"):
+        prepare_packet(packet)
+
+    assert not packet.output_dir.exists()
+
+
 def test_real_packet_uses_exact_r11_model_manifest(tmp_path):
     packet = build_packet(
         output_dir=tmp_path / "real-packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
 
     assert len(packet.blobs) == 17
@@ -209,7 +219,7 @@ def test_lifecycle_rejects_self_consistent_authority_substitution_before_push(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     packet = _mutate_real_packet_authority(packet, mutation)
     prepare_packet(packet)
@@ -259,7 +269,7 @@ def test_lifecycle_consumes_each_prepared_attempt_before_push(tmp_path, monkeypa
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
     pushes = []
@@ -312,7 +322,7 @@ def test_lifecycle_rejects_self_consistent_runner_substitution_before_push(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
     runner_path = packet.kernel_dir / packet.code_file
@@ -371,7 +381,7 @@ def test_lifecycle_rejects_manifest_consistent_crlf_runner_before_claim_or_push(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
     runner_path = packet.kernel_dir / packet.code_file
@@ -442,7 +452,7 @@ def test_lifecycle_rejects_packet_local_attempt_registry_before_push(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
     second_packet_dir = tmp_path / "packet-copy"
@@ -525,7 +535,7 @@ def test_lifecycle_attempt_claim_survives_packet_duplication(
         output_dir=tmp_path / "packet",
         kernel_id="noahboo/t2mlx-model-source-conformance-r11",
         source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
-        title="Trellis2MLX R11 Model Source Conformance",
+        title="t2mlx-model-source-conformance-r11",
     )
     prepare_packet(packet)
     second_packet_dir = tmp_path / "packet-copy"
