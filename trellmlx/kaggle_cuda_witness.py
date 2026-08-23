@@ -56,6 +56,7 @@ class KaggleCudaWitnessPacket:
     sparse_flow_noise_sample: str | None = None
     sparse_flow_noise_sample_sha256: str | None = None
     attempt_manifest: str | None = None
+    kernel_sources: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capsule_dir", Path(self.capsule_dir))
@@ -63,6 +64,7 @@ class KaggleCudaWitnessPacket:
         object.__setattr__(self, "inputs", tuple(self.inputs))
         object.__setattr__(self, "entrypoint_args", tuple(self.entrypoint_args))
         object.__setattr__(self, "expected_outputs", tuple(self.expected_outputs))
+        object.__setattr__(self, "kernel_sources", tuple(self.kernel_sources))
 
     @property
     def dataset_dir(self) -> Path:
@@ -132,6 +134,7 @@ def prepare_packet(packet: KaggleCudaWitnessPacket) -> KaggleCudaWitnessPacket:
         },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
+        "kernel_sources": list(packet.kernel_sources),
         "outputs": list(packet.outputs),
         "output_roles": {
             "json": packet.output_json,
@@ -167,6 +170,12 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         raise WitnessPacketError(f"missing kernel metadata: {kernel_metadata_path}")
     manifest = json.loads(manifest_path.read_text())
     kernel_metadata = json.loads(kernel_metadata_path.read_text())
+    manifest_kernel_sources = tuple(manifest.get("kernel_sources", ()))
+    metadata_kernel_sources = tuple(kernel_metadata.get("kernel_sources", ()))
+    if manifest_kernel_sources != metadata_kernel_sources:
+        raise WitnessPacketError(
+            "prepared manifest and kernel metadata kernel_sources mismatch"
+        )
     inputs = tuple(path for path in manifest["files"] if path != "witness-manifest.json")
     outputs = tuple(manifest.get("outputs", ("cuda_result.json", "cuda_result.npz")))
     output_roles = manifest.get("output_roles") or {}
@@ -241,6 +250,7 @@ def load_prepared_packet(output_dir: Path) -> KaggleCudaWitnessPacket:
         sparse_flow_noise_sample=input_roles.get("sparse_flow_noise_sample"),
         sparse_flow_noise_sample_sha256=input_roles.get("sparse_flow_noise_sample_sha256"),
         attempt_manifest=input_roles.get("attempt_manifest"),
+        kernel_sources=metadata_kernel_sources,
     )
     _validate_refs(packet)
     return packet
@@ -487,6 +497,24 @@ def build_kernel_output_command(packet: KaggleCudaWitnessPacket, output_dir: Pat
     ]
 
 
+def admit_kernel_output_download_dir(download_dir: Path) -> Path:
+    """Admit a fresh or empty download directory without masking remote output."""
+
+    download_dir = Path(download_dir)
+    if download_dir.exists():
+        if not download_dir.is_dir():
+            raise WitnessPacketError(
+                f"kernel output download path is not a directory: {download_dir}"
+            )
+        if any(download_dir.iterdir()):
+            raise WitnessPacketError(
+                f"kernel output download directory is not empty: {download_dir}"
+            )
+    else:
+        download_dir.mkdir(parents=True)
+    return download_dir
+
+
 def run_command(
     cmd: Sequence[str],
     *,
@@ -563,7 +591,7 @@ def validate_downloaded_outputs(
     expected_source_identity = {
         "dataset_sources": [packet.dataset_id],
         "competition_sources": [],
-        "kernel_sources": [],
+        "kernel_sources": list(packet.kernel_sources),
         "model_sources": [],
     }
     expected_receipt_identity = {
@@ -1047,9 +1075,16 @@ def _validate_attempt_output_graph(packet: KaggleCudaWitnessPacket) -> None:
 
 
 def _validate_refs(packet: KaggleCudaWitnessPacket) -> None:
-    for field, value in (("dataset_id", packet.dataset_id), ("kernel_id", packet.kernel_id)):
+    refs = (
+        ("dataset_id", packet.dataset_id),
+        ("kernel_id", packet.kernel_id),
+        *(("kernel_sources", value) for value in packet.kernel_sources),
+    )
+    for field, value in refs:
         if len(value.split("/")) != 2 or not all(value.split("/")):
             raise WitnessPacketError(f"{field} must be a Kaggle ref like owner/slug")
+    if len(set(packet.kernel_sources)) != len(packet.kernel_sources):
+        raise WitnessPacketError("kernel_sources must be unique")
     kernel_slug = _slug_from_ref(packet.kernel_id)
     title_slug = _kaggle_slug(packet.title)
     if kernel_slug != title_slug:
@@ -1181,7 +1216,7 @@ def _kernel_metadata(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         "machine_shape": packet.accelerator,
         "dataset_sources": [packet.dataset_id],
         "competition_sources": [],
-        "kernel_sources": [],
+        "kernel_sources": list(packet.kernel_sources),
         "model_sources": [],
     }
 
@@ -1229,12 +1264,21 @@ def _runner_script(packet: KaggleCudaWitnessPacket) -> str:
             if attempt_contract is not None
             else None
         ),
+        "model_kernel_source": (
+            attempt_contract.get("model_kernel_source")
+            if attempt_contract is not None
+            else None
+        ),
+        "model_source_marker": (
+            "runtime/huggingface/models--microsoft--TRELLIS.2-4B/"
+            "blobs/f5ec14c7f71b3d7f2cb0221c5f568a6871dc5e90"
+        ),
         "manifest_sha256": sha256_file(manifest_path),
         "manifest_identity": _manifest_identity(packet),
         "source_identity": {
             "dataset_sources": [packet.dataset_id],
             "competition_sources": [],
-            "kernel_sources": [],
+            "kernel_sources": list(packet.kernel_sources),
             "model_sources": [],
         },
     }
@@ -1252,6 +1296,7 @@ from pathlib import Path
 CONFIG = json.loads({json.dumps(json.dumps(config, sort_keys=True))})
 RECEIPT = Path("kaggle_cuda_witness_receipt.json")
 CHILD_REPORT_FALLBACK = Path("kaggle_cuda_witness_child_report.json")
+KAGGLE_INPUT_ROOT = Path("/kaggle/input")
 
 
 def sha256_file(path: Path) -> str:
@@ -1307,7 +1352,7 @@ def write_receipt(status: str, *, phase: str, message: str | None, extra: dict |
 
 
 def mounted_input_snapshot() -> dict:
-    root = Path("/kaggle/input")
+    root = KAGGLE_INPUT_ROOT
     snapshot = {{
         "mounted_input_root_exists": None,
         "mounted_input_dirs": [],
@@ -1326,13 +1371,40 @@ def mounted_input_snapshot() -> dict:
 
 
 def find_manifest() -> Path | None:
-    preferred = Path("/kaggle/input") / CONFIG["dataset_slug"] / "witness-manifest.json"
+    preferred = KAGGLE_INPUT_ROOT / CONFIG["dataset_slug"] / "witness-manifest.json"
     if preferred.exists():
         return preferred
-    candidates = sorted(Path("/kaggle/input").rglob("witness-manifest.json"))
+    candidates = sorted(KAGGLE_INPUT_ROOT.rglob("witness-manifest.json"))
     if candidates:
         return candidates[0]
     return None
+
+
+def find_model_blob_root() -> dict | None:
+    source_ref = CONFIG["model_kernel_source"]
+    if source_ref is None:
+        return None
+    marker = Path(CONFIG["model_source_marker"])
+    candidates = []
+    if KAGGLE_INPUT_ROOT.is_dir():
+        for mount in sorted(KAGGLE_INPUT_ROOT.iterdir()):
+            if mount.is_dir() and (mount / marker).is_file():
+                candidates.append(mount)
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "mounted model kernel source is missing or ambiguous: "
+            f"requested={{source_ref}}, marker={{marker}}, "
+            f"candidates={{[str(path) for path in candidates]}}"
+        )
+    mount = candidates[0]
+    return {{
+        "requested_kernel_source": source_ref,
+        "effective_mount_root": str(mount),
+        "effective_blob_root": str(mount / "runtime" / "huggingface"),
+        "marker": str(marker),
+        "marker_sha256": sha256_file(mount / marker),
+        "candidate_count": len(candidates),
+    }}
 
 
 def output_snapshot() -> dict:
@@ -1676,6 +1748,16 @@ def main() -> int:
             }},
         )
         return 6
+    try:
+        model_source_mount = find_model_blob_root()
+    except Exception as exc:
+        write_receipt(
+            "failed",
+            phase="model_source_mount",
+            message=f"{{type(exc).__name__}}: {{exc}}",
+            extra={{"mounted_input_snapshot": mounted_input_snapshot()}},
+        )
+        return 10
     copied = {{}}
     input_staging = {{
         "mode": CONFIG["input_staging_mode"],
@@ -1851,6 +1933,13 @@ def main() -> int:
         else:
             command += ["--output-npz", str(execution_output_path(CONFIG["output_npz"]))]
     command += CONFIG.get("entrypoint_args", [])
+    if model_source_mount is not None:
+        command += [
+            "--model-blob-root",
+            model_source_mount["effective_blob_root"],
+            "--model-source-kernel",
+            model_source_mount["requested_kernel_source"],
+        ]
     if CONFIG["output_ply"]:
         if CONFIG["execution_output_coordinate"] is None:
             command += ["--output-ply", CONFIG["output_ply"]]
@@ -1895,6 +1984,7 @@ def main() -> int:
                 "effective_command": command,
                 "inputs": copied,
                 "input_staging": input_staging,
+                "model_source_mount": model_source_mount,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
                 "exit_code": completed.returncode,
@@ -1914,6 +2004,7 @@ def main() -> int:
         }},
         "inputs": copied,
         "input_staging": input_staging,
+        "model_source_mount": model_source_mount,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "exit_code": completed.returncode,
@@ -1982,6 +2073,7 @@ def _manifest_identity(packet: KaggleCudaWitnessPacket) -> dict[str, object]:
         },
         "accelerator": packet.accelerator,
         "enable_internet": packet.enable_internet,
+        "kernel_sources": list(packet.kernel_sources),
         "outputs": list(packet.outputs),
         "output_roles": {
             "json": packet.output_json,
@@ -2078,6 +2170,13 @@ def _native_attempt_contract(
     }
     if capture_contract.profile_is_explicit:
         contract["capture_profile"] = capture_contract.capture_profile
+    if packet.kernel_sources:
+        if len(packet.kernel_sources) != 1:
+            raise WitnessPacketError(
+                "attempt-bearing model source requires exactly one kernel source"
+            )
+        contract["schema"] = "trellis2mlx.native_image_to_glb_attempt.v4"
+        contract["model_kernel_source"] = packet.kernel_sources[0]
     return contract
 
 

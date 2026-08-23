@@ -43,6 +43,7 @@ class NativeImageToGLBAttemptSpec:
     rembg_files: Mapping[str, AttemptAsset]
     expected_outputs: tuple[str, ...]
     capture_profile: str = "full"
+    model_kernel_source: str | None = None
     output_coordinate: str = "outputs"
     work_coordinate: str = "runtime"
     accelerator: str = "NvidiaTeslaT4"
@@ -64,8 +65,10 @@ DINOV3_MODEL_COORDINATE = "."
 ATTEMPT_MANIFEST = "native-image-to-glb-attempt.json"
 ATTEMPT_SPEC_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt_spec.v2"
 ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
+ATTEMPT_SPEC_SCHEMA_V4 = "trellis2mlx.native_image_to_glb_attempt_spec.v4"
 ATTEMPT_MANIFEST_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt.v2"
 ATTEMPT_MANIFEST_SCHEMA = "trellis2mlx.native_image_to_glb_attempt.v3"
+ATTEMPT_MANIFEST_SCHEMA_V4 = "trellis2mlx.native_image_to_glb_attempt.v4"
 CAPTURE_PROFILE_OUTPUTS = {
     "full": (
         "00-preprocessed_image.png",
@@ -150,7 +153,7 @@ def capture_contract_from_spec_payload(payload: Mapping[str, Any]) -> CaptureCon
     return resolve_capture_contract(
         capture_profile=payload.get("capture_profile"),
         expected_outputs=payload.get("expected_outputs"),
-        profile_is_explicit=schema == ATTEMPT_SPEC_SCHEMA,
+        profile_is_explicit=schema in {ATTEMPT_SPEC_SCHEMA, ATTEMPT_SPEC_SCHEMA_V4},
         context="attempt spec",
     )
 
@@ -160,7 +163,10 @@ def capture_contract_from_manifest(payload: Mapping[str, Any]) -> CaptureContrac
     return resolve_capture_contract(
         capture_profile=payload.get("capture_profile"),
         expected_outputs=payload.get("expected_outputs"),
-        profile_is_explicit=schema == ATTEMPT_MANIFEST_SCHEMA,
+        profile_is_explicit=schema in {
+            ATTEMPT_MANIFEST_SCHEMA,
+            ATTEMPT_MANIFEST_SCHEMA_V4,
+        },
         context="attempt manifest",
     )
 
@@ -247,11 +253,17 @@ def load_attempt_spec_bytes(
         "enable_internet",
     }
     schema = payload.get("schema") if isinstance(payload, dict) else None
-    if schema == ATTEMPT_SPEC_SCHEMA:
+    if schema in {ATTEMPT_SPEC_SCHEMA, ATTEMPT_SPEC_SCHEMA_V4}:
         expected_fields.add("capture_profile")
+    if schema == ATTEMPT_SPEC_SCHEMA_V4:
+        expected_fields.add("model_kernel_source")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt spec field set is incomplete or contains unknown fields")
-    if schema not in {ATTEMPT_SPEC_SCHEMA_V2, ATTEMPT_SPEC_SCHEMA}:
+    if schema not in {
+        ATTEMPT_SPEC_SCHEMA_V2,
+        ATTEMPT_SPEC_SCHEMA,
+        ATTEMPT_SPEC_SCHEMA_V4,
+    }:
         raise AttemptSpecError(f"unexpected attempt spec schema: {payload.get('schema')!r}")
 
     def resolved_path(value: object, label: str) -> Path:
@@ -282,6 +294,11 @@ def load_attempt_spec_bytes(
     if not isinstance(rembg_payload, dict):
         raise AttemptSpecError("attempt RMBG file map is invalid")
     capture_contract = capture_contract_from_spec_payload(payload)
+    if schema == ATTEMPT_SPEC_SCHEMA_V4 and (
+        not isinstance(payload["model_kernel_source"], str)
+        or not payload["model_kernel_source"]
+    ):
+        raise AttemptSpecError("attempt model kernel source is missing")
     if type(payload["enable_internet"]) is not bool:
         raise AttemptSpecError("attempt enable_internet must be boolean")
     scalar_fields = (
@@ -315,6 +332,7 @@ def load_attempt_spec_bytes(
         },
         expected_outputs=capture_contract.expected_outputs,
         capture_profile=capture_contract.capture_profile,
+        model_kernel_source=payload.get("model_kernel_source"),
         output_coordinate=payload["output_coordinate"],
         work_coordinate=payload["work_coordinate"],
         accelerator=payload["accelerator"],
@@ -449,6 +467,9 @@ def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAss
     }
     if capture_contract.profile_is_explicit:
         payload["capture_profile"] = capture_contract.capture_profile
+    if spec.model_kernel_source is not None:
+        payload["schema"] = ATTEMPT_MANIFEST_SCHEMA_V4
+        payload["model_kernel_source"] = spec.model_kernel_source
     return payload
 
 
@@ -499,11 +520,17 @@ def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
         "assets",
     }
     schema = payload.get("schema") if isinstance(payload, dict) else None
-    if schema == ATTEMPT_MANIFEST_SCHEMA:
+    if schema in {ATTEMPT_MANIFEST_SCHEMA, ATTEMPT_MANIFEST_SCHEMA_V4}:
         expected_fields.add("capture_profile")
+    if schema == ATTEMPT_MANIFEST_SCHEMA_V4:
+        expected_fields.add("model_kernel_source")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt manifest field set is invalid")
-    if schema not in {ATTEMPT_MANIFEST_SCHEMA_V2, ATTEMPT_MANIFEST_SCHEMA}:
+    if schema not in {
+        ATTEMPT_MANIFEST_SCHEMA_V2,
+        ATTEMPT_MANIFEST_SCHEMA,
+        ATTEMPT_MANIFEST_SCHEMA_V4,
+    }:
         raise AttemptSpecError("attempt manifest schema is invalid")
     capture_contract_from_manifest(payload)
     return payload
@@ -539,6 +566,16 @@ def validate_attempt_manifest(
                 f"expected {expected!r}, got {payload.get(field)!r}"
             )
     capture_contract = capture_contract_from_manifest(payload)
+    model_kernel_source = payload.get("model_kernel_source")
+    if model_kernel_source is None:
+        if packet.kernel_sources:
+            raise AttemptSpecError(
+                "attempt manifest is missing its packet kernel source identity"
+            )
+    elif packet.kernel_sources != (model_kernel_source,):
+        raise AttemptSpecError(
+            "attempt manifest model kernel source does not match packet sources"
+        )
 
     def argument(flag: str) -> str:
         positions = [
@@ -618,6 +655,14 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         spec.expected_outputs,
         context="attempt",
     )
+    if spec.model_kernel_source is not None:
+        if not isinstance(spec.model_kernel_source, str):
+            raise AttemptSpecError("attempt model kernel source is invalid")
+        parts = spec.model_kernel_source.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise AttemptSpecError(
+                "attempt model kernel source must be a Kaggle ref like owner/slug"
+            )
     _validate_execution_coordinates(spec)
     validate_attempt_topology(spec)
 
@@ -737,4 +782,9 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
         output_npz=None,
         expected_outputs=capture_contract.expected_outputs,
         attempt_manifest=ATTEMPT_MANIFEST,
+        kernel_sources=(
+            (spec.model_kernel_source,)
+            if spec.model_kernel_source is not None
+            else ()
+        ),
     )

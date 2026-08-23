@@ -2138,8 +2138,8 @@ def test_prepare_model_view_uses_admitted_rembg_without_remote_fetch(tmp_path, m
     rembg.mkdir()
     calls = []
 
-    def snapshot_download(*, repo_id, revision, cache_dir):
-        calls.append((repo_id, revision, Path(cache_dir)))
+    def snapshot_download(*, repo_id, revision, cache_dir, allow_patterns):
+        calls.append((repo_id, revision, Path(cache_dir), tuple(allow_patterns)))
         if repo_id == witness.MODEL_REPOSITORY:
             return trellis
         if repo_id == witness.SPARSE_DECODER_REPOSITORY:
@@ -2153,6 +2153,11 @@ def test_prepare_model_view_uses_admitted_rembg_without_remote_fetch(tmp_path, m
     )
     monkeypatch.setattr(witness, "MODEL_PIPELINE_SHA256", _sha256(pipeline_path))
     monkeypatch.setattr(witness, "verify_admitted_inputs_before_use", lambda *_args: None)
+    monkeypatch.setattr(
+        witness.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(free=10**12),
+    )
     args = types.SimpleNamespace(
         work_dir=tmp_path / "runtime",
         dinov3_model_path=dino,
@@ -2166,13 +2171,564 @@ def test_prepare_model_view_uses_admitted_rembg_without_remote_fetch(tmp_path, m
     assert rewritten["args"]["rembg_model"]["args"]["model_name"] == str(rembg.resolve())
     assert report["model_assets"]["rembg"]["snapshot_path"] == str(rembg.resolve())
     assert calls == [
-        (witness.MODEL_REPOSITORY, witness.MODEL_REVISION, tmp_path / "runtime" / "huggingface"),
+        (
+            witness.MODEL_REPOSITORY,
+            witness.MODEL_REVISION,
+            tmp_path / "runtime" / "huggingface",
+            witness._selective_model_patterns("trellis"),
+        ),
         (
             witness.SPARSE_DECODER_REPOSITORY,
             witness.SPARSE_DECODER_REVISION,
             tmp_path / "runtime" / "huggingface",
+            witness._selective_model_patterns("sparse_decoder"),
         ),
     ]
+
+
+def test_prepare_model_view_uses_verified_mounted_blobs_without_remote_fetch(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    blob_root = tmp_path / "mounted-kernel-output" / "runtime" / "huggingface"
+    pipeline = {
+        "args": {
+            "models": {
+                "shape": "ckpts/shape",
+                "decoder": f"{witness.SPARSE_DECODER_REPOSITORY}/decoder",
+            },
+            "image_cond_model": {"args": {"model_name": "remote-dino"}},
+            "rembg_model": {"args": {"model_name": "remote-rembg"}},
+        }
+    }
+    payloads = {
+        "trellis": {
+            "pipeline.json": json.dumps(pipeline, sort_keys=True).encode(),
+            "ckpts/shape.json": b"shape-config",
+            "ckpts/shape.safetensors": b"shape-weights",
+        },
+        "sparse_decoder": {
+            "decoder.json": b"decoder-config",
+            "decoder.safetensors": b"decoder-weights",
+        },
+    }
+    cache_dirs = {
+        "trellis": "models--microsoft--TRELLIS.2-4B",
+        "sparse_decoder": "models--microsoft--TRELLIS-image-large",
+    }
+    manifest = {}
+    for family, files in payloads.items():
+        records = {}
+        blobs = blob_root / cache_dirs[family] / "blobs"
+        blobs.mkdir(parents=True)
+        for index, (coordinate, payload) in enumerate(files.items()):
+            blob = f"{family}-blob-{index}"
+            path = blobs / blob
+            path.write_bytes(payload)
+            records[coordinate] = {
+                "blob": blob,
+                "sha256": _sha256(path),
+                "size_bytes": len(payload),
+            }
+        manifest[family] = {
+            "cache_dir": cache_dirs[family],
+            "files": records,
+        }
+
+    def unexpected_snapshot_download(**_kwargs):
+        raise AssertionError("mounted model admission must not fetch remotely")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=unexpected_snapshot_download),
+    )
+    monkeypatch.setattr(witness, "MODEL_BLOB_MANIFEST", manifest)
+    monkeypatch.setattr(
+        witness,
+        "MODEL_PIPELINE_SHA256",
+        manifest["trellis"]["files"]["pipeline.json"]["sha256"],
+    )
+    monkeypatch.setattr(witness, "verify_admitted_inputs_before_use", lambda *_args: None)
+    dino = tmp_path / "admitted-dino"
+    rembg = tmp_path / "admitted-rembg"
+    dino.mkdir()
+    rembg.mkdir()
+    args = types.SimpleNamespace(
+        work_dir=tmp_path / "runtime",
+        dinov3_model_path=dino,
+        rembg_model_path=rembg,
+        model_blob_root=blob_root,
+        model_source_kernel="operator/pinned-model-output",
+    )
+    report = {}
+
+    model_view = witness.prepare_model_view(args, report)
+
+    rewritten = json.loads((model_view / "pipeline.json").read_text())
+    shape = Path(rewritten["args"]["models"]["shape"])
+    decoder = Path(rewritten["args"]["models"]["decoder"])
+    assert shape.with_suffix(".json").is_symlink()
+    assert shape.with_suffix(".safetensors").is_symlink()
+    assert decoder.with_suffix(".json").is_symlink()
+    assert decoder.with_suffix(".safetensors").is_symlink()
+    assert report["model_assets"]["source_mode"] == "mounted-kernel-output"
+    assert report["model_assets"]["source_kernel"] == "operator/pinned-model-output"
+    assert report["model_assets"]["mounted_blob_bytes"] == sum(
+        len(payload)
+        for files in payloads.values()
+        for payload in files.values()
+    )
+
+
+def test_prepare_model_view_rejects_corrupt_mounted_blob_without_remote_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    blob_root = tmp_path / "mounted" / "runtime" / "huggingface"
+    blobs = blob_root / "models--microsoft--TRELLIS.2-4B" / "blobs"
+    blobs.mkdir(parents=True)
+    pipeline_blob = blobs / "pipeline-blob"
+    pipeline_blob.write_text('{"args": {}}')
+    expected = hashlib.sha256(b"different-authority").hexdigest()
+    monkeypatch.setattr(
+        witness,
+        "MODEL_BLOB_MANIFEST",
+        {
+            "trellis": {
+                "cache_dir": "models--microsoft--TRELLIS.2-4B",
+                "files": {
+                    "pipeline.json": {
+                        "blob": "pipeline-blob",
+                        "sha256": expected,
+                        "size_bytes": pipeline_blob.stat().st_size,
+                    }
+                },
+            },
+            "sparse_decoder": {
+                "cache_dir": "models--microsoft--TRELLIS-image-large",
+                "files": {},
+            },
+        },
+    )
+    monkeypatch.setattr(witness, "verify_admitted_inputs_before_use", lambda *_args: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(
+            snapshot_download=lambda **_kwargs: pytest.fail("remote fallback occurred")
+        ),
+    )
+    dino = tmp_path / "dino"
+    rembg = tmp_path / "rembg"
+    dino.mkdir()
+    rembg.mkdir()
+    args = types.SimpleNamespace(
+        work_dir=tmp_path / "runtime",
+        dinov3_model_path=dino,
+        rembg_model_path=rembg,
+        model_blob_root=blob_root,
+        model_source_kernel="operator/pinned-model-output",
+    )
+
+    with pytest.raises(RuntimeError, match="mounted model blob.*pipeline.json"):
+        witness.prepare_model_view(args, {})
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        None,
+        "wrong_kernel",
+        "missing_assets_mode",
+        "missing_assets_root",
+        "missing_assets_kernel",
+        "missing_storage_mode",
+        "missing_storage_root",
+        "missing_storage_kernel",
+        "wrong_blob",
+        "writable_payload",
+        "low_reserve",
+    ),
+)
+def test_completed_report_requires_full_mounted_model_authority(tmp_path, mutation):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    source_kernel = "operator/pinned-model-output"
+    source_root = "/kaggle/input/pinned-model-output/runtime/huggingface"
+    file_records = {
+        family: {
+            coordinate: {
+                **expected,
+                "source_path": (
+                    f"{source_root}/{family_manifest['cache_dir']}/blobs/"
+                    f"{expected['blob']}"
+                ),
+                "linked_path": f"/kaggle/working/runtime/{family}/{coordinate}",
+            }
+            for coordinate, expected in family_manifest["files"].items()
+        }
+        for family, family_manifest in witness.MODEL_BLOB_MANIFEST.items()
+    }
+    report["requested_route"].update(
+        model_blob_root=source_root,
+        model_source_kernel=source_kernel,
+    )
+    report["model_assets"].update(
+        source_mode="mounted-kernel-output",
+        source_kernel=source_kernel,
+        source_root=source_root,
+        mounted_blob_bytes=witness.MODEL_REQUIRED_BYTES,
+        writable_model_bytes=0,
+        files=file_records,
+    )
+    report["model_storage_admission"] = {
+        "source_mode": "mounted-kernel-output",
+        "source_kernel": source_kernel,
+        "source_root": source_root,
+        "mounted_blob_bytes": witness.MODEL_REQUIRED_BYTES,
+        "writable_model_bytes": 0,
+        "output_reserve_bytes": witness.MODEL_OUTPUT_RESERVE_BYTES,
+        "free_bytes": witness.MODEL_OUTPUT_RESERVE_BYTES + 1,
+    }
+    if mutation == "wrong_kernel":
+        report["model_assets"]["source_kernel"] = "operator/substituted-output"
+    elif mutation == "missing_assets_mode":
+        report["model_assets"].pop("source_mode")
+    elif mutation == "missing_assets_root":
+        report["model_assets"].pop("source_root")
+    elif mutation == "missing_assets_kernel":
+        report["model_assets"].pop("source_kernel")
+    elif mutation == "missing_storage_mode":
+        report["model_storage_admission"].pop("source_mode")
+    elif mutation == "missing_storage_root":
+        report["model_storage_admission"].pop("source_root")
+    elif mutation == "missing_storage_kernel":
+        report["model_storage_admission"].pop("source_kernel")
+    elif mutation == "wrong_blob":
+        report["model_assets"]["files"]["trellis"]["pipeline.json"][
+            "sha256"
+        ] = "0" * 64
+    elif mutation == "writable_payload":
+        report["model_assets"]["writable_model_bytes"] = 1
+    elif mutation == "low_reserve":
+        report["model_storage_admission"]["free_bytes"] = (
+            witness.MODEL_OUTPUT_RESERVE_BYTES - 1
+        )
+    report_path.write_text(json.dumps(report))
+
+    if mutation is None:
+        assert witness.validate_completed_report(report_path)["status"] == "completed"
+    else:
+        with pytest.raises(ValueError, match="mounted model"):
+            witness.validate_completed_report(report_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        None,
+        "missing",
+        "wrong_kernel",
+        "wrong_report_kernel",
+        "missing_mount_root",
+        "relative_mount_root",
+        "nested_mount_root",
+        "wrong_root",
+        "missing_marker_coordinate",
+        "wrong_marker_coordinate",
+        "ambiguous",
+        "wrong_marker",
+    ),
+)
+def test_mounted_model_download_receipt_reconciles_effective_source(
+    tmp_path,
+    mutation,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    kernel_source = "operator/pinned-model-output"
+    mount_root = "/kaggle/input/pinned-model-output"
+    blob_root = f"{mount_root}/runtime/huggingface"
+    marker_coordinate = (
+        "runtime/huggingface/models--microsoft--TRELLIS.2-4B/"
+        "blobs/f5ec14c7f71b3d7f2cb0221c5f568a6871dc5e90"
+    )
+    packet = types.SimpleNamespace(kernel_sources=(kernel_source,))
+    report = {
+        "requested_route": {
+            "model_source_kernel": kernel_source,
+            "model_blob_root": blob_root,
+        },
+        "model_assets": {
+            "source_mode": "mounted-kernel-output",
+            "source_kernel": kernel_source,
+            "source_root": blob_root,
+        },
+        "model_storage_admission": {
+            "source_mode": "mounted-kernel-output",
+            "source_kernel": kernel_source,
+            "source_root": blob_root,
+        },
+    }
+    mount = {
+        "requested_kernel_source": kernel_source,
+        "effective_mount_root": mount_root,
+        "effective_blob_root": blob_root,
+        "marker": marker_coordinate,
+        "candidate_count": 1,
+        "marker_sha256": witness.MODEL_PIPELINE_SHA256,
+    }
+    receipt = {"model_source_mount": mount}
+    if mutation == "missing":
+        receipt.pop("model_source_mount")
+    elif mutation == "wrong_kernel":
+        mount["requested_kernel_source"] = "operator/substituted-output"
+    elif mutation == "wrong_report_kernel":
+        substituted = "operator/substituted-output"
+        report["requested_route"]["model_source_kernel"] = substituted
+        report["model_assets"] = {"source_kernel": substituted}
+        report["model_storage_admission"] = {"source_kernel": substituted}
+    elif mutation == "missing_mount_root":
+        mount.pop("effective_mount_root")
+    elif mutation == "relative_mount_root":
+        mount["effective_mount_root"] = "kaggle/input/pinned-model-output"
+    elif mutation == "nested_mount_root":
+        mount["effective_mount_root"] = "/kaggle/input/parent/pinned-model-output"
+    elif mutation == "wrong_root":
+        mount["effective_blob_root"] = "/kaggle/input/substituted/runtime/huggingface"
+    elif mutation == "missing_marker_coordinate":
+        mount.pop("marker")
+    elif mutation == "wrong_marker_coordinate":
+        mount["marker"] = "runtime/huggingface/substituted/pipeline.json"
+    elif mutation == "ambiguous":
+        mount["candidate_count"] = 2
+    elif mutation == "wrong_marker":
+        mount["marker_sha256"] = "0" * 64
+    (tmp_path / "kaggle_cuda_witness_receipt.json").write_text(json.dumps(receipt))
+
+    if mutation is None:
+        witness._validate_mounted_model_receipt(packet, tmp_path, report)
+    else:
+        with pytest.raises(ValueError, match="mounted model"):
+            witness._validate_mounted_model_receipt(packet, tmp_path, report)
+
+
+def test_mounted_report_rejects_empty_packet_kernel_sources(tmp_path):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    packet = types.SimpleNamespace(kernel_sources=())
+    report = {
+        "requested_route": {
+            "model_source_kernel": "operator/substituted-output",
+            "model_blob_root": "/kaggle/input/substituted/runtime/huggingface",
+        }
+    }
+    (tmp_path / "kaggle_cuda_witness_receipt.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="mounted model"):
+        witness._validate_mounted_model_receipt(packet, tmp_path, report)
+
+
+@pytest.mark.parametrize("receipt_mount", ("absent", "null"))
+def test_generic_report_without_mounted_route_admits_empty_packet_kernel_sources(
+    tmp_path,
+    receipt_mount,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    packet = types.SimpleNamespace(kernel_sources=())
+    report = {
+        "requested_route": {
+            "model_source_kernel": None,
+            "model_blob_root": None,
+        }
+    }
+    receipt = {}
+    if receipt_mount == "null":
+        receipt["model_source_mount"] = None
+    (tmp_path / "kaggle_cuda_witness_receipt.json").write_text(json.dumps(receipt))
+
+    witness._validate_mounted_model_receipt(packet, tmp_path, report)
+
+
+@pytest.mark.parametrize("packet_source_present", (False, True))
+@pytest.mark.parametrize("report_root_present", (False, True))
+@pytest.mark.parametrize("report_kernel_present", (False, True))
+@pytest.mark.parametrize("receipt_mount_state", ("absent", "null", "mounted"))
+def test_model_source_authority_presence_matrix(
+    tmp_path,
+    packet_source_present,
+    report_root_present,
+    report_kernel_present,
+    receipt_mount_state,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    kernel_source = "operator/pinned-model-output"
+    mount_root = "/kaggle/input/pinned-model-output"
+    blob_root = f"{mount_root}/runtime/huggingface"
+    packet = types.SimpleNamespace(
+        kernel_sources=(kernel_source,) if packet_source_present else ()
+    )
+    report = {
+        "requested_route": {
+            "model_source_kernel": kernel_source if report_kernel_present else None,
+            "model_blob_root": blob_root if report_root_present else None,
+        }
+    }
+    if report_root_present and report_kernel_present:
+        source_record = {
+            "source_mode": "mounted-kernel-output",
+            "source_kernel": kernel_source,
+            "source_root": blob_root,
+        }
+    else:
+        source_record = {"source_mode": "selective-snapshot-download"}
+    report["model_assets"] = dict(source_record)
+    report["model_storage_admission"] = dict(source_record)
+    receipt = {}
+    if receipt_mount_state == "null":
+        receipt["model_source_mount"] = None
+    elif receipt_mount_state == "mounted":
+        receipt["model_source_mount"] = {
+            "requested_kernel_source": kernel_source,
+            "effective_mount_root": mount_root,
+            "effective_blob_root": blob_root,
+            "marker": witness.MODEL_SOURCE_MARKER,
+            "candidate_count": 1,
+            "marker_sha256": witness.MODEL_PIPELINE_SHA256,
+        }
+    (tmp_path / "kaggle_cuda_witness_receipt.json").write_text(json.dumps(receipt))
+
+    generic = (
+        not packet_source_present
+        and not report_root_present
+        and not report_kernel_present
+        and receipt_mount_state in {"absent", "null"}
+    )
+    mounted = (
+        packet_source_present
+        and report_root_present
+        and report_kernel_present
+        and receipt_mount_state == "mounted"
+    )
+    if generic or mounted:
+        witness._validate_mounted_model_receipt(packet, tmp_path, report)
+    else:
+        with pytest.raises(ValueError, match="mounted model"):
+            witness._validate_mounted_model_receipt(packet, tmp_path, report)
+
+
+@pytest.mark.parametrize(
+    ("carrier", "field", "value"),
+    (
+        ("model_assets", "source_mode", "mounted-kernel-output"),
+        ("model_assets", "source_root", "/kaggle/input/pinned/runtime/huggingface"),
+        ("model_assets", "source_kernel", "operator/pinned-model-output"),
+        ("model_storage_admission", "source_mode", "mounted-kernel-output"),
+        (
+            "model_storage_admission",
+            "source_root",
+            "/kaggle/input/pinned/runtime/huggingface",
+        ),
+        (
+            "model_storage_admission",
+            "source_kernel",
+            "operator/pinned-model-output",
+        ),
+    ),
+)
+def test_generic_report_rejects_mounted_effective_source_authority(
+    tmp_path,
+    carrier,
+    field,
+    value,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    report_path = _write_completed_fixture(tmp_path)
+    report = json.loads(report_path.read_text())
+    report["requested_route"].update(
+        model_blob_root=None,
+        model_source_kernel=None,
+    )
+    report["model_assets"]["source_mode"] = "selective-snapshot-download"
+    report["model_storage_admission"] = {
+        "source_mode": "selective-snapshot-download"
+    }
+    report[carrier][field] = value
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="mounted model"):
+        witness.validate_completed_report(report_path)
+
+    receipt = {"model_source_mount": None}
+    packet = types.SimpleNamespace(kernel_sources=())
+    with pytest.raises(ValueError, match="mounted model"):
+        witness._normalize_model_source_authority(packet, report, receipt)
+
+
+def test_model_manifest_has_measured_required_size_and_remote_capacity_fails_first(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import source_cuda_native_image_to_glb_witness as witness
+
+    assert witness.MODEL_REQUIRED_BYTES == 14_967_470_615
+    assert sum(
+        len(family["files"])
+        for family in witness.MODEL_BLOB_MANIFEST.values()
+    ) == 17
+    monkeypatch.setattr(witness, "verify_admitted_inputs_before_use", lambda *_args: None)
+    monkeypatch.setattr(
+        witness.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(
+            free=witness.MODEL_REQUIRED_BYTES
+            + witness.MODEL_OUTPUT_RESERVE_BYTES
+            - 1
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(
+            snapshot_download=lambda **_kwargs: pytest.fail(
+                "capacity failure must precede remote acquisition"
+            )
+        ),
+    )
+    dino = tmp_path / "dino"
+    rembg = tmp_path / "rembg"
+    dino.mkdir()
+    rembg.mkdir()
+    args = types.SimpleNamespace(
+        work_dir=tmp_path / "runtime",
+        dinov3_model_path=dino,
+        rembg_model_path=rembg,
+    )
+    report = {}
+
+    with pytest.raises(RuntimeError, match="insufficient writable storage"):
+        witness.prepare_model_view(args, report)
+
+    assert report["model_storage_admission"] == {
+        "source_mode": "selective-snapshot-download",
+        "free_bytes": witness.MODEL_REQUIRED_BYTES
+        + witness.MODEL_OUTPUT_RESERVE_BYTES
+        - 1,
+        "model_required_bytes": witness.MODEL_REQUIRED_BYTES,
+        "output_reserve_bytes": witness.MODEL_OUTPUT_RESERVE_BYTES,
+        "required_bytes": witness.MODEL_REQUIRED_BYTES
+        + witness.MODEL_OUTPUT_RESERVE_BYTES,
+    }
 
 
 def _write_completed_fixture(

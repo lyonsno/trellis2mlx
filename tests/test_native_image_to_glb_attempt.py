@@ -191,6 +191,62 @@ def test_structured_attempt_requires_hash_bound_dinov3_model_path(tmp_path):
     } == {role: role for role in dinov3}
 
 
+def test_structured_attempt_binds_read_only_model_kernel_source(tmp_path):
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        capture_profile="final-consumer",
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["final-consumer"],
+        model_kernel_source="operator/pinned-model-output",
+    )
+
+    packet = build_attempt_packet(spec)
+    manifest = json.loads(
+        (spec.capsule_dir / "native-image-to-glb-attempt.json").read_text()
+    )
+
+    assert manifest["schema"] == "trellis2mlx.native_image_to_glb_attempt.v4"
+    assert manifest["model_kernel_source"] == "operator/pinned-model-output"
+    assert packet.kernel_sources == ("operator/pinned-model-output",)
+    assert "--model-blob-root" not in packet.entrypoint_args
+    assert "--model-source-kernel" not in packet.entrypoint_args
+
+
+def test_model_kernel_source_runner_rejects_ambiguous_mount_and_admits_one(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import MODEL_SOURCE_MARKER
+    from trellmlx.kaggle_cuda_witness import prepare_packet
+
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        capture_profile="final-consumer",
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["final-consumer"],
+        model_kernel_source="operator/pinned-model-output",
+    )
+    packet = prepare_packet(build_attempt_packet(spec))
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+    marker = Path(namespace["CONFIG"]["model_source_marker"])
+    assert marker.as_posix() == MODEL_SOURCE_MARKER
+    mount_a = tmp_path / "kaggle-input" / "mount-a"
+    mount_b = tmp_path / "kaggle-input" / "mount-b"
+    for mount in (mount_a, mount_b):
+        source = mount / marker
+        source.parent.mkdir(parents=True)
+        source.write_text("pinned pipeline")
+    namespace["KAGGLE_INPUT_ROOT"] = tmp_path / "kaggle-input"
+
+    with pytest.raises(RuntimeError, match="missing or ambiguous"):
+        namespace["find_model_blob_root"]()
+
+    (mount_b / marker).unlink()
+    mounted = namespace["find_model_blob_root"]()
+    assert mounted["requested_kernel_source"] == "operator/pinned-model-output"
+    assert mounted["effective_mount_root"] == str(mount_a)
+    assert mounted["effective_blob_root"] == str(
+        mount_a / "runtime" / "huggingface"
+    )
+
+
 @pytest.mark.parametrize(
     "mutation", ("missing_role", "renamed_coordinate", "aliased_sources")
 )

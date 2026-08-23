@@ -48,8 +48,115 @@ NVDIFFRAST_COMMIT = "253ac4fcea7de5f396371124af597e6cc957bfae"
 MODEL_REPOSITORY = "microsoft/TRELLIS.2-4B"
 MODEL_REVISION = "af44b45f2e35a493886929c6d786e563ec68364d"
 MODEL_PIPELINE_SHA256 = "222c359ab1ed9bc6735a640a34f95d47f8681b9bc4aaa101bfb80274676253c6"
+MODEL_SOURCE_MARKER = (
+    "runtime/huggingface/models--microsoft--TRELLIS.2-4B/"
+    "blobs/f5ec14c7f71b3d7f2cb0221c5f568a6871dc5e90"
+)
 SPARSE_DECODER_REPOSITORY = "microsoft/TRELLIS-image-large"
 SPARSE_DECODER_REVISION = "25e0d31ffbebe4b5a97464dd851910efc3002d96"
+MODEL_BLOB_MANIFEST = {
+    "trellis": {
+        "cache_dir": "models--microsoft--TRELLIS.2-4B",
+        "files": {
+            "pipeline.json": {
+                "blob": "f5ec14c7f71b3d7f2cb0221c5f568a6871dc5e90",
+                "sha256": MODEL_PIPELINE_SHA256,
+                "size_bytes": 4186,
+            },
+            "ckpts/ss_flow_img_dit_1_3B_64_bf16.json": {
+                "blob": "f71c87cda44a9a940fa3a2d250a0944d606d2245",
+                "sha256": "6cdfb636854f60ffcadd8c49244169cd449f34c5ccdb55b5ff7c04678f9c399e",
+                "size_bytes": 467,
+            },
+            "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors": {
+                "blob": "ca01377c485bec418076d38ee80166d32dc776d744f2553b835cba1e97a7abf6",
+                "sha256": "ca01377c485bec418076d38ee80166d32dc776d744f2553b835cba1e97a7abf6",
+                "size_bytes": 2584426920,
+            },
+            "ckpts/shape_dec_next_dc_f16c32_fp16.json": {
+                "blob": "e46164e905de0e68328f5f4b1f128b8dac608d97",
+                "sha256": "5f1b856dffce79466fb18f5f0eefc08f08c673b24b3c05b20359c0b6d318a209",
+                "size_bytes": 678,
+            },
+            "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors": {
+                "blob": "e3b718d3e43e4f8780e9a24ac6fff231811a67e3b058e336e10fe654c911d581",
+                "sha256": "e3b718d3e43e4f8780e9a24ac6fff231811a67e3b058e336e10fe654c911d581",
+                "size_bytes": 948490494,
+            },
+            "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.json": {
+                "blob": "6e39aacbf7bd43d16d3dad35c95d43c0b17d6a4f",
+                "sha256": "ddbd7a1d34ce9a8e7af2f6ef9ae686d9ab49f69e62dacb98d8409b511cdbd5e2",
+                "size_bytes": 458,
+            },
+            "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors": {
+                "blob": "ec5e0917ef9b7e25ad51dffc7d19687a42019871f94239f2fa7f86264c55b70f",
+                "sha256": "ec5e0917ef9b7e25ad51dffc7d19687a42019871f94239f2fa7f86264c55b70f",
+                "size_bytes": 2584574424,
+            },
+            "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json": {
+                "blob": "cfd8d761e89aad595e97ec0cfe4b8469c9053583",
+                "sha256": "7ebd6d367393f52fee9e92c2b3d727a9026a338549c6a6fa84c7ea122140ffdd",
+                "size_bytes": 458,
+            },
+            "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors": {
+                "blob": "07cd0596f634c5adc1890023d16023afc5eed02fb84b22bb23aff5bf0030fbbd",
+                "sha256": "07cd0596f634c5adc1890023d16023afc5eed02fb84b22bb23aff5bf0030fbbd",
+                "size_bytes": 2584574424,
+            },
+            "ckpts/tex_dec_next_dc_f16c32_fp16.json": {
+                "blob": "e17107bef522e2aded7b3bc22ef421b57e16e779",
+                "sha256": "22074e4ab5b28e2b72d33a3fe61bf416134b89e12d0fc5c729f37da75da0c4d1",
+                "size_bytes": 705,
+            },
+            "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors": {
+                "blob": "97ea69addea2ecd9312910f5f548234665eef51c088386180b7cd5b258645e3c",
+                "sha256": "97ea69addea2ecd9312910f5f548234665eef51c088386180b7cd5b258645e3c",
+                "size_bytes": 948458812,
+            },
+            "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json": {
+                "blob": "b260bbc6cce80ccd7b61e32a40474225522b2043",
+                "sha256": "3093796257a62f838d2e5578ac4580ca3b7d88d10b87d348065d3fdfcc4c2077",
+                "size_bytes": 458,
+            },
+            "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors": {
+                "blob": "8371aa1c5d13be79dcd5ddfd2cf3835e902e204dc34427169a1c702828e1a94d",
+                "sha256": "8371aa1c5d13be79dcd5ddfd2cf3835e902e204dc34427169a1c702828e1a94d",
+                "size_bytes": 2584672728,
+            },
+            "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json": {
+                "blob": "d949ce887c62645f6a927ee66bba2a0df56e383e",
+                "sha256": "31f4fdad9974930e5e9324ac9dfb6ef7de6b30cea51854ba515ef827a8d353b2",
+                "size_bytes": 458,
+            },
+            "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors": {
+                "blob": "580401269059a339b8318ab9ced459a13ba63391721c83a6c383198c29e77686",
+                "sha256": "580401269059a339b8318ab9ced459a13ba63391721c83a6c383198c29e77686",
+                "size_bytes": 2584672728,
+            },
+        },
+    },
+    "sparse_decoder": {
+        "cache_dir": "models--microsoft--TRELLIS-image-large",
+        "files": {
+            "ckpts/ss_dec_conv3d_16l8_fp16.json": {
+                "blob": "9f3affaf13ab29fe48105229da9fab72ea8de716",
+                "sha256": "646781293f1cda74720de85d1cef50a957fb4aebd9a4bd014e454e32f2330ac5",
+                "size_bytes": 245,
+            },
+            "ckpts/ss_dec_conv3d_16l8_fp16.safetensors": {
+                "blob": "1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a",
+                "sha256": "1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a",
+                "size_bytes": 147591972,
+            },
+        },
+    },
+}
+MODEL_REQUIRED_BYTES = sum(
+    record["size_bytes"]
+    for family in MODEL_BLOB_MANIFEST.values()
+    for record in family["files"].values()
+)
+MODEL_OUTPUT_RESERVE_BYTES = 2 * 1024**3
 DINOV3_REPOSITORY = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 DINOV3_REVISION = "ea8dc2863c51be0a264bab82070e3e8836b02d51"
 DINOV3_FILES = {
@@ -240,6 +347,12 @@ def _requested_route(args: argparse.Namespace) -> dict[str, Any]:
         "nvdiffrast_commit": NVDIFFRAST_COMMIT,
         "model_repository": args.model_repository,
         "model_revision": MODEL_REVISION,
+        "model_blob_root": (
+            str(Path(args.model_blob_root).resolve())
+            if args.model_blob_root is not None
+            else None
+        ),
+        "model_source_kernel": args.model_source_kernel,
         "sparse_decoder_repository": SPARSE_DECODER_REPOSITORY,
         "sparse_decoder_revision": SPARSE_DECODER_REVISION,
         "dinov3_repository": DINOV3_REPOSITORY,
@@ -331,6 +444,18 @@ def _validate_request(args: argparse.Namespace) -> None:
         raise ValueError("the native source route requires sparse_conv_backend='flex_gemm'")
     if args.model_repository != MODEL_REPOSITORY:
         raise ValueError(f"this witness admits only model_repository={MODEL_REPOSITORY!r}")
+    if (args.model_blob_root is None) != (args.model_source_kernel is None):
+        raise ValueError(
+            "--model-blob-root and --model-source-kernel must be provided together"
+        )
+    if args.model_source_kernel is not None:
+        parts = args.model_source_kernel.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError("--model-source-kernel must be a Kaggle ref like owner/slug")
+        if not Path(args.model_blob_root).resolve().is_dir():
+            raise ValueError(
+                f"mounted model blob root is missing: {Path(args.model_blob_root).resolve()}"
+            )
     try:
         parsed_run_id = uuid.UUID(args.run_id)
     except (ValueError, TypeError, AttributeError) as exc:
@@ -998,11 +1123,92 @@ def prepare_runtime(args: argparse.Namespace, report: dict[str, Any]) -> dict[st
     }
 
 
-def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path:
+def _selective_model_patterns(family: str) -> tuple[str, ...]:
+    return tuple(MODEL_BLOB_MANIFEST[family]["files"])
+
+
+def _verify_and_link_mounted_models(
+    *,
+    blob_root: Path,
+    work_dir: Path,
+) -> tuple[dict[str, Path], dict[str, Any]]:
+    blob_root = Path(blob_root).resolve(strict=True)
+    assets_root = work_dir / "pinned-model-assets"
+    if assets_root.exists():
+        shutil.rmtree(assets_root)
+    records: dict[str, Any] = {}
+    mounted_blob_bytes = 0
+    snapshots: dict[str, Path] = {}
+    for family, family_manifest in MODEL_BLOB_MANIFEST.items():
+        snapshot = assets_root / family
+        snapshots[family] = snapshot
+        family_records = {}
+        blob_dir = blob_root / family_manifest["cache_dir"] / "blobs"
+        for coordinate, expected in family_manifest["files"].items():
+            source = blob_dir / expected["blob"]
+            try:
+                source_resolved = source.resolve(strict=True)
+                size_bytes = source_resolved.stat().st_size
+                actual_sha256 = sha256_file(source_resolved)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"mounted model blob is missing for {family}:{coordinate}: {source}"
+                ) from exc
+            if (
+                size_bytes != expected["size_bytes"]
+                or actual_sha256 != expected["sha256"]
+            ):
+                raise RuntimeError(
+                    "mounted model blob identity mismatch for "
+                    f"{family}:{coordinate}: expected sha256={expected['sha256']} "
+                    f"size={expected['size_bytes']}, got sha256={actual_sha256} "
+                    f"size={size_bytes}"
+                )
+            destination = snapshot / coordinate
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(source_resolved)
+            family_records[coordinate] = {
+                "source_path": str(source),
+                "resolved_source_path": str(source_resolved),
+                "linked_path": str(destination),
+                "blob": expected["blob"],
+                "sha256": actual_sha256,
+                "size_bytes": size_bytes,
+            }
+            mounted_blob_bytes += size_bytes
+        records[family] = family_records
+    return snapshots, {
+        "source_mode": "mounted-kernel-output",
+        "source_root": str(blob_root),
+        "mounted_blob_bytes": mounted_blob_bytes,
+        "writable_model_bytes": 0,
+        "files": records,
+    }
+
+
+def _download_model_snapshots(
+    *,
+    work_dir: Path,
+    report: dict[str, Any],
+) -> tuple[dict[str, Path], dict[str, Any]]:
     from huggingface_hub import snapshot_download
 
-    verify_admitted_inputs_before_use(args, report)
-    work_dir = Path(args.work_dir).resolve()
+    usage = shutil.disk_usage(work_dir)
+    required_bytes = MODEL_REQUIRED_BYTES + MODEL_OUTPUT_RESERVE_BYTES
+    admission = {
+        "source_mode": "selective-snapshot-download",
+        "free_bytes": usage.free,
+        "model_required_bytes": MODEL_REQUIRED_BYTES,
+        "output_reserve_bytes": MODEL_OUTPUT_RESERVE_BYTES,
+        "required_bytes": required_bytes,
+    }
+    report["model_storage_admission"] = admission
+    if usage.free < required_bytes:
+        raise RuntimeError(
+            "insufficient writable storage for pinned model acquisition and output "
+            f"reserve: free={usage.free}, required={required_bytes}, "
+            f"models={MODEL_REQUIRED_BYTES}, outputs={MODEL_OUTPUT_RESERVE_BYTES}"
+        )
     hf_cache = work_dir / "huggingface"
     snapshots = {
         "trellis": Path(
@@ -1010,6 +1216,7 @@ def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path
                 repo_id=MODEL_REPOSITORY,
                 revision=MODEL_REVISION,
                 cache_dir=hf_cache,
+                allow_patterns=list(_selective_model_patterns("trellis")),
             )
         ).resolve(),
         "sparse_decoder": Path(
@@ -1017,11 +1224,44 @@ def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path
                 repo_id=SPARSE_DECODER_REPOSITORY,
                 revision=SPARSE_DECODER_REVISION,
                 cache_dir=hf_cache,
+                allow_patterns=list(_selective_model_patterns("sparse_decoder")),
             )
         ).resolve(),
-        "rembg": Path(args.rembg_model_path).resolve(),
-        "dinov3": Path(args.dinov3_model_path).resolve(),
     }
+    return snapshots, admission
+
+
+def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path:
+
+    verify_admitted_inputs_before_use(args, report)
+    work_dir = Path(args.work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    model_blob_root = getattr(args, "model_blob_root", None)
+    model_source_kernel = getattr(args, "model_source_kernel", None)
+    if (model_blob_root is None) != (model_source_kernel is None):
+        raise RuntimeError(
+            "mounted model source requires both model blob root and source kernel"
+        )
+    if model_blob_root is not None:
+        snapshots, source_record = _verify_and_link_mounted_models(
+            blob_root=Path(model_blob_root),
+            work_dir=work_dir,
+        )
+        source_record["source_kernel"] = model_source_kernel
+        report["model_storage_admission"] = {
+            **source_record,
+            "free_bytes": shutil.disk_usage(work_dir).free,
+            "output_reserve_bytes": MODEL_OUTPUT_RESERVE_BYTES,
+        }
+    else:
+        snapshots, source_record = _download_model_snapshots(
+            work_dir=work_dir,
+            report=report,
+        )
+    snapshots.update(
+        rembg=Path(args.rembg_model_path).resolve(),
+        dinov3=Path(args.dinov3_model_path).resolve(),
+    )
     pipeline_path = snapshots["trellis"] / "pipeline.json"
     if sha256_file(pipeline_path) != MODEL_PIPELINE_SHA256:
         raise RuntimeError("pinned TRELLIS.2 pipeline.json digest mismatch")
@@ -1046,6 +1286,7 @@ def prepare_model_view(args: argparse.Namespace, report: dict[str, Any]) -> Path
     rewritten_path = model_view / "pipeline.json"
     _atomic_write_json(rewritten_path, pipeline_config)
     report["model_assets"] = {
+        **source_record,
         "trellis": {
             "repository": MODEL_REPOSITORY,
             "revision": MODEL_REVISION,
@@ -1087,6 +1328,115 @@ def _as_numpy(value: Any) -> np.ndarray:
             tensor = tensor.float()
         return np.ascontiguousarray(tensor.numpy())
     return np.ascontiguousarray(np.asarray(value))
+
+
+def _normalize_child_model_source_authority(
+    requested_route: dict[str, Any],
+    model_assets: dict[str, Any] | None,
+    model_storage_admission: dict[str, Any] | None,
+) -> tuple[str, str] | None:
+    if not isinstance(requested_route, dict):
+        raise ValueError("mounted model requested route is invalid")
+    for label, record in (
+        ("assets", model_assets),
+        ("storage admission", model_storage_admission),
+    ):
+        if record is not None and not isinstance(record, dict):
+            raise ValueError(f"mounted model {label} authority is invalid")
+
+    assets = model_assets or {}
+    storage = model_storage_admission or {}
+    requested_root = requested_route.get("model_blob_root")
+    requested_kernel = requested_route.get("model_source_kernel")
+    assets_source = (
+        assets.get("source_mode"),
+        assets.get("source_root"),
+        assets.get("source_kernel"),
+    )
+    storage_source = (
+        storage.get("source_mode"),
+        storage.get("source_root"),
+        storage.get("source_kernel"),
+    )
+
+    if requested_root is None and requested_kernel is None:
+        for label, (mode, root, kernel) in (
+            ("assets", assets_source),
+            ("storage admission", storage_source),
+        ):
+            if (
+                mode not in (None, "selective-snapshot-download")
+                or root is not None
+                or kernel is not None
+            ):
+                raise ValueError(
+                    f"mounted model {label} authority contradicts generic route"
+                )
+        return None
+
+    if not isinstance(requested_root, str) or not Path(requested_root).is_absolute():
+        raise ValueError("requested mounted model blob root is missing or non-absolute")
+    if (
+        not isinstance(requested_kernel, str)
+        or len(requested_kernel.split("/")) != 2
+        or not all(requested_kernel.split("/"))
+    ):
+        raise ValueError("requested mounted model source kernel identity is invalid")
+    expected_source = ("mounted-kernel-output", requested_root, requested_kernel)
+    if assets_source != expected_source:
+        raise ValueError("mounted model assets source authority mismatch")
+    if storage_source != expected_source:
+        raise ValueError("mounted model storage admission source authority mismatch")
+    return requested_root, requested_kernel
+
+
+def _validate_mounted_model_authority(
+    requested_route: dict[str, Any],
+    report: dict[str, Any],
+    model_assets: dict[str, Any],
+) -> None:
+    authority = _normalize_child_model_source_authority(
+        requested_route,
+        model_assets,
+        report.get("model_storage_admission"),
+    )
+    if authority is None:
+        return
+    requested_root, requested_kernel = authority
+    if model_assets.get("mounted_blob_bytes") != MODEL_REQUIRED_BYTES:
+        raise ValueError("mounted model assets byte total mismatch")
+    if model_assets.get("writable_model_bytes") != 0:
+        raise ValueError("mounted model assets wrote model payload bytes")
+    families = model_assets.get("files")
+    if not isinstance(families, dict) or set(families) != set(MODEL_BLOB_MANIFEST):
+        raise ValueError("mounted model assets family set is incomplete")
+    for family, expected_family in MODEL_BLOB_MANIFEST.items():
+        actual_files = families.get(family)
+        expected_files = expected_family["files"]
+        if not isinstance(actual_files, dict) or set(actual_files) != set(expected_files):
+            raise ValueError(f"mounted model assets file set is incomplete for {family}")
+        for coordinate, expected in expected_files.items():
+            actual = actual_files[coordinate]
+            if not isinstance(actual, dict) or any(
+                actual.get(field) != expected[field]
+                for field in ("blob", "sha256", "size_bytes")
+            ):
+                raise ValueError(
+                    f"mounted model blob identity mismatch for {family}:{coordinate}"
+                )
+    storage = report.get("model_storage_admission")
+    if not isinstance(storage, dict):
+        raise ValueError("mounted model storage admission is missing")
+    for field, expected in (
+        ("mounted_blob_bytes", MODEL_REQUIRED_BYTES),
+        ("writable_model_bytes", 0),
+        ("output_reserve_bytes", MODEL_OUTPUT_RESERVE_BYTES),
+    ):
+        if storage.get(field) != expected:
+            raise ValueError(f"mounted model storage admission {field} mismatch")
+    free_bytes = storage.get("free_bytes")
+    if type(free_bytes) is not int or free_bytes < MODEL_OUTPUT_RESERVE_BYTES:
+        raise ValueError("mounted model storage admission does not preserve output reserve")
 
 
 def _sparse_arrays(prefix: str, value: Any) -> dict[str, np.ndarray]:
@@ -1981,6 +2331,7 @@ def _validate_authority(report: dict[str, Any], *, expected_run_id: str | None, 
         raise ValueError("model assets RMBG snapshot path identity mismatch")
     if model_assets.get("path_rewrite_only") is not True:
         raise ValueError("model assets path rewrite identity is missing")
+    _validate_mounted_model_authority(requested_route, report, model_assets)
 
     source_identities = report.get("source_identities_after_build")
     if not isinstance(source_identities, dict):
@@ -2264,6 +2615,70 @@ def _packet_capture_profile(packet: Any) -> str:
     return _packet_capture_contract(packet).capture_profile
 
 
+def _normalize_model_source_authority(
+    packet: Any,
+    report: dict[str, Any],
+    receipt: dict[str, Any],
+) -> tuple[dict[str, Any], str, str] | None:
+    requested_route = report.get("requested_route", {})
+    packet_sources = tuple(packet.kernel_sources)
+    receipt_mount = receipt.get("model_source_mount")
+    child_authority = _normalize_child_model_source_authority(
+        requested_route,
+        report.get("model_assets"),
+        report.get("model_storage_admission"),
+    )
+
+    if not packet_sources and child_authority is None and receipt_mount is None:
+        return None
+
+    if len(packet_sources) != 1:
+        raise ValueError("mounted model authority requires exactly one packet source")
+    expected_kernel = packet_sources[0]
+    if child_authority is None:
+        raise ValueError("mounted model child report authority is missing")
+    report_blob_root, report_kernel = child_authority
+    if report_kernel != expected_kernel:
+        raise ValueError("mounted model report kernel source mismatch")
+    if not isinstance(receipt_mount, dict):
+        raise ValueError("mounted model receipt authority is missing")
+    if receipt_mount.get("requested_kernel_source") != expected_kernel:
+        raise ValueError("mounted model receipt kernel source mismatch")
+    return receipt_mount, expected_kernel, report_blob_root
+
+
+def _validate_mounted_model_receipt(
+    packet: Any,
+    output_dir: Path,
+    report: dict[str, Any],
+) -> None:
+    receipt_path = Path(output_dir) / "kaggle_cuda_witness_receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    authority = _normalize_model_source_authority(packet, report, receipt)
+    if authority is None:
+        return
+    mount, _expected_kernel, expected_blob_root = authority
+    effective_mount_root = mount.get("effective_mount_root")
+    if not isinstance(effective_mount_root, str):
+        raise ValueError("mounted model receipt effective mount root is missing")
+    mount_path = PurePosixPath(effective_mount_root)
+    kaggle_input_root = PurePosixPath("/kaggle/input")
+    if not mount_path.is_absolute() or mount_path.parent != kaggle_input_root:
+        raise ValueError("mounted model receipt effective mount root is invalid")
+    derived_blob_root = str(mount_path / "runtime" / "huggingface")
+    if mount.get("effective_blob_root") != derived_blob_root:
+        raise ValueError("mounted model receipt blob root is not derived from mount root")
+    if derived_blob_root != expected_blob_root:
+        raise ValueError("mounted model receipt blob root mismatch")
+    if mount.get("marker") != MODEL_SOURCE_MARKER:
+        raise ValueError("mounted model receipt marker coordinate mismatch")
+    if mount.get("candidate_count") != 1:
+        raise ValueError("mounted model receipt source selection is ambiguous")
+    marker_sha256 = mount.get("marker_sha256")
+    if marker_sha256 != MODEL_PIPELINE_SHA256:
+        raise ValueError("mounted model receipt pipeline marker mismatch")
+
+
 def validate_downloaded_native_image_to_glb_outputs(
     packet: Any,
     output_dir: Path,
@@ -2293,6 +2708,7 @@ def validate_downloaded_native_image_to_glb_outputs(
         expected_run_id=packet.run_id,
         expected_image_sha256=packet.expected_image_sha256,
     )
+    _validate_mounted_model_receipt(packet, output_dir, report)
     if report.get("capture_profile", "full") != capture_profile:
         raise WitnessPacketError("downloaded report capture profile mismatch")
     return {"downloaded_outputs": records, "report": report}
@@ -2689,6 +3105,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", required=True, type=Path)
     parser.add_argument("--run-id")
     parser.add_argument("--model-repository", default=MODEL_REPOSITORY)
+    parser.add_argument("--model-blob-root", type=Path)
+    parser.add_argument("--model-source-kernel")
     parser.add_argument("--dinov3-model-path", type=Path)
     parser.add_argument("--rembg-model-file")
     parser.add_argument("--rembg-config-file")

@@ -79,7 +79,7 @@ def _write_success_receipt(
         "source_identity": {
             "dataset_sources": [packet.dataset_id],
             "competition_sources": [],
-            "kernel_sources": [],
+            "kernel_sources": list(packet.kernel_sources),
             "model_sources": [],
         },
         "outputs": outputs,
@@ -182,6 +182,255 @@ def test_prepare_packet_can_enable_kernel_internet_explicitly(tmp_path):
     assert kernel_metadata["enable_internet"] == "true"
     assert manifest["enable_internet"] is True
     assert loaded.enable_internet is True
+
+
+def test_prepare_packet_binds_kernel_sources_across_metadata_runner_and_reload(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket,
+        WitnessPacketError,
+        load_prepared_packet,
+        prepare_packet,
+    )
+
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "cuda_probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(
+        KaggleCudaWitnessPacket(
+            capsule_dir=capsule,
+            output_dir=tmp_path / "packet",
+            dataset_id="operator/kernel-source-inputs",
+            kernel_id="operator/kernel-source-cuda",
+            title="Kernel Source CUDA",
+            entrypoint="cuda_probe.py",
+            inputs=("cuda_probe.py",),
+            kernel_sources=("operator/pinned-model-output",),
+        )
+    )
+
+    metadata = json.loads((packet.kernel_dir / "kernel-metadata.json").read_text())
+    manifest = json.loads((packet.dataset_dir / "witness-manifest.json").read_text())
+    runner = (packet.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    config_line = next(line for line in runner.splitlines() if line.startswith("CONFIG = "))
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    assert metadata["kernel_sources"] == ["operator/pinned-model-output"]
+    assert manifest["kernel_sources"] == ["operator/pinned-model-output"]
+    assert namespace["CONFIG"]["source_identity"]["kernel_sources"] == [
+        "operator/pinned-model-output"
+    ]
+    assert "operator/pinned-model-output" in config_line
+    assert load_prepared_packet(packet.output_dir).kernel_sources == (
+        "operator/pinned-model-output",
+    )
+
+    manifest["kernel_sources"] = ["operator/substituted-output"]
+    (packet.dataset_dir / "witness-manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(
+        WitnessPacketError,
+        match="manifest and kernel metadata kernel_sources mismatch",
+    ):
+        load_prepared_packet(packet.output_dir)
+
+def test_kernel_output_download_directory_admits_absent_or_empty_but_rejects_data(
+    tmp_path,
+):
+    from trellmlx.kaggle_cuda_witness import (
+        WitnessPacketError,
+        admit_kernel_output_download_dir,
+    )
+
+    absent = tmp_path / "absent"
+    assert admit_kernel_output_download_dir(absent) == absent
+    assert absent.is_dir()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert admit_kernel_output_download_dir(empty) == empty
+
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    (occupied / "prior-output.json").write_text("{}\n")
+    with pytest.raises(WitnessPacketError, match="not empty"):
+        admit_kernel_output_download_dir(occupied)
+    assert (occupied / "prior-output.json").is_file()
+
+
+def test_native_lifecycle_driver_consumes_canonical_download_admission(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    observed = []
+
+    def admit(path):
+        observed.append(Path(path))
+        return Path(path)
+
+    monkeypatch.setattr(lifecycle, "admit_kernel_output_download_dir", admit)
+    target = tmp_path / "downloads"
+
+    assert lifecycle.prepare_kernel_output_download(target) == target
+    assert observed == [target]
+
+
+def _lifecycle_recovery_state():
+    return {
+        "current_phase": "kernel_wait",
+        "phase_events": [],
+    }
+
+
+def test_native_lifecycle_remote_error_owns_populated_destination_failure(tmp_path):
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    state = _lifecycle_recovery_state()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "prior-output.json").write_text("{}\n")
+
+    assert lifecycle.recover_kernel_output(
+        packet=object(),
+        download_dir=download_dir,
+        lifecycle=state,
+        lifecycle_path=tmp_path / "lifecycle.json",
+        terminal_status="error",
+    ) is None
+    assert state["primary_failure"]["failure_phase"] == "kernel_terminal"
+    assert state["primary_failure"]["terminal_kernel_status"] == "error"
+    assert state["output_recovery"]["status"] == "failed"
+    assert state["output_recovery"]["error_type"] == "WitnessPacketError"
+    assert (download_dir / "prior-output.json").is_file()
+
+
+def test_native_lifecycle_remote_failure_owns_output_command_failure(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    state = _lifecycle_recovery_state()
+    monkeypatch.setattr(
+        lifecycle,
+        "run_command",
+        lambda *_args, **_kwargs: {"status": "failed", "stderr": "download broke"},
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "build_kernel_output_command",
+        lambda _packet, _download_dir: ["kaggle", "kernels", "output"],
+    )
+
+    assert lifecycle.recover_kernel_output(
+        packet=object(),
+        download_dir=tmp_path / "downloads",
+        lifecycle=state,
+        lifecycle_path=tmp_path / "lifecycle.json",
+        terminal_status="failed",
+    ) is None
+    assert state["primary_failure"]["terminal_kernel_status"] == "failed"
+    assert state["output_recovery"]["status"] == "failed"
+    assert state["output_recovery"]["error_type"] == "RuntimeError"
+    assert "kernel_output failed" in state["output_recovery"]["error_message"]
+
+
+def test_native_lifecycle_remote_error_preserves_recovered_failure_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    state = _lifecycle_recovery_state()
+    download_dir = tmp_path / "downloads"
+
+    def output_command(_command, *, phase, report_path):
+        assert phase == "kernel_output"
+        download_dir.mkdir(exist_ok=True)
+        (download_dir / "report.json").write_text('{"status":"failed"}\n')
+        return {"status": "done", "report_path": str(report_path)}
+
+    monkeypatch.setattr(lifecycle, "run_command", output_command)
+    monkeypatch.setattr(
+        lifecycle,
+        "build_kernel_output_command",
+        lambda _packet, _download_dir: ["kaggle", "kernels", "output"],
+    )
+
+    assert lifecycle.recover_kernel_output(
+        packet=object(),
+        download_dir=download_dir,
+        lifecycle=state,
+        lifecycle_path=tmp_path / "lifecycle.json",
+        terminal_status="error",
+    ) is None
+    assert state["primary_failure"]["terminal_kernel_status"] == "error"
+    assert state["output_recovery"]["status"] == "recovered"
+    assert state["output_recovery"]["files"] == [
+        {
+            "path": "report.json",
+            "sha256": "7fd0d3d434f0a0935c3b41f2e3a1f373bb10ee85dc2178c4e8c47e2f2e590ec6",
+            "size_bytes": 20,
+        }
+    ]
+
+
+def test_native_lifecycle_complete_kernel_keeps_destination_failure_primary(tmp_path):
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+    from trellmlx.kaggle_cuda_witness import WitnessPacketError
+
+    state = _lifecycle_recovery_state()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "prior-output.json").write_text("{}\n")
+
+    with pytest.raises(WitnessPacketError, match="not empty"):
+        lifecycle.recover_kernel_output(
+            packet=object(),
+            download_dir=download_dir,
+            lifecycle=state,
+            lifecycle_path=tmp_path / "lifecycle.json",
+            terminal_status="complete",
+        )
+    assert "primary_failure" not in state
+
+
+def test_native_lifecycle_final_failure_identity_prefers_remote_primary():
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    state = {
+        "current_phase": "kernel_output_download",
+        "primary_failure": {
+            "failure_phase": "kernel_terminal",
+            "error_type": "RemoteKernelTerminalError",
+            "error_message": "kernel terminal status is not complete: error",
+        },
+    }
+
+    assert lifecycle.select_failure_identity(
+        state,
+        RuntimeError("local recovery failed"),
+    ) == (
+        "kernel_terminal",
+        "RemoteKernelTerminalError",
+        "kernel terminal status is not complete: error",
+    )
+
+
+def test_native_lifecycle_final_failure_identity_uses_local_failure_without_primary():
+    from scripts import run_kaggle_native_image_to_glb_lifecycle as lifecycle
+
+    assert lifecycle.select_failure_identity(
+        {"current_phase": "kernel_output_download"},
+        RuntimeError("local recovery failed"),
+    ) == (
+        "kernel_output_download",
+        "RuntimeError",
+        "local recovery failed",
+    )
 
 
 def test_prepare_packet_runner_config_compiles_with_default_optional_outputs(tmp_path):

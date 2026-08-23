@@ -116,6 +116,37 @@ def test_v3_final_consumer_spec_binds_profile_to_runner_and_outputs(tmp_path):
     assert attempt["capture_profile"] == "final-consumer"
 
 
+def test_v4_final_consumer_spec_binds_model_kernel_source(tmp_path):
+    from trellmlx.native_image_to_glb_attempt import (
+        build_attempt_packet,
+        load_attempt_spec,
+    )
+
+    spec_path = _write_valid_spec(tmp_path)
+    payload = json.loads(spec_path.read_text())
+    payload.update(
+        schema="trellis2mlx.native_image_to_glb_attempt_spec.v4",
+        capture_profile="final-consumer",
+        model_kernel_source="operator/pinned-model-output",
+        expected_outputs=[
+            "07-decoder_raw_mesh.npz",
+            "10-postprocess_stage11_pre_orientation.npz",
+            "11-postprocess_stage12_post_orientation.npz",
+            "12-consumer_glb.glb",
+        ],
+    )
+    spec_path.write_text(json.dumps(payload))
+
+    packet = build_attempt_packet(load_attempt_spec(spec_path))
+    attempt = json.loads(
+        (packet.capsule_dir / "native-image-to-glb-attempt.json").read_text()
+    )
+
+    assert packet.kernel_sources == ("operator/pinned-model-output",)
+    assert attempt["schema"] == "trellis2mlx.native_image_to_glb_attempt.v4"
+    assert attempt["model_kernel_source"] == "operator/pinned-model-output"
+
+
 def test_v3_final_consumer_spec_rejects_mismatched_output_set(tmp_path):
     from trellmlx.native_image_to_glb_attempt import (
         AttemptSpecError,
