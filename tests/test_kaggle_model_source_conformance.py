@@ -712,9 +712,12 @@ def test_lifecycle_composes_terminal_download_and_semantic_admission(
         {
             "effective_input_root": "/kaggle/input",
             "effective_working_root": "/kaggle/working",
-            "effective_mount_root": "/kaggle/input/mounted-source",
+            "effective_mount_root": (
+                "/kaggle/input/notebooks/operator/pinned-model-output"
+            ),
             "effective_blob_root": (
-                "/kaggle/input/mounted-source/runtime/huggingface"
+                "/kaggle/input/notebooks/operator/pinned-model-output/"
+                "runtime/huggingface"
             ),
         }
     )
@@ -815,6 +818,72 @@ def test_runner_preserves_failure_receipt_when_source_mount_is_missing(tmp_path)
     assert receipt["requested_source_kernel"] == packet.source_kernel
 
 
+def test_runner_resolves_nested_notebook_kernel_source_mount(tmp_path):
+    packet, payloads = _packet(tmp_path)
+    prepare_packet(packet)
+    input_root = tmp_path / "input"
+    working_root = tmp_path / "working"
+    input_root.mkdir()
+    working_root.mkdir()
+    mount = _materialize_mount(
+        input_root / "notebooks" / "operator",
+        payloads,
+        name="pinned-model-output",
+    )
+
+    completed = _run_prepared(
+        packet,
+        input_root=input_root,
+        working_root=working_root,
+    )
+    receipt = json.loads((working_root / packet.receipt_name).read_text())
+
+    assert completed.returncode == 0, completed.stderr
+    assert receipt["status"] == "completed"
+    assert receipt["candidate_count"] == 1
+    assert receipt["effective_mount_root"] == str(mount)
+    assert receipt["effective_blob_root"] == str(mount / "runtime" / "huggingface")
+
+
+def test_validate_downloaded_receipt_admits_bound_nested_kernel_source_mount(
+    tmp_path,
+):
+    packet, payloads = _packet(tmp_path)
+    prepare_packet(packet)
+    input_root = tmp_path / "input"
+    working_root = tmp_path / "working"
+    output_root = tmp_path / "download"
+    input_root.mkdir()
+    working_root.mkdir()
+    output_root.mkdir()
+    _materialize_mount(
+        input_root / "notebooks" / "operator",
+        payloads,
+        name="pinned-model-output",
+    )
+    completed = _run_prepared(
+        packet,
+        input_root=input_root,
+        working_root=working_root,
+    )
+    assert completed.returncode == 0
+    receipt = json.loads((working_root / packet.receipt_name).read_text())
+    mount = "/kaggle/input/notebooks/operator/pinned-model-output"
+    receipt.update(
+        {
+            "effective_input_root": "/kaggle/input",
+            "effective_working_root": "/kaggle/working",
+            "effective_mount_root": mount,
+            "effective_blob_root": f"{mount}/runtime/huggingface",
+        }
+    )
+    (output_root / packet.receipt_name).write_text(json.dumps(receipt))
+
+    admitted = validate_downloaded_receipt(packet, output_root)
+
+    assert admitted["effective_mount_root"] == mount
+
+
 def test_lifecycle_rejects_prior_remote_receipt_after_terminal_complete(
     tmp_path,
     monkeypatch,
@@ -838,9 +907,12 @@ def test_lifecycle_rejects_prior_remote_receipt_after_terminal_complete(
             "attempt_id": "0" * 32,
             "effective_input_root": "/kaggle/input",
             "effective_working_root": "/kaggle/working",
-            "effective_mount_root": "/kaggle/input/mounted-source",
+            "effective_mount_root": (
+                "/kaggle/input/notebooks/operator/pinned-model-output"
+            ),
             "effective_blob_root": (
-                "/kaggle/input/mounted-source/runtime/huggingface"
+                "/kaggle/input/notebooks/operator/pinned-model-output/"
+                "runtime/huggingface"
             ),
         }
     )
@@ -1023,8 +1095,12 @@ def test_validate_downloaded_receipt_rejects_false_closure_classes(tmp_path):
     receipt = json.loads((working_root / packet.receipt_name).read_text())
     receipt["effective_input_root"] = "/kaggle/input"
     receipt["effective_working_root"] = "/kaggle/working"
-    receipt["effective_mount_root"] = "/kaggle/input/mounted-source"
-    receipt["effective_blob_root"] = "/kaggle/input/mounted-source/runtime/huggingface"
+    receipt["effective_mount_root"] = (
+        "/kaggle/input/notebooks/operator/pinned-model-output"
+    )
+    receipt["effective_blob_root"] = (
+        "/kaggle/input/notebooks/operator/pinned-model-output/runtime/huggingface"
+    )
     receipt_path = output_root / packet.receipt_name
     receipt_path.write_text(json.dumps(receipt))
 
@@ -1046,6 +1122,22 @@ def test_validate_downloaded_receipt_rejects_false_closure_classes(tmp_path):
         changed[field] = value
         receipt_path.write_text(json.dumps(changed))
         with pytest.raises(ModelSourceConformanceError, match=match):
+            validate_downloaded_receipt(packet, output_root)
+
+    invalid_mounts = (
+        "notebooks/operator/pinned-model-output",
+        "/tmp/notebooks/operator/pinned-model-output",
+        "/kaggle/input/notebooks/operator/pinned-model-output/extra",
+        "/kaggle/input/notebooks/attacker/pinned-model-output",
+        "/kaggle/input/notebooks/operator/substituted-output",
+        "/kaggle/input/datasets/operator/pinned-model-output",
+    )
+    for mount in invalid_mounts:
+        changed = dict(receipt)
+        changed["effective_mount_root"] = mount
+        changed["effective_blob_root"] = f"{mount}/runtime/huggingface"
+        receipt_path.write_text(json.dumps(changed))
+        with pytest.raises(ModelSourceConformanceError, match="mount root"):
             validate_downloaded_receipt(packet, output_root)
 
     changed = dict(receipt)

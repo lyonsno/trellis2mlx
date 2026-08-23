@@ -199,8 +199,14 @@ def validate_downloaded_receipt(
     if not isinstance(mount_value, str):
         raise ModelSourceConformanceError("downloaded receipt mount root is missing")
     mount = PurePosixPath(mount_value)
-    if not mount.is_absolute() or mount.parent != PurePosixPath("/kaggle/input"):
-        raise ModelSourceConformanceError("downloaded receipt mount root is invalid")
+    source_owner, source_slug = packet.source_kernel.split("/")
+    expected_mount = (
+        PurePosixPath("/kaggle/input/notebooks") / source_owner / source_slug
+    )
+    if not mount.is_absolute() or mount != expected_mount:
+        raise ModelSourceConformanceError(
+            "downloaded receipt mount root does not match source kernel"
+        )
     expected_blob_root = str(mount / "runtime" / "huggingface")
     if receipt.get("effective_blob_root") != expected_blob_root:
         raise ModelSourceConformanceError("downloaded receipt blob root is invalid")
@@ -563,11 +569,14 @@ def main() -> int:
         marker = Path(CONFIG["marker"])
         candidates = []
         if INPUT_ROOT.is_dir():
-            candidates = [
-                mount
-                for mount in sorted(INPUT_ROOT.iterdir())
-                if mount.is_dir() and (mount / marker).is_file()
-            ]
+            for marker_path in sorted(INPUT_ROOT.rglob(marker.name)):
+                if not marker_path.is_file():
+                    continue
+                relative = marker_path.relative_to(INPUT_ROOT)
+                if relative.parts[-len(marker.parts):] != marker.parts:
+                    continue
+                mount_parts = relative.parts[:-len(marker.parts)]
+                candidates.append(INPUT_ROOT.joinpath(*mount_parts))
         context["candidate_count"] = len(candidates)
         if len(candidates) != 1:
             raise RuntimeError(
