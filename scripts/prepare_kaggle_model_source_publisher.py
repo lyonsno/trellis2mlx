@@ -42,7 +42,7 @@ from trellmlx.kaggle_model_source_publisher import (
 )
 
 
-PUBLISHER_KERNEL_PREFIX = "noahboo/t2mlx-pinned-model-source-r11"
+PUBLISHER_KERNEL_PREFIX = "noahboo/t2mlx-r11-source"
 _REPOSITORY_AUTHORITY = {
     "trellis": (MODEL_REPOSITORY, MODEL_REVISION),
     "sparse_decoder": (SPARSE_DECODER_REPOSITORY, SPARSE_DECODER_REVISION),
@@ -79,7 +79,7 @@ def build_packet(
     attempt_id: str | None = None,
 ) -> ModelSourcePublisherPacket:
     effective_attempt_id = attempt_id or uuid.uuid4().hex
-    kernel_id = f"{PUBLISHER_KERNEL_PREFIX}-{effective_attempt_id[:8]}"
+    kernel_id = f"{PUBLISHER_KERNEL_PREFIX}-{effective_attempt_id}"
     return ModelSourcePublisherPacket(
         output_dir=output_dir,
         kernel_id=kernel_id,
@@ -92,7 +92,7 @@ def build_packet(
 
 
 def validate_r11_publisher_authority(packet: ModelSourcePublisherPacket) -> None:
-    expected_kernel_id = f"{PUBLISHER_KERNEL_PREFIX}-{packet.attempt_id[:8]}"
+    expected_kernel_id = f"{PUBLISHER_KERNEL_PREFIX}-{packet.attempt_id}"
     expected = {
         "kernel_id": expected_kernel_id,
         "title": expected_kernel_id.split("/", 1)[1],

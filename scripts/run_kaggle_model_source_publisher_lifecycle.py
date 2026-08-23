@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 import traceback
 
@@ -124,9 +125,9 @@ def claim_prepared_attempt(
 ) -> dict[str, object]:
     owner, slug = packet.kernel_id.split("/", 1)
     packet_dir = Path(packet.output_dir).resolve(strict=True)
-    claim_path = (
-        Path(registry_root) / owner / slug / f"{packet.attempt_id}.json"
-    ).resolve(strict=False)
+    claim_path = (Path(registry_root) / owner / f"{slug}.json").resolve(
+        strict=False
+    )
     if claim_path == packet_dir or claim_path.is_relative_to(packet_dir):
         raise ModelSourcePublisherError(
             "attempt claim must resolve outside the prepared packet: "
@@ -188,7 +189,7 @@ def main() -> int:
     lifecycle: dict[str, object] = {
         "schema": "trellis2mlx.kaggle_model_source_publisher.lifecycle.v1",
         "status": "running",
-        "current_phase": "preflight",
+        "current_phase": "lifecycle_initialization",
         "failure_phase": None,
         "last_trustworthy_phase": None,
         "started_at": utc_now(),
@@ -204,9 +205,9 @@ def main() -> int:
         "phase_events": [],
         "kernel_status_observations": [],
     }
-    write_json(lifecycle_path, lifecycle)
     active_event: dict[str, object] | None = None
     try:
+        write_json(lifecycle_path, lifecycle)
         active_event = begin_phase(lifecycle, lifecycle_path, "preflight")
         if not lifecycle["kaggle_token_present"]:
             raise RuntimeError("KAGGLE_API_TOKEN is absent")
@@ -381,7 +382,18 @@ def main() -> int:
         return 0
     except BaseException as exc:
         if active_event is not None and active_event.get("status") == "running":
-            finish_phase(lifecycle, lifecycle_path, active_event, status="failed")
+            try:
+                finish_phase(
+                    lifecycle,
+                    lifecycle_path,
+                    active_event,
+                    status="failed",
+                )
+            except BaseException as lifecycle_sink_exc:
+                lifecycle["lifecycle_sink_error"] = {
+                    "error_type": type(lifecycle_sink_exc).__name__,
+                    "error_message": str(lifecycle_sink_exc),
+                }
         ended_epoch = time.time()
         failure_phase, error_type, error_message = select_failure_identity(
             lifecycle, exc
@@ -398,8 +410,27 @@ def main() -> int:
                 "traceback": traceback.format_exc(),
             }
         )
-        write_json(lifecycle_path, lifecycle)
-        write_json(failure_path, lifecycle)
+        lifecycle_write_error = None
+        try:
+            write_json(lifecycle_path, lifecycle)
+        except BaseException as lifecycle_sink_exc:
+            lifecycle_write_error = {
+                "error_type": type(lifecycle_sink_exc).__name__,
+                "error_message": str(lifecycle_sink_exc),
+            }
+            lifecycle["lifecycle_sink_error"] = lifecycle_write_error
+        try:
+            write_json(failure_path, lifecycle)
+        except BaseException as failure_sink_exc:
+            print(
+                "publisher lifecycle failed and neither durable sink accepted "
+                "the terminal report: "
+                f"primary={type(exc).__name__}: {exc}; "
+                f"lifecycle_sink={lifecycle_write_error}; "
+                f"failure_sink={type(failure_sink_exc).__name__}: "
+                f"{failure_sink_exc}",
+                file=sys.stderr,
+            )
         return 1
 
 

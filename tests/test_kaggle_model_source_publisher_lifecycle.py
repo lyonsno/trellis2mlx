@@ -116,11 +116,45 @@ def test_lifecycle_attempt_claim_survives_packet_repreparation(tmp_path, monkeyp
     monkeypatch.setattr(lifecycle, "run_command", stop_after_push)
     monkeypatch.setattr(sys, "argv", _argv(tmp_path, packet, "first"))
     assert lifecycle.main() == 1
+    owner, slug = packet.kernel_id.split("/", 1)
+    claim_path = tmp_path / "attempt-registry" / owner / f"{slug}.json"
+    assert claim_path.is_file()
+    claim = json.loads(claim_path.read_text())
+    assert claim["attempt_id"] == packet.attempt_id
+    assert claim["kernel_id"] == packet.kernel_id
 
     prepare_publisher_packet(packet)
     monkeypatch.setattr(sys, "argv", _argv(tmp_path, packet, "second"))
     assert lifecycle.main() == 1
     assert len(pushes) == 1
+
+
+def test_lifecycle_bootstrap_failure_uses_distinct_failure_sink(
+    tmp_path,
+    monkeypatch,
+):
+    packet = build_packet(output_dir=tmp_path / "packet", attempt_id="6" * 32)
+    prepare_publisher_packet(packet)
+    invalid_parent = tmp_path / "not-a-directory"
+    invalid_parent.write_text("occupied")
+    failure_path = tmp_path / "reports" / "bootstrap-failure.json"
+    argv = _argv(tmp_path, packet)
+    argv[argv.index("--lifecycle-report") + 1] = str(
+        invalid_parent / "lifecycle.json"
+    )
+    argv[argv.index("--failure-report") + 1] = str(failure_path)
+    _allow_custody(monkeypatch)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert lifecycle.main() == 1
+    failure = json.loads(failure_path.read_text())
+    assert failure["status"] == "failed"
+    assert failure["current_phase"] == "lifecycle_initialization"
+    assert failure["failure_phase"] == "lifecycle_initialization"
+    assert failure["last_trustworthy_phase"] is None
+    assert failure["terminal_at"]
+    assert failure["error_type"] in {"FileExistsError", "NotADirectoryError"}
+    assert failure["error_message"]
 
 
 def test_lifecycle_rejects_registry_owner_symlink_into_packet(tmp_path, monkeypatch):

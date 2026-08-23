@@ -25,7 +25,7 @@ from trellmlx.kaggle_model_source_publisher import ModelSourcePublisherError
 def test_canonical_publisher_packet_matches_native_model_authority(tmp_path: Path):
     packet = build_packet(output_dir=tmp_path / "packet", attempt_id="a" * 32)
 
-    assert packet.kernel_id == f"{PUBLISHER_KERNEL_PREFIX}-{packet.attempt_id[:8]}"
+    assert packet.kernel_id == f"{PUBLISHER_KERNEL_PREFIX}-{packet.attempt_id}"
     assert packet.title == packet.kernel_id.split("/", 1)[1]
     assert packet.marker == MODEL_SOURCE_MARKER
     assert packet.marker_sha256 == MODEL_PIPELINE_SHA256
@@ -56,6 +56,22 @@ def test_canonical_publisher_packet_matches_native_model_authority(tmp_path: Pat
         for family, manifest in MODEL_BLOB_MANIFEST.items()
     }
     validate_r11_publisher_authority(packet)
+
+
+def test_canonical_publisher_route_is_injective_for_shared_attempt_prefix(tmp_path):
+    first = build_packet(
+        output_dir=tmp_path / "first",
+        attempt_id="deadbeef" + "0" * 24,
+    )
+    second = build_packet(
+        output_dir=tmp_path / "second",
+        attempt_id="deadbeef" + "f" * 24,
+    )
+
+    assert first.kernel_id != second.kernel_id
+    assert first.title != second.title
+    validate_r11_publisher_authority(first)
+    validate_r11_publisher_authority(second)
 
 
 @pytest.mark.parametrize(
