@@ -81,7 +81,7 @@ def prepare_packet(
     packet.kernel_dir.mkdir(parents=True)
 
     runner_path = packet.kernel_dir / packet.code_file
-    runner_path.write_text(_runner_script(packet))
+    runner_path.write_text(render_runner(packet))
     metadata = _kernel_metadata(packet)
     _write_json(packet.kernel_dir / "kernel-metadata.json", metadata)
     manifest = _packet_manifest(packet)
@@ -430,7 +430,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def _runner_script(packet: ModelSourceConformancePacket) -> str:
+def render_runner(packet: ModelSourceConformancePacket) -> str:
+    """Render the exact runner bytes for an authenticated packet."""
+
+    _validate_packet(packet)
     config = {
         "schema": SCHEMA,
         "requested_source_kernel": packet.source_kernel,

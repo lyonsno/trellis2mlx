@@ -1,7 +1,9 @@
 import json
 import os
 from dataclasses import replace
+import hashlib
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -25,7 +27,11 @@ from scripts.run_kaggle_model_source_conformance_lifecycle import (
     normalize_kernel_status,
     prepare_download_dir,
     select_failure_identity,
+    verify_generator_custody,
 )
+
+
+OBJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _blob(relative_path: str, payload: bytes) -> ModelSourceBlob:
@@ -234,9 +240,11 @@ def test_lifecycle_rejects_self_consistent_authority_substitution_before_push(
             "--failure-report",
             str(tmp_path / "reports" / "failure.json"),
             "--object-root",
-            str(tmp_path),
+            str(OBJECT_ROOT),
             "--object-commit",
             "a" * 40,
+            "--attempt-registry-root",
+            str(tmp_path / "attempt-registry"),
             "--expected-kernel-id",
             packet.kernel_id,
         ],
@@ -281,9 +289,11 @@ def test_lifecycle_consumes_each_prepared_attempt_before_push(tmp_path, monkeypa
             "--failure-report",
             str(tmp_path / "reports" / "failure.json"),
             "--object-root",
-            str(tmp_path),
+            str(OBJECT_ROOT),
             "--object-commit",
             "a" * 40,
+            "--attempt-registry-root",
+            str(tmp_path / "attempt-registry"),
             "--expected-kernel-id",
             packet.kernel_id,
         ],
@@ -292,6 +302,167 @@ def test_lifecycle_consumes_each_prepared_attempt_before_push(tmp_path, monkeypa
     assert lifecycle.main() == 1
     assert lifecycle.main() == 1
     assert len(pushes) == 1
+
+
+def test_lifecycle_rejects_self_consistent_runner_substitution_before_push(
+    tmp_path,
+    monkeypatch,
+):
+    packet = build_packet(
+        output_dir=tmp_path / "packet",
+        kernel_id="noahboo/t2mlx-model-source-conformance-r11",
+        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        title="Trellis2MLX R11 Model Source Conformance",
+    )
+    prepare_packet(packet)
+    runner_path = packet.kernel_dir / packet.code_file
+    replacement = runner_path.read_text() + "\n# self-consistent substituted runner\n"
+    runner_path.write_text(replacement)
+    manifest_path = packet.output_dir / "packet.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["runner_sha256"] = hashlib.sha256(replacement.encode()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    pushes = []
+
+    def reject_push(command, *, phase, report_path):
+        pushes.append((command, phase, report_path))
+        raise AssertionError("substituted runner reached kernel push")
+
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "test-token")
+    monkeypatch.setattr(lifecycle, "run_command", reject_push)
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_local_custody",
+        lambda _root, commit: {"object_commit": commit, "object_status": "clean"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_kaggle_model_source_conformance_lifecycle.py",
+            "--packet-dir",
+            str(packet.output_dir),
+            "--download-dir",
+            str(tmp_path / "downloads"),
+            "--lifecycle-report",
+            str(tmp_path / "reports" / "lifecycle.json"),
+            "--failure-report",
+            str(tmp_path / "reports" / "failure.json"),
+            "--object-root",
+            str(OBJECT_ROOT),
+            "--object-commit",
+            "a" * 40,
+            "--attempt-registry-root",
+            str(tmp_path / "attempt-registry"),
+            "--expected-kernel-id",
+            packet.kernel_id,
+        ],
+    )
+
+    assert lifecycle.main() == 1
+    assert pushes == []
+
+
+@pytest.mark.parametrize("duplicate_mode", ("copy", "reprepare"))
+def test_lifecycle_attempt_claim_survives_packet_duplication(
+    tmp_path,
+    monkeypatch,
+    duplicate_mode,
+):
+    packet = build_packet(
+        output_dir=tmp_path / "packet",
+        kernel_id="noahboo/t2mlx-model-source-conformance-r11",
+        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        title="Trellis2MLX R11 Model Source Conformance",
+    )
+    prepare_packet(packet)
+    second_packet_dir = tmp_path / "packet-copy"
+    if duplicate_mode == "copy":
+        shutil.copytree(packet.output_dir, second_packet_dir)
+    pushes = []
+
+    def stop_after_push(command, *, phase, report_path):
+        pushes.append((command, phase, report_path))
+        raise RuntimeError("stop after observing push")
+
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "test-token")
+    monkeypatch.setattr(lifecycle, "run_command", stop_after_push)
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_local_custody",
+        lambda _root, commit: {"object_commit": commit, "object_status": "clean"},
+    )
+
+    def run(packet_dir: Path, suffix: str) -> int:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_kaggle_model_source_conformance_lifecycle.py",
+                "--packet-dir",
+                str(packet_dir),
+                "--download-dir",
+                str(tmp_path / f"downloads-{suffix}"),
+                "--lifecycle-report",
+                str(tmp_path / "reports" / f"lifecycle-{suffix}.json"),
+                "--failure-report",
+                str(tmp_path / "reports" / f"failure-{suffix}.json"),
+                "--object-root",
+                str(OBJECT_ROOT),
+                "--object-commit",
+                "a" * 40,
+                "--attempt-registry-root",
+                str(tmp_path / "attempt-registry"),
+                "--expected-kernel-id",
+                packet.kernel_id,
+            ],
+        )
+        return lifecycle.main()
+
+    assert run(packet.output_dir, "first") == 1
+    if duplicate_mode == "reprepare":
+        prepare_packet(packet)
+        second_packet_dir = packet.output_dir
+    assert run(second_packet_dir, "second") == 1
+    assert len(pushes) == 1
+    claim_paths = list((tmp_path / "attempt-registry").rglob("*.json"))
+    assert len(claim_paths) == 1
+    claim = json.loads(claim_paths[0].read_text())
+    assert claim["kernel_id"] == packet.kernel_id
+    assert claim["attempt_id"] == packet.attempt_id
+    assert claim["packet_contract_sha256"] == packet.packet_contract_sha256
+    assert claim["packet_manifest_sha256"]
+    assert claim["runner_sha256"]
+    assert claim["object_commit"] == "a" * 40
+    assert claim["lifecycle_report"].endswith("lifecycle-first.json")
+
+    fresh_packet = build_packet(
+        output_dir=tmp_path / "fresh-packet",
+        kernel_id=packet.kernel_id,
+        source_kernel=packet.source_kernel,
+        title=packet.title,
+    )
+    assert fresh_packet.attempt_id != packet.attempt_id
+    prepare_packet(fresh_packet)
+    assert run(fresh_packet.output_dir, "fresh") == 1
+    assert len(pushes) == 2
+
+
+def test_generator_custody_requires_effective_modules_beneath_object_root(tmp_path):
+    custody = verify_generator_custody(OBJECT_ROOT)
+    assert set(custody) == {
+        "load_prepared_packet",
+        "render_runner",
+        "validate_r11_authority",
+        "lifecycle",
+    }
+    assert all(
+        Path(path).resolve().is_relative_to(OBJECT_ROOT)
+        for path in custody.values()
+    )
+
+    with pytest.raises(RuntimeError, match="outside object root"):
+        verify_generator_custody(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -413,9 +584,11 @@ def test_lifecycle_composes_terminal_download_and_semantic_admission(
             "--failure-report",
             str(failure_report),
             "--object-root",
-            str(tmp_path),
+            str(OBJECT_ROOT),
             "--object-commit",
             "a" * 40,
+            "--attempt-registry-root",
+            str(tmp_path / "attempt-registry"),
             "--expected-kernel-id",
             packet.kernel_id,
         ],
@@ -535,9 +708,11 @@ def test_lifecycle_rejects_prior_remote_receipt_after_terminal_complete(
             "--failure-report",
             str(tmp_path / "reports" / "failure.json"),
             "--object-root",
-            str(tmp_path),
+            str(OBJECT_ROOT),
             "--object-commit",
             "a" * 40,
+            "--attempt-registry-root",
+            str(tmp_path / "attempt-registry"),
             "--expected-kernel-id",
             packet.kernel_id,
         ],

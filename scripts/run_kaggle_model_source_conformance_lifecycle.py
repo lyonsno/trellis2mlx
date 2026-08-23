@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ from trellmlx.kaggle_model_source_conformance import (
     build_kernel_push_command,
     build_kernel_status_command,
     load_prepared_packet,
+    render_runner,
+    sha256_file,
     validate_downloaded_receipt,
 )
 try:
@@ -166,11 +169,73 @@ def snapshot_recovered_files(download_dir: Path) -> list[dict[str, object]]:
     return records
 
 
-def claim_prepared_attempt(packet_dir: Path, attempt_id: str) -> dict[str, object]:
-    claim_path = Path(packet_dir) / "attempt-consumed.json"
+def verify_generator_custody(object_root: Path) -> dict[str, str]:
+    object_root = Path(object_root).resolve(strict=True)
+    functions = {
+        "load_prepared_packet": load_prepared_packet,
+        "render_runner": render_runner,
+        "validate_r11_authority": validate_r11_authority,
+    }
+    paths = {}
+    for name, function in functions.items():
+        source_file = inspect.getsourcefile(function)
+        if source_file is None:
+            raise RuntimeError(f"cannot resolve effective generator source: {name}")
+        source_path = Path(source_file).resolve(strict=True)
+        if not source_path.is_relative_to(object_root):
+            raise RuntimeError(
+                f"effective generator source is outside object root: "
+                f"{name}={source_path}, root={object_root}"
+            )
+        paths[name] = str(source_path)
+    lifecycle_path = Path(__file__).resolve(strict=True)
+    if not lifecycle_path.is_relative_to(object_root):
+        raise RuntimeError(
+            "effective lifecycle source is outside object root: "
+            f"path={lifecycle_path}, root={object_root}"
+        )
+    paths["lifecycle"] = str(lifecycle_path)
+    return paths
+
+
+def validate_prepared_runner(packet) -> dict[str, object]:
+    runner_path = packet.kernel_dir / packet.code_file
+    expected = render_runner(packet)
+    try:
+        actual = runner_path.read_text()
+    except OSError as exc:
+        raise ModelSourceConformanceError(
+            f"cannot read prepared runner: {runner_path}"
+        ) from exc
+    if actual != expected:
+        raise ModelSourceConformanceError(
+            "prepared runner diverges from the verified object generator"
+        )
+    digest = hashlib.sha256(actual.encode()).hexdigest()
+    return {"path": str(runner_path), "sha256": digest}
+
+
+def claim_prepared_attempt(
+    registry_root: Path,
+    *,
+    packet,
+    packet_manifest_sha256: str,
+    runner_sha256: str,
+    object_commit: str,
+    lifecycle_report: Path,
+) -> dict[str, object]:
+    owner, slug = packet.kernel_id.split("/", 1)
+    claim_path = Path(registry_root) / owner / slug / f"{packet.attempt_id}.json"
+    claim_path.parent.mkdir(parents=True, exist_ok=True)
     claim = {
         "schema": "trellis2mlx.kaggle_model_source_conformance.attempt_claim.v1",
-        "attempt_id": attempt_id,
+        "kernel_id": packet.kernel_id,
+        "attempt_id": packet.attempt_id,
+        "packet_contract_sha256": packet.packet_contract_sha256,
+        "packet_manifest_sha256": packet_manifest_sha256,
+        "runner_sha256": runner_sha256,
+        "object_commit": object_commit,
+        "lifecycle_report": str(Path(lifecycle_report).resolve()),
         "claimed_at": utc_now(),
     }
     encoded = (json.dumps(claim, indent=2, sort_keys=True) + "\n").encode()
@@ -182,7 +247,8 @@ def claim_prepared_attempt(packet_dir: Path, attempt_id: str) -> dict[str, objec
         )
     except FileExistsError as exc:
         raise ModelSourceConformanceError(
-            f"prepared attempt has already been consumed: {attempt_id}"
+            "prepared attempt has already been consumed: "
+            f"kernel={packet.kernel_id}, attempt={packet.attempt_id}"
         ) from exc
     try:
         os.write(descriptor, encoded)
@@ -197,6 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-dir", type=Path, required=True)
     parser.add_argument("--lifecycle-report", type=Path, required=True)
     parser.add_argument("--failure-report", type=Path, required=True)
+    parser.add_argument("--attempt-registry-root", type=Path, required=True)
     parser.add_argument("--object-root", type=Path, required=True)
     parser.add_argument("--object-commit", required=True)
     parser.add_argument("--expected-kernel-id", required=True)
@@ -210,6 +277,7 @@ def main() -> int:
     lifecycle_path = args.lifecycle_report.resolve()
     failure_path = args.failure_report.resolve()
     object_root = args.object_root.resolve()
+    attempt_registry_root = args.attempt_registry_root.resolve()
     started_epoch = time.time()
     lifecycle: dict[str, object] = {
         "schema": "trellis2mlx.kaggle_model_source_conformance.lifecycle.v1",
@@ -225,6 +293,7 @@ def main() -> int:
         "download_dir": str(download_dir),
         "object_root": str(object_root),
         "object_commit": args.object_commit,
+        "attempt_registry_root": str(attempt_registry_root),
         "kaggle_token_present": bool(os.environ.get("KAGGLE_API_TOKEN")),
         "phase_events": [],
         "kernel_status_observations": [],
@@ -239,6 +308,7 @@ def main() -> int:
             object_root,
             args.object_commit,
         )
+        lifecycle["generator_custody"] = verify_generator_custody(object_root)
         packet = load_prepared_packet(packet_dir)
         if packet.kernel_id != args.expected_kernel_id:
             raise RuntimeError(
@@ -246,9 +316,17 @@ def main() -> int:
                 f"expected={args.expected_kernel_id}, actual={packet.kernel_id}"
             )
         validate_r11_authority(packet)
+        runner_identity = validate_prepared_runner(packet)
+        packet_manifest_sha256 = sha256_file(packet_dir / "packet.json")
+        lifecycle["admitted_runner"] = runner_identity
+        lifecycle["packet_manifest_sha256"] = packet_manifest_sha256
         lifecycle["attempt_claim"] = claim_prepared_attempt(
-            packet_dir,
-            packet.attempt_id,
+            attempt_registry_root,
+            packet=packet,
+            packet_manifest_sha256=packet_manifest_sha256,
+            runner_sha256=str(runner_identity["sha256"]),
+            object_commit=args.object_commit,
+            lifecycle_report=lifecycle_path,
         )
         lifecycle.update(
             {
