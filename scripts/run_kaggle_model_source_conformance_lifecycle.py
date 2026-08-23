@@ -200,9 +200,9 @@ def verify_generator_custody(object_root: Path) -> dict[str, str]:
 
 def validate_prepared_runner(packet) -> dict[str, object]:
     runner_path = packet.kernel_dir / packet.code_file
-    expected = render_runner(packet)
+    expected = render_runner(packet).encode("utf-8")
     try:
-        actual = runner_path.read_text()
+        actual = runner_path.read_bytes()
     except OSError as exc:
         raise ModelSourceConformanceError(
             f"cannot read prepared runner: {runner_path}"
@@ -211,7 +211,7 @@ def validate_prepared_runner(packet) -> dict[str, object]:
         raise ModelSourceConformanceError(
             "prepared runner diverges from the verified object generator"
         )
-    digest = hashlib.sha256(actual.encode()).hexdigest()
+    digest = hashlib.sha256(actual).hexdigest()
     return {"path": str(runner_path), "sha256": digest}
 
 
@@ -225,7 +225,15 @@ def claim_prepared_attempt(
     lifecycle_report: Path,
 ) -> dict[str, object]:
     owner, slug = packet.kernel_id.split("/", 1)
-    claim_path = Path(registry_root) / owner / slug / f"{packet.attempt_id}.json"
+    packet_dir = Path(packet.output_dir).resolve(strict=True)
+    claim_path = (
+        Path(registry_root) / owner / slug / f"{packet.attempt_id}.json"
+    ).resolve(strict=False)
+    if claim_path == packet_dir or claim_path.is_relative_to(packet_dir):
+        raise ModelSourceConformanceError(
+            "attempt claim must resolve outside the prepared packet: "
+            f"claim={claim_path}, packet={packet_dir}"
+        )
     claim_path.parent.mkdir(parents=True, exist_ok=True)
     claim = {
         "schema": "trellis2mlx.kaggle_model_source_conformance.attempt_claim.v1",

@@ -363,6 +363,148 @@ def test_lifecycle_rejects_self_consistent_runner_substitution_before_push(
     assert pushes == []
 
 
+def test_lifecycle_rejects_manifest_consistent_crlf_runner_before_claim_or_push(
+    tmp_path,
+    monkeypatch,
+):
+    packet = build_packet(
+        output_dir=tmp_path / "packet",
+        kernel_id="noahboo/t2mlx-model-source-conformance-r11",
+        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        title="Trellis2MLX R11 Model Source Conformance",
+    )
+    prepare_packet(packet)
+    runner_path = packet.kernel_dir / packet.code_file
+    canonical = runner_path.read_bytes()
+    assert b"\n" in canonical
+    assert b"\r\n" not in canonical
+    replacement = canonical.replace(b"\n", b"\r\n")
+    runner_path.write_bytes(replacement)
+    manifest_path = packet.output_dir / "packet.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["runner_sha256"] = hashlib.sha256(replacement).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    pushes = []
+
+    def reject_push(command, *, phase, report_path):
+        pushes.append((command, phase, report_path))
+        raise AssertionError("byte-substituted runner reached kernel push")
+
+    registry_root = tmp_path / "attempt-registry"
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "test-token")
+    monkeypatch.setattr(lifecycle, "run_command", reject_push)
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_local_custody",
+        lambda _root, commit: {"object_commit": commit, "object_status": "clean"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_kaggle_model_source_conformance_lifecycle.py",
+            "--packet-dir",
+            str(packet.output_dir),
+            "--download-dir",
+            str(tmp_path / "downloads"),
+            "--lifecycle-report",
+            str(tmp_path / "reports" / "lifecycle.json"),
+            "--failure-report",
+            str(tmp_path / "reports" / "failure.json"),
+            "--object-root",
+            str(OBJECT_ROOT),
+            "--object-commit",
+            "a" * 40,
+            "--attempt-registry-root",
+            str(registry_root),
+            "--expected-kernel-id",
+            packet.kernel_id,
+        ],
+    )
+
+    assert lifecycle.main() == 1
+    assert pushes == []
+    assert list(registry_root.rglob("*.json")) == []
+
+
+@pytest.mark.parametrize("registry_mode", ("equal", "nested", "symlink"))
+@pytest.mark.parametrize("duplicate_mode", ("copy", "reprepare"))
+def test_lifecycle_rejects_packet_local_attempt_registry_before_push(
+    tmp_path,
+    monkeypatch,
+    registry_mode,
+    duplicate_mode,
+):
+    packet = build_packet(
+        output_dir=tmp_path / "packet",
+        kernel_id="noahboo/t2mlx-model-source-conformance-r11",
+        source_kernel="noahboo/t2mlx-native-pixal9-t4-f6446f9-r10",
+        title="Trellis2MLX R11 Model Source Conformance",
+    )
+    prepare_packet(packet)
+    second_packet_dir = tmp_path / "packet-copy"
+    if duplicate_mode == "copy":
+        shutil.copytree(packet.output_dir, second_packet_dir)
+    pushes = []
+
+    def reject_push(command, *, phase, report_path):
+        pushes.append((command, phase, report_path))
+        raise RuntimeError("stop after observing push")
+
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "test-token")
+    monkeypatch.setattr(lifecycle, "run_command", reject_push)
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_local_custody",
+        lambda _root, commit: {"object_commit": commit, "object_status": "clean"},
+    )
+
+    def registry_for(packet_dir: Path, suffix: str) -> Path:
+        if registry_mode == "equal":
+            return packet_dir
+        target = packet_dir / "attempt-registry"
+        if registry_mode == "nested":
+            return target
+        target.mkdir(parents=True, exist_ok=True)
+        alias = tmp_path / f"external-looking-{suffix}"
+        alias.symlink_to(target, target_is_directory=True)
+        return alias
+
+    def run(packet_dir: Path, suffix: str) -> int:
+        registry_root = registry_for(packet_dir, suffix)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_kaggle_model_source_conformance_lifecycle.py",
+                "--packet-dir",
+                str(packet_dir),
+                "--download-dir",
+                str(tmp_path / f"downloads-local-{suffix}"),
+                "--lifecycle-report",
+                str(tmp_path / "reports" / f"lifecycle-local-{suffix}.json"),
+                "--failure-report",
+                str(tmp_path / "reports" / f"failure-local-{suffix}.json"),
+                "--object-root",
+                str(OBJECT_ROOT),
+                "--object-commit",
+                "a" * 40,
+                "--attempt-registry-root",
+                str(registry_root),
+                "--expected-kernel-id",
+                packet.kernel_id,
+            ],
+        )
+        return lifecycle.main()
+
+    assert run(packet.output_dir, "first") == 1
+    if duplicate_mode == "reprepare":
+        prepare_packet(packet)
+        second_packet_dir = packet.output_dir
+    assert run(second_packet_dir, "second") == 1
+    assert pushes == []
+
+
 @pytest.mark.parametrize("duplicate_mode", ("copy", "reprepare"))
 def test_lifecycle_attempt_claim_survives_packet_duplication(
     tmp_path,
@@ -432,7 +574,16 @@ def test_lifecycle_attempt_claim_survives_packet_duplication(
     assert claim["attempt_id"] == packet.attempt_id
     assert claim["packet_contract_sha256"] == packet.packet_contract_sha256
     assert claim["packet_manifest_sha256"]
-    assert claim["runner_sha256"]
+    runner_sha256 = hashlib.sha256(
+        (packet.kernel_dir / packet.code_file).read_bytes()
+    ).hexdigest()
+    packet_manifest = json.loads((packet.output_dir / "packet.json").read_text())
+    lifecycle_report = json.loads(
+        (tmp_path / "reports" / "lifecycle-first.json").read_text()
+    )
+    assert packet_manifest["runner_sha256"] == runner_sha256
+    assert lifecycle_report["admitted_runner"]["sha256"] == runner_sha256
+    assert claim["runner_sha256"] == runner_sha256
     assert claim["object_commit"] == "a" * 40
     assert claim["lifecycle_report"].endswith("lifecycle-first.json")
 
