@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 import trimesh
 
 
@@ -297,4 +298,63 @@ def test_trimesh_fix_normals_witness_changes_only_face_sign(tmp_path):
     assert report["face_rows_reversed"] == len(outward)
     assert report["face_rows_other"] == 0
     assert report["output"]["inward_face_count"] == 0
+    assert Path(report["output"]["artifact"]).is_file()
+
+
+def test_trimesh_fix_normals_preserve_visuals_witness_keeps_uv_and_texture(tmp_path):
+    witness = load_witness_module()
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    outward = np.array(
+        [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int32
+    )
+    uv = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=np.float32,
+    )
+    texture = Image.fromarray(
+        np.array(
+            [
+                [[255, 0, 0], [0, 255, 0]],
+                [[0, 0, 255], [255, 255, 255]],
+            ],
+            dtype=np.uint8,
+        ),
+        mode="RGB",
+    )
+    material = trimesh.visual.material.PBRMaterial(
+        baseColorTexture=texture,
+        metallicFactor=0.0,
+        roughnessFactor=0.8,
+        doubleSided=False,
+    )
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=outward[:, ::-1],
+        visual=trimesh.visual.TextureVisuals(uv=uv, material=material),
+        process=False,
+    )
+    source = tmp_path / "textured-inward.glb"
+    source.write_bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+    report = witness.run_trimesh_fix_normals_preserve_visuals_witness(
+        input_mesh=source,
+        output_dir=tmp_path / "out",
+    )
+
+    assert report["status"] == "done"
+    assert report["vertices_exact"]
+    assert report["face_rows_reversed"] == len(outward)
+    assert report["face_rows_other"] == 0
+    assert report["output"]["inward_face_count"] == 0
+    assert report["visual_payload_exact"]
+    assert report["input"]["visual"]["visual_kind"] == "texture"
+    assert report["input"]["visual"]["texture_digests"]
     assert Path(report["output"]["artifact"]).is_file()

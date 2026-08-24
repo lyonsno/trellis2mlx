@@ -71,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply only the established trimesh winding/outward repair.",
     )
+    parser.add_argument(
+        "--trimesh-fix-normals-preserve-visuals",
+        action="store_true",
+        help=(
+            "Apply established normal repair to a single-mesh GLB while "
+            "preserving its UVs, textures, material, and scene transform."
+        ),
+    )
     return parser
 
 
@@ -786,6 +794,112 @@ def run_trimesh_fix_normals_witness(
     return report
 
 
+def _array_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _visual_signature(mesh: trimesh.Trimesh) -> dict[str, Any]:
+    uv = getattr(mesh.visual, "uv", None)
+    material = getattr(mesh.visual, "material", None)
+    texture_digests: dict[str, str] = {}
+    if material is not None:
+        for name in ("baseColorTexture", "metallicRoughnessTexture"):
+            texture = getattr(material, name, None)
+            if texture is not None:
+                texture_digests[name] = _array_sha256(np.asarray(texture))
+    return {
+        "visual_kind": getattr(mesh.visual, "kind", None),
+        "uv_sha256": _array_sha256(np.asarray(uv)) if uv is not None else None,
+        "uv_shape": list(np.asarray(uv).shape) if uv is not None else None,
+        "texture_digests": texture_digests,
+        "material": {
+            name: getattr(material, name, None) if material is not None else None
+            for name in (
+                "doubleSided",
+                "metallicFactor",
+                "roughnessFactor",
+            )
+        },
+    }
+
+
+def run_trimesh_fix_normals_preserve_visuals_witness(
+    *, input_mesh: Path, output_dir: Path
+) -> dict[str, Any]:
+    """Repair face signs while retaining the input GLB's visual payload."""
+    if input_mesh.suffix.lower() != ".glb":
+        raise ValueError("visual-preserving normal repair requires a GLB input")
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from trellmlx.mesh_cleanup import fix_normals
+
+    started = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scene = trimesh.load(input_mesh, force="scene", process=False)
+    if not isinstance(scene, trimesh.Scene) or len(scene.geometry) != 1:
+        raise ValueError("visual-preserving witness requires exactly one mesh")
+    geometry_name, mesh = next(iter(scene.geometry.items()))
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise ValueError("visual-preserving witness geometry must be a triangle mesh")
+
+    vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+    input_visual = _visual_signature(mesh)
+    if input_visual["visual_kind"] != "texture" or input_visual["uv_sha256"] is None:
+        raise ValueError("visual-preserving witness requires textured UV geometry")
+
+    out_vertices, out_faces = fix_normals(vertices, faces, verbose=False)
+    repaired_mesh = mesh.copy()
+    repaired_mesh.vertices = out_vertices
+    repaired_mesh.faces = out_faces
+    repaired_scene = scene.copy()
+    repaired_scene.geometry[geometry_name] = repaired_mesh
+
+    artifact = output_dir / "trimesh-fix-normals-textured.glb"
+    artifact.write_bytes(repaired_scene.export(file_type="glb"))
+    output_scene = trimesh.load(artifact, force="scene", process=False)
+    output_mesh = next(iter(output_scene.geometry.values()))
+    output_visual = _visual_signature(output_mesh)
+
+    same_rows = np.all(out_faces == faces, axis=1)
+    reversed_rows = np.all(out_faces == faces[:, ::-1], axis=1)
+    report = {
+        "schema": "trellis2mlx.trimesh_fix_normals_preserve_visuals_witness.v1",
+        "status": "done",
+        "input": {
+            "path": str(input_mesh),
+            "sha256": sha256(input_mesh),
+            **mesh_summary(vertices, faces, edges=True),
+            **component_sign_summary(vertices, faces),
+            "visual": input_visual,
+        },
+        "output": {
+            **mesh_summary(out_vertices, out_faces, edges=True),
+            **component_sign_summary(out_vertices, out_faces),
+            "visual": output_visual,
+            "artifact": str(artifact),
+            "artifact_sha256": sha256(artifact),
+        },
+        "vertices_exact": bool(np.array_equal(vertices, out_vertices)),
+        "face_rows_same": int(np.count_nonzero(same_rows)),
+        "face_rows_reversed": int(np.count_nonzero(reversed_rows)),
+        "face_rows_other": int(
+            len(faces) - np.count_nonzero(same_rows | reversed_rows)
+        ),
+        "visual_payload_exact": input_visual == output_visual,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    (output_dir / "trimesh-fix-normals-textured-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selected_modes = sum(
@@ -798,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
             args.component_sign_only,
             args.reference_stage_sign_ladder,
             args.trimesh_fix_normals_only,
+            args.trimesh_fix_normals_preserve_visuals,
         )
     )
     if selected_modes > 1:
@@ -817,6 +932,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.trimesh_fix_normals_only:
         run_trimesh_fix_normals_witness(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
+        )
+        return 0
+    if args.trimesh_fix_normals_preserve_visuals:
+        run_trimesh_fix_normals_preserve_visuals_witness(
             input_mesh=args.input_obj,
             output_dir=args.output_dir,
         )
