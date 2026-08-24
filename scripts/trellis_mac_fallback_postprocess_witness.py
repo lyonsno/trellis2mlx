@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
             "adjacency-orientation operation in the reference-fast route."
         ),
     )
+    parser.add_argument(
+        "--trimesh-fix-normals-only",
+        action="store_true",
+        help="Apply only the established trimesh winding/outward repair.",
+    )
     return parser
 
 
@@ -729,6 +734,58 @@ def run_reference_stage_sign_ladder(
     return report
 
 
+def run_trimesh_fix_normals_witness(
+    *, input_mesh: Path, output_dir: Path
+) -> dict[str, Any]:
+    """Apply trimesh normal repair without changing mesh geometry."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from trellmlx.mesh_cleanup import fix_normals
+
+    started = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vertices, faces = load_mesh(input_mesh)
+    out_vertices, out_faces = fix_normals(vertices, faces, verbose=False)
+    same_shape = out_faces.shape == faces.shape
+    same_rows = np.all(out_faces == faces, axis=1) if same_shape else np.array([])
+    reversed_rows = (
+        np.all(out_faces == faces[:, ::-1], axis=1)
+        if same_shape
+        else np.array([])
+    )
+    artifact = output_dir / "trimesh-fix-normals-flat.glb"
+    export_flat_glb(artifact, out_vertices, out_faces)
+    report = {
+        "schema": "trellis2mlx.trimesh_fix_normals_only_witness.v1",
+        "status": "done",
+        "input": {
+            "path": str(input_mesh),
+            "sha256": sha256(input_mesh),
+            **mesh_summary(vertices, faces, edges=True),
+            **component_sign_summary(vertices, faces),
+        },
+        "output": {
+            **mesh_summary(out_vertices, out_faces, edges=True),
+            **component_sign_summary(out_vertices, out_faces),
+            "artifact": str(artifact),
+            "artifact_sha256": sha256(artifact),
+        },
+        "vertices_exact": bool(np.array_equal(vertices, out_vertices)),
+        "face_rows_same": int(np.count_nonzero(same_rows)),
+        "face_rows_reversed": int(np.count_nonzero(reversed_rows)),
+        "face_rows_other": int(
+            len(faces) - np.count_nonzero(same_rows | reversed_rows)
+            if same_shape
+            else len(faces)
+        ),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    (output_dir / "trimesh-fix-normals-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selected_modes = sum(
@@ -740,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             args.product_route is not None,
             args.component_sign_only,
             args.reference_stage_sign_ladder,
+            args.trimesh_fix_normals_only,
         )
     )
     if selected_modes > 1:
@@ -755,6 +813,12 @@ def main(argv: list[str] | None = None) -> int:
             input_mesh=args.input_obj,
             output_dir=args.output_dir,
             target_faces=args.target_faces,
+        )
+        return 0
+    if args.trimesh_fix_normals_only:
+        run_trimesh_fix_normals_witness(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
         )
         return 0
     if args.product_route is not None:

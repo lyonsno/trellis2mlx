@@ -268,3 +268,33 @@ def test_radial_flux_summary_distinguishes_tetrahedron_sign():
     assert outward_report["predominant_sign"] == "outward"
     assert inward_report["predominant_sign"] == "inward"
     assert outward_report["radial_score"] == -inward_report["radial_score"]
+
+
+def test_trimesh_fix_normals_witness_changes_only_face_sign(tmp_path):
+    witness = load_witness_module()
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    outward = np.array(
+        [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int32
+    )
+    source = tmp_path / "inward.npz"
+    np.savez_compressed(source, vertices=vertices, faces=outward[:, ::-1])
+
+    report = witness.run_trimesh_fix_normals_witness(
+        input_mesh=source,
+        output_dir=tmp_path / "out",
+    )
+
+    assert report["status"] == "done"
+    assert report["vertices_exact"]
+    assert report["face_rows_reversed"] == len(outward)
+    assert report["face_rows_other"] == 0
+    assert report["output"]["inward_face_count"] == 0
+    assert Path(report["output"]["artifact"]).is_file()
