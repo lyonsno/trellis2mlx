@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-obj", required=True, type=Path)
     parser.add_argument("--reference-glb", type=Path)
+    parser.add_argument("--comparison-mesh", type=Path)
     parser.add_argument("--clean-checkpoint", type=Path)
     parser.add_argument("--uv-checkpoint", type=Path)
     parser.add_argument("--final-glb", type=Path)
@@ -77,6 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Apply established normal repair to a single-mesh GLB while "
             "preserving its UVs, textures, material, and scene transform."
+        ),
+    )
+    parser.add_argument(
+        "--matched-raw-comparison",
+        action="store_true",
+        help="Export two raw meshes identically and record topology summaries.",
+    )
+    parser.add_argument(
+        "--orient-before-reference-fast",
+        action="store_true",
+        help=(
+            "Orient raw face adjacency before replaying the exact reference-fast "
+            "simplification ladder."
         ),
     )
     return parser
@@ -196,6 +210,23 @@ def face_normal_comparison(
     }
 
 
+def face_row_relationship(
+    original: np.ndarray, candidate: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classify triangle rows independent of cyclic starting vertex."""
+    original = np.asarray(original)
+    candidate = np.asarray(candidate)
+    if original.shape != candidate.shape:
+        return np.array([], dtype=bool), np.array([], dtype=bool)
+    same = np.zeros(len(original), dtype=bool)
+    reversed_rows = np.zeros(len(original), dtype=bool)
+    for permutation in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+        same |= np.all(candidate == original[:, permutation], axis=1)
+    for permutation in ((0, 2, 1), (2, 1, 0), (1, 0, 2)):
+        reversed_rows |= np.all(candidate == original[:, permutation], axis=1)
+    return same, reversed_rows
+
+
 def export_flat_glb(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     mesh.visual.face_colors = np.tile(
@@ -203,6 +234,43 @@ def export_flat_glb(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(path)
+
+
+def run_matched_raw_comparison(
+    *, left_mesh: Path, right_mesh: Path, output_dir: Path
+) -> dict[str, Any]:
+    """Export two decoder waists through one geometry-only witness path."""
+    started = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    left_vertices, left_faces = load_mesh(left_mesh)
+    right_vertices, right_faces = load_mesh(right_mesh)
+    left_artifact = output_dir / "00-left-raw-flat.glb"
+    right_artifact = output_dir / "01-right-raw-flat.glb"
+    export_flat_glb(left_artifact, left_vertices, left_faces)
+    export_flat_glb(right_artifact, right_vertices, right_faces)
+    report = {
+        "schema": "trellis2mlx.matched_raw_mesh_comparison.v1",
+        "status": "done",
+        "left": {
+            "path": str(left_mesh),
+            "sha256": sha256(left_mesh),
+            **mesh_summary(left_vertices, left_faces, edges=True),
+            "artifact": str(left_artifact),
+            "artifact_sha256": sha256(left_artifact),
+        },
+        "right": {
+            "path": str(right_mesh),
+            "sha256": sha256(right_mesh),
+            **mesh_summary(right_vertices, right_faces, edges=True),
+            "artifact": str(right_artifact),
+            "artifact_sha256": sha256(right_artifact),
+        },
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    (output_dir / "matched-raw-comparison-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    return report
 
 
 def undo_glb_axis_transform(vertices: np.ndarray) -> np.ndarray:
@@ -742,6 +810,73 @@ def run_reference_stage_sign_ladder(
     return report
 
 
+def run_orient_before_reference_fast_witness(
+    *,
+    input_mesh: Path,
+    output_dir: Path,
+    target_faces: int,
+    orient=None,
+    stage_runner=None,
+) -> dict[str, Any]:
+    """Test whether raw adjacency orientation changes later simplification damage."""
+    if orient is None:
+        from trellmlx.mesh_cleanup import orient_faces_by_adjacency
+
+        orient = orient_faces_by_adjacency
+    if stage_runner is None:
+        stage_runner = run_reference_stage_sign_ladder
+
+    started = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vertices, faces = load_mesh(input_mesh)
+    out_vertices, out_faces = orient(vertices, faces, verbose=False)
+    same_shape = out_faces.shape == faces.shape
+    same_rows, reversed_rows = face_row_relationship(faces, out_faces)
+    checkpoint = output_dir / "00-raw-adjacency-oriented.npz"
+    np.savez_compressed(checkpoint, vertices=out_vertices, faces=out_faces)
+    artifact = output_dir / "00-raw-adjacency-oriented-flat.glb"
+    export_flat_glb(artifact, out_vertices, out_faces)
+    ladder_dir = output_dir / "reference-fast-ladder"
+    ladder = stage_runner(
+        input_mesh=checkpoint,
+        output_dir=ladder_dir,
+        target_faces=target_faces,
+    )
+    report = {
+        "schema": "trellis2mlx.orient_before_reference_fast_witness.v1",
+        "status": "done",
+        "input": {
+            "path": str(input_mesh),
+            "sha256": sha256(input_mesh),
+            **mesh_summary(vertices, faces, edges=True),
+        },
+        "oriented_raw": {
+            **mesh_summary(out_vertices, out_faces, edges=True),
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": sha256(checkpoint),
+            "artifact": str(artifact),
+            "artifact_sha256": sha256(artifact),
+        },
+        "vertices_exact": bool(np.array_equal(vertices, out_vertices)),
+        "face_rows_same": int(np.count_nonzero(same_rows)),
+        "face_rows_reversed": int(np.count_nonzero(reversed_rows)),
+        "face_rows_other": int(
+            len(faces) - np.count_nonzero(same_rows | reversed_rows)
+            if same_shape
+            else len(faces)
+        ),
+        "reference_fast_ladder_report": str(
+            ladder_dir / "reference-stage-sign-ladder-report.json"
+        ),
+        "reference_fast_ladder_status": ladder.get("status"),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    (output_dir / "orient-before-reference-fast-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    return report
+
+
 def run_trimesh_fix_normals_witness(
     *, input_mesh: Path, output_dir: Path
 ) -> dict[str, Any]:
@@ -913,10 +1048,28 @@ def main(argv: list[str] | None = None) -> int:
             args.reference_stage_sign_ladder,
             args.trimesh_fix_normals_only,
             args.trimesh_fix_normals_preserve_visuals,
+            args.matched_raw_comparison,
+            args.orient_before_reference_fast,
         )
     )
     if selected_modes > 1:
         raise SystemExit("orientation-only modes are mutually exclusive")
+    if args.matched_raw_comparison:
+        if args.comparison_mesh is None:
+            raise SystemExit("--matched-raw-comparison requires --comparison-mesh")
+        run_matched_raw_comparison(
+            left_mesh=args.input_obj,
+            right_mesh=args.comparison_mesh,
+            output_dir=args.output_dir,
+        )
+        return 0
+    if args.orient_before_reference_fast:
+        run_orient_before_reference_fast_witness(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
+            target_faces=args.target_faces,
+        )
+        return 0
     if args.component_sign_only:
         run_component_sign_witness(
             input_mesh=args.input_obj,

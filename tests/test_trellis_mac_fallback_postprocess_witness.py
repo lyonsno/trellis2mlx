@@ -48,6 +48,17 @@ def test_face_normal_comparison_detects_per_face_reversal():
     assert report["same_direction_faces"] == 0
 
 
+def test_face_row_relationship_accepts_cyclic_reversal():
+    witness = load_witness_module()
+    original = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+    candidate = np.array([[1, 2, 0], [3, 5, 4]], dtype=np.int32)
+
+    same, reversed_rows = witness.face_row_relationship(original, candidate)
+
+    np.testing.assert_array_equal(same, [True, False])
+    np.testing.assert_array_equal(reversed_rows, [False, True])
+
+
 def test_load_mesh_reads_pipeline_checkpoint(tmp_path):
     witness = load_witness_module()
     vertices = np.array(
@@ -73,6 +84,30 @@ def test_load_mesh_rejects_checkpoint_without_faces(tmp_path):
 
     with np.testing.assert_raises_regex(ValueError, "missing.*faces"):
         witness.load_mesh(checkpoint)
+
+
+def test_matched_raw_comparison_exports_both_meshes(tmp_path):
+    witness = load_witness_module()
+    vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    left = tmp_path / "left.npz"
+    right = tmp_path / "right.npz"
+    np.savez_compressed(left, vertices=vertices, faces=faces)
+    np.savez_compressed(right, vertices=vertices * 2, faces=faces)
+
+    report = witness.run_matched_raw_comparison(
+        left_mesh=left,
+        right_mesh=right,
+        output_dir=tmp_path / "comparison",
+    )
+
+    assert report["status"] == "done"
+    assert Path(report["left"]["artifact"]).is_file()
+    assert Path(report["right"]["artifact"]).is_file()
+    assert report["left"]["faces"] == report["right"]["faces"] == 1
 
 
 def test_undo_glb_axis_transform_recovers_pipeline_vertices():
@@ -244,6 +279,46 @@ def test_reference_stage_sign_ladder_captures_each_operation(tmp_path):
     }
     assert all(stage["inward_face_count"] == 0 for stage in report["stages"].values())
     assert all(Path(stage["artifact"]).is_file() for stage in report["stages"].values())
+
+
+def test_orient_before_reference_fast_records_face_reversals(tmp_path):
+    witness = load_witness_module()
+    vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    source = tmp_path / "mesh.npz"
+    np.savez_compressed(source, vertices=vertices, faces=faces)
+    observed = {}
+
+    def reverse(stage_vertices, stage_faces, **kwargs):
+        return stage_vertices, stage_faces[:, ::-1]
+
+    def fake_stage_runner(*, input_mesh, output_dir, target_faces):
+        observed["input_mesh"] = input_mesh
+        observed["target_faces"] = target_faces
+        output_dir.mkdir(parents=True)
+        (output_dir / "reference-stage-sign-ladder-report.json").write_text("{}\n")
+        return {"status": "done"}
+
+    report = witness.run_orient_before_reference_fast_witness(
+        input_mesh=source,
+        output_dir=tmp_path / "preorient",
+        target_faces=100,
+        orient=reverse,
+        stage_runner=fake_stage_runner,
+    )
+
+    assert report["status"] == "done"
+    assert report["vertices_exact"] is True
+    assert report["face_rows_same"] == 0
+    assert report["face_rows_reversed"] == 1
+    assert report["face_rows_other"] == 0
+    assert observed["input_mesh"] == (
+        tmp_path / "preorient" / "00-raw-adjacency-oriented.npz"
+    )
+    assert observed["target_faces"] == 100
 
 
 def test_radial_flux_summary_distinguishes_tetrahedron_sign():
