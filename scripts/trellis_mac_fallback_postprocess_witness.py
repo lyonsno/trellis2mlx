@@ -93,6 +93,32 @@ def build_parser() -> argparse.ArgumentParser:
             "simplification ladder."
         ),
     )
+    parser.add_argument(
+        "--orient-after-initial-cleanup",
+        action="store_true",
+        help=(
+            "Orient face adjacency after the reference-fast initial cleanup "
+            "and before its terminal simplification."
+        ),
+    )
+    parser.add_argument(
+        "--orient-outward-after-initial-cleanup",
+        action="store_true",
+        help=(
+            "Orient face adjacency after the reference-fast initial cleanup, "
+            "choose an outward sign per component, and then run terminal "
+            "simplification."
+        ),
+    )
+    parser.add_argument(
+        "--fix-normals-after-initial-cleanup",
+        action="store_true",
+        help=(
+            "Apply the established trimesh winding and outward-orientation "
+            "repair after reference-fast initial cleanup and before terminal "
+            "simplification."
+        ),
+    )
     return parser
 
 
@@ -699,6 +725,11 @@ def run_reference_stage_sign_ladder(
     simplify=None,
     cleanup=None,
     orient=None,
+    orient_after_initial_cleanup: bool = False,
+    orient_outward_after_initial_cleanup: bool = False,
+    outward_signer=None,
+    fix_normals_after_initial_cleanup: bool = False,
+    normal_fixer=None,
 ) -> dict[str, Any]:
     """Locate the operation where reference-fast component sign changes."""
     if postprocess is None:
@@ -714,6 +745,11 @@ def run_reference_stage_sign_ladder(
 
         cleanup = cleanup or cleanup_mesh
         orient = orient or orient_faces_by_adjacency
+    outward_signer = outward_signer or orient_components_outward
+    if fix_normals_after_initial_cleanup and normal_fixer is None:
+        from trellmlx.mesh_cleanup import fix_normals
+
+        normal_fixer = fix_normals
 
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -747,6 +783,37 @@ def run_reference_stage_sign_ladder(
         cleanup_count += 1
         name = "02-initial-cleanup" if cleanup_count == 1 else "04-final-cleanup"
         capture(name, out_vertices, out_faces)
+        if cleanup_count == 1 and (
+            orient_after_initial_cleanup or orient_outward_after_initial_cleanup
+        ):
+            out_vertices, out_faces = orient(
+                out_vertices,
+                out_faces,
+                verbose=False,
+            )
+            capture(
+                "02a-initial-adjacency-orientation",
+                out_vertices,
+                out_faces,
+            )
+            if orient_outward_after_initial_cleanup:
+                out_faces, _ = outward_signer(out_vertices, out_faces)
+                capture(
+                    "02b-initial-component-outward-sign",
+                    out_vertices,
+                    out_faces,
+                )
+        elif cleanup_count == 1 and fix_normals_after_initial_cleanup:
+            out_vertices, out_faces = normal_fixer(
+                out_vertices,
+                out_faces,
+                verbose=False,
+            )
+            capture(
+                "02a-initial-fix-normals",
+                out_vertices,
+                out_faces,
+            )
         return out_vertices, out_faces
 
     def capture_orient(stage_vertices, stage_faces, **kwargs):
@@ -792,6 +859,19 @@ def run_reference_stage_sign_ladder(
             "aggregate_radial_flux": radial_flux_summary(vertices, faces),
         },
         "target_faces": int(target_faces),
+        "orientation_policy": (
+            "trimesh-fix-normals-after-initial-cleanup;adjacency-after-final-cleanup"
+            if fix_normals_after_initial_cleanup
+            else (
+                "adjacency-and-outward-sign-after-initial-cleanup;adjacency-after-final-cleanup"
+                if orient_outward_after_initial_cleanup
+                else (
+                    "after-initial-and-final-cleanup"
+                    if orient_after_initial_cleanup
+                    else "after-final-cleanup"
+                )
+            )
+        ),
         "stages": stages,
         "operation_trace": operation_trace,
         "final_matches_last_capture": {
@@ -1050,6 +1130,9 @@ def main(argv: list[str] | None = None) -> int:
             args.trimesh_fix_normals_preserve_visuals,
             args.matched_raw_comparison,
             args.orient_before_reference_fast,
+            args.orient_after_initial_cleanup,
+            args.orient_outward_after_initial_cleanup,
+            args.fix_normals_after_initial_cleanup,
         )
     )
     if selected_modes > 1:
@@ -1068,6 +1151,30 @@ def main(argv: list[str] | None = None) -> int:
             input_mesh=args.input_obj,
             output_dir=args.output_dir,
             target_faces=args.target_faces,
+        )
+        return 0
+    if args.orient_after_initial_cleanup:
+        run_reference_stage_sign_ladder(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
+            target_faces=args.target_faces,
+            orient_after_initial_cleanup=True,
+        )
+        return 0
+    if args.orient_outward_after_initial_cleanup:
+        run_reference_stage_sign_ladder(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
+            target_faces=args.target_faces,
+            orient_outward_after_initial_cleanup=True,
+        )
+        return 0
+    if args.fix_normals_after_initial_cleanup:
+        run_reference_stage_sign_ladder(
+            input_mesh=args.input_obj,
+            output_dir=args.output_dir,
+            target_faces=args.target_faces,
+            fix_normals_after_initial_cleanup=True,
         )
         return 0
     if args.component_sign_only:

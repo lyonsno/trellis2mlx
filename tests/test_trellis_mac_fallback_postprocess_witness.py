@@ -281,6 +281,208 @@ def test_reference_stage_sign_ladder_captures_each_operation(tmp_path):
     assert all(Path(stage["artifact"]).is_file() for stage in report["stages"].values())
 
 
+def test_reference_stage_ladder_feeds_initial_orientation_to_final_simplify(
+    tmp_path,
+):
+    witness = load_witness_module()
+    vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    source = tmp_path / "mesh.npz"
+    np.savez_compressed(source, vertices=vertices, faces=faces)
+    simplify_inputs = []
+
+    def capture_simplify(stage_vertices, stage_faces, *args, **kwargs):
+        simplify_inputs.append(np.array(stage_faces, copy=True))
+        return stage_vertices, stage_faces
+
+    def passthrough(stage_vertices, stage_faces, *args, **kwargs):
+        return stage_vertices, stage_faces
+
+    def reverse(stage_vertices, stage_faces, **kwargs):
+        return stage_vertices, stage_faces[:, ::-1]
+
+    def fake_postprocess(stage_vertices, stage_faces, **kwargs):
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        return kwargs["orient_faces_by_adjacency"](
+            stage_vertices, stage_faces
+        )
+
+    report = witness.run_reference_stage_sign_ladder(
+        input_mesh=source,
+        output_dir=tmp_path / "ladder",
+        target_faces=1,
+        postprocess=fake_postprocess,
+        simplify=capture_simplify,
+        cleanup=passthrough,
+        orient=reverse,
+        orient_after_initial_cleanup=True,
+    )
+
+    np.testing.assert_array_equal(simplify_inputs[0], faces)
+    np.testing.assert_array_equal(simplify_inputs[1], faces[:, ::-1])
+    assert report["orientation_policy"] == "after-initial-and-final-cleanup"
+    assert list(report["stages"]) == [
+        "01-coarse-simplify",
+        "02-initial-cleanup",
+        "02a-initial-adjacency-orientation",
+        "03-final-simplify",
+        "04-final-cleanup",
+        "05-adjacency-orientation",
+    ]
+
+
+def test_reference_stage_ladder_feeds_outward_signed_faces_to_final_simplify(
+    tmp_path,
+):
+    witness = load_witness_module()
+    vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    source = tmp_path / "mesh.npz"
+    np.savez_compressed(source, vertices=vertices, faces=faces)
+    simplify_inputs = []
+
+    def capture_simplify(stage_vertices, stage_faces, *args, **kwargs):
+        simplify_inputs.append(np.array(stage_faces, copy=True))
+        return stage_vertices, stage_faces
+
+    def passthrough(stage_vertices, stage_faces, *args, **kwargs):
+        return stage_vertices, stage_faces
+
+    def reverse_adjacency(stage_vertices, stage_faces, **kwargs):
+        return stage_vertices, stage_faces[:, ::-1]
+
+    def reverse_components(stage_vertices, stage_faces):
+        return stage_faces[:, ::-1], [{"flipped": True}]
+
+    def fake_postprocess(stage_vertices, stage_faces, **kwargs):
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        return kwargs["orient_faces_by_adjacency"](
+            stage_vertices, stage_faces
+        )
+
+    report = witness.run_reference_stage_sign_ladder(
+        input_mesh=source,
+        output_dir=tmp_path / "ladder",
+        target_faces=1,
+        postprocess=fake_postprocess,
+        simplify=capture_simplify,
+        cleanup=passthrough,
+        orient=reverse_adjacency,
+        orient_outward_after_initial_cleanup=True,
+        outward_signer=reverse_components,
+    )
+
+    np.testing.assert_array_equal(simplify_inputs[0], faces)
+    np.testing.assert_array_equal(simplify_inputs[1], faces)
+    assert report["orientation_policy"] == (
+        "adjacency-and-outward-sign-after-initial-cleanup;"
+        "adjacency-after-final-cleanup"
+    )
+    assert list(report["stages"]) == [
+        "01-coarse-simplify",
+        "02-initial-cleanup",
+        "02a-initial-adjacency-orientation",
+        "02b-initial-component-outward-sign",
+        "03-final-simplify",
+        "04-final-cleanup",
+        "05-adjacency-orientation",
+    ]
+
+
+def test_reference_stage_ladder_feeds_fixed_normals_to_final_simplify(tmp_path):
+    witness = load_witness_module()
+    vertices = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.array([[0, 1, 2]], dtype=np.int32)
+    source = tmp_path / "mesh.npz"
+    np.savez_compressed(source, vertices=vertices, faces=faces)
+    simplify_inputs = []
+
+    def capture_simplify(stage_vertices, stage_faces, *args, **kwargs):
+        simplify_inputs.append(np.array(stage_faces, copy=True))
+        return stage_vertices, stage_faces
+
+    def passthrough(stage_vertices, stage_faces, *args, **kwargs):
+        return stage_vertices, stage_faces
+
+    def reverse_normals(stage_vertices, stage_faces, **kwargs):
+        return stage_vertices, stage_faces[:, ::-1]
+
+    def fake_postprocess(stage_vertices, stage_faces, **kwargs):
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["simplify"](
+            stage_vertices, stage_faces
+        )
+        stage_vertices, stage_faces = kwargs["cleanup_mesh"](
+            stage_vertices, stage_faces
+        )
+        return kwargs["orient_faces_by_adjacency"](
+            stage_vertices, stage_faces
+        )
+
+    report = witness.run_reference_stage_sign_ladder(
+        input_mesh=source,
+        output_dir=tmp_path / "ladder",
+        target_faces=1,
+        postprocess=fake_postprocess,
+        simplify=capture_simplify,
+        cleanup=passthrough,
+        orient=passthrough,
+        fix_normals_after_initial_cleanup=True,
+        normal_fixer=reverse_normals,
+    )
+
+    np.testing.assert_array_equal(simplify_inputs[0], faces)
+    np.testing.assert_array_equal(simplify_inputs[1], faces[:, ::-1])
+    assert report["orientation_policy"] == (
+        "trimesh-fix-normals-after-initial-cleanup;"
+        "adjacency-after-final-cleanup"
+    )
+    assert list(report["stages"]) == [
+        "01-coarse-simplify",
+        "02-initial-cleanup",
+        "02a-initial-fix-normals",
+        "03-final-simplify",
+        "04-final-cleanup",
+        "05-adjacency-orientation",
+    ]
+
+
 def test_orient_before_reference_fast_records_face_reversals(tmp_path):
     witness = load_witness_module()
     vertices = np.array(
