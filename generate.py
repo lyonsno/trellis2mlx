@@ -440,6 +440,7 @@ def _cleanup_and_simplify_mesh(
     keep_largest=False,
     simplify_first=False,
     reference_cleanup=False,
+    reference_cleanup_early_outward=False,
     qem_simplify=False,
     qem_backend="mlx",
     source_native_source_root=None,
@@ -455,6 +456,7 @@ def _cleanup_and_simplify_mesh(
     source_native_orient=None,
     source_native_postprocess=None,
     orient_faces_by_adjacency=None,
+    orient_components_outward=None,
     operation_trace=None,
     log=print,
 ):
@@ -545,6 +547,15 @@ def _cleanup_and_simplify_mesh(
 
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
+    if reference_cleanup_early_outward and not reference_cleanup:
+        raise ValueError(
+            "reference_cleanup_early_outward requires reference_cleanup"
+        )
+    if reference_cleanup_early_outward and qem_simplify:
+        raise ValueError(
+            "reference_cleanup_early_outward is only calibrated for the "
+            "fast-simplification reference-cleanup route"
+        )
 
     local_cleanup_override = cleanup_mesh is not None
 
@@ -556,7 +567,7 @@ def _cleanup_and_simplify_mesh(
         log(f"  Cleanup final: {time.perf_counter()-t0:.1f}s", flush=True)
         return vertices, faces
 
-    def reference_final_cleanup(vertices, faces):
+    def reference_final_cleanup(vertices, faces, *, orient=True):
         if no_cleanup:
             return vertices, faces
         use_source_native_cleanup = (
@@ -598,15 +609,21 @@ def _cleanup_and_simplify_mesh(
                 "output_faces": len(faces),
                 "do_fix_normals": False,
             })
-        orient_input_faces = len(faces)
-        vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
-        if operation_trace is not None:
-            operation_trace.append({
-                "operation": orient_operation,
-                "input_faces": orient_input_faces,
-                "output_faces": len(faces),
-            })
-        log(f"  Reference cleanup final cleanup/orient: {time.perf_counter()-t0:.1f}s", flush=True)
+        if orient:
+            orient_input_faces = len(faces)
+            vertices, faces = orient_reference_faces(vertices, faces, verbose=False)
+            if operation_trace is not None:
+                operation_trace.append({
+                    "operation": orient_operation,
+                    "input_faces": orient_input_faces,
+                    "output_faces": len(faces),
+                })
+        suffix = "/orient" if orient else ""
+        log(
+            f"  Reference cleanup final cleanup{suffix}: "
+            f"{time.perf_counter()-t0:.1f}s",
+            flush=True,
+        )
         return vertices, faces
 
     if not no_cleanup:
@@ -711,6 +728,51 @@ def _cleanup_and_simplify_mesh(
             flush=True,
         )
 
+        if reference_cleanup_early_outward:
+            if orient_faces_by_adjacency is None:
+                from trellmlx.mesh_cleanup import (
+                    orient_faces_by_adjacency as orient_early_faces,
+                )
+            else:
+                orient_early_faces = orient_faces_by_adjacency
+            if orient_components_outward is None:
+                from trellmlx.mesh_cleanup import (
+                    orient_components_outward as orient_early_outward,
+                )
+            else:
+                orient_early_outward = orient_components_outward
+
+            t0 = time.perf_counter()
+            orient_input_faces = len(faces)
+            vertices, faces = orient_early_faces(vertices, faces, verbose=False)
+            if operation_trace is not None:
+                operation_trace.append({
+                    "operation": "orient_faces_by_adjacency_early",
+                    "input_faces": orient_input_faces,
+                    "output_faces": len(faces),
+                })
+            outward_input_faces = len(faces)
+            faces, component_records = orient_early_outward(vertices, faces)
+            flipped_records = [
+                record for record in component_records if record["flipped"]
+            ]
+            if operation_trace is not None:
+                operation_trace.append({
+                    "operation": "orient_components_outward_early",
+                    "input_faces": outward_input_faces,
+                    "output_faces": len(faces),
+                    "component_count": len(component_records),
+                    "flipped_component_count": len(flipped_records),
+                    "flipped_face_count": sum(
+                        int(record["faces"]) for record in flipped_records
+                    ),
+                })
+            log(
+                "  Reference cleanup early adjacency/outward orientation: "
+                f"{time.perf_counter()-t0:.1f}s",
+                flush=True,
+            )
+
         if len(faces) > target_faces:
             t0 = time.perf_counter()
             simplify_input_faces = len(faces)
@@ -733,7 +795,11 @@ def _cleanup_and_simplify_mesh(
                 flush=True,
             )
 
-        return reference_final_cleanup(vertices, faces)
+        return reference_final_cleanup(
+            vertices,
+            faces,
+            orient=not reference_cleanup_early_outward,
+        )
 
     # Simplify-first mode: reduce face count before expensive cleanup
     if simplify_first and target_faces and len(faces) > target_faces:
@@ -1042,6 +1108,14 @@ def main():
     parser.add_argument("--reference-cleanup", action="store_true",
                         help="Use reference cleanup order: coarse simplify, cleanup, final simplify, "
                              "final cleanup, adjacency orientation")
+    parser.add_argument(
+        "--reference-cleanup-early-outward",
+        action="store_true",
+        help=(
+            "Experimental reference-cleanup policy: orient adjacency and choose "
+            "component outward signs after initial cleanup, before final simplify"
+        ),
+    )
     parser.add_argument("--texture-size", type=int, default=1024,
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
@@ -1403,6 +1477,16 @@ def main():
     args = parser.parse_args()
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
 
+    if args.reference_cleanup_early_outward and not args.reference_cleanup:
+        parser.error(
+            "--reference-cleanup-early-outward requires --reference-cleanup"
+        )
+    if args.reference_cleanup_early_outward and args.qem_simplify:
+        parser.error(
+            "--reference-cleanup-early-outward is only calibrated for the "
+            "fast-simplification reference-cleanup route"
+        )
+
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
     if args.stop_after_stage and not args.save_checkpoints:
@@ -1708,6 +1792,9 @@ def main():
                 keep_largest=args.keep_largest,
                 simplify_first=args.simplify_first,
                 reference_cleanup=args.reference_cleanup,
+                reference_cleanup_early_outward=(
+                    args.reference_cleanup_early_outward
+                ),
                 qem_simplify=args.qem_simplify,
                 qem_backend=args.qem_backend,
                 source_native_source_root=args.source_native_source_root,
@@ -3352,6 +3439,7 @@ def main():
         keep_largest=args.keep_largest,
         simplify_first=args.simplify_first,
         reference_cleanup=args.reference_cleanup,
+        reference_cleanup_early_outward=args.reference_cleanup_early_outward,
         qem_simplify=args.qem_simplify,
         qem_backend=args.qem_backend,
         source_native_source_root=args.source_native_source_root,
@@ -3534,6 +3622,9 @@ def main():
             output_path = Path(args.output)
             postprocess_route = {
                 "reference_cleanup": bool(args.reference_cleanup),
+                "reference_cleanup_early_outward": bool(
+                    args.reference_cleanup_early_outward
+                ),
                 "qem_simplify": bool(args.qem_simplify),
                 "qem_backend": args.qem_backend,
                 "source_native_source_root": args.source_native_source_root,

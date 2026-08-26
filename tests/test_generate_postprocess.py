@@ -440,6 +440,82 @@ def test_postprocess_source_native_qem_backend_uses_source_native_cleanup():
     ]
 
 
+def test_postprocess_reference_cleanup_early_outward_pins_experimental_order():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices = FaceBag(10)
+    cleanup_outputs = [FaceBag(500_000), FaceBag(190_000)]
+    calls = []
+    operation_trace = []
+
+    def cleanup_mesh(v, faces, keep_largest=False, do_fix_normals=True, verbose=True):
+        calls.append(("cleanup", len(faces), do_fix_normals))
+        return v, cleanup_outputs.pop(0)
+
+    def simplify(v, faces, target_reduction=None, target_count=None):
+        calls.append(("simplify", target_count))
+        if target_count == 600_000:
+            return v, FaceBag(590_000)
+        if target_count == 200_000:
+            return v, FaceBag(180_000)
+        raise AssertionError(f"unexpected simplify target {target_count}")
+
+    def orient_adjacency(v, faces, verbose=True):
+        calls.append(("adjacency", len(faces)))
+        return v, faces
+
+    def orient_outward(v, faces):
+        calls.append(("outward", len(faces)))
+        return faces, [
+            {"faces": len(faces), "flipped": True},
+        ]
+
+    _cleanup_and_simplify_mesh(
+        vertices,
+        FaceBag(1_000_000),
+        target_faces=200_000,
+        no_cleanup=False,
+        reference_cleanup=True,
+        reference_cleanup_early_outward=True,
+        cleanup_mesh=cleanup_mesh,
+        simplify=simplify,
+        orient_faces_by_adjacency=orient_adjacency,
+        orient_components_outward=orient_outward,
+        operation_trace=operation_trace,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [
+        ("simplify", 600_000),
+        ("cleanup", 590_000, False),
+        ("adjacency", 500_000),
+        ("outward", 500_000),
+        ("simplify", 200_000),
+        ("cleanup", 180_000, False),
+    ]
+    assert [entry["operation"] for entry in operation_trace] == [
+        "simplify_coarse",
+        "cleanup_initial",
+        "orient_faces_by_adjacency_early",
+        "orient_components_outward_early",
+        "simplify_final",
+        "cleanup_final",
+    ]
+
+
+def test_postprocess_early_outward_requires_reference_cleanup():
+    from generate import _cleanup_and_simplify_mesh
+
+    with pytest.raises(ValueError, match="requires reference_cleanup"):
+        _cleanup_and_simplify_mesh(
+            FaceBag(10),
+            FaceBag(100),
+            target_faces=50,
+            no_cleanup=False,
+            reference_cleanup_early_outward=True,
+        )
+
+
 def test_postprocess_source_native_qem_backend_uses_combined_source_route_by_default():
     from generate import _cleanup_and_simplify_mesh
 

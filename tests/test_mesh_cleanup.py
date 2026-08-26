@@ -425,3 +425,40 @@ def test_orient_faces_by_adjacency_flips_same_direction_neighbor_only():
     assert out_vertices is vertices
     np.testing.assert_array_equal(out_faces[0], faces[0])
     np.testing.assert_array_equal(out_faces[1], np.array([1, 3, 2]))
+
+
+def test_orient_components_outward_flips_only_inward_component_sign():
+    from trellmlx.mesh_cleanup import orient_components_outward
+
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    outward = np.array(
+        [
+            [0, 2, 1],
+            [0, 1, 3],
+            [0, 3, 2],
+            [1, 2, 3],
+        ],
+        dtype=np.int64,
+    )
+    inward = outward[:, ::-1]
+
+    oriented, records = orient_components_outward(vertices, inward)
+
+    np.testing.assert_array_equal(oriented, outward)
+    assert records == [
+        {
+            "faces": 4,
+            "vertices": 4,
+            "radial_score": pytest.approx(-1.0),
+            "radial_confidence": pytest.approx(1.0),
+            "flipped": True,
+        }
+    ]

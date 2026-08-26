@@ -312,51 +312,12 @@ def orient_components_outward(
     vertices: np.ndarray,
     faces: np.ndarray,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Choose an outward sign per face-adjacent component.
+    """Delegate component sign selection to the production-shared helper."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from trellmlx.mesh_cleanup import orient_components_outward as orient_shared
 
-    The radial score is the area-weighted flux of each component's face
-    normals away from its own vertex centroid. It remains usable for open
-    shells where signed-volume-only repair intentionally declines to act.
-    """
-    vertices = np.asarray(vertices, dtype=np.float64)
-    faces = np.asarray(faces, dtype=np.int64)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    components = trimesh.graph.connected_components(
-        mesh.face_adjacency,
-        nodes=np.arange(len(faces), dtype=np.int64),
-        min_len=1,
-    )
-    oriented = faces.copy()
-    records: list[dict[str, Any]] = []
-    for component in components:
-        component = np.asarray(component, dtype=np.int64)
-        component_faces = faces[component]
-        vertex_ids = np.unique(component_faces)
-        center = vertices[vertex_ids].mean(axis=0)
-        triangles = vertices[component_faces]
-        crosses = np.cross(
-            triangles[:, 1] - triangles[:, 0],
-            triangles[:, 2] - triangles[:, 0],
-        )
-        radial = triangles.mean(axis=1) - center
-        contributions = np.einsum("ij,ij->i", crosses, radial)
-        score = float(contributions.sum())
-        absolute_flux = float(np.abs(contributions).sum())
-        confidence = abs(score) / absolute_flux if absolute_flux > 0.0 else 0.0
-        flipped = score < 0.0
-        if flipped:
-            oriented[component] = oriented[component][:, ::-1]
-        records.append(
-            {
-                "faces": int(len(component)),
-                "vertices": int(len(vertex_ids)),
-                "radial_score": score,
-                "radial_confidence": confidence,
-                "flipped": flipped,
-            }
-        )
-    records.sort(key=lambda item: item["faces"], reverse=True)
-    return np.ascontiguousarray(oriented, dtype=np.int32), records
+    return orient_shared(vertices, faces)
 
 
 def component_sign_summary(

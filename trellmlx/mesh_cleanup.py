@@ -499,6 +499,61 @@ def orient_faces_by_adjacency(
     return vertices, oriented.astype(faces.dtype, copy=False)
 
 
+def orient_components_outward(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, list[dict[str, object]]]:
+    """Choose an outward sign for each face-adjacent component.
+
+    Adjacency orientation only makes each component internally coherent; it
+    deliberately preserves the seed face's arbitrary sign. This second step
+    uses area-weighted radial flux about each component's own vertex centroid
+    to choose between the two coherent signs. Unlike signed-volume repair, the
+    score remains defined for open decoder shells.
+
+    Returns the re-signed faces and diagnostic records. Vertices and face row
+    order are not changed.
+    """
+    vertices64 = np.asarray(vertices, dtype=np.float64)
+    faces64 = np.asarray(faces, dtype=np.int64)
+    if len(faces64) == 0:
+        return np.ascontiguousarray(faces, dtype=faces.dtype), []
+
+    n_components, labels = _face_connected_components(faces64, len(faces64))
+    oriented = np.array(faces, copy=True)
+    records: list[dict[str, object]] = []
+    for component_index in range(n_components):
+        component = np.flatnonzero(labels == component_index)
+        component_faces = faces64[component]
+        vertex_ids = np.unique(component_faces)
+        center = vertices64[vertex_ids].mean(axis=0)
+        triangles = vertices64[component_faces]
+        crosses = np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        )
+        radial = triangles.mean(axis=1) - center
+        contributions = np.einsum("ij,ij->i", crosses, radial)
+        score = float(contributions.sum())
+        absolute_flux = float(np.abs(contributions).sum())
+        confidence = abs(score) / absolute_flux if absolute_flux > 0.0 else 0.0
+        flipped = score < 0.0
+        if flipped:
+            oriented[component] = oriented[component][:, ::-1]
+        records.append(
+            {
+                "faces": int(len(component)),
+                "vertices": int(len(vertex_ids)),
+                "radial_score": score,
+                "radial_confidence": confidence,
+                "flipped": flipped,
+            }
+        )
+
+    records.sort(key=lambda item: int(item["faces"]), reverse=True)
+    return np.ascontiguousarray(oriented, dtype=faces.dtype), records
+
+
 def _reindex_mesh(vertices, faces):
     """Remove unreferenced vertices and reindex faces."""
     used = np.unique(faces)
