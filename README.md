@@ -1,31 +1,70 @@
 # trellis2mlx
 
-MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference for Apple Silicon.
+MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference and
+cross-runtime causal forensics for Apple Silicon.
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. Image -> textured GLB, including native MLX DINOv3 conditioning, sparse/shape/texture stages, mesh extraction, simplification, UV unwrap, and texture baking.
+Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac
+using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. The
+end-to-end route includes native MLX DINOv3 conditioning, sparse/shape/texture
+flows, mesh extraction, simplification, UV unwrap, texture baking, PBR
+materials, and GLB export.
 
-Claim boundary: this is the first fully working MLX-native end-to-end TRELLIS.2 pipeline we know of, validated locally on Apple Silicon with native DINO conditioning and coherent textured GLB output.
+> **Status:** the public `main` branch is a working technical preview. The
+> published research branch adds hash-bound CUDA/MPS/MLX replay and finalization
+> experiments. Output quality is still input-sensitive, and exact end-to-end
+> CUDA parity is not claimed.
 
-This is a technical preview: the full route works, the output is real, and the public contract is proof-first rather than polished-app-first. Output quality is still seed/input-sensitive, and native-DINO generation parity remains an active quality investigation.
-
-### Input → Output
+## Research result: coherent full MLX product
 
 <table>
 <tr>
-<td><img src="assets/blender_mlx_preview_paint_more_stone.png" width="240" alt="Input image"></td>
-<td><img src="assets/outputs/blender-ball-angle1.png" width="240" alt="Output angle 1"></td>
-<td><img src="assets/outputs/blender-ball-angle2.png" width="240" alt="Output angle 2"></td>
-<td><img src="assets/outputs/blender-ball-angle3.png" width="240" alt="Output angle 3"></td>
+<td><img src="assets/research/feature-animation-input.png" width="260" alt="Stylized horned character input"></td>
+<td><img src="assets/research/feature-animation-mlx-front.png" width="360" alt="Front Cycles render of the MLX-generated textured GLB"></td>
+<td><img src="assets/research/feature-animation-mlx-oblique.png" width="330" alt="Oblique Cycles render of the MLX-generated textured GLB"></td>
 </tr>
 <tr>
 <td align="center"><em>Input</em></td>
-<td align="center"><em>Generated — front</em></td>
-<td align="center"><em>Generated — side</em></td>
-<td align="center"><em>Generated — back</em></td>
+<td align="center"><em>MLX result, front</em></td>
+<td align="center"><em>MLX result, oblique</em></td>
 </tr>
 </table>
 
-*Single image → textured 3D mesh with PBR materials. ~12 min on M4 Max, ~21 min on M2 Pro. No NVIDIA GPU, no PyTorch — pure MLX on Apple Silicon.*
+This is a Blender/Cycles render of one MLX-generated GLB from the
+[`cc/pixal9-capture-contract-r9-0821`](https://github.com/lyonsno/trellis2mlx/tree/cc/pixal9-capture-contract-r9-0821)
+research route at commit
+[`e1d987d`](https://github.com/lyonsno/trellis2mlx/commit/e1d987d12c9dc3ed668af5f96d0d525a801bdb6f):
+seed 81414, 512 resolution, 8 steps, no cascade, 100K target faces, 512 texture,
+and source-ordered cleanup. The exact product completed in 158.4 seconds on the
+measured M4 Max route.
+
+The result is visually strong, but it is not presented as topology-perfect.
+Localized one-sided failures remain around finely articulated crevices, and the
+rear hair/horn regions retain texture smearing. The case settings, measurements,
+asset hashes, and limitations are preserved in the
+[`feature-animation-81412` manifest](docs/research/feature-animation-81412.json).
+
+## What the port uncovered
+
+Finishing the port exposed a more interesting systems problem than raw feature
+parity:
+
+1. **The backend authority map matters.** A frozen CUDA witness aligned more
+   closely with MLX/CPU than with PyTorch MPS, so copying the existing Mac port's
+   discrepancy would have moved MLX away from source behavior.
+2. **Local correctness is contextual.** Source-correct tensors could still
+   cross a different decoded separatrix when inserted into the wrong residual
+   neighborhood; residual-complete joins could recover the source continuation
+   exactly.
+3. **Inference and finalization are separate causal surfaces.** Semantically
+   coherent raw MLX geometry could be damaged or rescued by cleanup order, while
+   a six-case replay showed that neither cleanup order wins globally.
+
+[Read the compact cross-runtime causal-forensics case study →](docs/cross-runtime-causal-forensics.md)
+
+Claim boundary: this is the first fully working MLX-native end-to-end TRELLIS.2
+pipeline we know of, validated locally on Apple Silicon with native DINO
+conditioning and coherent textured GLB output. It is not a claim to be the first
+TRELLIS.2 project on Mac, nor a claim that every MLX seed reproduces source CUDA.
 
 ## Validation snapshot
 
@@ -151,9 +190,15 @@ Peak memory: ~3 GB for SLat flow, ~5 GB during decode on the M4 Max reference pa
 
 ### Parity and quality status
 
-Native MLX model components track the PyTorch reference closely in direct checks, but small DINO/precision differences can amplify through flow sampling and produce different generations. Treat the current release as a working end-to-end MLX pipeline, not a promise that every seed/input matches the PyTorch route visually.
+Native MLX model components track a same-weight PyTorch comparator closely in
+direct checks, but that historical comparator is not a universal source
+authority. CUDA, PyTorch MPS, CPU, and MLX can form different numerical islands;
+on a frozen block-7 witness, source CUDA was materially closer to MLX/CPU than to
+PyTorch MPS. Treat the current release as a working end-to-end MLX pipeline, not
+a promise that every seed/input matches source CUDA or another Mac route
+visually.
 
-12-step sampling parity, same weights + noise:
+Historical 12-step same-weight, same-noise PyTorch comparator:
 
 | Step | Correlation | Max diff |
 |------|-------------|----------|
@@ -163,7 +208,13 @@ Native MLX model components track the PyTorch reference closely in direct checks
 | 9 | 0.998852 | 0.434 |
 | 12 | 0.968466 | 2.128 |
 
-Divergence is monotonic precision accumulation (bf16 -> fp16), not architectural; single forward pass correlation is 0.999999. Native DINOv3 feature parity and downstream generation quality remain tracked separately from route validity.
+These measurements remain useful, but the old conclusion that the entire
+divergence was monotonic BF16-to-FP16 accumulation was too strong. Controlled
+replays now show both smooth accumulation and discrete basin changes. Raw mesh,
+cleanup order, simplification, UV processing, and texture bake are tracked as
+separate causal surfaces. See
+[`docs/cross-runtime-causal-forensics.md`](docs/cross-runtime-causal-forensics.md)
+for the current evidence and claim boundary.
 
 ### Quantization (experimental)
 
@@ -223,7 +274,8 @@ failure phase if the run stops early.
 - [x] MLX Flash Attention (`mx.fast.scaled_dot_product_attention`)
 - [x] Periodic eval to prevent memory bus starvation
 - [x] INT4 quantization utility
-- [x] 12-step numerical parity verified against PyTorch
+- [x] Historical 12-step same-noise PyTorch comparator recorded
+- [x] CUDA/MPS/MLX authority split established with frozen witnesses and controlled replay
 - [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
 - [x] Metal-accelerated QEM mesh simplification (`--qem-simplify`) — topology-preserving edge collapse with normal-flip guard, adapted from [mtlmesh](https://github.com/pedronaugusto/trellis2-apple)
 - [x] Texture SLat flow + decoder → per-voxel PBR attributes
