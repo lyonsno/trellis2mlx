@@ -19,8 +19,8 @@ materials, and GLB export.
 <table>
 <tr>
 <td><img src="assets/research/feature-animation-input.png" width="260" alt="Stylized horned character input"></td>
-<td><img src="assets/research/feature-animation-mlx-front.png" width="360" alt="Front Cycles render of the MLX-generated textured GLB"></td>
-<td><img src="assets/research/feature-animation-mlx-oblique.png" width="330" alt="Oblique Cycles render of the MLX-generated textured GLB"></td>
+<td><img src="assets/research/feature-animation-mlx-front.png" width="340" alt="Front Cycles beauty render of the MLX-generated textured GLB"></td>
+<td><img src="assets/research/feature-animation-mlx-oblique.png" width="340" alt="Oblique Cycles beauty render of the MLX-generated textured GLB"></td>
 </tr>
 <tr>
 <td align="center"><em>Input</em></td>
@@ -29,13 +29,16 @@ materials, and GLB export.
 </tr>
 </table>
 
-This is a Blender/Cycles render of one MLX-generated GLB from the
+These are Blender/Cycles beauty renders of one MLX-generated GLB from the
 [`cc/pixal9-capture-contract-r9-0821`](https://github.com/lyonsno/trellis2mlx/tree/cc/pixal9-capture-contract-r9-0821)
 research route at commit
 [`e1d987d`](https://github.com/lyonsno/trellis2mlx/commit/e1d987d12c9dc3ed668af5f96d0d525a801bdb6f):
 seed 81414, 512 resolution, 8 steps, no cascade, 100K target faces, 512 texture,
 and source-ordered cleanup. The exact product completed in 158.4 seconds on the
 measured M4 Max route.
+
+Cycles lighting and subsurface-scattering treatment improve presentation in
+these witnesses; the geometry and baked textures come from the recorded GLB.
 
 The result is visually strong, but it is not presented as topology-perfect.
 Localized one-sided failures remain around finely articulated crevices, and the

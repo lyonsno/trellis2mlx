@@ -27,16 +27,20 @@
     "mlx_raw_faces": 2197170,
     "mlx_raw_face_delta_percent": -29.84
   },
+  "presentation": {
+    "renderer": "Blender Cycles",
+    "note": "Beauty witnesses add lighting and subsurface-scattering material treatment; they depict the same generated GLB recorded by this case."
+  },
   "witnesses": [
     {
       "view": "front",
       "path": "assets/research/feature-animation-mlx-front.png",
-      "sha256": "604b451e6eacf21d9999c1356520ebc1fa1b84274916252a8365a0483afa73a7"
+      "sha256": "f5a454d96d07bb1da69f4ff7fa83289195a413039ef3091542e9aafc4841e9ca"
     },
     {
       "view": "oblique",
       "path": "assets/research/feature-animation-mlx-oblique.png",
-      "sha256": "db951b04ce6c5a90c7b3e205b1283aa50ac7e9aeed086e020a481a7498c6b939"
+      "sha256": "3813f51ea7036942e3961963c985d240ae464a1a4fe44ff3c51b54023a59bbe7"
     }
   ],
   "limitations": [
