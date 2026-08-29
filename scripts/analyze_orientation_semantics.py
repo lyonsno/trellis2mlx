@@ -166,6 +166,32 @@ def _output_flips(
     )
 
 
+def analyze_orientation_topology(faces: np.ndarray) -> dict[str, int]:
+    """Summarize whether manifold-edge winding constraints are satisfiable."""
+    faces = np.ascontiguousarray(faces, dtype=np.int32)
+    face_a, face_b, required_xor, edge_group_count = (
+        _manifold_constraints(faces)
+    )
+    solved = _solve_parity_components(
+        len(faces),
+        face_a,
+        face_b,
+        required_xor,
+    )
+    return {
+        "faces": int(len(faces)),
+        "edge_groups": edge_group_count,
+        "manifold_edges": int(len(face_a)),
+        "components": solved["component_count"],
+        "orientable_components": solved["orientable_component_count"],
+        "contradictory_components": solved[
+            "contradictory_component_count"
+        ],
+        "orientable_faces": solved["orientable_face_count"],
+        "contradictory_faces": solved["contradictory_face_count"],
+    }
+
+
 def _component_non_global_choices(
     values: np.ndarray,
     roots: np.ndarray,
@@ -280,20 +306,7 @@ def analyze_face_orientations(
     return {
         "schema": "trellis2mlx.orientation_semantics.v1",
         "semantic_parity": semantic_parity,
-        "topology": {
-            "faces": int(len(input_faces)),
-            "edge_groups": edge_group_count,
-            "manifold_edges": int(len(face_a)),
-            "components": solved["component_count"],
-            "orientable_components": solved[
-                "orientable_component_count"
-            ],
-            "contradictory_components": solved[
-                "contradictory_component_count"
-            ],
-            "orientable_faces": solved["orientable_face_count"],
-            "contradictory_faces": solved["contradictory_face_count"],
-        },
+        "topology": analyze_orientation_topology(input_faces),
         **output_reports,
         "comparison": comparison,
     }

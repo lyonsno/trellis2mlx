@@ -6,6 +6,7 @@ import numpy as np
 from scripts.analyze_orientation_semantics import (
     _solve_parity_components,
     analyze_face_orientations,
+    analyze_orientation_topology,
     main,
 )
 
@@ -70,6 +71,20 @@ def test_parity_solver_marks_contradictory_component():
     assert result["component_count"] == 1
     assert result["contradictory_component_count"] == 1
     assert result["contradictory_face_count"] == 3
+
+
+def test_orientation_topology_reports_satisfiable_sheet():
+    faces = np.array(
+        [[0, 1, 2], [2, 1, 3]],
+        dtype=np.int32,
+    )
+
+    topology = analyze_orientation_topology(faces)
+
+    assert topology["faces"] == 2
+    assert topology["manifold_edges"] == 1
+    assert topology["orientable_components"] == 1
+    assert topology["contradictory_components"] == 0
 
 
 def test_orientation_analysis_writes_failure_report_for_wrong_hash(
