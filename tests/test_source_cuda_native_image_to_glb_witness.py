@@ -1367,6 +1367,37 @@ def test_no_download_preflight_records_exact_route_without_primary_artifacts(tmp
     assert list(output_dir.iterdir()) == [output_dir / "report.json"]
 
 
+def test_no_download_preflight_admits_feature_request_settings(tmp_path):
+    from scripts.source_cuda_native_image_to_glb_witness import main
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"authorized-image-fixture")
+    args = _base_args(tmp_path, image)
+
+    rc = main(
+        args
+        + [
+            "--seed",
+            "81414",
+            "--target-faces",
+            "100000",
+            "--texture-size",
+            "512",
+            "--no-download",
+        ]
+    )
+
+    report = json.loads((tmp_path / "outputs" / "report.json").read_text())
+    assert rc == 0
+    assert report["status"] == "preflight_stopped"
+    assert report["requested_route"]["seed"] == 81414
+    assert report["requested_route"]["postprocess"] == {
+        "decimation_target": 100000,
+        "remesh": False,
+        "texture_size": 512,
+    }
+
+
 def test_no_download_final_consumer_profile_records_bounded_capture_contract(tmp_path):
     from scripts.source_cuda_native_image_to_glb_witness import main
 

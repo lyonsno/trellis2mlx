@@ -14,7 +14,9 @@ from trellmlx.native_image_to_glb_attempt import (
     NativeImageToGLBAttemptSpec,
     build_attempt_packet,
     capture_contract_from_entrypoint_args,
+    load_attempt_manifest,
     load_attempt_spec,
+    validate_attempt_manifest,
 )
 
 
@@ -209,6 +211,127 @@ def test_structured_attempt_binds_read_only_model_kernel_source(tmp_path):
     assert packet.kernel_sources == ("operator/pinned-model-output",)
     assert "--model-blob-root" not in packet.entrypoint_args
     assert "--model-source-kernel" not in packet.entrypoint_args
+
+
+def test_v5_full_capture_binds_feature_request_settings(tmp_path):
+    from trellmlx.kaggle_cuda_witness import prepare_packet
+
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["full"],
+        model_kernel_source="operator/pinned-model-output",
+        pipeline_type="512",
+        seed=81414,
+        steps=8,
+        target_faces=100000,
+        texture_size=512,
+        request_settings_bound=True,
+    )
+
+    packet = build_attempt_packet(spec)
+    manifest_path = spec.capsule_dir / "native-image-to-glb-attempt.json"
+    manifest = load_attempt_manifest(manifest_path)
+    validate_attempt_manifest(packet, manifest)
+    prepared = prepare_packet(packet)
+    runner = (prepared.kernel_dir / "run_kaggle_cuda_witness.py").read_text()
+    namespace = {"__name__": "runner_test"}
+    exec(runner, namespace)
+
+    assert manifest["schema"] == "trellis2mlx.native_image_to_glb_attempt.v5"
+    assert manifest["capture_profile"] == "full"
+    assert {
+        field: manifest[field]
+        for field in (
+            "pipeline_type",
+            "seed",
+            "steps",
+            "target_faces",
+            "texture_size",
+        )
+    } == {
+        "pipeline_type": "512",
+        "seed": 81414,
+        "steps": 8,
+        "target_faces": 100000,
+        "texture_size": 512,
+    }
+    assert "--capture-profile" not in packet.entrypoint_args
+    assert namespace["CONFIG"]["attempt_contract"] == manifest
+
+
+def test_v5_manifest_rejects_request_setting_substitution(tmp_path):
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["full"],
+        model_kernel_source="operator/pinned-model-output",
+        seed=81414,
+        target_faces=100000,
+        texture_size=512,
+        request_settings_bound=True,
+    )
+    packet = build_attempt_packet(spec)
+    manifest = load_attempt_manifest(
+        spec.capsule_dir / "native-image-to-glb-attempt.json"
+    )
+    manifest["seed"] = 81415
+
+    with pytest.raises(AttemptSpecError, match="seed request setting mismatch"):
+        validate_attempt_manifest(packet, manifest)
+
+
+def test_v5_runner_rejects_partially_bound_request_settings(tmp_path):
+    from trellmlx.kaggle_cuda_witness import prepare_packet
+
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["full"],
+        model_kernel_source="operator/pinned-model-output",
+        seed=81414,
+        target_faces=100000,
+        texture_size=512,
+        request_settings_bound=True,
+    )
+    packet = build_attempt_packet(spec)
+    texture_index = packet.entrypoint_args.index("--texture-size")
+    packet = replace(
+        packet,
+        entrypoint_args=(
+            packet.entrypoint_args[:texture_index]
+            + packet.entrypoint_args[texture_index + 2 :]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="partially bound"):
+        prepare_packet(packet)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("seed", -1, "seed"),
+        ("steps", 7, "steps"),
+        ("target_faces", 0, "target_faces"),
+        ("texture_size", 513, "texture_size"),
+    ),
+)
+def test_v5_request_settings_reject_invalid_values(tmp_path, field, value, message):
+    spec = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["full"],
+        model_kernel_source="operator/pinned-model-output",
+        request_settings_bound=True,
+        **{field: value},
+    )
+
+    with pytest.raises(AttemptSpecError, match=message):
+        build_attempt_packet(spec)
+
+
+def test_non_default_request_settings_require_v5_binding(tmp_path):
+    spec = replace(_review_attempt_spec(tmp_path), seed=81414)
+
+    with pytest.raises(AttemptSpecError, match="v5-bound"):
+        build_attempt_packet(spec)
 
 
 def test_model_kernel_source_runner_rejects_ambiguous_mount_and_admits_one(tmp_path):
@@ -476,6 +599,84 @@ def test_attempt_spec_loads_complete_structured_json(tmp_path):
     assert spec.entrypoint == assets["entrypoint"]
     assert spec.dinov3_files == dinov3
     assert spec.rembg_files == rembg
+
+
+def test_attempt_spec_loads_v5_feature_request_contract(tmp_path):
+    original = replace(
+        _review_attempt_spec(tmp_path),
+        expected_outputs=CAPTURE_PROFILE_OUTPUTS["full"],
+        model_kernel_source="operator/pinned-model-output",
+        pipeline_type="512",
+        seed=81414,
+        steps=8,
+        target_faces=100000,
+        texture_size=512,
+        request_settings_bound=True,
+    )
+
+    def record(asset):
+        return {
+            "source": str(asset.source),
+            "coordinate": asset.coordinate,
+            "sha256": asset.sha256,
+            "size_bytes": asset.size_bytes,
+        }
+
+    path = tmp_path / "feature-attempt.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "trellis2mlx.native_image_to_glb_attempt_spec.v5",
+                "run_id": original.run_id,
+                "dataset_id": original.dataset_id,
+                "kernel_id": original.kernel_id,
+                "title": original.title,
+                "capsule_dir": str(original.capsule_dir),
+                "output_dir": str(original.output_dir),
+                "entrypoint": record(original.entrypoint),
+                "authority_helper": record(original.authority_helper),
+                "image": record(original.image),
+                "dinov3_files": {
+                    name: record(asset)
+                    for name, asset in original.dinov3_files.items()
+                },
+                "rembg_files": {
+                    name: record(asset)
+                    for name, asset in original.rembg_files.items()
+                },
+                "expected_outputs": list(original.expected_outputs),
+                "capture_profile": original.capture_profile,
+                "model_kernel_source": original.model_kernel_source,
+                "pipeline_type": original.pipeline_type,
+                "seed": original.seed,
+                "steps": original.steps,
+                "target_faces": original.target_faces,
+                "texture_size": original.texture_size,
+                "output_coordinate": original.output_coordinate,
+                "work_coordinate": original.work_coordinate,
+                "accelerator": original.accelerator,
+                "enable_internet": original.enable_internet,
+            }
+        )
+    )
+
+    loaded = load_attempt_spec(path)
+
+    assert loaded.request_settings_bound is True
+    assert loaded.capture_profile == "full"
+    assert loaded.model_kernel_source == "operator/pinned-model-output"
+    assert (
+        loaded.pipeline_type,
+        loaded.seed,
+        loaded.steps,
+        loaded.target_faces,
+        loaded.texture_size,
+    ) == ("512", 81414, 8, 100000, 512)
+    packet = build_attempt_packet(loaded)
+    validate_attempt_manifest(
+        packet,
+        load_attempt_manifest(loaded.capsule_dir / "native-image-to-glb-attempt.json"),
+    )
 
 
 def test_attempt_spec_rejects_unknown_authority_fields(tmp_path):

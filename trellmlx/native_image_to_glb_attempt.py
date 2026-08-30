@@ -44,6 +44,12 @@ class NativeImageToGLBAttemptSpec:
     expected_outputs: tuple[str, ...]
     capture_profile: str = "full"
     model_kernel_source: str | None = None
+    pipeline_type: str = "512"
+    seed: int = 42
+    steps: int = 8
+    target_faces: int = 350000
+    texture_size: int = 1024
+    request_settings_bound: bool = False
     output_coordinate: str = "outputs"
     work_coordinate: str = "runtime"
     accelerator: str = "NvidiaTeslaT4"
@@ -66,9 +72,11 @@ ATTEMPT_MANIFEST = "native-image-to-glb-attempt.json"
 ATTEMPT_SPEC_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt_spec.v2"
 ATTEMPT_SPEC_SCHEMA = "trellis2mlx.native_image_to_glb_attempt_spec.v3"
 ATTEMPT_SPEC_SCHEMA_V4 = "trellis2mlx.native_image_to_glb_attempt_spec.v4"
+ATTEMPT_SPEC_SCHEMA_V5 = "trellis2mlx.native_image_to_glb_attempt_spec.v5"
 ATTEMPT_MANIFEST_SCHEMA_V2 = "trellis2mlx.native_image_to_glb_attempt.v2"
 ATTEMPT_MANIFEST_SCHEMA = "trellis2mlx.native_image_to_glb_attempt.v3"
 ATTEMPT_MANIFEST_SCHEMA_V4 = "trellis2mlx.native_image_to_glb_attempt.v4"
+ATTEMPT_MANIFEST_SCHEMA_V5 = "trellis2mlx.native_image_to_glb_attempt.v5"
 CAPTURE_PROFILE_OUTPUTS = {
     "full": (
         "00-preprocessed_image.png",
@@ -108,6 +116,7 @@ def resolve_capture_contract(
     capture_profile: object,
     expected_outputs: object,
     profile_is_explicit: bool,
+    allow_explicit_full: bool = False,
     context: str,
 ) -> CaptureContract:
     if not isinstance(expected_outputs, (list, tuple)) or not all(
@@ -129,7 +138,7 @@ def resolve_capture_contract(
             profile_binds_outputs=False,
         )
 
-    if capture_profile == "full":
+    if capture_profile == "full" and not allow_explicit_full:
         raise AttemptSpecError(
             f"{context} cannot declare an explicit full capture profile"
         )
@@ -142,7 +151,11 @@ def resolve_capture_contract(
     return CaptureContract(
         capture_profile=capture_profile,
         expected_outputs=outputs,
-        manifest_schema=ATTEMPT_MANIFEST_SCHEMA,
+        manifest_schema=(
+            ATTEMPT_MANIFEST_SCHEMA_V5
+            if capture_profile == "full"
+            else ATTEMPT_MANIFEST_SCHEMA
+        ),
         profile_is_explicit=True,
         profile_binds_outputs=True,
     )
@@ -153,7 +166,12 @@ def capture_contract_from_spec_payload(payload: Mapping[str, Any]) -> CaptureCon
     return resolve_capture_contract(
         capture_profile=payload.get("capture_profile"),
         expected_outputs=payload.get("expected_outputs"),
-        profile_is_explicit=schema in {ATTEMPT_SPEC_SCHEMA, ATTEMPT_SPEC_SCHEMA_V4},
+        profile_is_explicit=schema in {
+            ATTEMPT_SPEC_SCHEMA,
+            ATTEMPT_SPEC_SCHEMA_V4,
+            ATTEMPT_SPEC_SCHEMA_V5,
+        },
+        allow_explicit_full=schema == ATTEMPT_SPEC_SCHEMA_V5,
         context="attempt spec",
     )
 
@@ -166,7 +184,9 @@ def capture_contract_from_manifest(payload: Mapping[str, Any]) -> CaptureContrac
         profile_is_explicit=schema in {
             ATTEMPT_MANIFEST_SCHEMA,
             ATTEMPT_MANIFEST_SCHEMA_V4,
+            ATTEMPT_MANIFEST_SCHEMA_V5,
         },
+        allow_explicit_full=schema == ATTEMPT_MANIFEST_SCHEMA_V5,
         context="attempt manifest",
     )
 
@@ -175,12 +195,14 @@ def capture_contract_from_profile(
     capture_profile: str,
     expected_outputs: tuple[str, ...],
     *,
+    bind_full: bool = False,
     context: str,
 ) -> CaptureContract:
     return resolve_capture_contract(
         capture_profile=capture_profile,
         expected_outputs=expected_outputs,
-        profile_is_explicit=capture_profile != "full",
+        profile_is_explicit=capture_profile != "full" or bind_full,
+        allow_explicit_full=bind_full,
         context=context,
     )
 
@@ -257,12 +279,25 @@ def load_attempt_spec_bytes(
         expected_fields.add("capture_profile")
     if schema == ATTEMPT_SPEC_SCHEMA_V4:
         expected_fields.add("model_kernel_source")
+    if schema == ATTEMPT_SPEC_SCHEMA_V5:
+        expected_fields.update(
+            {
+                "capture_profile",
+                "model_kernel_source",
+                "pipeline_type",
+                "seed",
+                "steps",
+                "target_faces",
+                "texture_size",
+            }
+        )
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt spec field set is incomplete or contains unknown fields")
     if schema not in {
         ATTEMPT_SPEC_SCHEMA_V2,
         ATTEMPT_SPEC_SCHEMA,
         ATTEMPT_SPEC_SCHEMA_V4,
+        ATTEMPT_SPEC_SCHEMA_V5,
     }:
         raise AttemptSpecError(f"unexpected attempt spec schema: {payload.get('schema')!r}")
 
@@ -294,7 +329,7 @@ def load_attempt_spec_bytes(
     if not isinstance(rembg_payload, dict):
         raise AttemptSpecError("attempt RMBG file map is invalid")
     capture_contract = capture_contract_from_spec_payload(payload)
-    if schema == ATTEMPT_SPEC_SCHEMA_V4 and (
+    if schema in {ATTEMPT_SPEC_SCHEMA_V4, ATTEMPT_SPEC_SCHEMA_V5} and (
         not isinstance(payload["model_kernel_source"], str)
         or not payload["model_kernel_source"]
     ):
@@ -333,6 +368,12 @@ def load_attempt_spec_bytes(
         expected_outputs=capture_contract.expected_outputs,
         capture_profile=capture_contract.capture_profile,
         model_kernel_source=payload.get("model_kernel_source"),
+        pipeline_type=payload.get("pipeline_type", "512"),
+        seed=payload.get("seed", 42),
+        steps=payload.get("steps", 8),
+        target_faces=payload.get("target_faces", 350000),
+        texture_size=payload.get("texture_size", 1024),
+        request_settings_bound=schema == ATTEMPT_SPEC_SCHEMA_V5,
         output_coordinate=payload["output_coordinate"],
         work_coordinate=payload["work_coordinate"],
         accelerator=payload["accelerator"],
@@ -439,10 +480,32 @@ def _validate_execution_coordinates(spec: NativeImageToGLBAttemptSpec) -> None:
         )
 
 
+def _validate_request_settings(spec: NativeImageToGLBAttemptSpec) -> None:
+    if spec.pipeline_type != "512":
+        raise AttemptSpecError("attempt pipeline_type must be '512'")
+    integer_settings = {
+        "seed": spec.seed,
+        "steps": spec.steps,
+        "target_faces": spec.target_faces,
+        "texture_size": spec.texture_size,
+    }
+    if any(type(value) is not int for value in integer_settings.values()):
+        raise AttemptSpecError("attempt integer request settings are invalid")
+    if spec.seed < 0:
+        raise AttemptSpecError("attempt seed must be nonnegative")
+    if spec.steps != 8:
+        raise AttemptSpecError("attempt steps must equal 8")
+    if spec.target_faces <= 0:
+        raise AttemptSpecError("attempt target_faces must be positive")
+    if spec.texture_size <= 0 or spec.texture_size & (spec.texture_size - 1):
+        raise AttemptSpecError("attempt texture_size must be a positive power of two")
+
+
 def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAsset]) -> dict:
     capture_contract = capture_contract_from_profile(
         spec.capture_profile,
         spec.expected_outputs,
+        bind_full=spec.request_settings_bound,
         context="attempt",
     )
     payload = {
@@ -470,6 +533,18 @@ def _manifest(spec: NativeImageToGLBAttemptSpec, assets: Mapping[str, AttemptAss
     if spec.model_kernel_source is not None:
         payload["schema"] = ATTEMPT_MANIFEST_SCHEMA_V4
         payload["model_kernel_source"] = spec.model_kernel_source
+    if spec.request_settings_bound:
+        payload.update(
+            {
+                "schema": ATTEMPT_MANIFEST_SCHEMA_V5,
+                "capture_profile": capture_contract.capture_profile,
+                "pipeline_type": spec.pipeline_type,
+                "seed": spec.seed,
+                "steps": spec.steps,
+                "target_faces": spec.target_faces,
+                "texture_size": spec.texture_size,
+            }
+        )
     return payload
 
 
@@ -524,12 +599,25 @@ def load_attempt_manifest_bytes(data: bytes) -> dict[str, Any]:
         expected_fields.add("capture_profile")
     if schema == ATTEMPT_MANIFEST_SCHEMA_V4:
         expected_fields.add("model_kernel_source")
+    if schema == ATTEMPT_MANIFEST_SCHEMA_V5:
+        expected_fields.update(
+            {
+                "capture_profile",
+                "model_kernel_source",
+                "pipeline_type",
+                "seed",
+                "steps",
+                "target_faces",
+                "texture_size",
+            }
+        )
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise AttemptSpecError("attempt manifest field set is invalid")
     if schema not in {
         ATTEMPT_MANIFEST_SCHEMA_V2,
         ATTEMPT_MANIFEST_SCHEMA,
         ATTEMPT_MANIFEST_SCHEMA_V4,
+        ATTEMPT_MANIFEST_SCHEMA_V5,
     }:
         raise AttemptSpecError("attempt manifest schema is invalid")
     capture_contract_from_manifest(payload)
@@ -592,10 +680,29 @@ def validate_attempt_manifest(
     )
     if (
         packet_capture_contract.capture_profile != capture_contract.capture_profile
-        or packet_capture_contract.profile_is_explicit
-        != capture_contract.profile_is_explicit
+        or (
+            packet_capture_contract.profile_is_explicit
+            != capture_contract.profile_is_explicit
+            and payload.get("schema") != ATTEMPT_MANIFEST_SCHEMA_V5
+        )
     ):
         raise AttemptSpecError("attempt manifest capture profile argument mismatch")
+
+    if payload.get("schema") == ATTEMPT_MANIFEST_SCHEMA_V5:
+        setting_flags = {
+            "pipeline_type": "--pipeline-type",
+            "seed": "--seed",
+            "steps": "--steps",
+            "target_faces": "--target-faces",
+            "texture_size": "--texture-size",
+        }
+        for field, flag in setting_flags.items():
+            packet_value = argument(flag)
+            expected_value = str(payload.get(field))
+            if packet_value != expected_value:
+                raise AttemptSpecError(
+                    f"attempt manifest {field} request setting mismatch"
+                )
 
     if payload.get("output_coordinate") != argument("--output-dir"):
         raise AttemptSpecError("attempt manifest output coordinate mismatch")
@@ -653,8 +760,26 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
     capture_contract = capture_contract_from_profile(
         spec.capture_profile,
         spec.expected_outputs,
+        bind_full=spec.request_settings_bound,
         context="attempt",
     )
+    default_settings = ("512", 42, 8, 350000, 1024)
+    request_settings = (
+        spec.pipeline_type,
+        spec.seed,
+        spec.steps,
+        spec.target_faces,
+        spec.texture_size,
+    )
+    if not spec.request_settings_bound and request_settings != default_settings:
+        raise AttemptSpecError(
+            "non-default request settings require a v5-bound attempt"
+        )
+    _validate_request_settings(spec)
+    if type(spec.request_settings_bound) is not bool:
+        raise AttemptSpecError("attempt request_settings_bound must be boolean")
+    if spec.request_settings_bound and spec.model_kernel_source is None:
+        raise AttemptSpecError("v5-bound attempt requires a model kernel source")
     if spec.model_kernel_source is not None:
         if not isinstance(spec.model_kernel_source, str):
             raise AttemptSpecError("attempt model kernel source is invalid")
@@ -768,6 +893,23 @@ def build_attempt_packet(spec: NativeImageToGLBAttemptSpec):
             *(
                 ("--capture-profile", capture_contract.capture_profile)
                 if capture_contract.profile_is_explicit
+                and capture_contract.capture_profile != "full"
+                else ()
+            ),
+            *(
+                (
+                    "--pipeline-type",
+                    spec.pipeline_type,
+                    "--seed",
+                    str(spec.seed),
+                    "--steps",
+                    str(spec.steps),
+                    "--target-faces",
+                    str(spec.target_faces),
+                    "--texture-size",
+                    str(spec.texture_size),
+                )
+                if spec.request_settings_bound
                 else ()
             ),
             "--dinov3-model-path",

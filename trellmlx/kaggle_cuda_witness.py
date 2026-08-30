@@ -2107,6 +2107,7 @@ def _native_attempt_contract(
     outer_manifest: dict[str, object],
 ) -> dict[str, object]:
     from trellmlx.native_image_to_glb_attempt import (
+        ATTEMPT_MANIFEST_SCHEMA_V5,
         AttemptSpecError,
         capture_contract_from_entrypoint_args,
     )
@@ -2177,6 +2178,38 @@ def _native_attempt_contract(
             )
         contract["schema"] = "trellis2mlx.native_image_to_glb_attempt.v4"
         contract["model_kernel_source"] = packet.kernel_sources[0]
+    setting_flags = {
+        "pipeline_type": "--pipeline-type",
+        "seed": "--seed",
+        "steps": "--steps",
+        "target_faces": "--target-faces",
+        "texture_size": "--texture-size",
+    }
+    present_settings = {
+        field for field, flag in setting_flags.items() if flag in packet.entrypoint_args
+    }
+    if present_settings and present_settings != set(setting_flags):
+        raise WitnessPacketError(
+            "attempt-bearing packet request settings are only partially bound"
+        )
+    if present_settings:
+        if len(packet.kernel_sources) != 1:
+            raise WitnessPacketError(
+                "v5 attempt-bearing packet requires exactly one kernel source"
+            )
+        contract["schema"] = ATTEMPT_MANIFEST_SCHEMA_V5
+        contract["capture_profile"] = capture_contract.capture_profile
+        contract["pipeline_type"] = _entrypoint_argument(
+            packet, setting_flags["pipeline_type"]
+        )
+        for field in ("seed", "steps", "target_faces", "texture_size"):
+            raw_value = _entrypoint_argument(packet, setting_flags[field])
+            try:
+                contract[field] = int(raw_value)
+            except ValueError as exc:
+                raise WitnessPacketError(
+                    f"attempt-bearing packet {field} is not an integer"
+                ) from exc
     return contract
 
 

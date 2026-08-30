@@ -28,7 +28,7 @@ import numpy as np
 try:
     import trellmlx.witness_authority as witness_authority_module
 except ModuleNotFoundError as exc:
-    if exc.name != "trellmlx":
+    if exc.name not in {"trellmlx", "trellmlx.witness_authority"}:
         raise
     import witness_authority as witness_authority_module
 
@@ -430,14 +430,14 @@ def _validate_request(args: argparse.Namespace) -> None:
         )
     if args.pipeline_type != "512":
         raise ValueError("this witness admits only pipeline_type='512'")
-    if args.seed != 42:
-        raise ValueError("this witness admits only seed 42")
+    if args.seed < 0:
+        raise ValueError("this witness requires a nonnegative seed")
     if args.steps != 8:
         raise ValueError("this witness admits exactly 8 sparse, shape, and texture steps")
-    if args.target_faces != 350000:
-        raise ValueError("this witness admits target_faces=350000")
-    if args.texture_size != 1024:
-        raise ValueError("this witness admits texture_size=1024")
+    if args.target_faces <= 0:
+        raise ValueError("this witness requires positive target_faces")
+    if args.texture_size <= 0 or args.texture_size & (args.texture_size - 1):
+        raise ValueError("this witness requires a positive power-of-two texture_size")
     if args.attention_backend != "xformers":
         raise ValueError("the T4 native source route requires attention_backend='xformers'")
     if args.sparse_conv_backend != "flex_gemm":

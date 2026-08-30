@@ -951,10 +951,16 @@ def prepare_mechanics_packet(
     capsule.mkdir(exist_ok=True)
     smoke = capsule / "source_cuda_native_mechanics_smoke.py"
     witness = capsule / "source_cuda_native_image_to_glb_witness.py"
+    authority = capsule / "witness_authority.py"
     smoke.write_text(SCRIPT.read_text())
     witness.write_text(
         Path(__file__).parents[1]
         .joinpath("scripts/source_cuda_native_image_to_glb_witness.py")
+        .read_text()
+    )
+    authority.write_text(
+        Path(__file__).parents[1]
+        .joinpath("trellmlx/witness_authority.py")
         .read_text()
     )
     module = load_module()
@@ -966,7 +972,7 @@ def prepare_mechanics_packet(
             kernel_id="operator/native-mechanics-cuda",
             title="Native Mechanics CUDA",
             entrypoint=smoke.name,
-            inputs=(smoke.name, witness.name),
+            inputs=(smoke.name, witness.name, authority.name),
             run_id=run_id,
             enable_internet=enable_internet,
             accelerator=accelerator,
