@@ -17,7 +17,7 @@ dependencies = [
     "libigl",
     "xatlas",
     "opencv-python",
-    "rembg[cpu]",
+    "rembg[cpu]==2.0.76",
 ]
 
 [project.optional-dependencies]

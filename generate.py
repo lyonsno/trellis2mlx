@@ -109,6 +109,43 @@ SHAPE_SLAT_STD = np.array([
     5.347008, 5.405691,
 ], dtype=np.float32)
 
+CONDITIONING_PROVENANCE_SCHEMA = "trellis2mlx-conditioning-v1"
+
+
+def _artifact_identity(path: str | Path) -> dict[str, object]:
+    resolved = Path(path).expanduser().resolve()
+    return {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
+def _array_identity(array: np.ndarray) -> dict[str, object]:
+    contiguous = np.ascontiguousarray(array)
+    return {
+        "shape": list(contiguous.shape),
+        "dtype": str(contiguous.dtype),
+        "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+    }
+
+
+def _upstream_conditioning_route(
+    sample_path: str | Path,
+    archive: np.lib.npyio.NpzFile,
+) -> dict[str, object] | None:
+    if "conditioning_route_json" in archive.files:
+        return json.loads(
+            np.asarray(archive["conditioning_route_json"]).item()
+        )
+
+    sidecar_path = Path(sample_path).with_suffix(".json")
+    if not sidecar_path.is_file():
+        return None
+    sidecar = json.loads(sidecar_path.read_text())
+    route_json = sidecar.get("conditioning_route_json")
+    return json.loads(route_json) if route_json else None
+
 TEX_SLAT_MEAN = np.array([
     3.501659, 2.212398, 2.226094, 0.251093, -0.026248, -0.687364,
     0.439898, -0.928075, 0.029398, -0.339596, -0.869527, 1.038479,
@@ -1904,6 +1941,17 @@ def main():
             )
         cond = mx.array(conditioning_sample_npz["cond"])
         neg_cond = mx.array(conditioning_sample_npz["neg_cond"])
+        conditioning_route = {
+            "schema": CONDITIONING_PROVENANCE_SCHEMA,
+            "route": "checkpoint-sample",
+            "artifact": _artifact_identity(args.conditioning_sample),
+        }
+        upstream_route = _upstream_conditioning_route(
+            args.conditioning_sample,
+            conditioning_sample_npz,
+        )
+        if upstream_route is not None:
+            conditioning_route["upstream_route"] = upstream_route
         print(
             f"  Conditioning sample: {args.conditioning_sample} "
             f"cond={cond.shape} neg_cond={neg_cond.shape}",
@@ -1912,17 +1960,34 @@ def main():
     elif args.image:
         # Preprocess: background removal + center crop
         image_paths = args.image
+        preprocess_routes = []
         if not args.no_rembg:
-            from trellmlx.preprocess import preprocess_image
+            from rembg import new_session
+            from trellmlx.preprocess import (
+                DEFAULT_BACKGROUND_MODEL,
+                preprocess_image_with_provenance,
+            )
             import tempfile
+
+            rembg_session = new_session(DEFAULT_BACKGROUND_MODEL)
             processed_paths = []
             for img_path in image_paths:
                 print(f"  Preprocessing {img_path}...", flush=True)
-                processed = preprocess_image(img_path)
+                result = preprocess_image_with_provenance(
+                    img_path,
+                    rembg_session=rembg_session,
+                )
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                processed.save(tmp.name)
+                result.image.save(tmp.name)
                 processed_paths.append(tmp.name)
+                preprocess_routes.append(result.provenance)
             image_paths = processed_paths
+        else:
+            from trellmlx.preprocess import describe_unprocessed_image
+
+            preprocess_routes = [
+                describe_unprocessed_image(img_path) for img_path in image_paths
+            ]
 
         if len(image_paths) == 1:
             cond = _extract_image_features(image_paths[0])
@@ -1935,17 +2000,36 @@ def main():
             cond = mx.concatenate(view_features, axis=1)
             print(f"  Multi-view: {len(image_paths)} views → {cond.shape[1]} context tokens", flush=True)
         neg_cond = mx.zeros_like(cond)
+        conditioning_route = {
+            "schema": CONDITIONING_PROVENANCE_SCHEMA,
+            "route": "image",
+            "background_removal": not args.no_rembg,
+            "views": preprocess_routes,
+        }
     else:
         print("No image — random conditioning", flush=True)
         cond = mx.random.normal((1, 10, 1024))
         neg_cond = mx.zeros_like(cond)
+        conditioning_route = {
+            "schema": CONDITIONING_PROVENANCE_SCHEMA,
+            "route": "random",
+            "seed": args.seed,
+        }
+    cond_np = np.array(cond)
+    neg_cond_np = np.array(neg_cond)
+    conditioning_route["cond"] = _array_identity(cond_np)
+    conditioning_route["neg_cond"] = _array_identity(neg_cond_np)
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(
             args.save_checkpoints,
             "conditioning",
-            cond=np.array(cond),
-            neg_cond=np.array(neg_cond),
+            cond=cond_np,
+            neg_cond=neg_cond_np,
+            conditioning_route_json=json.dumps(
+                conditioning_route,
+                sort_keys=True,
+            ),
         )
         if args.stop_after_stage == "conditioning":
             print("  Stop after stage: conditioning", flush=True)
@@ -1957,11 +2041,11 @@ def main():
             raise ValueError("--edit-target requires --image (source image)")
         print(f"  VS3D mode: extracting target features from {args.edit_target}...", flush=True)
         if not args.no_rembg:
-            from trellmlx.preprocess import preprocess_image
+            from trellmlx.preprocess import preprocess_image_with_provenance
             import tempfile
-            tgt_processed = preprocess_image(args.edit_target)
+            tgt_result = preprocess_image_with_provenance(args.edit_target)
             tgt_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tgt_processed.save(tgt_tmp.name)
+            tgt_result.image.save(tgt_tmp.name)
             tgt_image_path = tgt_tmp.name
         else:
             tgt_image_path = args.edit_target
