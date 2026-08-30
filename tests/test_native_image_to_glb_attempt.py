@@ -351,7 +351,13 @@ def test_model_kernel_source_runner_rejects_ambiguous_mount_and_admits_one(tmp_p
     marker = Path(namespace["CONFIG"]["model_source_marker"])
     assert marker.as_posix() == MODEL_SOURCE_MARKER
     mount_a = tmp_path / "kaggle-input" / "mount-a"
-    mount_b = tmp_path / "kaggle-input" / "mount-b"
+    mount_b = (
+        tmp_path
+        / "kaggle-input"
+        / "notebooks"
+        / "operator"
+        / "pinned-model-output"
+    )
     for mount in (mount_a, mount_b):
         source = mount / marker
         source.parent.mkdir(parents=True)
@@ -367,6 +373,16 @@ def test_model_kernel_source_runner_rejects_ambiguous_mount_and_admits_one(tmp_p
     assert mounted["effective_mount_root"] == str(mount_a)
     assert mounted["effective_blob_root"] == str(
         mount_a / "runtime" / "huggingface"
+    )
+
+    (mount_a / marker).unlink()
+    source_b = mount_b / marker
+    source_b.write_text("pinned pipeline")
+    mounted = namespace["find_model_blob_root"]()
+    assert mounted["requested_kernel_source"] == "operator/pinned-model-output"
+    assert mounted["effective_mount_root"] == str(mount_b)
+    assert mounted["effective_blob_root"] == str(
+        mount_b / "runtime" / "huggingface"
     )
 
 

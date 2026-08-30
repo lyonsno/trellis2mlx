@@ -1387,8 +1387,16 @@ def find_model_blob_root() -> dict | None:
     marker = Path(CONFIG["model_source_marker"])
     candidates = []
     if KAGGLE_INPUT_ROOT.is_dir():
-        for mount in sorted(KAGGLE_INPUT_ROOT.iterdir()):
-            if mount.is_dir() and (mount / marker).is_file():
+        marker_suffix = marker.parts
+        for marker_match in sorted(KAGGLE_INPUT_ROOT.rglob(marker.name)):
+            if not marker_match.is_file():
+                continue
+            if marker_match.parts[-len(marker_suffix) :] != marker_suffix:
+                continue
+            mount = marker_match
+            for _ in marker_suffix:
+                mount = mount.parent
+            if mount not in candidates:
                 candidates.append(mount)
     if len(candidates) != 1:
         raise RuntimeError(
