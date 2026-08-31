@@ -765,6 +765,78 @@ class TestSLatFlowModelSourceContracts:
         assert block1["final_out_flat"].shape == (6, 4)
         assert block1["final_output"].shape == (6, 4)
 
+    def test_trace_block_boundaries_matches_single_trace_and_full_forward(self):
+        from trellmlx.models.slat_flow import SLatFlowModel
+
+        model = SLatFlowModel(
+            in_channels=4,
+            out_channels=4,
+            model_channels=12,
+            num_heads=3,
+            num_blocks=3,
+            mlp_hidden=16,
+            context_channels=4,
+        )
+        x = mx.random.normal((6, 4), dtype=mx.float32)
+        coords = mx.array(
+            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 1, 1], [2, 2, 2]],
+            dtype=mx.int32,
+        )
+        t = mx.array([1000.0], dtype=mx.float32)
+        cond = mx.random.normal((1, 5, 4), dtype=mx.float32)
+
+        boundaries = model.trace_block_boundaries(
+            x,
+            t,
+            cond,
+            coords=coords,
+            block_indices=[0, 2],
+        )
+        block0 = model.trace_block(x, t, cond, coords=coords, block_index=0)
+        block2 = model.trace_block(x, t, cond, coords=coords, block_index=2)
+        full = model(x, t, cond, coords=coords)
+        mx.eval(*boundaries.values(), *block0.values(), *block2.values(), full)
+
+        assert set(boundaries) == {
+            "input_projected",
+            "block0_after_mlp",
+            "block2_after_mlp",
+            "final_input",
+            "final_norm",
+            "final_out_flat",
+            "final_output",
+        }
+        assert mx.array_equal(
+            boundaries["block0_after_mlp"], block0["block0_after_mlp"]
+        ).item()
+        assert mx.array_equal(
+            boundaries["block2_after_mlp"], block2["block2_after_mlp"]
+        ).item()
+        assert mx.array_equal(boundaries["final_output"], full).item()
+
+    def test_trace_block_boundaries_rejects_duplicate_and_out_of_range_indices(self):
+        import pytest
+
+        from trellmlx.models.slat_flow import SLatFlowModel
+
+        model = SLatFlowModel(
+            in_channels=4,
+            out_channels=4,
+            model_channels=12,
+            num_heads=3,
+            num_blocks=2,
+            mlp_hidden=16,
+            context_channels=4,
+        )
+        x = mx.zeros((2, 4), dtype=mx.float32)
+        t = mx.array([1000.0], dtype=mx.float32)
+        cond = mx.zeros((1, 2, 4), dtype=mx.float32)
+
+        with pytest.raises(ValueError, match="duplicates"):
+            model.trace_block_boundaries(x, t, cond, block_indices=[1, 1])
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+            model.trace_block_boundaries(x, t, cond, block_indices=[2])
+
     def test_parameter_count_small(self):
         """Small model parameter count should be predictable."""
         import mlx.utils

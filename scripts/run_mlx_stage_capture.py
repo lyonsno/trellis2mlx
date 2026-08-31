@@ -149,6 +149,28 @@ def _parse_sparse_flow_trace_keys(value: str | None) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+def _parse_shape_flow_trace_block_indices(
+    value: str | None, fallback: int
+) -> list[int]:
+    if value is None:
+        return [fallback]
+    fields = [field.strip() for field in value.split(",")]
+    if not fields or any(not field for field in fields):
+        raise ValueError(
+            "--shape-flow-trace-block-indices must be a comma-separated list "
+            "of block indices"
+        )
+    try:
+        indices = [int(field) for field in fields]
+    except ValueError as exc:
+        raise ValueError(
+            "--shape-flow-trace-block-indices must contain integers"
+        ) from exc
+    if len(set(indices)) != len(indices):
+        raise ValueError("--shape-flow-trace-block-indices must not contain duplicates")
+    return indices
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run trellis2mlx stage capture")
     parser.add_argument("--image", required=True)
@@ -251,6 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="improved",
     )
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0)
+    parser.add_argument("--shape-flow-trace-block-indices")
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0)
     parser.add_argument("--shape-flow-trace-keys")
     parser.add_argument(
@@ -418,6 +441,10 @@ def build_route_identity(
     output_dir = str(Path(args.output_dir))
     target_faces = _resolve_target_faces(args)
     shape_flow_trace_requested_keys = _parse_sparse_flow_trace_keys(args.shape_flow_trace_keys)
+    shape_flow_trace_block_indices = _parse_shape_flow_trace_block_indices(
+        args.shape_flow_trace_block_indices,
+        args.shape_flow_trace_block_index,
+    )
     decoder_identity = _validate_decoder_route_args(args)
     turing_lut_identity = _validate_turing_rsqrt_route_args(args)
     turing_rope_lut_identity = _validate_turing_rope_route_args(args)
@@ -611,7 +638,8 @@ def build_route_identity(
             "sparse_flow_layernorm_correction_branch": args.sparse_flow_layernorm_correction_branch,
             "sparse_flow_layernorm_correction_mode": args.sparse_flow_layernorm_correction_mode,
             "sparse_flow_layernorm_correction_include": args.sparse_flow_layernorm_correction_include,
-            "shape_flow_trace_block_index": args.shape_flow_trace_block_index,
+            "shape_flow_trace_block_index": shape_flow_trace_block_indices[0],
+            "shape_flow_trace_block_indices": shape_flow_trace_block_indices,
             "shape_flow_trace_step_index": args.shape_flow_trace_step_index,
             "shape_flow_trace_key_selection": (
                 "explicit" if shape_flow_trace_requested_keys else "full"
@@ -1443,6 +1471,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 primary_output_validation = modulation_binding
             if args.stop_after_stage == "shape_flow_block_trace":
+                _bind_effective_shape_flow_trace_block_indices(
+                    route_identity,
+                    checkpoint_npz,
+                )
                 _bind_effective_shape_flow_trace_keys(route_identity, checkpoint_npz)
                 _bind_effective_shape_flow_trace_sample_identity(
                     route_identity, checkpoint_npz
@@ -1828,6 +1860,59 @@ def _bind_effective_shape_flow_trace_keys(
     if selection == "explicit" and effective_keys != requested:
         raise ValueError("shape-flow effective selected keys differ from the explicit request")
     route["shape_flow_trace_keys"] = effective_keys
+
+
+def _bind_effective_shape_flow_trace_block_indices(
+    route_identity: dict[str, Any], checkpoint_path: Path
+) -> None:
+    route = route_identity.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("route identity has no route object")
+
+    requested = route.get("shape_flow_trace_block_indices")
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or any(not isinstance(index, int) or isinstance(index, bool) for index in requested)
+    ):
+        raise ValueError("route identity omits requested shape-flow trace block indices")
+    if len(set(requested)) != len(requested):
+        raise ValueError("requested shape-flow trace block indices contain duplicates")
+    requested_scalar = route.get("shape_flow_trace_block_index")
+    if requested_scalar != requested[0]:
+        raise ValueError(
+            "requested shape-flow trace legacy scalar differs from the requested list"
+        )
+
+    with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+        if "trace_block_indices" not in checkpoint or "trace_block_index" not in checkpoint:
+            raise ValueError("shape-flow trace omits effective block-index metadata")
+        indices = np.asarray(checkpoint["trace_block_indices"])
+        if indices.ndim != 1 or indices.dtype.kind not in {"i", "u"} or not indices.size:
+            raise ValueError(
+                "shape-flow effective block indices must be a non-empty "
+                "one-dimensional integer list"
+            )
+        effective = [int(value) for value in indices.tolist()]
+        if len(set(effective)) != len(effective):
+            raise ValueError("shape-flow effective block indices contain duplicates")
+
+        scalar = np.asarray(checkpoint["trace_block_index"])
+        if scalar.shape != () or scalar.dtype.kind not in {"i", "u"}:
+            raise ValueError("shape-flow effective legacy block index must be an integer scalar")
+        effective_scalar = int(scalar.item())
+
+    if effective != requested:
+        raise ValueError(
+            "shape-flow effective block indices differ from the requested list"
+        )
+    if effective_scalar != effective[0]:
+        raise ValueError(
+            "shape-flow effective legacy scalar differs from the effective block list"
+        )
+
+    route["shape_flow_trace_block_indices_effective"] = effective
+    route["shape_flow_trace_block_index_effective"] = effective_scalar
 
 
 def _bind_effective_shape_flow_trace_sample_identity(
@@ -3811,11 +3896,19 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         ])
     if args.stop_after_stage == "shape_flow_block_trace":
         command.extend([
-            "--shape-flow-trace-block-index",
-            str(args.shape_flow_trace_block_index),
             "--shape-flow-trace-step-index",
             str(args.shape_flow_trace_step_index),
         ])
+        if args.shape_flow_trace_block_indices is not None:
+            command.extend([
+                "--shape-flow-trace-block-indices",
+                args.shape_flow_trace_block_indices,
+            ])
+        else:
+            command.extend([
+                "--shape-flow-trace-block-index",
+                str(args.shape_flow_trace_block_index),
+            ])
         if args.shape_flow_trace_keys:
             command.extend(["--shape-flow-trace-keys", args.shape_flow_trace_keys])
         if args.shape_flow_trace_sample:

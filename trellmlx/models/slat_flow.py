@@ -564,6 +564,97 @@ class SLatFlowModel(nn.Module):
         mx.eval(*trace.values())
         return trace
 
+    def trace_block_boundaries(
+        self,
+        x: mx.array,
+        t: mx.array,
+        cond: mx.array,
+        coords: mx.array = None,
+        block_indices: list[int] | tuple[int, ...] = (),
+        cross_kv_cache: list = None,
+        shape_block_injection=None,
+        shape_block_injection_branch: str | None = None,
+        shape_timestep_modulation_lut=None,
+    ) -> dict[str, mx.array]:
+        """Trace compact post-block boundaries during one ordinary forward pass."""
+
+        selected = tuple(block_indices)
+        if not selected:
+            raise ValueError("block_indices must contain at least one block index")
+        if len(set(selected)) != len(selected):
+            raise ValueError("block_indices must not contain duplicates")
+        invalid = [index for index in selected if index < 0 or index >= len(self.blocks)]
+        if invalid:
+            raise ValueError(
+                f"block_indices must be in [0, {len(self.blocks) - 1}], got {invalid}"
+            )
+
+        input_dtype = x.dtype
+        B = t.shape[0] if len(t.shape) else 1
+        cond_B = cond.shape[0] if cond is not None and len(cond.shape) else B
+        if B != 1 or cond_B != 1:
+            raise ValueError(
+                f"Only B=1 supported for SLatFlowModel trace, got t B={B}, cond B={cond_B}"
+            )
+
+        x = self.input_layer(x)
+        compute_dtype = _infer_compute_dtype(self)
+        if shape_timestep_modulation_lut is not None and not self.shape_flow_layernorm:
+            raise ValueError(
+                "source-CUDA timestep modulation LUT is only valid for shape flow"
+            )
+        mod = _shape_shared_modulation(
+            t,
+            self.t_embedder,
+            self.adaLN_modulation,
+            compute_dtype,
+            shape_timestep_modulation_lut,
+        )
+        x = x.astype(compute_dtype)
+        cond = cond.astype(compute_dtype)
+
+        rope_phases = None
+        if coords is not None:
+            rope_phases = self._coords_to_rope_phases(coords)
+
+        selected_set = set(selected)
+        trace: dict[str, mx.array] = {"input_projected": x}
+        for i, block in enumerate(self.blocks):
+            block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
+            block_injection = None
+            if shape_block_injection is not None:
+                block_injection = _injections_for_block(shape_block_injection, i)
+            if block_injection is None:
+                x = block(
+                    x,
+                    mod[0],
+                    cond,
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
+            else:
+                x = block.forward_with_injection(
+                    x,
+                    mod[0],
+                    cond,
+                    injection=block_injection,
+                    branch=shape_block_injection_branch or "pos",
+                    rope_phases=rope_phases,
+                    cross_kv_cache=block_kv,
+                )
+            if i in selected_set:
+                trace[f"block{i}_after_mlp"] = x
+            if (i + 1) % 6 == 0:
+                mx.eval(x)
+
+        trace["final_input"] = x
+        final_norm, final_output = self._final_projection(x, input_dtype)
+        trace["final_norm"] = final_norm
+        trace["final_out_flat"] = final_output
+        trace["final_output"] = final_output
+        mx.eval(*trace.values())
+        return trace
+
     def compile(self):
         """Enable mx.compile for the transformer block loop."""
         self._compiled = True

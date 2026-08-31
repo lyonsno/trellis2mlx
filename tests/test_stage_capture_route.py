@@ -2875,6 +2875,55 @@ def test_stage_capture_wrapper_exposes_shape_flow_block_trace_route(tmp_path):
     ] == "source-cuda-sequential"
 
 
+def test_stage_capture_wrapper_forwards_compact_multi_block_shape_trace(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    support_path = tmp_path / "reference_shape_slat.npz"
+    support_path.write_bytes(b"shape-slat-support")
+    noise_path = tmp_path / "shape_flow_step.npz"
+    noise_path.write_bytes(b"shape-flow-noise")
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "shape_flow_block_trace",
+            "--no-cascade",
+            "--shape-slat-support-sample",
+            str(support_path),
+            "--shape-flow-noise-sample",
+            str(noise_path),
+            "--shape-flow-trace-block-indices",
+            "1,7,29",
+            "--shape-flow-trace-step-index",
+            "0",
+            "--shape-flow-trace-keys",
+            "pos_block1_after_mlp,neg_block1_after_mlp,pos_block7_after_mlp,neg_block7_after_mlp,pos_block29_after_mlp,neg_block29_after_mlp",
+        ]
+    )
+
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert command[command.index("--shape-flow-trace-block-indices") + 1] == "1,7,29"
+    assert route_identity["route"]["shape_flow_trace_block_indices"] == [1, 7, 29]
+    assert route_identity["route"]["shape_flow_trace_block_index"] == 1
+
+
+def test_generate_exposes_compact_multi_block_shape_trace():
+    source = GENERATE_SOURCE.read_text()
+
+    assert "--shape-flow-trace-block-indices" in source
+    assert "lr_slat_flow.trace_block_boundaries" in source
+    assert "trace_block_indices=np.asarray(shape_trace_block_indices" in source
+
+
 def test_shape_flow_attention_selectors_compose_into_final_glb_route(tmp_path):
     from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
 
@@ -3555,9 +3604,11 @@ def test_shape_flow_attention_matching_primary_completes_route_binding(
 
         np.savez(
             checkpoint,
-            pos_block0_after_self=np.zeros((1, 2, 3), dtype=np.float32),
-            coords=np.zeros((2, 4), dtype=np.int32),
-            shape_flow_trace_selected_keys=np.array(["pos_block0_after_self"]),
+                pos_block0_after_self=np.zeros((1, 2, 3), dtype=np.float32),
+                coords=np.zeros((2, 4), dtype=np.int32),
+                trace_block_index=np.asarray(0, dtype=np.int32),
+                trace_block_indices=np.asarray([0], dtype=np.int32),
+                shape_flow_trace_selected_keys=np.array(["pos_block0_after_self"]),
             shape_flow_layernorm_backend=np.array("mlx-two-pass"),
             shape_flow_terminal_linear_configured_json=np.array(
                 json.dumps(
@@ -5747,6 +5798,101 @@ def test_stage_capture_binds_omitted_full_shape_trace_keys_from_primary_output(t
     route_identity["route"]["shape_flow_trace_key_selection"] = "stale-default"
     with pytest.raises(ValueError, match="unsupported shape-flow trace key selection"):
         _bind_effective_shape_flow_trace_keys(route_identity, checkpoint)
+
+
+def test_stage_capture_binds_effective_shape_flow_trace_block_indices(tmp_path):
+    import numpy as np
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_trace_block_indices,
+    )
+
+    checkpoint = tmp_path / "shape_flow_block_trace.npz"
+    np.savez(
+        checkpoint,
+        trace_block_indices=np.asarray([1, 7, 29], dtype=np.int32),
+        trace_block_index=np.asarray(1, dtype=np.int32),
+    )
+    route_identity = {
+        "route": {
+            "shape_flow_trace_block_index": 1,
+            "shape_flow_trace_block_indices": [1, 7, 29],
+        }
+    }
+
+    _bind_effective_shape_flow_trace_block_indices(route_identity, checkpoint)
+
+    assert route_identity["route"][
+        "shape_flow_trace_block_indices_effective"
+    ] == [1, 7, 29]
+
+
+def test_stage_capture_rejects_untruthful_effective_shape_flow_trace_block_indices(
+    tmp_path,
+):
+    import numpy as np
+    import pytest
+
+    from scripts.run_mlx_stage_capture import (
+        _bind_effective_shape_flow_trace_block_indices,
+    )
+
+    route_identity = {
+        "route": {
+            "shape_flow_trace_block_index": 1,
+            "shape_flow_trace_block_indices": [1, 7, 29],
+        }
+    }
+    cases = [
+        (
+            {},
+            "omits effective block-index metadata",
+        ),
+        (
+            {
+                "trace_block_indices": np.asarray([1], dtype=np.int32),
+                "trace_block_index": np.asarray(1, dtype=np.int32),
+            },
+            "differ from the requested list",
+        ),
+        (
+            {
+                "trace_block_indices": np.asarray([1, 7, 29], dtype=np.int32),
+                "trace_block_index": np.asarray(7, dtype=np.int32),
+            },
+            "legacy scalar differs",
+        ),
+        (
+            {
+                "trace_block_indices": np.asarray([[1, 7, 29]], dtype=np.int32),
+                "trace_block_index": np.asarray(1, dtype=np.int32),
+            },
+            "one-dimensional integer list",
+        ),
+        (
+            {
+                "trace_block_indices": np.asarray([1.0, 7.0, 29.0]),
+                "trace_block_index": np.asarray(1, dtype=np.int32),
+            },
+            "one-dimensional integer list",
+        ),
+        (
+            {
+                "trace_block_indices": np.asarray([1, 7, 7], dtype=np.int32),
+                "trace_block_index": np.asarray(1, dtype=np.int32),
+            },
+            "contain duplicates",
+        ),
+    ]
+
+    for index, (payload, message) in enumerate(cases):
+        checkpoint = tmp_path / f"shape_flow_block_trace_{index}.npz"
+        np.savez(checkpoint, **payload)
+        with pytest.raises(ValueError, match=message):
+            _bind_effective_shape_flow_trace_block_indices(
+                route_identity,
+                checkpoint,
+            )
 
 
 def test_stage_capture_wrapper_forwards_sparse_block_injection_route(tmp_path):

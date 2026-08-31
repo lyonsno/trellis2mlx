@@ -204,6 +204,28 @@ def _parse_shape_flow_trace_keys(value: str | None) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+def _parse_shape_flow_trace_block_indices(
+    value: str | None, fallback: int
+) -> list[int]:
+    if value is None:
+        return [fallback]
+    fields = [field.strip() for field in value.split(",")]
+    if not fields or any(not field for field in fields):
+        raise ValueError(
+            "--shape-flow-trace-block-indices must be a comma-separated list "
+            "of block indices"
+        )
+    try:
+        indices = [int(field) for field in fields]
+    except ValueError as exc:
+        raise ValueError(
+            "--shape-flow-trace-block-indices must contain integers"
+        ) from exc
+    if len(set(indices)) != len(indices):
+        raise ValueError("--shape-flow-trace-block-indices must not contain duplicates")
+    return indices
+
+
 def _shape_flow_attention_route_from_env() -> dict[str, str]:
     backend_requested = os.environ.get(
         "TRELLIS2MLX_ATTENTION_BACKEND",
@@ -1201,6 +1223,9 @@ def main():
     parser.add_argument("--shape-flow-trace-block-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow block index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
+    parser.add_argument("--shape-flow-trace-block-indices",
+                        help="Diagnostic: comma-separated shape SLat flow block indices to "
+                             "capture compact post-MLP boundaries for in one forward pass.")
     parser.add_argument("--shape-flow-trace-step-index", type=int, default=0,
                         help="Diagnostic: shape SLat flow sampler step index to trace with "
                              "--stop-after-stage shape_flow_block_trace (default: 0).")
@@ -2907,7 +2932,11 @@ def main():
                 f"--shape-flow-trace-step-index must be in [0, {n_steps - 1}], "
                 f"got {shape_trace_step_index}"
             )
-        shape_trace_block_index = args.shape_flow_trace_block_index
+        shape_trace_block_indices = _parse_shape_flow_trace_block_indices(
+            args.shape_flow_trace_block_indices,
+            args.shape_flow_trace_block_index,
+        )
+        shape_trace_block_index = shape_trace_block_indices[0]
         shape_cond = cond_tgt if vs3d_mode else cond
         shape_neg_cond = neg_cond
         shape_pos_kv_cache = lr_slat_flow.build_cross_kv_cache(shape_cond)
@@ -2965,12 +2994,22 @@ def main():
             shape_trace_t = shape_trace_t / 1000.0 if shape_trace_t > 1.0 else shape_trace_t
 
         shape_t_tensor = mx.array([1000.0 * shape_trace_t], dtype=mx.float32)
-        pos_trace = lr_slat_flow.trace_block(
+        trace_method = (
+            lr_slat_flow.trace_block_boundaries
+            if args.shape_flow_trace_block_indices is not None
+            else lr_slat_flow.trace_block
+        )
+        trace_block_args = (
+            {"block_indices": shape_trace_block_indices}
+            if args.shape_flow_trace_block_indices is not None
+            else {"block_index": shape_trace_block_index}
+        )
+        pos_trace = trace_method(
             shape_trace_sample,
             shape_t_tensor,
             shape_cond,
             coords=mx.array(lr_coords),
-            block_index=shape_trace_block_index,
+            **trace_block_args,
             cross_kv_cache=shape_pos_kv_cache,
             shape_block_injection=(
                 shape_block_injection
@@ -2981,12 +3020,12 @@ def main():
             shape_block_injection_branch="pos",
             shape_timestep_modulation_lut=shape_timestep_modulation_lut,
         )
-        neg_trace = lr_slat_flow.trace_block(
+        neg_trace = trace_method(
             shape_trace_sample,
             shape_t_tensor,
             shape_neg_cond,
             coords=mx.array(lr_coords),
-            block_index=shape_trace_block_index,
+            **trace_block_args,
             cross_kv_cache=shape_neg_kv_cache,
             shape_block_injection=(
                 shape_block_injection
@@ -3028,6 +3067,7 @@ def main():
             coords=lr_coords_4d.astype(np.int32, copy=False),
             coords_3d=lr_coords.astype(np.int32, copy=False),
             trace_block_index=np.array(shape_trace_block_index, dtype=np.int32),
+            trace_block_indices=np.asarray(shape_trace_block_indices, dtype=np.int32),
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
             shape_flow_trace_requested_keys=np.array(requested_trace_keys, dtype=str),
             shape_flow_trace_selected_keys=np.array(effective_trace_keys, dtype=str),
@@ -3085,7 +3125,7 @@ def main():
         )
         print(
             f"  Stop after stage: shape_flow_block_trace step={shape_trace_step_index} "
-            f"block={shape_trace_block_index}",
+            f"blocks={shape_trace_block_indices}",
             flush=True,
         )
         return
