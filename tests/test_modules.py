@@ -343,6 +343,16 @@ class TestScaledDotProductAttention:
         expected = np.full((1, 1, 1, 4096), 1.0 / 4096.0, dtype=np.float32)
         assert np.array_equal(np.asarray(actual), expected)
 
+    def test_source_cuda_softmax_accepts_feature_animation_shape_width(self):
+        from trellmlx.modules.attention import _source_cuda_long_row_softmax
+
+        scores = mx.zeros((1, 1, 1, 3436), dtype=mx.float32)
+        actual = _source_cuda_long_row_softmax(scores)
+        mx.eval(actual)
+
+        expected = np.full((1, 1, 1, 3436), 1.0 / 3436.0, dtype=np.float32)
+        assert np.array_equal(np.asarray(actual), expected)
+
     def test_source_cuda_softmax_accepts_exact_shape_support_width(self):
         from trellmlx.modules.attention import _source_cuda_long_row_softmax
 
@@ -381,6 +391,9 @@ class TestScaledDotProductAttention:
         monkeypatch.setattr(attention.mx.fast, "scaled_dot_product_attention", fast)
         q = mx.ones((1, 1, 2, 4), dtype=mx.bfloat16)
         sparse_kv = mx.ones((1, 1, 4096, 4), dtype=mx.bfloat16)
+        feature_animation_shape_kv = mx.ones(
+            (1, 1, 3436, 4), dtype=mx.bfloat16
+        )
         exact_shape_kv = mx.ones((1, 1, 6022, 4), dtype=mx.bfloat16)
         self_kv = mx.ones((1, 1, 7697, 4), dtype=mx.bfloat16)
         cross_kv = mx.ones((1, 1, 1029, 4), dtype=mx.bfloat16)
@@ -388,6 +401,11 @@ class TestScaledDotProductAttention:
 
         sparse_out = attention.scaled_dot_product_attention(
             q, sparse_kv, sparse_kv
+        )
+        feature_animation_shape_out = attention.scaled_dot_product_attention(
+            q,
+            feature_animation_shape_kv,
+            feature_animation_shape_kv,
         )
         exact_shape_out = attention.scaled_dot_product_attention(
             q, exact_shape_kv, exact_shape_kv
@@ -397,10 +415,17 @@ class TestScaledDotProductAttention:
         unsupported_out = attention.scaled_dot_product_attention(
             q, unsupported_kv, unsupported_kv
         )
-        mx.eval(exact_shape_out, self_out, cross_out, unsupported_out)
+        mx.eval(
+            feature_animation_shape_out,
+            exact_shape_out,
+            self_out,
+            cross_out,
+            unsupported_out,
+        )
 
         assert calls == [
             ("manual", 4096),
+            ("manual", 3436),
             ("manual", 6022),
             ("manual", 7697),
             ("manual", 1029),
@@ -408,6 +433,10 @@ class TestScaledDotProductAttention:
         ]
         assert np.array_equal(
             np.asarray(sparse_out.astype(mx.float32)),
+            np.full(q.shape, 2.0, dtype=np.float32),
+        )
+        assert np.array_equal(
+            np.asarray(feature_animation_shape_out.astype(mx.float32)),
             np.full(q.shape, 2.0, dtype=np.float32),
         )
         assert np.array_equal(

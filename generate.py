@@ -214,7 +214,7 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     elif backend_requested in {"fast", "mlx-fast"}:
         backend_effective = "fast"
     elif backend_requested == "source-cuda-self":
-        backend_effective = "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        backend_effective = "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     else:
         raise ValueError(
             "TRELLIS2MLX_ATTENTION_BACKEND must be one of "
@@ -255,10 +255,10 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
                 "source-cuda-sequential value projection"
             )
         softmax_effective = (
-            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
         )
         value_effective = (
-            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
         )
     else:
         softmax_effective = "fused-fast-attention"

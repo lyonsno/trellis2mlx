@@ -497,10 +497,10 @@ def build_route_identity(
                 "source-cuda-sequential value projection"
             )
         shape_attention_softmax_effective = (
-            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
         )
         shape_attention_value_effective = (
-            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
         )
     else:
         shape_attention_softmax_effective = "fused-fast-attention"
@@ -2513,7 +2513,7 @@ def _normalize_attention_backend(requested: str) -> str:
     if requested in {"fast", "mlx-fast"}:
         return "fast"
     if requested == "source-cuda-self":
-        return "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        return "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     return f"unsupported:{requested}"
 
 

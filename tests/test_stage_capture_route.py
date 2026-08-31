@@ -1062,7 +1062,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_step_route(tmp_path):
         command.index("--shape-flow-attention-value-backend") + 1
     ] == "source-cuda-sequential"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
 
 
@@ -1130,7 +1130,7 @@ def test_stage_capture_wrapper_exposes_shape_flow_steps_route(tmp_path):
         "source-cuda-self"
     )
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
 
 
@@ -1765,12 +1765,12 @@ def _write_valid_shape_flow_step_checkpoint(
     steps=8,
     tokens=2,
     channels=4,
-    attention_backend_effective="source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise",
+    attention_backend_effective="source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise",
     attention_softmax_backend_effective=(
-        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
     ),
     attention_value_backend_effective=(
-        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
     ),
 ):
     import json
@@ -3173,13 +3173,13 @@ def test_shape_flow_source_cuda_self_route_records_width_scoped_effective_identi
     )
     assert route["shape_flow_attention_backend_requested"] == "source-cuda-self"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_value_backend_effective"] == (
-        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_gelu_backend_effective"] == (
         "source-cuda-bf16-table-formula-otherwise"
@@ -3207,13 +3207,13 @@ def test_generate_source_cuda_self_route_records_authenticated_widths(
     route = generate._shape_flow_attention_route_from_env()
 
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_value_backend_effective"] == (
-        "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_gelu_backend_effective"] == (
         "source-cuda-bf16-table-formula-otherwise"
@@ -3713,19 +3713,19 @@ def test_shape_flow_attention_matching_metadata_cannot_validate_partial_first_st
             rope_backend=np.array("mlx-real"),
             shape_flow_attention_backend_requested=np.array("source-cuda-self"),
             shape_flow_attention_backend_effective=np.array(
-                "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+                "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_attention_softmax_backend_requested=np.array(
                 "source-cuda-turing"
             ),
             shape_flow_attention_softmax_backend_effective=np.array(
-                "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+                "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_attention_value_backend_requested=np.array(
                 "source-cuda-sequential"
             ),
             shape_flow_attention_value_backend_effective=np.array(
-                "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+                "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
             ),
             shape_flow_gelu_backend_effective=np.array(
                 "source-cuda-bf16-table-formula-otherwise"
@@ -3819,7 +3819,7 @@ def test_shape_flow_attention_complete_first_step_primary_binds_route(
     assert report["primary_output_validation"]["token_count"] == 2
     assert report["route_identity"]["route"][
         "shape_flow_attention_backend_effective"
-    ] == "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+    ] == "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
 
 
 def test_generate_scopes_shape_attention_and_restores_texture_route(monkeypatch):
@@ -3843,7 +3843,7 @@ def test_generate_scopes_shape_attention_and_restores_texture_route(monkeypatch)
     texture_route = generate._restore_attention_route_env(baseline)
 
     assert shape_route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert texture_route["shape_flow_attention_backend_effective"] == "fast"
     assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "fast"
@@ -3990,15 +3990,15 @@ def _final_glb_expected_route():
         "sparse_flow_rope_phase_lut_content_sha256_effective": None,
         "shape_flow_attention_backend_requested": "source-cuda-self",
         "shape_flow_attention_backend_effective": (
-            "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_attention_softmax_backend_requested": "source-cuda-turing",
         "shape_flow_attention_softmax_backend_effective": (
-            "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_attention_value_backend_requested": "source-cuda-sequential",
         "shape_flow_attention_value_backend_effective": (
-            "source-cuda-sequential-widths-1029-4096-6022-7697-fast-otherwise"
+            "source-cuda-sequential-widths-1029-3436-4096-6022-7697-fast-otherwise"
         ),
         "shape_flow_gelu_backend_effective": (
             "source-cuda-bf16-table-formula-otherwise"
@@ -4491,10 +4491,10 @@ def test_generate_configures_shape_flow_attention_route_for_first_step(
 
     assert os.environ["TRELLIS2MLX_ATTENTION_BACKEND"] == "source-cuda-self"
     assert route["shape_flow_attention_backend_effective"] == (
-        "source-cuda-self-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-self-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
     assert route["shape_flow_attention_softmax_backend_effective"] == (
-        "source-cuda-turing-widths-1029-4096-6022-7697-fast-otherwise"
+        "source-cuda-turing-widths-1029-3436-4096-6022-7697-fast-otherwise"
     )
 
 

@@ -261,10 +261,10 @@ def _source_cuda_long_row_softmax(scores: mx.array) -> mx.array:
     if scores.dtype != mx.float32:
         raise ValueError("softmax scores must use float32")
     width = int(scores.shape[-1])
-    if width not in {1029, 4096, 6022, 7697}:
+    if width not in {1029, 3436, 4096, 6022, 7697}:
         raise ValueError(
             "source CUDA softmax requires an authenticated width of "
-            "1029, 4096, 6022, or 7697"
+            "1029, 3436, 4096, 6022, or 7697"
         )
     row_count = scores.size // scores.shape[-1]
     if row_count <= 0:
@@ -583,7 +583,7 @@ def scaled_dot_product_attention_for_backend(
                 "source-cuda-self requires source-cuda-turing softmax and "
                 "source-cuda-sequential value projection"
             )
-        if k.shape[-2] in {1029, 4096, 6022, 7697}:
+        if k.shape[-2] in {1029, 3436, 4096, 6022, 7697}:
             return _manual_scaled_dot_product_attention(
                 q,
                 k,
