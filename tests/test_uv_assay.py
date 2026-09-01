@@ -162,6 +162,48 @@ class TestUVAssaySmooth:
         _print_report(report)
         assert report["pixel_coverage_pct"] > 10
 
+    def test_xatlas_winding_repair_is_explicitly_routed(self, monkeypatch):
+        import trellmlx.texture_bake as texture_bake
+
+        observed = {}
+
+        class FakeChartOptions:
+            def __init__(self):
+                self.max_iterations = 1
+                self.fix_winding = False
+
+        class FakeAtlas:
+            def add_mesh(self, vertices, faces):
+                observed["vertices"] = vertices.copy()
+                observed["faces"] = faces.copy()
+
+            def generate(self, *, chart_options):
+                observed["max_iterations"] = chart_options.max_iterations
+                observed["fix_winding"] = chart_options.fix_winding
+
+            def __getitem__(self, index):
+                assert index == 0
+                vertices = observed["vertices"]
+                faces = observed["faces"]
+                return (
+                    np.arange(len(vertices), dtype=np.uint32),
+                    faces.astype(np.uint32),
+                    np.zeros((len(vertices), 2), dtype=np.float32),
+                )
+
+        fake_xatlas = type(
+            "FakeXatlas",
+            (),
+            {"ChartOptions": FakeChartOptions, "Atlas": FakeAtlas},
+        )
+        monkeypatch.setitem(__import__("sys").modules, "xatlas", fake_xatlas)
+
+        verts, faces = _make_shoe_like_mesh()
+        texture_bake.uv_unwrap(verts, faces, fix_winding=True)
+
+        assert observed["max_iterations"] == 0
+        assert observed["fix_winding"] is True
+
     def test_lscm(self):
         from trellmlx.texture_bake import uv_unwrap_lscm
         verts, faces = _make_shoe_like_mesh()

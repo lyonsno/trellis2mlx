@@ -14,7 +14,7 @@ Pipeline:
 import numpy as np
 
 
-def uv_unwrap(vertices, faces):
+def uv_unwrap(vertices, faces, *, fix_winding=False):
     """UV unwrap a mesh using xatlas.
 
     Uses max_iterations=0 to skip iterative chart boundary refinement,
@@ -22,9 +22,14 @@ def uv_unwrap(vertices, faces):
     real TRELLIS.2 meshes). Chart quality is still good — the iteration
     only refines boundary placement, not the parameterization.
 
+    Xatlas winding repair is caller-selected because it can materially change
+    UV coordinates even when geometry, face order, and chart count stay fixed.
+
     Args:
         vertices: [V, 3] float32
         faces: [F, 3] int
+        fix_winding: Ask xatlas to account for inconsistent input winding while
+            generating UV coordinates. Defaults to False for compatibility.
 
     Returns:
         new_vertices: [V', 3] float32 (may have more vertices due to seam splits)
@@ -36,6 +41,7 @@ def uv_unwrap(vertices, faces):
 
     chart_options = xatlas.ChartOptions()
     chart_options.max_iterations = 0
+    chart_options.fix_winding = bool(fix_winding)
 
     atlas = xatlas.Atlas()
     atlas.add_mesh(vertices.astype(np.float32), faces.astype(np.uint32))

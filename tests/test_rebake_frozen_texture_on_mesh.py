@@ -72,6 +72,39 @@ def test_texture_backend_is_bound_to_production_vocabulary(monkeypatch):
         MODULE.parse_args()
 
 
+def test_xatlas_winding_repair_is_explicit_and_rejects_other_uv_routes(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            str(SCRIPT),
+            "--mesh",
+            "mesh.ply",
+            "--texture-checkpoint-dir",
+            "checkpoints",
+            "--output",
+            "output.glb",
+            "--report",
+            "report.json",
+            "--mesh-grid-size",
+            "512",
+            "--uv-method",
+            "xatlas",
+            "--xatlas-fix-winding",
+        ],
+    )
+
+    args = MODULE.parse_args()
+    assert args.xatlas_fix_winding is True
+    unwrap = MODULE.select_unwrap(
+        args.uv_method,
+        xatlas_fix_winding=args.xatlas_fix_winding,
+    )
+    assert unwrap.keywords == {"fix_winding": True}
+
+    with pytest.raises(ValueError, match="only applies to xatlas"):
+        MODULE.select_unwrap("cube", xatlas_fix_winding=True)
+
+
 def test_validate_output_paths_rejects_aliases_and_existing_outputs(tmp_path):
     mesh = (tmp_path / "mesh.ply").resolve()
     texture_npz = (tmp_path / "texture.npz").resolve()

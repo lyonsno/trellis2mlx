@@ -9,6 +9,7 @@ remain frozen while only the finalized mesh surface changes.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import os
@@ -35,11 +36,13 @@ def require_sha256(path: Path, expected: str | None) -> str:
     return actual
 
 
-def select_unwrap(method: str):
+def select_unwrap(method: str, *, xatlas_fix_winding: bool = False):
     from trellmlx.texture_bake import uv_unwrap, uv_unwrap_cube, uv_unwrap_lscm
 
     if method == "xatlas":
-        return uv_unwrap
+        return partial(uv_unwrap, fix_winding=xatlas_fix_winding)
+    if xatlas_fix_winding:
+        raise ValueError("--xatlas-fix-winding only applies to xatlas UV unwrap")
     if method == "cube":
         return uv_unwrap_cube
     if method == "lscm":
@@ -57,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--texture-size", type=int, default=512)
     parser.add_argument(
         "--uv-method", choices=("xatlas", "cube", "lscm"), default="xatlas"
+    )
+    parser.add_argument(
+        "--xatlas-fix-winding",
+        action="store_true",
+        help=(
+            "Ask xatlas to account for inconsistent input winding while "
+            "generating UV coordinates; valid only with --uv-method xatlas."
+        ),
     )
     parser.add_argument(
         "--texture-backend",
@@ -144,7 +155,10 @@ def main() -> None:
             f"{checkpoint_grid_size} != {args.mesh_grid_size}"
         )
 
-    unwrap = select_unwrap(args.uv_method)
+    unwrap = select_unwrap(
+        args.uv_method,
+        xatlas_fix_winding=args.xatlas_fix_winding,
+    )
     unwrap_started = time.perf_counter()
     uv_vertices, uv_faces, uvs, vmapping = unwrap(vertices, faces)
     unwrap_seconds = time.perf_counter() - unwrap_started
@@ -219,6 +233,7 @@ def main() -> None:
             "mesh_cleanup": False,
             "mesh_simplification": False,
             "uv_method": args.uv_method,
+            "xatlas_fix_winding": bool(args.xatlas_fix_winding),
             "texture_backend": args.texture_backend,
             "texture_size": args.texture_size,
         },
