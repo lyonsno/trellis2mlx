@@ -41,13 +41,48 @@ from ..modules.rope import build_sparse_rope_phases
 
 
 _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS = (0, 308, 616, 924, 1232, 1536)
-_SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS = (6022, 6038)
-_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS = (3436,)
-_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = (
-    *_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS,
-    *_SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS,
+_SOURCE_CUDA_FEATURE_TERMINAL_LINEAR_PARTITIONS = (0, 384, 768, 1152, 1536)
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_CONTRACTS = {
+    3436: {
+        "algorithm": "four-contiguous-fp32-fma-partitions-with-bias-epilogue",
+        "authenticated_rows": (3436,),
+        "partition_bounds": _SOURCE_CUDA_FEATURE_TERMINAL_LINEAR_PARTITIONS,
+        "source_recurrence_sha256": (
+            "0a13c73936e10e25f4cb93b8bbc0f26e634d9db7ee2a64a3f181a783bb98bba9",
+        ),
+        "cuda_prefix_ladder_sha256": (
+            "2c4cb6cf9c075b04b8a376e09fbe94d0d875d7cab4820b857380854f1b8112c2"
+        ),
+    },
+    6022: {
+        "algorithm": "five-contiguous-fp32-fma-partitions-with-bias-epilogue",
+        "authenticated_rows": (6022, 6038),
+        "partition_bounds": _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS,
+        "source_recurrence_sha256": (
+            "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f",
+            "ebde6bc1f271813801e44a312da8077d7c46cf5092f7dfee8b0100e48e3d874c",
+        ),
+        "cuda_prefix_ladder_sha256": (
+            "b21bad4d52e8202efdeec5a87af4fa9b52edaa7d513bd57fddf393a6f80dd6cc"
+        ),
+    },
+    6038: {
+        "algorithm": "five-contiguous-fp32-fma-partitions-with-bias-epilogue",
+        "authenticated_rows": (6022, 6038),
+        "partition_bounds": _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS,
+        "source_recurrence_sha256": (
+            "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f",
+            "ebde6bc1f271813801e44a312da8077d7c46cf5092f7dfee8b0100e48e3d874c",
+        ),
+        "cuda_prefix_ladder_sha256": (
+            "b21bad4d52e8202efdeec5a87af4fa9b52edaa7d513bd57fddf393a6f80dd6cc"
+        ),
+    },
+}
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = tuple(
+    _SOURCE_CUDA_T4_TERMINAL_LINEAR_CONTRACTS
 )
-_source_cuda_terminal_linear_kernel = None
+_source_cuda_terminal_linear_kernels = {}
 
 
 def shape_flow_terminal_linear_backend_identity(
@@ -72,52 +107,31 @@ def shape_flow_terminal_linear_backend_identity(
         and output_width == 32
         and has_bias
     ):
-        identity = {
+        contract = _SOURCE_CUDA_T4_TERMINAL_LINEAR_CONTRACTS[row_count]
+        return {
             "backend": "source-cuda-t4-volta-sgemm-32x128-tn-metal",
-            "algorithm": "five-contiguous-fp32-fma-partitions-with-bias-epilogue",
+            "algorithm": contract["algorithm"],
             "experimental": True,
             "cuda_source_kernel": "volta_sgemm_32x128_tn",
             "authenticated_contract": {
-                "rows": list(
-                    _SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS
-                ),
+                "rows": list(contract["authenticated_rows"]),
                 "input_width": 1536,
                 "output_width": 32,
                 "input_dtype": "float32",
                 "weight_dtype": "float32",
                 "bias_dtype": "float32",
                 "output_dtype": "float32",
-                "partition_bounds": list(
-                    _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
-                ),
+                "partition_bounds": list(contract["partition_bounds"]),
                 "cuda_device_anchor": "Tesla T4 sm_75",
                 "torch_anchor": "2.10.0+cu128",
-                "source_recurrence_sha256": [
-                    "5dd57e90fad742e37a345d2e19bf484298577cd5d84336371c8793f587ca947f",
-                    "ebde6bc1f271813801e44a312da8077d7c46cf5092f7dfee8b0100e48e3d874c",
-                ],
-                "cuda_prefix_ladder_sha256": (
-                    "b21bad4d52e8202efdeec5a87af4fa9b52edaa7d513bd57fddf393a6f80dd6cc"
+                "source_recurrence_sha256": list(
+                    contract["source_recurrence_sha256"]
                 ),
+                "cuda_prefix_ladder_sha256": contract[
+                    "cuda_prefix_ladder_sha256"
+                ],
             },
         }
-        if row_count in _SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS:
-            identity["provisional_contract"] = {
-                "rows": list(_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS),
-                "input_width": 1536,
-                "output_width": 32,
-                "input_dtype": "float32",
-                "weight_dtype": "float32",
-                "bias_dtype": "float32",
-                "output_dtype": "float32",
-                "partition_bounds": list(
-                    _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
-                ),
-                "external_admission": (
-                    "pending-paired-source-cuda-terminal-comparison"
-                ),
-            }
-        return identity
     if source_cuda_terminal:
         return {
             "backend": "numpy-fp32-blas",
@@ -156,7 +170,7 @@ def _source_cuda_t4_terminal_linear(
     linear: nn.Linear,
 ) -> mx.array:
     """Execute the observed T4 SGEMM reduction law for terminal projection."""
-    global _source_cuda_terminal_linear_kernel
+    global _source_cuda_terminal_linear_kernels
 
     if x.ndim != 2 or x.shape[1] != 1536:
         raise ValueError("T4 terminal linear requires rank-2 width-1536 input")
@@ -165,12 +179,21 @@ def _source_cuda_t4_terminal_linear(
     if linear.bias is None or linear.bias.shape != (32,):
         raise ValueError("T4 terminal linear requires width-32 bias")
 
-    if _source_cuda_terminal_linear_kernel is None:
+    rows = int(x.shape[0])
+    contract = _SOURCE_CUDA_T4_TERMINAL_LINEAR_CONTRACTS.get(rows)
+    partition_bounds = (
+        _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
+        if contract is None
+        else contract["partition_bounds"]
+    )
+    kernel = _source_cuda_terminal_linear_kernels.get(partition_bounds)
+    if kernel is None:
         source = r"""
                 constexpr uint reduction = 1536;
                 constexpr uint columns = 32;
-                constexpr uint partition_bounds[6] = {
-                    0, 308, 616, 924, 1232, 1536
+                constexpr uint partition_count = __PARTITION_COUNT__;
+                constexpr uint partition_bounds[__BOUND_COUNT__] = {
+                    __PARTITION_BOUNDS__
                 };
 
                 uint output_index = thread_position_in_grid.x;
@@ -185,7 +208,7 @@ def _source_cuda_t4_terminal_linear(
                 uint weight_offset = column * reduction;
                 float accumulator = bias[column];
 
-                for (uint partition = 0; partition < 5; ++partition) {
+                for (uint partition = 0; partition < partition_count; ++partition) {
                     float partial = 0.0f;
                     for (uint k = partition_bounds[partition];
                          k < partition_bounds[partition + 1];
@@ -198,19 +221,28 @@ def _source_cuda_t4_terminal_linear(
                     accumulator = accumulator + partial;
                 }
                 out[output_index] = accumulator;
-            """
-        _source_cuda_terminal_linear_kernel = mx.fast.metal_kernel(
-            name="shape_flow_source_cuda_t4_terminal_linear_fp32",
+            """.replace(
+            "__PARTITION_COUNT__", str(len(partition_bounds) - 1)
+        ).replace(
+            "__BOUND_COUNT__", str(len(partition_bounds))
+        ).replace(
+            "__PARTITION_BOUNDS__", ", ".join(map(str, partition_bounds))
+        )
+        kernel = mx.fast.metal_kernel(
+            name=(
+                "shape_flow_source_cuda_t4_terminal_linear_fp32_"
+                f"p{len(partition_bounds) - 1}"
+            ),
             input_names=["inp", "weight", "bias", "row_count"],
             output_names=["out"],
             source=source,
             ensure_row_contiguous=True,
         )
+        _source_cuda_terminal_linear_kernels[partition_bounds] = kernel
 
-    rows = int(x.shape[0])
     output_count = rows * 32
     grid_size = ((output_count + 255) // 256) * 256
-    return _source_cuda_terminal_linear_kernel(
+    return kernel(
         inputs=[
             x.astype(mx.float32),
             linear.weight.astype(mx.float32),

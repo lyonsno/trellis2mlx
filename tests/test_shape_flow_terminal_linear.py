@@ -7,6 +7,7 @@ import numpy as np
 
 
 PARTITION_BOUNDS = (0, 308, 616, 924, 1232, 1536)
+FEATURE_PARTITION_BOUNDS = (0, 384, 768, 1152, 1536)
 
 
 def _round_to_bfloat16_float32(value: np.ndarray) -> np.ndarray:
@@ -28,9 +29,11 @@ def _source_partitioned_reference(
     x: np.ndarray,
     weight: np.ndarray,
     bias: np.ndarray,
+    *,
+    partition_bounds: tuple[int, ...] = PARTITION_BOUNDS,
 ) -> np.ndarray:
     output = np.broadcast_to(bias, (x.shape[0], weight.shape[0])).copy()
-    for start, stop in zip(PARTITION_BOUNDS[:-1], PARTITION_BOUNDS[1:]):
+    for start, stop in zip(partition_bounds[:-1], partition_bounds[1:]):
         partial = np.zeros_like(output)
         for reduction_index in range(start, stop):
             partial = _fma_float32(
@@ -84,6 +87,38 @@ def test_source_cuda_terminal_linear_reproduces_authenticated_partition_schedule
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint32),
         expected.view(np.uint32),
+    )
+
+
+def test_source_cuda_terminal_linear_uses_authenticated_feature_schedule():
+    import mlx.core as mx
+
+    from trellmlx.models.slat_flow import _source_cuda_t4_terminal_linear
+
+    rng = np.random.default_rng(81414)
+    active_row = rng.standard_normal((1, 1536), dtype=np.float32)
+    x = np.zeros((3436, 1536), dtype=np.float32)
+    x[0] = active_row[0]
+    weight = _round_to_bfloat16_float32(
+        rng.standard_normal((32, 1536), dtype=np.float32) * 0.03
+    )
+    bias = _round_to_bfloat16_float32(
+        rng.standard_normal(32, dtype=np.float32) * 0.03
+    )
+    expected = _source_partitioned_reference(
+        active_row,
+        weight,
+        bias,
+        partition_bounds=FEATURE_PARTITION_BOUNDS,
+    )
+
+    linear = SimpleNamespace(weight=mx.array(weight), bias=mx.array(bias))
+    actual = _source_cuda_t4_terminal_linear(mx.array(x), linear)
+    mx.eval(actual)
+
+    np.testing.assert_array_equal(
+        np.asarray(actual[0]).view(np.uint32),
+        expected[0].view(np.uint32),
     )
 
 
@@ -142,10 +177,20 @@ def test_terminal_linear_backend_identity_names_geometry_and_source_evidence():
     assert feature_animation_candidate["backend"] == (
         "source-cuda-t4-volta-sgemm-32x128-tn-metal"
     )
-    assert feature_animation_candidate["provisional_contract"]["rows"] == [3436]
-    assert feature_animation_candidate["provisional_contract"][
-        "external_admission"
-    ] == "pending-paired-source-cuda-terminal-comparison"
+    assert "provisional_contract" not in feature_animation_candidate
+    assert feature_animation_candidate["algorithm"] == (
+        "four-contiguous-fp32-fma-partitions-with-bias-epilogue"
+    )
+    assert feature_animation_candidate["authenticated_contract"]["rows"] == [3436]
+    assert feature_animation_candidate["authenticated_contract"][
+        "partition_bounds"
+    ] == [0, 384, 768, 1152, 1536]
+    assert feature_animation_candidate["authenticated_contract"][
+        "source_recurrence_sha256"
+    ] == ["0a13c73936e10e25f4cb93b8bbc0f26e634d9db7ee2a64a3f181a783bb98bba9"]
+    assert feature_animation_candidate["authenticated_contract"][
+        "cuda_prefix_ladder_sha256"
+    ] == "2c4cb6cf9c075b04b8a376e09fbe94d0d875d7cab4820b857380854f1b8112c2"
     assert exact["cuda_source_kernel"] == "volta_sgemm_32x128_tn"
     assert exact["authenticated_contract"]["rows"] == [6022, 6038]
     assert exact["authenticated_contract"]["partition_bounds"] == [
