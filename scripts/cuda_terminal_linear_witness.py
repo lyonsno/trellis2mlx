@@ -271,6 +271,8 @@ def run(args: argparse.Namespace) -> int:
     input_path = Path(args.input).resolve()
     output_npz = Path(args.output_npz).resolve()
     output_json = Path(args.output_json).resolve()
+    expected_rows = getattr(args, "expected_rows", EXPECTED_ROWS)
+    expected_step_index = getattr(args, "expected_step_index", STEP_INDEX)
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "status": "running",
@@ -287,6 +289,8 @@ def run(args: argparse.Namespace) -> int:
             "model_checkpoint_sha256": args.expected_model_checkpoint_sha256,
             "device": EXPECTED_DEVICE,
             "torch": EXPECTED_TORCH,
+            "rows": expected_rows,
+            "shape_flow_step_index": expected_step_index,
             "prefix_count": INPUT_CHANNELS + 1,
         },
         "phase_timings": {},
@@ -315,6 +319,8 @@ def run(args: argparse.Namespace) -> int:
             expected_model_checkpoint_sha256=(
                 args.expected_model_checkpoint_sha256
             ),
+            expected_rows=expected_rows,
+            step_index=expected_step_index,
         )
         report["effective_input"] = {
             "path": str(input_path),
@@ -413,7 +419,7 @@ def run(args: argparse.Namespace) -> int:
 
         phase = "capture_prefix_ladder"
         phase_started = time.perf_counter()
-        selected_rows_np = _default_probe_rows(EXPECTED_ROWS)
+        selected_rows_np = _default_probe_rows(expected_rows)
         selected_rows = torch.from_numpy(selected_rows_np).to(
             device=CUDA_DEVICE
         )
@@ -460,6 +466,8 @@ def run(args: argparse.Namespace) -> int:
             "model_checkpoint_sha256": (
                 args.expected_model_checkpoint_sha256
             ),
+            "rows": expected_rows,
+            "shape_flow_step_index": expected_step_index,
             "cuda": report["effective_cuda"],
             "prefix_count": INPUT_CHANNELS + 1,
             "selected_rows": selected_rows_np.tolist(),
@@ -523,6 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-mlx-exact-state-trace-sha256", required=True
     )
     parser.add_argument("--expected-model-checkpoint-sha256", required=True)
+    parser.add_argument("--expected-rows", type=int, default=EXPECTED_ROWS)
+    parser.add_argument(
+        "--expected-step-index", type=int, default=STEP_INDEX
+    )
     return parser
 
 

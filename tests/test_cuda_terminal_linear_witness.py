@@ -231,6 +231,49 @@ def test_pre_cuda_failure_removes_stale_primary_before_preflight(
     assert not output_npz.exists()
 
 
+def test_run_forwards_requested_row_geometry_to_input_validation(
+    tmp_path, monkeypatch
+):
+    import scripts.cuda_terminal_linear_witness as witness
+
+    input_path = tmp_path / "input.npz"
+    output_npz = tmp_path / "output.npz"
+    output_json = tmp_path / "output.json"
+    input_path.write_bytes(b"row-bound-input")
+    observed = []
+
+    monkeypatch.setattr(witness, "sha256_file", lambda path: "f" * 64)
+    monkeypatch.setattr(witness, "_load_npz", lambda path: {})
+
+    def observe_validation(*args, **kwargs):
+        del args
+        observed.append((kwargs["expected_rows"], kwargs["step_index"]))
+        raise RuntimeError("stop after geometry validation")
+
+    monkeypatch.setattr(witness, "validate_witness_arrays", observe_validation)
+
+    result = witness.run(
+        Namespace(
+            input=str(input_path),
+            output_npz=str(output_npz),
+            output_json=str(output_json),
+            expected_input_sha256="f" * 64,
+            expected_source_recurrence_sha256="a" * 64,
+            expected_mlx_exact_state_trace_sha256="b" * 64,
+            expected_model_checkpoint_sha256="c" * 64,
+            expected_rows=3436,
+            expected_step_index=0,
+        )
+    )
+
+    report = json.loads(output_json.read_text())
+    assert result == 1
+    assert observed == [(3436, 0)]
+    assert report["requested"]["rows"] == 3436
+    assert report["requested"]["shape_flow_step_index"] == 0
+    assert report["failure_phase"] == "preflight_input"
+
+
 def test_cuda_identity_binds_tensor_execution_to_authenticated_device_zero(
     tmp_path, monkeypatch
 ):
