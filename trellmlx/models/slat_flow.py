@@ -41,7 +41,12 @@ from ..modules.rope import build_sparse_rope_phases
 
 
 _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS = (0, 308, 616, 924, 1232, 1536)
-_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = (6022, 6038)
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS = (6022, 6038)
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS = (3436,)
+_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS = (
+    *_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS,
+    *_SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS,
+)
 _source_cuda_terminal_linear_kernel = None
 
 
@@ -67,13 +72,15 @@ def shape_flow_terminal_linear_backend_identity(
         and output_width == 32
         and has_bias
     ):
-        return {
+        identity = {
             "backend": "source-cuda-t4-volta-sgemm-32x128-tn-metal",
             "algorithm": "five-contiguous-fp32-fma-partitions-with-bias-epilogue",
             "experimental": True,
             "cuda_source_kernel": "volta_sgemm_32x128_tn",
             "authenticated_contract": {
-                "rows": list(_SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS),
+                "rows": list(
+                    _SOURCE_CUDA_T4_TERMINAL_LINEAR_AUTHENTICATED_ROWS
+                ),
                 "input_width": 1536,
                 "output_width": 32,
                 "input_dtype": "float32",
@@ -94,6 +101,23 @@ def shape_flow_terminal_linear_backend_identity(
                 ),
             },
         }
+        if row_count in _SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS:
+            identity["provisional_contract"] = {
+                "rows": list(_SOURCE_CUDA_T4_TERMINAL_LINEAR_PROVISIONAL_ROWS),
+                "input_width": 1536,
+                "output_width": 32,
+                "input_dtype": "float32",
+                "weight_dtype": "float32",
+                "bias_dtype": "float32",
+                "output_dtype": "float32",
+                "partition_bounds": list(
+                    _SOURCE_CUDA_TERMINAL_LINEAR_PARTITIONS
+                ),
+                "external_admission": (
+                    "pending-paired-source-cuda-terminal-comparison"
+                ),
+            }
+        return identity
     if source_cuda_terminal:
         return {
             "backend": "numpy-fp32-blas",
@@ -204,7 +228,7 @@ def _source_cuda_terminal_linear(
     x: mx.array,
     linear: nn.Linear,
 ) -> mx.array:
-    """Dispatch only source-authenticated terminal projection schedules."""
+    """Dispatch authenticated and explicitly provisional source schedules."""
     if (
         x.ndim == 2
         and x.shape[0] in _SOURCE_CUDA_T4_TERMINAL_LINEAR_ROWS

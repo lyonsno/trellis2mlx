@@ -106,6 +106,13 @@ def test_terminal_linear_backend_identity_names_geometry_and_source_evidence():
         has_bias=True,
         source_cuda_terminal=True,
     )
+    feature_animation_candidate = shape_flow_terminal_linear_backend_identity(
+        3436,
+        input_width=1536,
+        output_width=32,
+        has_bias=True,
+        source_cuda_terminal=True,
+    )
     fallback = shape_flow_terminal_linear_backend_identity(
         8,
         input_width=1536,
@@ -132,6 +139,13 @@ def test_terminal_linear_backend_identity_names_geometry_and_source_evidence():
     assert exact_cuda_support["backend"] == (
         "source-cuda-t4-volta-sgemm-32x128-tn-metal"
     )
+    assert feature_animation_candidate["backend"] == (
+        "source-cuda-t4-volta-sgemm-32x128-tn-metal"
+    )
+    assert feature_animation_candidate["provisional_contract"]["rows"] == [3436]
+    assert feature_animation_candidate["provisional_contract"][
+        "external_admission"
+    ] == "pending-paired-source-cuda-terminal-comparison"
     assert exact["cuda_source_kernel"] == "volta_sgemm_32x128_tn"
     assert exact["authenticated_contract"]["rows"] == [6022, 6038]
     assert exact["authenticated_contract"]["partition_bounds"] == [
@@ -150,7 +164,7 @@ def test_terminal_linear_backend_identity_names_geometry_and_source_evidence():
         "ebde6bc1f271813801e44a312da8077d7c46cf5092f7dfee8b0100e48e3d874c",
     ]
     assert fallback["backend"] == "numpy-fp32-blas"
-    assert fallback["excluded_row_geometry"] == [6022, 6038]
+    assert fallback["excluded_row_geometry"] == [3436, 6022, 6038]
     assert wrong_output_width["backend"] == "numpy-fp32-blas"
     assert native["backend"] == "mlx-native-linear"
 
@@ -160,6 +174,7 @@ def test_terminal_linear_dispatch_selects_exact_geometry_only(monkeypatch):
 
     exact = SimpleNamespace(ndim=2, shape=(6038, 1536))
     exact_cuda_support = SimpleNamespace(ndim=2, shape=(6022, 1536))
+    feature_animation_candidate = SimpleNamespace(ndim=2, shape=(3436, 1536))
     fallback = SimpleNamespace(ndim=2, shape=(8, 1536))
     linear = SimpleNamespace(
         weight=SimpleNamespace(ndim=2, shape=(32, 1536)),
@@ -171,7 +186,12 @@ def test_terminal_linear_dispatch_selects_exact_geometry_only(monkeypatch):
         "_source_cuda_t4_terminal_linear",
         lambda x, selected_linear: (
             sentinel
-            if (x is exact or x is exact_cuda_support) and selected_linear is linear
+            if (
+                x is exact
+                or x is exact_cuda_support
+                or x is feature_animation_candidate
+            )
+            and selected_linear is linear
             else None
         ),
     )
@@ -179,6 +199,10 @@ def test_terminal_linear_dispatch_selects_exact_geometry_only(monkeypatch):
     assert slat_flow._source_cuda_terminal_linear(exact, linear) is sentinel
     assert (
         slat_flow._source_cuda_terminal_linear(exact_cuda_support, linear)
+        is sentinel
+    )
+    assert (
+        slat_flow._source_cuda_terminal_linear(feature_animation_candidate, linear)
         is sentinel
     )
     assert slat_flow.shape_flow_terminal_linear_backend_identity(
