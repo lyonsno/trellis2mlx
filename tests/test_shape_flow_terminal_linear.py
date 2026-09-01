@@ -122,6 +122,58 @@ def test_source_cuda_terminal_linear_uses_authenticated_feature_schedule():
     )
 
 
+def test_source_cuda_terminal_projection_materializes_custom_kernel_boundary(
+    monkeypatch,
+):
+    import trellmlx.models.slat_flow as slat_flow
+
+    hidden = object()
+    normalized = object()
+    projected = object()
+    linear = object()
+    events = []
+
+    monkeypatch.setattr(
+        slat_flow,
+        "get_shape_flow_layernorm_backend",
+        lambda: slat_flow.CUDA_WELFORD_TURING_T4_BACKEND,
+    )
+    monkeypatch.setattr(
+        slat_flow,
+        "_shape_flow_terminal_layernorm",
+        lambda value, eps: (
+            events.append(("layernorm", value, eps)) or normalized
+        ),
+    )
+    monkeypatch.setattr(
+        slat_flow,
+        "_source_cuda_terminal_linear",
+        lambda value, selected_linear: (
+            events.append(("linear", value, selected_linear)) or projected
+        ),
+    )
+    monkeypatch.setattr(
+        slat_flow.mx,
+        "eval",
+        lambda *values: events.append(("eval", values)),
+    )
+
+    model = SimpleNamespace(shape_flow_layernorm=True, out_layer=linear)
+    actual_norm, actual_output = slat_flow.SLatFlowModel._final_projection(
+        model,
+        hidden,
+        input_dtype=None,
+    )
+
+    assert actual_norm is normalized
+    assert actual_output is projected
+    assert events == [
+        ("layernorm", hidden, 1e-5),
+        ("linear", normalized, linear),
+        ("eval", (normalized, projected)),
+    ]
+
+
 def test_terminal_linear_backend_identity_names_geometry_and_source_evidence():
     from trellmlx.models.slat_flow import (
         shape_flow_terminal_linear_backend_identity,

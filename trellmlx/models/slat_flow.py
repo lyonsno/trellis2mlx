@@ -478,7 +478,13 @@ class SLatFlowModel(nn.Module):
             )
             x = layernorm(x, eps=1e-5)
         if source_cuda_terminal:
-            return x, _source_cuda_terminal_linear(x, self.out_layer)
+            output = _source_cuda_terminal_linear(x, self.out_layer)
+            # Keep the authenticated custom kernels on their own completed
+            # Metal boundary before guidance and scheduler arithmetic consume
+            # the projection. Trace routes already materialize both values;
+            # the ordinary forward must preserve the same composition law.
+            mx.eval(x, output)
+            return x, output
         return x, self.out_layer(x)
 
     def terminal_linear_backend_identity(self, row_count: int) -> dict:
