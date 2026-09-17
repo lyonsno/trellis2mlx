@@ -359,6 +359,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--repair-exterior-surface",
+        action="store_true",
+        help=(
+            "Apply the camera-independent exterior-sheet orientation and "
+            "touching-contour closure law before UV unwrap."
+        ),
+    )
+    parser.add_argument(
         "--texture-backend",
         choices=("cpu", "gpu"),
         default="gpu",
@@ -369,6 +377,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-texture-json-sha256")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def validate_repair_route(args: argparse.Namespace) -> None:
+    if args.repair_exterior_surface and (
+        args.orient_connected_components_outward
+        or args.face_reversal_manifest is not None
+    ):
+        raise ValueError(
+            "--repair-exterior-surface cannot be combined with exact or "
+            "component-only orientation repair options"
+        )
 
 
 def validate_output_paths(
@@ -517,6 +536,7 @@ def make_failure_state(args: argparse.Namespace) -> dict:
                 "face_reversal_manifest": (
                     str(manifest_path) if manifest_path is not None else None
                 ),
+                "repair_exterior_surface": bool(args.repair_exterior_surface),
                 "uv_method": args.uv_method,
                 "xatlas_fix_winding": bool(args.xatlas_fix_winding),
                 "texture_backend": args.texture_backend,
@@ -541,6 +561,11 @@ def make_failure_state(args: argparse.Namespace) -> dict:
                 "source_mesh_sha256": None,
                 "source_mesh_faces": None,
                 "reversed_faces": 0,
+            },
+            "exterior_surface_repair": {
+                "requested": bool(args.repair_exterior_surface),
+                "applied": False,
+                "receipt": None,
             },
         },
         "primary_output": {
@@ -609,12 +634,14 @@ def run(args: argparse.Namespace, state: dict) -> None:
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
     state["phase"] = "implementation_identity"
+    validate_repair_route(args)
     implementation_identity = snapshot_implementation_identity(
         repo_root=repo_root,
         files=(
             script_path,
             repo_root / "trellmlx" / "texture_bake.py",
             repo_root / "trellmlx" / "checkpoint.py",
+            repo_root / "trellmlx" / "exterior_surface_repair.py",
             repo_root / "pyproject.toml",
             repo_root / "uv.lock",
         ),
@@ -677,26 +704,48 @@ def run(args: argparse.Namespace, state: dict) -> None:
     state["effective"]["mesh"].pop("carrier_type")
     vertices = np.asarray(loaded.vertices)
     faces = np.asarray(loaded.faces)
+    source_face_count = int(len(faces))
     state["effective"]["mesh"].update(
         {
             "vertices": int(len(vertices)),
             "faces": int(len(faces)),
         }
     )
-    state["phase"] = "connected_component_orientation"
-    faces, orientation_receipt = prepare_faces_for_bake(
-        vertices,
-        faces,
-        orient_connected_components=args.orient_connected_components_outward,
-        orientation_confidence=args.orientation_confidence,
-    )
-    state["phase"] = "face_reversal_manifest"
-    faces, face_reversal_receipt = apply_face_reversal_manifest(
-        faces,
-        manifest_path=face_reversal_manifest,
-        source_mesh_sha256=mesh_sha256,
-        failure_evidence=state["effective"]["face_reversal"],
-    )
+    if args.repair_exterior_surface:
+        state["phase"] = "exterior_surface_repair"
+        from trellmlx.exterior_surface_repair import repair_exterior_surface
+
+        faces, exterior_surface_receipt = repair_exterior_surface(
+            vertices,
+            faces,
+            component_orientation_confidence=args.orientation_confidence,
+        )
+        orientation_receipt = exterior_surface_receipt["component_orientation"]
+        _, face_reversal_receipt = apply_face_reversal_manifest(
+            np.asarray(loaded.faces),
+            manifest_path=None,
+            source_mesh_sha256=mesh_sha256,
+        )
+        state["effective"]["exterior_surface_repair"] = {
+            "requested": True,
+            "applied": True,
+            "receipt": exterior_surface_receipt,
+        }
+    else:
+        state["phase"] = "connected_component_orientation"
+        faces, orientation_receipt = prepare_faces_for_bake(
+            vertices,
+            faces,
+            orient_connected_components=args.orient_connected_components_outward,
+            orientation_confidence=args.orientation_confidence,
+        )
+        state["phase"] = "face_reversal_manifest"
+        faces, face_reversal_receipt = apply_face_reversal_manifest(
+            faces,
+            manifest_path=face_reversal_manifest,
+            source_mesh_sha256=mesh_sha256,
+            failure_evidence=state["effective"]["face_reversal"],
+        )
     state["effective"]["face_reversal"] = face_reversal_receipt
 
     state["phase"] = "texture_checkpoint_load"
@@ -780,6 +829,10 @@ def run(args: argparse.Namespace, state: dict) -> None:
             "path": str(mesh_path),
             "sha256": mesh_sha256,
             "vertices": int(len(vertices)),
+            "faces": source_face_count,
+        },
+        "repaired_mesh": {
+            "vertices": int(len(vertices)),
             "faces": int(len(faces)),
         },
         "texture_checkpoint": {
@@ -802,6 +855,7 @@ def run(args: argparse.Namespace, state: dict) -> None:
                 if face_reversal_manifest is not None
                 else None
             ),
+            "repair_exterior_surface": bool(args.repair_exterior_surface),
             "uv_method": args.uv_method,
             "xatlas_fix_winding": bool(args.xatlas_fix_winding),
             "texture_backend": args.texture_backend,
@@ -809,6 +863,7 @@ def run(args: argparse.Namespace, state: dict) -> None:
         },
         "connected_component_orientation": orientation_receipt,
         "face_reversal": face_reversal_receipt,
+        "exterior_surface_repair": state["effective"]["exterior_surface_repair"],
         "uv_mesh": {
             "vertices": int(len(uv_vertices)),
             "faces": int(len(uv_faces)),

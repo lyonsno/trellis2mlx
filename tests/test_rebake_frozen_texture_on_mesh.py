@@ -526,6 +526,7 @@ def test_prebake_orientation_is_explicit_and_defaults_off(monkeypatch):
     monkeypatch.setattr("sys.argv", base_args)
     args = MODULE.parse_args()
     assert args.orient_connected_components_outward is False
+    assert args.repair_exterior_surface is False
     assert args.orientation_confidence == 0.5
     assert args.face_reversal_manifest is None
 
@@ -548,6 +549,174 @@ def test_prebake_orientation_is_explicit_and_defaults_off(monkeypatch):
     )
     args = MODULE.parse_args()
     assert args.face_reversal_manifest == Path("crown-subsheet.json")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        base_args + ["--repair-exterior-surface"],
+    )
+    args = MODULE.parse_args()
+    assert args.repair_exterior_surface is True
+
+
+def test_generalized_repair_rejects_exact_repair_composition(monkeypatch):
+    args = MODULE.parse_args
+    base_args = [
+        str(SCRIPT),
+        "--mesh",
+        "mesh.ply",
+        "--texture-checkpoint-dir",
+        "checkpoints",
+        "--output",
+        "output.glb",
+        "--report",
+        "report.json",
+        "--mesh-grid-size",
+        "512",
+        "--repair-exterior-surface",
+        "--face-reversal-manifest",
+        "exact.json",
+    ]
+    monkeypatch.setattr("sys.argv", base_args)
+    parsed = args()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MODULE.validate_repair_route(parsed)
+
+
+def test_generalized_repair_rejects_component_only_repair_composition(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            str(SCRIPT),
+            "--mesh",
+            "mesh.ply",
+            "--texture-checkpoint-dir",
+            "checkpoints",
+            "--output",
+            "output.glb",
+            "--report",
+            "report.json",
+            "--mesh-grid-size",
+            "512",
+            "--repair-exterior-surface",
+            "--orient-connected-components-outward",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MODULE.validate_repair_route(MODULE.parse_args())
+
+
+def test_generalized_run_separates_source_and_repaired_mesh_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import trimesh
+
+    import trellmlx.checkpoint as checkpoint_module
+    import trellmlx.exterior_surface_repair as repair_module
+    import trellmlx.texture_bake as texture_bake_module
+
+    mesh = tmp_path / "source.ply"
+    mesh.write_bytes(b"stable source carrier")
+    checkpoint = tmp_path / "checkpoints"
+    checkpoint.mkdir()
+    (checkpoint / "texture.npz").write_bytes(b"stable texture payload")
+    (checkpoint / "texture.json").write_text("{}\n")
+    output = tmp_path / "output.glb"
+    report = tmp_path / "report.json"
+    vertices = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    source_faces = np.asarray([[0, 1, 2]], dtype=np.int64)
+    repaired_faces = np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+    loaded = trimesh.Trimesh(vertices=vertices, faces=source_faces, process=False)
+    repair_receipt = {
+        "component_orientation": {
+            "components": 1,
+            "flipped_components": 0,
+            "flipped_faces": 0,
+            "min_confidence": 0.5,
+        },
+        "orientation": {"reversed_faces": 0},
+        "bridges": {"accepted_pairs": 1, "pairs": []},
+    }
+
+    monkeypatch.setattr(MODULE, "snapshot_implementation_identity", lambda **_: {})
+    monkeypatch.setattr(trimesh, "load", lambda *_, **__: loaded)
+    monkeypatch.setattr(
+        repair_module,
+        "repair_exterior_surface",
+        lambda *_, **__: (repaired_faces, repair_receipt),
+    )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "load_checkpoint",
+        lambda *_, **__: {
+            "tex_np": np.zeros((1, 4), dtype=np.float32),
+            "tex_coords_spatial": np.zeros((1, 3), dtype=np.float32),
+            "mesh_grid_size": 8,
+        },
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "select_unwrap",
+        lambda *_, **__: lambda actual_vertices, actual_faces: (
+            actual_vertices,
+            actual_faces,
+            np.zeros((len(actual_vertices), 2), dtype=np.float32),
+            np.arange(len(actual_vertices), dtype=np.int64),
+        ),
+    )
+    monkeypatch.setattr(
+        texture_bake_module,
+        "bake_texture",
+        lambda *_, **__: (
+            np.zeros((2, 2, 4), dtype=np.uint8),
+            np.zeros((2, 2, 4), dtype=np.uint8),
+            "OPAQUE",
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            str(SCRIPT),
+            "--mesh",
+            str(mesh),
+            "--texture-checkpoint-dir",
+            str(checkpoint),
+            "--output",
+            str(output),
+            "--report",
+            str(report),
+            "--mesh-grid-size",
+            "8",
+            "--texture-size",
+            "2",
+            "--texture-backend",
+            "cpu",
+            "--repair-exterior-surface",
+        ],
+    )
+    args = MODULE.parse_args()
+
+    MODULE.run(args, MODULE.make_failure_state(args))
+
+    result = json.loads(report.read_text())
+    assert result["mesh"] == {
+        "path": str(mesh.resolve()),
+        "sha256": MODULE.sha256_file(mesh),
+        "vertices": 4,
+        "faces": 1,
+    }
+    assert result["repaired_mesh"] == {"vertices": 4, "faces": 2}
+    assert result["face_reversal"]["source_mesh_faces"] == 1
+    assert "sha256" not in result["repaired_mesh"]
 
 
 def test_validate_output_paths_rejects_aliases_and_existing_outputs(tmp_path):
