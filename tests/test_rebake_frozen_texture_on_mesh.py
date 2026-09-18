@@ -644,7 +644,6 @@ def test_generalized_run_separates_source_and_repaired_mesh_identity(
             "min_confidence": 0.5,
         },
         "orientation": {"reversed_faces": 0},
-        "bridges": {"accepted_pairs": 1, "pairs": []},
     }
 
     monkeypatch.setattr(MODULE, "snapshot_implementation_identity", lambda **_: {})

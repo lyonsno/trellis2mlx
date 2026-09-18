@@ -362,8 +362,8 @@ def parse_args() -> argparse.Namespace:
         "--repair-exterior-surface",
         action="store_true",
         help=(
-            "Apply the camera-independent exterior-sheet orientation and "
-            "touching-contour closure law before UV unwrap."
+            "Reverse one uniquely dominant exterior-inverted sheet before "
+            "UV unwrap; ambiguous meshes are left unchanged."
         ),
     )
     parser.add_argument(

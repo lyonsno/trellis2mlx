@@ -2925,7 +2925,10 @@ def test_generate_exposes_compact_multi_block_shape_trace():
 
 
 def test_shape_flow_attention_selectors_compose_into_final_glb_route(tmp_path):
-    from scripts.run_mlx_stage_capture import _build_generate_command, build_parser
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+    )
 
     args = build_parser().parse_args(
         [
@@ -2943,6 +2946,9 @@ def test_shape_flow_attention_selectors_compose_into_final_glb_route(tmp_path):
             "source-cuda-sequential",
             "--reference-cleanup",
             "--qem-simplify",
+            "--repair-exterior-surface",
+            "--exterior-orientation-confidence",
+            "0.625",
             "--qem-backend",
             "source-native",
             "--source-native-source-root",
@@ -2968,10 +2974,41 @@ def test_shape_flow_attention_selectors_compose_into_final_glb_route(tmp_path):
     )
     assert "--reference-cleanup" in command
     assert "--qem-simplify" in command
+    assert "--repair-exterior-surface" in command
+    assert command[command.index("--exterior-orientation-confidence") + 1] == (
+        "0.625"
+    )
     assert command[command.index("--qem-backend") + 1] == "source-native"
     assert command[command.index("--source-native-source-root") + 1] == "/tmp/mtlmesh"
     assert command[command.index("--source-native-python") + 1] == "/tmp/python"
     assert command[command.index("--expected-source-native-commit") + 1] == "c" * 40
+
+
+def test_stage_capture_records_requested_exterior_repair_route(tmp_path):
+    from scripts.run_mlx_stage_capture import (
+        _build_generate_command,
+        build_parser,
+        build_route_identity,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "input.png",
+            "--output-dir",
+            str(tmp_path),
+            "--stop-after-stage",
+            "final_glb",
+            "--repair-exterior-surface",
+            "--exterior-orientation-confidence",
+            "0.625",
+        ]
+    )
+    command = _build_generate_command(args, tmp_path / "checkpoints")
+    route_identity = build_route_identity(args, command)
+
+    assert route_identity["route"]["repair_exterior_surface"] is True
+    assert route_identity["route"]["exterior_orientation_confidence"] == 0.625
 
 
 def test_shape_flow_attention_pre_shape_preflight_preserves_stale_primary_as_untrusted(
@@ -4072,6 +4109,8 @@ def _final_glb_expected_route():
         "reference_cleanup": True,
         "qem_simplify": True,
         "qem_backend": "source-native",
+        "repair_exterior_surface": True,
+        "exterior_orientation_confidence": 0.625,
         "source_native_source_root": "/tmp/mtlmesh",
         "source_native_python": "/tmp/python",
         "expected_source_native_commit": "c" * 40,
@@ -4193,11 +4232,19 @@ def _final_glb_checkpoint_routes(expected):
             "reference_cleanup",
             "qem_simplify",
             "qem_backend",
+            "repair_exterior_surface",
+            "exterior_orientation_confidence",
             "source_native_source_root",
             "source_native_python",
             "expected_source_native_commit",
             "uv_method",
         )
+    }
+    postprocess["exterior_surface_repair"] = {
+        "orientation": {
+            "selection_status": "selected",
+            "reversed_faces": 666,
+        }
     }
     decoder = {
         "decoder_linear_backend": expected[
@@ -4354,6 +4401,40 @@ def test_final_glb_validator_accepts_bound_reopenable_artifact(tmp_path):
     assert validation["reopenable_glb"] is True
     assert validation["mesh_count"] == 1
     assert validation["output_size_bytes"] == output.stat().st_size
+
+
+def test_final_glb_validator_rejects_requested_repair_without_receipt(tmp_path):
+    import numpy as np
+    import pytest
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
+    postprocess.pop("exterior_surface_repair")
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        decoder_route=decoder,
+        postprocess_route=postprocess,
+    )
+
+    with pytest.raises(ValueError, match="requested exterior repair.*receipt"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
 
 
 def test_final_glb_validator_accepts_routes_shaped_by_generate(monkeypatch, tmp_path):

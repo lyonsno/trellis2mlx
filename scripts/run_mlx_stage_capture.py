@@ -221,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-rembg", action="store_true")
     parser.add_argument("--reference-cleanup", action="store_true")
     parser.add_argument("--qem-simplify", action="store_true")
+    parser.add_argument("--repair-exterior-surface", action="store_true")
+    parser.add_argument(
+        "--exterior-orientation-confidence",
+        type=float,
+        default=0.5,
+    )
     parser.add_argument("--qem-backend", choices=["mlx", "source-native"], default="mlx")
     parser.add_argument("--source-native-source-root")
     parser.add_argument("--source-native-python")
@@ -743,6 +749,10 @@ def build_route_identity(
             "reference_cleanup": args.reference_cleanup,
             "qem_simplify": args.qem_simplify,
             "qem_backend": args.qem_backend,
+            "repair_exterior_surface": args.repair_exterior_surface,
+            "exterior_orientation_confidence": (
+                args.exterior_orientation_confidence
+            ),
             "source_native_source_root": args.source_native_source_root,
             "source_native_python": args.source_native_python,
             "expected_source_native_commit": (
@@ -1753,6 +1763,8 @@ def _validate_final_glb_checkpoint(
         "reference_cleanup",
         "qem_simplify",
         "qem_backend",
+        "repair_exterior_surface",
+        "exterior_orientation_confidence",
         "source_native_source_root",
         "source_native_python",
         "expected_source_native_commit",
@@ -1761,8 +1773,37 @@ def _validate_final_glb_checkpoint(
     expected_postprocess_route = {
         field: expected_route.get(field) for field in postprocess_fields
     }
-    if postprocess_route != expected_postprocess_route:
+    actual_postprocess_route = {
+        field: postprocess_route.get(field) for field in postprocess_fields
+    }
+    unexpected_postprocess_fields = sorted(
+        set(postprocess_route)
+        - set(postprocess_fields)
+        - {"exterior_surface_repair"}
+    )
+    if (
+        actual_postprocess_route != expected_postprocess_route
+        or unexpected_postprocess_fields
+    ):
         raise ValueError("final_glb postprocess route differs from requested route")
+    exterior_surface_repair = postprocess_route.get("exterior_surface_repair")
+    if expected_route.get("repair_exterior_surface"):
+        if not isinstance(exterior_surface_repair, dict):
+            raise ValueError(
+                "final_glb requested exterior repair but omits its receipt"
+            )
+        orientation = exterior_surface_repair.get("orientation")
+        if (
+            not isinstance(orientation, dict)
+            or not isinstance(orientation.get("selection_status"), str)
+            or not isinstance(orientation.get("reversed_faces"), int)
+            or orientation["reversed_faces"] < 0
+        ):
+            raise ValueError("final_glb exterior repair receipt is malformed")
+    elif exterior_surface_repair is not None:
+        raise ValueError(
+            "final_glb carries an exterior repair receipt that was not requested"
+        )
 
     import trimesh
 
@@ -3806,6 +3847,14 @@ def _build_generate_command(args: argparse.Namespace, checkpoint_dir: Path) -> l
         command.append("--reference-cleanup")
     if args.qem_simplify:
         command.append("--qem-simplify")
+    if args.repair_exterior_surface:
+        command.append("--repair-exterior-surface")
+    command.extend(
+        [
+            "--exterior-orientation-confidence",
+            str(args.exterior_orientation_confidence),
+        ]
+    )
     command.extend(["--qem-backend", args.qem_backend])
     if args.source_native_source_root:
         command.extend(

@@ -490,6 +490,38 @@ def _select_uv_method(method, vertices, faces):
     return uv_unwrap, "xatlas"
 
 
+def _apply_exterior_surface_repair(
+    vertices,
+    faces,
+    *,
+    enabled,
+    component_orientation_confidence=0.5,
+    log=print,
+):
+    """Apply the optional winding-only exterior repair before UV unwrap."""
+    if not enabled:
+        return faces, None
+
+    from trellmlx.exterior_surface_repair import repair_exterior_surface
+
+    repaired, receipt = repair_exterior_surface(
+        vertices,
+        faces,
+        component_orientation_confidence=component_orientation_confidence,
+    )
+    components = receipt["component_orientation"]
+    orientation = receipt["orientation"]
+    log(
+        "  Exterior surface repair: "
+        f"oriented {components['flipped_components']:,} components "
+        f"({components['flipped_faces']:,} faces); "
+        f"dominant sheet {orientation['selection_status']} "
+        f"({orientation['reversed_faces']:,} faces reversed)",
+        flush=True,
+    )
+    return repaired, receipt
+
+
 def _cleanup_and_simplify_mesh(
     vertices,
     faces,
@@ -1094,6 +1126,23 @@ def main():
                         help="Skip background removal (rembg) preprocessing")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Skip mesh cleanup entirely (no dedup, no repair, no hole fill)")
+    parser.add_argument(
+        "--repair-exterior-surface",
+        action="store_true",
+        help=(
+            "After cleanup, reverse one uniquely dominant exterior-inverted "
+            "sheet before UV unwrap; ambiguous meshes are left unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--exterior-orientation-confidence",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum signed-vote confidence for whole-component orientation "
+            "inside --repair-exterior-surface (default: 0.5)."
+        ),
+    )
     parser.add_argument("--keep-largest", action="store_true",
                         help="Keep only the largest connected component (removes floors, floaters, extra objects)")
     parser.add_argument("--simplify-first", action="store_true",
@@ -1778,11 +1827,26 @@ def main():
                 source_native_turing_rsqrt_lut=turing_lut,
                 source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
             )
+            faces, exterior_surface_receipt = _apply_exterior_surface_repair(
+                vertices,
+                faces,
+                enabled=args.repair_exterior_surface,
+                component_orientation_confidence=(
+                    args.exterior_orientation_confidence
+                ),
+            )
             if args.save_checkpoints:
                 from trellmlx.checkpoint import save_checkpoint
                 save_checkpoint(args.save_checkpoints, "mesh_clean",
                                 vertices=vertices, faces=faces,
-                                mesh_grid_size=mesh_grid_size)
+                                mesh_grid_size=mesh_grid_size,
+                                exterior_surface_repair_json=np.array(
+                                    json.dumps(
+                                        exterior_surface_receipt
+                                        or {"requested": False},
+                                        sort_keys=True,
+                                    )
+                                ))
                 maybe_checkpoint_yield(
                     stop_file=args.checkpoint_stop_file,
                     checkpoint_dir=args.save_checkpoints,
@@ -3484,11 +3548,24 @@ def main():
         source_native_turing_rsqrt_lut=turing_lut,
         source_native_turing_rsqrt_lut_sha256=turing_lut_sha256,
     )
+    faces, exterior_surface_receipt = _apply_exterior_surface_repair(
+        vertices,
+        faces,
+        enabled=args.repair_exterior_surface,
+        component_orientation_confidence=args.exterior_orientation_confidence,
+    )
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(args.save_checkpoints, "mesh_clean",
                         vertices=vertices, faces=faces,
-                        mesh_grid_size=mesh_grid_size)
+                        mesh_grid_size=mesh_grid_size,
+                        exterior_surface_repair_json=np.array(
+                            json.dumps(
+                                exterior_surface_receipt
+                                or {"requested": False},
+                                sort_keys=True,
+                            )
+                        ))
         maybe_checkpoint_yield(
             stop_file=args.checkpoint_stop_file,
             checkpoint_dir=args.save_checkpoints,
@@ -3660,6 +3737,11 @@ def main():
                 "reference_cleanup": bool(args.reference_cleanup),
                 "qem_simplify": bool(args.qem_simplify),
                 "qem_backend": args.qem_backend,
+                "repair_exterior_surface": bool(args.repair_exterior_surface),
+                "exterior_orientation_confidence": (
+                    args.exterior_orientation_confidence
+                ),
+                "exterior_surface_repair": exterior_surface_receipt,
                 "source_native_source_root": args.source_native_source_root,
                 "source_native_python": args.source_native_python,
                 "expected_source_native_commit": (
