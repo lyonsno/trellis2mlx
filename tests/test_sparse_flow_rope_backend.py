@@ -113,4 +113,3 @@ def test_generate_exposes_distinct_sparse_flow_rope_selector():
 
     assert "--sparse-flow-rope-backend" in result.stdout
     assert "--sparse-flow-rope-phase-lut" in result.stdout
-
