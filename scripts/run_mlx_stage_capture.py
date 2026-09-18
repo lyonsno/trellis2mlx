@@ -1788,18 +1788,18 @@ def _validate_final_glb_checkpoint(
         raise ValueError("final_glb postprocess route differs from requested route")
     exterior_surface_repair = postprocess_route.get("exterior_surface_repair")
     if expected_route.get("repair_exterior_surface"):
-        if not isinstance(exterior_surface_repair, dict):
+        if exterior_surface_repair is None:
             raise ValueError(
                 "final_glb requested exterior repair but omits its receipt"
             )
-        orientation = exterior_surface_repair.get("orientation")
-        if (
-            not isinstance(orientation, dict)
-            or not isinstance(orientation.get("selection_status"), str)
-            or not isinstance(orientation.get("reversed_faces"), int)
-            or orientation["reversed_faces"] < 0
-        ):
-            raise ValueError("final_glb exterior repair receipt is malformed")
+        from trellmlx.exterior_surface_repair import (
+            validate_exterior_surface_repair_receipt,
+        )
+
+        try:
+            validate_exterior_surface_repair_receipt(exterior_surface_repair)
+        except ValueError as exc:
+            raise ValueError(f"final_glb exterior repair receipt is invalid: {exc}") from exc
     elif exterior_surface_repair is not None:
         raise ValueError(
             "final_glb carries an exterior repair receipt that was not requested"

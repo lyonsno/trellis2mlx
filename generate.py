@@ -522,6 +522,62 @@ def _apply_exterior_surface_repair(
     return repaired, receipt
 
 
+def _postprocess_route(args, exterior_surface_receipt):
+    return {
+        "reference_cleanup": bool(args.reference_cleanup),
+        "qem_simplify": bool(args.qem_simplify),
+        "qem_backend": args.qem_backend,
+        "repair_exterior_surface": bool(args.repair_exterior_surface),
+        "exterior_orientation_confidence": args.exterior_orientation_confidence,
+        "exterior_surface_repair": exterior_surface_receipt,
+        "source_native_source_root": args.source_native_source_root,
+        "source_native_python": args.source_native_python,
+        "expected_source_native_commit": args.expected_source_native_commit,
+        "uv_method": args.uv_method,
+    }
+
+
+def _resume_source_identity(checkpoint_dir):
+    root = Path(checkpoint_dir).resolve()
+    files = {}
+    for stage in ("mesh_raw", "texture"):
+        for suffix in (".npz", ".json"):
+            path = root / f"{stage}{suffix}"
+            if path.is_file():
+                payload = path.read_bytes()
+                files[path.name] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                }
+    return {"checkpoint_dir": str(root), "files": files}
+
+
+def _save_final_glb_checkpoint(
+    checkpoint_dir,
+    output_path,
+    *,
+    producer_mode,
+    postprocess_route,
+    route_arrays=None,
+):
+    """Bind a final GLB to the route facts actually available to this run."""
+    from trellmlx.checkpoint import save_checkpoint
+
+    output_path = Path(output_path)
+    payload = output_path.read_bytes()
+    arrays = {
+        "output_path": np.asarray(str(output_path)),
+        "output_sha256": np.asarray(hashlib.sha256(payload).hexdigest()),
+        "output_size_bytes": np.asarray(len(payload), dtype=np.int64),
+        "producer_mode": np.asarray(producer_mode),
+        "postprocess_route_json": np.asarray(
+            json.dumps(postprocess_route, sort_keys=True)
+        ),
+    }
+    arrays.update(route_arrays or {})
+    save_checkpoint(checkpoint_dir, "final_glb", **arrays)
+
+
 def _cleanup_and_simplify_mesh(
     vertices,
     faces,
@@ -1911,6 +1967,23 @@ def main():
                 )
                 textured_mesh.export(args.output)
                 print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
+                if args.save_checkpoints:
+                    _save_final_glb_checkpoint(
+                        args.save_checkpoints,
+                        args.output,
+                        producer_mode="resume",
+                        postprocess_route=_postprocess_route(
+                            args, exterior_surface_receipt
+                        ),
+                        route_arrays={
+                            "resume_source_identity_json": np.asarray(
+                                json.dumps(
+                                    _resume_source_identity(args.resume),
+                                    sort_keys=True,
+                                )
+                            )
+                        },
+                    )
             else:
                 print("  WARNING: Empty mesh!", flush=True)
             print(f"\nResume total: {time.perf_counter()-t_total:.1f}s", flush=True)
@@ -3730,84 +3803,63 @@ def main():
         textured_mesh.export(args.output)
         print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
         if args.save_checkpoints:
-            from trellmlx.checkpoint import save_checkpoint
-
-            output_path = Path(args.output)
-            postprocess_route = {
-                "reference_cleanup": bool(args.reference_cleanup),
-                "qem_simplify": bool(args.qem_simplify),
-                "qem_backend": args.qem_backend,
-                "repair_exterior_surface": bool(args.repair_exterior_surface),
-                "exterior_orientation_confidence": (
-                    args.exterior_orientation_confidence
-                ),
-                "exterior_surface_repair": exterior_surface_receipt,
-                "source_native_source_root": args.source_native_source_root,
-                "source_native_python": args.source_native_python,
-                "expected_source_native_commit": (
-                    args.expected_source_native_commit
-                ),
-                "uv_method": args.uv_method,
-            }
-            save_checkpoint(
+            _save_final_glb_checkpoint(
                 args.save_checkpoints,
-                "final_glb",
-                output_path=np.array(str(output_path)),
-                output_sha256=np.array(
-                    hashlib.sha256(output_path.read_bytes()).hexdigest()
+                args.output,
+                producer_mode="fresh",
+                postprocess_route=_postprocess_route(
+                    args, exterior_surface_receipt
                 ),
-                output_size_bytes=np.array(
-                    output_path.stat().st_size, dtype=np.int64
-                ),
-                shape_flow_attention_route_json=np.array(
-                    json.dumps(shape_flow_attention_route or {}, sort_keys=True)
-                ),
-                sparse_flow_layernorm_backend=np.array(
-                    get_sparse_flow_layernorm_backend()
-                ),
-                sparse_flow_turing_rsqrt_lut_sha256=np.array(
-                    get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested()
-                    or ""
-                ),
-                sparse_flow_turing_rsqrt_lut_content_sha256=np.array(
-                    get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
-                ),
-                qk_norm_backend=np.array(get_qk_norm_backend()),
-                rope_backend=np.array(get_rope_backend()),
-                sparse_flow_turing_rope_phase_lut_sha256=np.array(
-                    get_turing_phase_lut_sha256() or ""
-                ),
-                sparse_flow_rope_backend=np.array(
-                    get_sparse_flow_rope_backend()
-                ),
-                sparse_flow_rope_phase_lut_artifact_sha256_attested=np.array(
-                    get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
-                    or ""
-                ),
-                sparse_flow_rope_phase_lut_content_sha256=np.array(
-                    get_sparse_flow_rope_phase_lut_content_sha256() or ""
-                ),
-                sparse_flow_attention_route_json=np.array(
-                    json.dumps(sparse_flow_attention_route, sort_keys=True)
-                ),
-                sparse_flow_terminal_linear_json=np.array(
-                    sparse_flow_terminal_linear_json
-                ),
-                sparse_flow_cfg_rescale_std_json=np.array(
-                    sparse_flow_cfg_rescale_std_json
-                ),
-                sparse_timestep_modulation_lut_json=np.array(
-                    sparse_timestep_modulation_lut_json
-                ),
-                texture_attention_route_json=np.array(
-                    json.dumps(texture_attention_route or {}, sort_keys=True)
-                ),
-                decoder_route_json=np.array(
-                    json.dumps(decoder_route, sort_keys=True)
-                ),
-                postprocess_route_json=np.array(
-                    json.dumps(postprocess_route, sort_keys=True)
-                ),
+                route_arrays={
+                    "shape_flow_attention_route_json": np.asarray(
+                        json.dumps(
+                            shape_flow_attention_route or {}, sort_keys=True
+                        )
+                    ),
+                    "sparse_flow_layernorm_backend": np.asarray(
+                        get_sparse_flow_layernorm_backend()
+                    ),
+                    "sparse_flow_turing_rsqrt_lut_sha256": np.asarray(
+                        get_sparse_flow_turing_rsqrt_lut_artifact_sha256_attested()
+                        or ""
+                    ),
+                    "sparse_flow_turing_rsqrt_lut_content_sha256": np.asarray(
+                        get_sparse_flow_turing_rsqrt_lut_content_sha256() or ""
+                    ),
+                    "qk_norm_backend": np.asarray(get_qk_norm_backend()),
+                    "rope_backend": np.asarray(get_rope_backend()),
+                    "sparse_flow_turing_rope_phase_lut_sha256": np.asarray(
+                        get_turing_phase_lut_sha256() or ""
+                    ),
+                    "sparse_flow_rope_backend": np.asarray(
+                        get_sparse_flow_rope_backend()
+                    ),
+                    "sparse_flow_rope_phase_lut_artifact_sha256_attested": np.asarray(
+                        get_sparse_flow_rope_phase_lut_artifact_sha256_attested()
+                        or ""
+                    ),
+                    "sparse_flow_rope_phase_lut_content_sha256": np.asarray(
+                        get_sparse_flow_rope_phase_lut_content_sha256() or ""
+                    ),
+                    "sparse_flow_attention_route_json": np.asarray(
+                        json.dumps(sparse_flow_attention_route, sort_keys=True)
+                    ),
+                    "sparse_flow_terminal_linear_json": np.asarray(
+                        sparse_flow_terminal_linear_json
+                    ),
+                    "sparse_flow_cfg_rescale_std_json": np.asarray(
+                        sparse_flow_cfg_rescale_std_json
+                    ),
+                    "sparse_timestep_modulation_lut_json": np.asarray(
+                        sparse_timestep_modulation_lut_json
+                    ),
+                    "texture_attention_route_json": np.asarray(
+                        json.dumps(texture_attention_route or {}, sort_keys=True)
+                    ),
+                    "decoder_route_json": np.asarray(
+                        json.dumps(decoder_route, sort_keys=True)
+                    ),
+                },
             )
         if args.stop_after_stage == "final_glb":
             print("  Stop after stage: final_glb", flush=True)

@@ -9,6 +9,8 @@ It changes triangle winding only; it never adds, removes, or welds geometry.
 
 from __future__ import annotations
 
+import math
+
 import igl
 import numpy as np
 import trimesh
@@ -128,31 +130,37 @@ def _exterior_side_classes(vertices: np.ndarray, faces: np.ndarray) -> np.ndarra
 
 
 def _negative_sheet_clusters(
-    vertices: np.ndarray, faces: np.ndarray, main_component: np.ndarray
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    components: list[np.ndarray],
+    face_adjacency: np.ndarray,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     triangles = vertices[faces]
     area_vectors = np.cross(
         triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]
     )
     centroids = triangles.mean(axis=1)
-    center = (vertices.min(axis=0) + vertices.max(axis=0)) * 0.5
-    scores = np.einsum("ij,ij->i", area_vectors, centroids - center)
-    negative = np.asarray(
-        [face_id for face_id in main_component if scores[face_id] < 0.0],
-        dtype=np.int64,
-    )
+    negative_mask = np.zeros(len(faces), dtype=bool)
+    for component in components:
+        component = np.asarray(component, dtype=np.int64)
+        component_vertices = np.unique(faces[component].reshape(-1))
+        component_points = vertices[component_vertices]
+        center = (
+            component_points.min(axis=0) + component_points.max(axis=0)
+        ) * 0.5
+        scores = np.einsum(
+            "ij,ij->i",
+            area_vectors[component],
+            centroids[component] - center,
+        )
+        negative_mask[component] = scores < 0.0
+    negative = np.flatnonzero(negative_mask)
     if len(negative) == 0:
         return [], area_vectors
-    negative_set = set(int(face_id) for face_id in negative)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    edges = np.asarray(
-        [
-            pair
-            for pair in mesh.face_adjacency
-            if int(pair[0]) in negative_set and int(pair[1]) in negative_set
-        ],
-        dtype=np.int64,
-    )
+    edges = face_adjacency[
+        negative_mask[face_adjacency[:, 0]]
+        & negative_mask[face_adjacency[:, 1]]
+    ]
     if len(edges) == 0:
         return (
             [np.asarray([face_id], dtype=np.int64) for face_id in negative],
@@ -176,8 +184,12 @@ def _find_orientation_patch(
             "alternative_area": 0.0,
             "candidates": [],
         }
-    main = np.asarray(max(components, key=len), dtype=np.int64)
-    clusters, area_vectors = _negative_sheet_clusters(vertices, faces, main)
+    clusters, area_vectors = _negative_sheet_clusters(
+        vertices,
+        faces,
+        components,
+        mesh.face_adjacency,
+    )
     areas = 0.5 * np.linalg.norm(area_vectors, axis=1)
     classes = _exterior_side_classes(vertices, faces)
     candidates = []
@@ -238,6 +250,123 @@ def _find_orientation_patch(
     return selected, receipt
 
 
+def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
+    """Reject receipts that cannot describe this winding-only repair."""
+
+    def require_dict(container: dict, name: str) -> dict:
+        value = container.get(name)
+        if not isinstance(value, dict):
+            raise ValueError(f"exterior repair receipt {name} must be an object")
+        return value
+
+    def require_int(container: dict, name: str, *, minimum: int = 0) -> int:
+        value = container.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(
+                f"exterior repair receipt {name} must be an integer >= {minimum}"
+            )
+        return value
+
+    def require_number(
+        container: dict, name: str, *, minimum: float = 0.0
+    ) -> float:
+        value = container.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+        ):
+            raise ValueError(
+                f"exterior repair receipt {name} must be finite and >= {minimum}"
+            )
+        return float(value)
+
+    if not isinstance(receipt, dict):
+        raise ValueError("exterior repair receipt must be an object")
+    if receipt.get("schema") != "trellis2mlx.exterior_surface_repair.v1":
+        raise ValueError("exterior repair receipt schema is missing or unsupported")
+
+    input_mesh = require_dict(receipt, "input_mesh")
+    output_mesh = require_dict(receipt, "output_mesh")
+    input_vertices = require_int(input_mesh, "vertices")
+    input_faces = require_int(input_mesh, "faces")
+    output_vertices = require_int(output_mesh, "vertices")
+    output_faces = require_int(output_mesh, "faces")
+    if (input_vertices, input_faces) != (output_vertices, output_faces):
+        raise ValueError(
+            "exterior repair receipt violates winding-only mesh cardinality"
+        )
+    for mesh in (input_mesh, output_mesh):
+        topology = require_dict(mesh, "topology")
+        for field in (
+            "boundary_edges",
+            "nonmanifold_edges",
+            "same_direction_shared_edges",
+        ):
+            require_int(topology, field)
+
+    component = require_dict(receipt, "component_orientation")
+    component_count = require_int(component, "components")
+    flipped_components = require_int(component, "flipped_components")
+    flipped_faces = require_int(component, "flipped_faces")
+    confidence = require_number(component, "min_confidence")
+    if confidence > 1.0:
+        raise ValueError("exterior repair receipt min_confidence must be <= 1")
+    if flipped_components > component_count or flipped_faces > input_faces:
+        raise ValueError("exterior repair receipt component counts are impossible")
+
+    orientation = require_dict(receipt, "orientation")
+    candidate_count = require_int(orientation, "candidate_count")
+    status = orientation.get("selection_status")
+    if status not in {"selected", "ambiguous", "none"}:
+        raise ValueError("exterior repair receipt selection_status is invalid")
+    require_number(orientation, "alternative_area")
+    reversed_faces = require_int(orientation, "reversed_faces")
+    candidates = orientation.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != candidate_count:
+        raise ValueError("exterior repair receipt candidates do not match count")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("exterior repair receipt candidate must be an object")
+        face_count = require_int(candidate, "face_count", minimum=1)
+        require_number(candidate, "area", minimum=np.finfo(np.float64).tiny)
+        back_faces = require_int(candidate, "back_side_faces")
+        neither_faces = require_int(candidate, "neither_side_faces")
+        if back_faces + neither_faces > face_count:
+            raise ValueError("exterior repair receipt candidate counts are impossible")
+
+    has_selected_fields = (
+        "selected_face_count" in orientation or "selected_area" in orientation
+    )
+    if status == "selected":
+        if candidate_count == 0:
+            raise ValueError("exterior repair receipt selected without a candidate")
+        selected_faces = require_int(
+            orientation, "selected_face_count", minimum=1
+        )
+        selected_area = require_number(
+            orientation,
+            "selected_area",
+            minimum=np.finfo(np.float64).tiny,
+        )
+        if (
+            reversed_faces != selected_faces
+            or selected_faces != candidates[0]["face_count"]
+            or selected_area != float(candidates[0]["area"])
+        ):
+            raise ValueError("exterior repair receipt selected counts disagree")
+    else:
+        if reversed_faces != 0 or has_selected_fields:
+            raise ValueError(
+                "exterior repair receipt refusal cannot reverse or select faces"
+            )
+        if status == "none" and candidate_count != 0:
+            raise ValueError("exterior repair receipt none status has candidates")
+        if status == "ambiguous" and candidate_count == 0:
+            raise ValueError("exterior repair receipt ambiguous status lacks candidates")
+
+
 def repair_exterior_surface(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -246,7 +375,11 @@ def repair_exterior_surface(
 ) -> tuple[np.ndarray, dict]:
     """Reverse one uniquely dominant exterior-inverted sheet, if present."""
     vertices = np.asarray(vertices, dtype=np.float64)
-    faces = np.asarray(faces, dtype=np.int64)
+    source_faces = np.asarray(faces)
+    if not np.issubdtype(source_faces.dtype, np.integer):
+        raise ValueError("faces must use an integer dtype")
+    source_face_dtype = source_faces.dtype
+    faces = np.asarray(source_faces, dtype=np.int64)
     if vertices.ndim != 2 or vertices.shape[1] != 3:
         raise ValueError("vertices must have shape (N, 3)")
     if faces.ndim != 2 or faces.shape[1] != 3:
@@ -269,7 +402,8 @@ def repair_exterior_surface(
         prepared[patch] = prepared[patch][:, [0, 2, 1]]
         reversed_faces = int(len(patch))
     output_topology = _topology_counts(prepared)
-    return prepared, {
+    receipt = {
+        "schema": "trellis2mlx.exterior_surface_repair.v1",
         "input_mesh": {
             "vertices": int(len(vertices)),
             "faces": int(len(faces)),
@@ -286,3 +420,5 @@ def repair_exterior_surface(
             "reversed_faces": reversed_faces,
         },
     }
+    validate_exterior_surface_repair_receipt(receipt)
+    return prepared.astype(source_face_dtype, copy=False), receipt

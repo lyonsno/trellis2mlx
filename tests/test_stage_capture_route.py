@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 
 GENERATE_SOURCE = Path(__file__).resolve().parents[1] / "generate.py"
 
@@ -4240,12 +4242,7 @@ def _final_glb_checkpoint_routes(expected):
             "uv_method",
         )
     }
-    postprocess["exterior_surface_repair"] = {
-        "orientation": {
-            "selection_status": "selected",
-            "reversed_faces": 666,
-        }
-    }
+    postprocess["exterior_surface_repair"] = _valid_exterior_repair_receipt()
     decoder = {
         "decoder_linear_backend": expected[
             "decoder_linear_backend_requested"
@@ -4271,6 +4268,49 @@ def _final_glb_checkpoint_routes(expected):
         "decoder_output_head_backend": "mlx-native-fp32",
     }
     return shape, texture, decoder, postprocess
+
+
+def _valid_exterior_repair_receipt():
+    topology = {
+        "boundary_edges": 12,
+        "nonmanifold_edges": 0,
+        "same_direction_shared_edges": 0,
+    }
+    return {
+        "schema": "trellis2mlx.exterior_surface_repair.v1",
+        "input_mesh": {
+            "vertices": 1000,
+            "faces": 2000,
+            "topology": dict(topology),
+        },
+        "output_mesh": {
+            "vertices": 1000,
+            "faces": 2000,
+            "topology": dict(topology),
+        },
+        "component_orientation": {
+            "components": 13,
+            "flipped_components": 2,
+            "flipped_faces": 40,
+            "min_confidence": 0.5,
+        },
+        "orientation": {
+            "candidate_count": 1,
+            "selection_status": "selected",
+            "alternative_area": 0.0,
+            "candidates": [
+                {
+                    "face_count": 666,
+                    "area": 3.0,
+                    "back_side_faces": 666,
+                    "neither_side_faces": 0,
+                }
+            ],
+            "selected_face_count": 666,
+            "selected_area": 3.0,
+            "reversed_faces": 666,
+        },
+    }
 
 
 def test_final_glb_validator_rejects_blank_primary(tmp_path):
@@ -4430,6 +4470,63 @@ def test_final_glb_validator_rejects_requested_repair_without_receipt(tmp_path):
     )
 
     with pytest.raises(ValueError, match="requested exterior repair.*receipt"):
+        _validate_final_glb_checkpoint(
+            checkpoint,
+            expected_output_path=output,
+            expected_route=expected,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda receipt: receipt["orientation"].update(
+                selection_status="ambiguous", reversed_faces=1
+            ),
+            "exterior repair receipt",
+        ),
+        (
+            lambda receipt: receipt["orientation"].update(reversed_faces=True),
+            "exterior repair receipt",
+        ),
+        (
+            lambda receipt: receipt.pop("component_orientation"),
+            "exterior repair receipt",
+        ),
+    ],
+)
+def test_final_glb_validator_rejects_impossible_repair_receipt(
+    tmp_path, mutate, message
+):
+    import copy
+    import numpy as np
+    import trimesh
+
+    from scripts.run_mlx_stage_capture import _validate_final_glb_checkpoint
+
+    output = tmp_path / "output.glb"
+    trimesh.Trimesh(
+        vertices=np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        process=False,
+    ).export(output)
+    checkpoint = tmp_path / "final_glb.npz"
+    expected = _final_glb_expected_route()
+    shape, texture, decoder, postprocess = _final_glb_checkpoint_routes(expected)
+    receipt = copy.deepcopy(postprocess["exterior_surface_repair"])
+    mutate(receipt)
+    postprocess["exterior_surface_repair"] = receipt
+    _write_final_glb_checkpoint(
+        checkpoint,
+        output,
+        shape_route=shape,
+        texture_route=texture,
+        decoder_route=decoder,
+        postprocess_route=postprocess,
+    )
+
+    with pytest.raises(ValueError, match=message):
         _validate_final_glb_checkpoint(
             checkpoint,
             expected_output_path=output,

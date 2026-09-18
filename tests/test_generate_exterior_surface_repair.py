@@ -1,5 +1,7 @@
 import subprocess
 import sys
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -92,3 +94,44 @@ def test_generate_leaves_faces_unchanged_when_repair_is_not_requested():
 
     assert actual_faces is faces
     assert receipt is None
+
+
+def test_final_glb_checkpoint_replaces_stale_binding_for_resumed_output(tmp_path):
+    import generate
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    output = tmp_path / "output.glb"
+    output.write_bytes(b"current resumed output")
+    np.savez(
+        checkpoint_dir / "final_glb.npz",
+        output_path=np.asarray("stale.glb"),
+        output_sha256=np.asarray("stale"),
+    )
+    postprocess_route = {
+        "repair_exterior_surface": True,
+        "exterior_orientation_confidence": 0.5,
+        "exterior_surface_repair": {"schema": "test-receipt"},
+    }
+    resume_identity = {"mesh_raw.npz": "a" * 64, "texture.npz": "b" * 64}
+
+    generate._save_final_glb_checkpoint(
+        checkpoint_dir,
+        output,
+        producer_mode="resume",
+        postprocess_route=postprocess_route,
+        route_arrays={
+            "resume_source_identity_json": np.asarray(
+                json.dumps(resume_identity, sort_keys=True)
+            )
+        },
+    )
+
+    with np.load(checkpoint_dir / "final_glb.npz", allow_pickle=False) as data:
+        assert data["output_path"].item() == str(output)
+        assert data["output_sha256"].item() == hashlib.sha256(
+            output.read_bytes()
+        ).hexdigest()
+        assert data["producer_mode"].item() == "resume"
+        assert json.loads(data["postprocess_route_json"].item()) == postprocess_route
+        assert json.loads(data["resume_source_identity_json"].item()) == resume_identity
