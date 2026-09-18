@@ -4278,7 +4278,7 @@ def _valid_exterior_repair_receipt():
         "same_direction_shared_edges": 0,
     }
     return {
-        "schema": "trellis2mlx.exterior_surface_repair.v1",
+        "schema": "trellis2mlx.exterior_surface_repair.v2",
         "input_mesh": {
             "vertices": 1000,
             "faces": 2000,
@@ -4352,6 +4352,43 @@ def _receipt_changes_winding_invariant_topology(receipt):
 
 def _receipt_flips_faces_without_a_component(receipt):
     receipt["component_orientation"]["flipped_components"] = 0
+
+
+def _receipt_has_more_components_than_faces(receipt):
+    receipt["component_orientation"]["components"] = (
+        receipt["input_mesh"]["faces"] + 1
+    )
+
+
+def _receipt_has_more_flipped_components_than_faces(receipt):
+    component = receipt["component_orientation"]
+    component["components"] = 100
+    component["flipped_components"] = component["flipped_faces"] + 1
+
+
+def _receipt_reverses_more_faces_than_mesh(receipt):
+    orientation = receipt["orientation"]
+    impossible = receipt["input_mesh"]["faces"] + 1
+    candidate = orientation["candidates"][0]
+    candidate["face_count"] = impossible
+    candidate["back_side_faces"] = impossible
+    orientation["selected_face_count"] = impossible
+    orientation["reversed_faces"] = impossible
+
+
+def _receipt_has_overlapping_candidate_cardinality(receipt):
+    orientation = receipt["orientation"]
+    first = orientation["candidates"][0]
+    first["face_count"] = 1500
+    first["back_side_faces"] = 1500
+    orientation["selected_face_count"] = 1500
+    orientation["reversed_faces"] = 1500
+    second = copy.deepcopy(first)
+    second["area"] = 1.0
+    second["back_side_area"] = 1.0
+    orientation["candidates"].append(second)
+    orientation["candidate_count"] = 2
+    orientation["alternative_area"] = 1.0
 
 
 def test_final_glb_validator_rejects_blank_primary(tmp_path):
@@ -4543,6 +4580,16 @@ def test_final_glb_validator_rejects_requested_repair_without_receipt(tmp_path):
         (_receipt_selects_ineligible_candidate, "exterior repair receipt"),
         (_receipt_changes_winding_invariant_topology, "exterior repair receipt"),
         (_receipt_flips_faces_without_a_component, "exterior repair receipt"),
+        (_receipt_has_more_components_than_faces, "exterior repair receipt"),
+        (
+            _receipt_has_more_flipped_components_than_faces,
+            "exterior repair receipt",
+        ),
+        (_receipt_reverses_more_faces_than_mesh, "exterior repair receipt"),
+        (
+            _receipt_has_overlapping_candidate_cardinality,
+            "exterior repair receipt",
+        ),
     ],
 )
 def test_final_glb_validator_rejects_impossible_repair_receipt(

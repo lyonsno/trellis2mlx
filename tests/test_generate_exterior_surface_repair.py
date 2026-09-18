@@ -112,7 +112,9 @@ def test_final_glb_checkpoint_replaces_stale_binding_for_resumed_output(tmp_path
     postprocess_route = {
         "repair_exterior_surface": True,
         "exterior_orientation_confidence": 0.5,
-        "exterior_surface_repair": {"schema": "test-receipt"},
+        "exterior_surface_repair": {
+            "schema": "trellis2mlx.exterior_surface_repair.v2"
+        },
     }
     resume_identity = {"mesh_raw.npz": "a" * 64, "texture.npz": "b" * 64}
 

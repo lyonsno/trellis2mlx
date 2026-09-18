@@ -292,7 +292,7 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
 
     if not isinstance(receipt, dict):
         raise ValueError("exterior repair receipt must be an object")
-    if receipt.get("schema") != "trellis2mlx.exterior_surface_repair.v1":
+    if receipt.get("schema") != "trellis2mlx.exterior_surface_repair.v2":
         raise ValueError("exterior repair receipt schema is missing or unsupported")
 
     input_mesh = require_dict(receipt, "input_mesh")
@@ -328,7 +328,13 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
     confidence = require_number(component, "min_confidence")
     if confidence > 1.0:
         raise ValueError("exterior repair receipt min_confidence must be <= 1")
-    if flipped_components > component_count or flipped_faces > input_faces:
+    if component_count > input_faces:
+        raise ValueError("exterior repair receipt has more components than faces")
+    if (
+        flipped_components > component_count
+        or flipped_components > flipped_faces
+        or flipped_faces > input_faces
+    ):
         raise ValueError("exterior repair receipt component counts are impossible")
     if (flipped_components == 0) != (flipped_faces == 0):
         raise ValueError("exterior repair receipt component flip counts disagree")
@@ -343,6 +349,7 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
     candidates = orientation.get("candidates")
     if not isinstance(candidates, list) or len(candidates) != candidate_count:
         raise ValueError("exterior repair receipt candidates do not match count")
+    candidate_face_total = 0
     for candidate in candidates:
         if not isinstance(candidate, dict):
             raise ValueError("exterior repair receipt candidate must be an object")
@@ -357,6 +364,7 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
         class_faces = back_faces + normal_faces + neither_faces + both_faces
         if class_faces != face_count:
             raise ValueError("exterior repair receipt candidate counts are impossible")
+        candidate_face_total += face_count
         back_area = require_number(candidate, "back_side_area")
         normal_area = require_number(candidate, "normal_side_area")
         neither_area = require_number(candidate, "neither_side_area")
@@ -368,6 +376,8 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
             raise ValueError("exterior repair receipt candidate areas disagree")
         if back_faces == 0 or normal_area != 0.0 or back_area <= neither_area + both_area:
             raise ValueError("exterior repair receipt candidate is ineligible")
+    if candidate_face_total > input_faces:
+        raise ValueError("exterior repair receipt candidates exceed input faces")
 
     expected_order = sorted(
         candidates,
@@ -414,6 +424,8 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
             minimum=np.finfo(np.float64).tiny,
         )
         if (
+            reversed_faces > input_faces
+            or
             reversed_faces != selected_faces
             or selected_faces != candidates[0]["face_count"]
             or selected_area != float(candidates[0]["area"])
@@ -466,7 +478,7 @@ def repair_exterior_surface(
         reversed_faces = int(len(patch))
     output_topology = _topology_counts(prepared)
     receipt = {
-        "schema": "trellis2mlx.exterior_surface_repair.v1",
+        "schema": "trellis2mlx.exterior_surface_repair.v2",
         "input_mesh": {
             "vertices": int(len(vertices)),
             "faces": int(len(faces)),
