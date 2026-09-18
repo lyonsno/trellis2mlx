@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "case_id": "feature-animation-81412",
+  "status": "research_branch_result",
+  "source": {
+    "repository": "https://github.com/lyonsno/trellis2mlx",
+    "branch": "cc/pixal9-capture-contract-r9-0821",
+    "commit": "e1d987d12c9dc3ed668af5f96d0d525a801bdb6f"
+  },
+  "input": {
+    "path": "assets/research/feature-animation-input.png",
+    "sha256": "07960308ee51479102bc4d1b6bd5416db4538e7e0197f5f04d7d2155b6bf9ba6"
+  },
+  "settings": {
+    "seed": 81414,
+    "steps": 8,
+    "resolution": 512,
+    "cascade": false,
+    "target_faces": 100000,
+    "texture_size": 512,
+    "simplify_first": false,
+    "cleanup_order": "source_ordered"
+  },
+  "measurements": {
+    "exact_product_seconds": 158.4,
+    "pytorch_mps_raw_faces": 3131410,
+    "mlx_raw_faces": 2197170,
+    "mlx_raw_face_delta_percent": -29.84
+  },
+  "presentation": {
+    "renderer": "Blender Cycles",
+    "note": "Beauty witnesses add lighting and subsurface-scattering material treatment; they depict the same generated GLB recorded by this case."
+  },
+  "witnesses": [
+    {
+      "view": "front",
+      "path": "assets/research/feature-animation-mlx-front.png",
+      "sha256": "f5a454d96d07bb1da69f4ff7fa83289195a413039ef3091542e9aafc4841e9ca"
+    },
+    {
+      "view": "oblique",
+      "path": "assets/research/feature-animation-mlx-oblique.png",
+      "sha256": "3813f51ea7036942e3961963c985d240ae464a1a4fe44ff3c51b54023a59bbe7"
+    }
+  ],
+  "limitations": [
+    "Localized one-sided face failures remain around finely articulated crevices.",
+    "Rear hair and horn regions retain visible texture smearing.",
+    "This route is not yet promoted to the public main branch."
+  ]
+}
