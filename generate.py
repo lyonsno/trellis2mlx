@@ -552,6 +552,28 @@ def _resume_source_identity(checkpoint_dir):
     return {"checkpoint_dir": str(root), "files": files}
 
 
+def _load_bound_resume_inputs(checkpoint_dir):
+    """Load resume carriers only when their bytes stay stable across ingestion."""
+    from trellmlx.checkpoint import load_checkpoint
+
+    before = _resume_source_identity(checkpoint_dir)
+    required = {"mesh_raw.npz", "texture.npz"}
+    missing = sorted(required - set(before["files"]))
+    if missing:
+        raise RuntimeError(f"resume source is missing required files: {missing}")
+    mesh_data = load_checkpoint(checkpoint_dir, "mesh_raw")
+    texture_data = load_checkpoint(checkpoint_dir, "texture")
+    after = _resume_source_identity(checkpoint_dir)
+    if after != before:
+        raise RuntimeError("resume source changed while loading")
+    return mesh_data, texture_data, before
+
+
+def _assert_resume_source_unchanged(checkpoint_dir, expected_identity):
+    if _resume_source_identity(checkpoint_dir) != expected_identity:
+        raise RuntimeError("resume source changed after loading")
+
+
 def _save_final_glb_checkpoint(
     checkpoint_dir,
     output_path,
@@ -1848,13 +1870,14 @@ def main():
 
     # === Resume from checkpoints ===
     if args.resume:
-        from trellmlx.checkpoint import load_checkpoint, has_checkpoint, list_checkpoints
+        from trellmlx.checkpoint import has_checkpoint, list_checkpoints
         available = list_checkpoints(args.resume)
         print(f"Resuming from {args.resume} (stages: {', '.join(available)})", flush=True)
 
         if has_checkpoint(args.resume, "texture") and has_checkpoint(args.resume, "mesh_raw"):
-            mesh_data = load_checkpoint(args.resume, "mesh_raw")
-            tex_data = load_checkpoint(args.resume, "texture")
+            mesh_data, tex_data, resume_source_identity = (
+                _load_bound_resume_inputs(args.resume)
+            )
 
             vertices = mesh_data["vertices"]
             faces = mesh_data["faces"]
@@ -1968,6 +1991,9 @@ def main():
                 textured_mesh.export(args.output)
                 print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
                 if args.save_checkpoints:
+                    _assert_resume_source_unchanged(
+                        args.resume, resume_source_identity
+                    )
                     _save_final_glb_checkpoint(
                         args.save_checkpoints,
                         args.output,
@@ -1978,7 +2004,7 @@ def main():
                         route_arrays={
                             "resume_source_identity_json": np.asarray(
                                 json.dumps(
-                                    _resume_source_identity(args.resume),
+                                    resume_source_identity,
                                     sort_keys=True,
                                 )
                             )

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,3 +136,56 @@ def test_final_glb_checkpoint_replaces_stale_binding_for_resumed_output(tmp_path
         assert data["producer_mode"].item() == "resume"
         assert json.loads(data["postprocess_route_json"].item()) == postprocess_route
         assert json.loads(data["resume_source_identity_json"].item()) == resume_identity
+
+
+def _write_resume_inputs(checkpoint_dir):
+    checkpoint_dir.mkdir()
+    np.savez(
+        checkpoint_dir / "mesh_raw.npz",
+        vertices=np.zeros((3, 3), dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int64),
+        mesh_grid_size=np.asarray(512),
+    )
+    np.savez(
+        checkpoint_dir / "texture.npz",
+        tex_np=np.zeros((1, 6), dtype=np.float32),
+        tex_coords_spatial=np.zeros((1, 3), dtype=np.int32),
+    )
+
+
+def test_resume_input_binding_rejects_checkpoint_mutation_during_load(
+    monkeypatch, tmp_path
+):
+    import generate
+    import trellmlx.checkpoint as checkpoint
+
+    checkpoint_dir = tmp_path / "source"
+    _write_resume_inputs(checkpoint_dir)
+    load_checkpoint = checkpoint.load_checkpoint
+
+    def mutating_load(actual_dir, stage):
+        result = load_checkpoint(actual_dir, stage)
+        if stage == "texture":
+            np.savez(
+                checkpoint_dir / "texture.npz",
+                tex_np=np.ones((1, 6), dtype=np.float32),
+                tex_coords_spatial=np.zeros((1, 3), dtype=np.int32),
+            )
+        return result
+
+    monkeypatch.setattr(checkpoint, "load_checkpoint", mutating_load)
+
+    with pytest.raises(RuntimeError, match="changed while loading"):
+        generate._load_bound_resume_inputs(checkpoint_dir)
+
+
+def test_resume_input_binding_rejects_checkpoint_deletion_after_load(tmp_path):
+    import generate
+
+    checkpoint_dir = tmp_path / "source"
+    _write_resume_inputs(checkpoint_dir)
+    _, _, identity = generate._load_bound_resume_inputs(checkpoint_dir)
+    (checkpoint_dir / "texture.npz").unlink()
+
+    with pytest.raises(RuntimeError, match="changed after loading"):
+        generate._assert_resume_source_unchanged(checkpoint_dir, identity)

@@ -215,12 +215,20 @@ def _find_orientation_patch(
                     "face_count": int(len(cluster)),
                     "area": float(areas[cluster].sum()),
                     "back_side_faces": int(len(back)),
+                    "normal_side_faces": int(len(normal)),
                     "neither_side_faces": int(len(neither)),
+                    "both_side_faces": int(len(both)),
+                    "back_side_area": back_area,
+                    "normal_side_area": normal_area,
+                    "neither_side_area": neither_area,
+                    "both_side_area": both_area,
                 }
             )
     candidates.sort(key=lambda row: (-row["area"], -row["face_count"]))
     selected = None
-    alternative_area = float(sum(row["area"] for row in candidates[1:]))
+    alternative_area = float(
+        math.fsum(row["area"] for row in candidates[1:])
+    )
     if (
         candidates
         and candidates[0]["area"] > alternative_area
@@ -305,6 +313,13 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
             "same_direction_shared_edges",
         ):
             require_int(topology, field)
+    input_topology = input_mesh["topology"]
+    output_topology = output_mesh["topology"]
+    for field in ("boundary_edges", "nonmanifold_edges"):
+        if input_topology[field] != output_topology[field]:
+            raise ValueError(
+                f"exterior repair receipt winding changed {field}"
+            )
 
     component = require_dict(receipt, "component_orientation")
     component_count = require_int(component, "components")
@@ -315,13 +330,15 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
         raise ValueError("exterior repair receipt min_confidence must be <= 1")
     if flipped_components > component_count or flipped_faces > input_faces:
         raise ValueError("exterior repair receipt component counts are impossible")
+    if (flipped_components == 0) != (flipped_faces == 0):
+        raise ValueError("exterior repair receipt component flip counts disagree")
 
     orientation = require_dict(receipt, "orientation")
     candidate_count = require_int(orientation, "candidate_count")
     status = orientation.get("selection_status")
     if status not in {"selected", "ambiguous", "none"}:
         raise ValueError("exterior repair receipt selection_status is invalid")
-    require_number(orientation, "alternative_area")
+    alternative_area = require_number(orientation, "alternative_area")
     reversed_faces = require_int(orientation, "reversed_faces")
     candidates = orientation.get("candidates")
     if not isinstance(candidates, list) or len(candidates) != candidate_count:
@@ -330,11 +347,57 @@ def validate_exterior_surface_repair_receipt(receipt: dict) -> None:
         if not isinstance(candidate, dict):
             raise ValueError("exterior repair receipt candidate must be an object")
         face_count = require_int(candidate, "face_count", minimum=1)
-        require_number(candidate, "area", minimum=np.finfo(np.float64).tiny)
+        area = require_number(
+            candidate, "area", minimum=np.finfo(np.float64).tiny
+        )
         back_faces = require_int(candidate, "back_side_faces")
+        normal_faces = require_int(candidate, "normal_side_faces")
         neither_faces = require_int(candidate, "neither_side_faces")
-        if back_faces + neither_faces > face_count:
+        both_faces = require_int(candidate, "both_side_faces")
+        class_faces = back_faces + normal_faces + neither_faces + both_faces
+        if class_faces != face_count:
             raise ValueError("exterior repair receipt candidate counts are impossible")
+        back_area = require_number(candidate, "back_side_area")
+        normal_area = require_number(candidate, "normal_side_area")
+        neither_area = require_number(candidate, "neither_side_area")
+        both_area = require_number(candidate, "both_side_area")
+        class_area = math.fsum(
+            (back_area, normal_area, neither_area, both_area)
+        )
+        if not math.isclose(area, class_area, rel_tol=1e-12, abs_tol=0.0):
+            raise ValueError("exterior repair receipt candidate areas disagree")
+        if back_faces == 0 or normal_area != 0.0 or back_area <= neither_area + both_area:
+            raise ValueError("exterior repair receipt candidate is ineligible")
+
+    expected_order = sorted(
+        candidates,
+        key=lambda candidate: (-candidate["area"], -candidate["face_count"]),
+    )
+    if candidates != expected_order:
+        raise ValueError("exterior repair receipt candidates are out of order")
+    expected_alternative_area = math.fsum(
+        float(candidate["area"]) for candidate in candidates[1:]
+    )
+    if not math.isclose(
+        alternative_area,
+        expected_alternative_area,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    ):
+        raise ValueError("exterior repair receipt alternative area disagrees")
+    dominates = bool(
+        candidates
+        and candidates[0]["area"] > alternative_area
+        and not math.isclose(
+            candidates[0]["area"],
+            alternative_area,
+            rel_tol=1e-12,
+            abs_tol=0.0,
+        )
+    )
+    expected_status = "selected" if dominates else "ambiguous" if candidates else "none"
+    if status != expected_status:
+        raise ValueError("exterior repair receipt status contradicts candidates")
 
     has_selected_fields = (
         "selected_face_count" in orientation or "selected_area" in orientation

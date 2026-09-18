@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import copy
 import pytest
 
 
@@ -4303,7 +4304,13 @@ def _valid_exterior_repair_receipt():
                     "face_count": 666,
                     "area": 3.0,
                     "back_side_faces": 666,
+                    "normal_side_faces": 0,
                     "neither_side_faces": 0,
+                    "both_side_faces": 0,
+                    "back_side_area": 3.0,
+                    "normal_side_area": 0.0,
+                    "neither_side_area": 0.0,
+                    "both_side_area": 0.0,
                 }
             ],
             "selected_face_count": 666,
@@ -4311,6 +4318,40 @@ def _valid_exterior_repair_receipt():
             "reversed_faces": 666,
         },
     }
+
+
+def _receipt_claims_ambiguity_for_dominant_candidate(receipt):
+    orientation = receipt["orientation"]
+    orientation["selection_status"] = "ambiguous"
+    orientation["reversed_faces"] = 0
+    orientation.pop("selected_face_count")
+    orientation.pop("selected_area")
+
+
+def _receipt_selects_without_dominance(receipt):
+    orientation = receipt["orientation"]
+    alternative = copy.deepcopy(orientation["candidates"][0])
+    alternative["area"] = 4.0
+    alternative["back_side_area"] = 4.0
+    orientation["candidates"].append(alternative)
+    orientation["candidate_count"] = 2
+    orientation["alternative_area"] = 4.0
+
+
+def _receipt_selects_ineligible_candidate(receipt):
+    candidate = receipt["orientation"]["candidates"][0]
+    candidate["back_side_faces"] = 0
+    candidate["normal_side_faces"] = candidate["face_count"]
+    candidate["back_side_area"] = 0.0
+    candidate["normal_side_area"] = candidate["area"]
+
+
+def _receipt_changes_winding_invariant_topology(receipt):
+    receipt["output_mesh"]["topology"]["boundary_edges"] += 1
+
+
+def _receipt_flips_faces_without_a_component(receipt):
+    receipt["component_orientation"]["flipped_components"] = 0
 
 
 def test_final_glb_validator_rejects_blank_primary(tmp_path):
@@ -4494,12 +4535,19 @@ def test_final_glb_validator_rejects_requested_repair_without_receipt(tmp_path):
             lambda receipt: receipt.pop("component_orientation"),
             "exterior repair receipt",
         ),
+        (
+            _receipt_claims_ambiguity_for_dominant_candidate,
+            "exterior repair receipt",
+        ),
+        (_receipt_selects_without_dominance, "exterior repair receipt"),
+        (_receipt_selects_ineligible_candidate, "exterior repair receipt"),
+        (_receipt_changes_winding_invariant_topology, "exterior repair receipt"),
+        (_receipt_flips_faces_without_a_component, "exterior repair receipt"),
     ],
 )
 def test_final_glb_validator_rejects_impossible_repair_receipt(
     tmp_path, mutate, message
 ):
-    import copy
     import numpy as np
     import trimesh
 
