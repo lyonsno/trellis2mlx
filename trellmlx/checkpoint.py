@@ -14,6 +14,8 @@ Usage:
 
 import json
 import os
+import hashlib
+import uuid
 
 import numpy as np
 
@@ -29,6 +31,8 @@ def save_checkpoint(checkpoint_dir: str, stage: str, **arrays):
     os.makedirs(checkpoint_dir, exist_ok=True)
     npz_path = os.path.join(checkpoint_dir, f"{stage}.npz")
     meta_path = os.path.join(checkpoint_dir, f"{stage}.json")
+    pending_path = os.path.join(checkpoint_dir, f"{stage}.pending")
+    complete_path = os.path.join(checkpoint_dir, f"{stage}.complete.json")
 
     # Separate scalars/metadata from arrays
     metadata = {}
@@ -50,21 +54,52 @@ def save_checkpoint(checkpoint_dir: str, stage: str, **arrays):
             except Exception:
                 metadata[key] = str(val)
 
-    # Save arrays
-    if np_arrays:
-        np.savez_compressed(
-            npz_path,
-            **np_arrays,
-        )
-    elif os.path.exists(npz_path):
-        os.remove(npz_path)
-
-    # Save metadata
-    if metadata:
-        with open(meta_path, "w") as f:
-            json.dump(metadata, f)
-    elif os.path.exists(meta_path):
-        os.remove(meta_path)
+    # A pending marker invalidates both old and partially replaced stage files.
+    # The completion manifest is published only after every payload is durable.
+    with open(pending_path, "w") as f:
+        f.write("pending\n")
+        f.flush()
+        os.fsync(f.fileno())
+    temp_paths = []
+    try:
+        replacements = {}
+        if np_arrays:
+            temp_npz = f"{npz_path}.{uuid.uuid4().hex}.tmp"
+            temp_paths.append(temp_npz)
+            with open(temp_npz, "wb") as f:
+                np.savez_compressed(f, **np_arrays)
+                f.flush()
+                os.fsync(f.fileno())
+            replacements[npz_path] = temp_npz
+        if metadata:
+            temp_meta = f"{meta_path}.{uuid.uuid4().hex}.tmp"
+            temp_paths.append(temp_meta)
+            with open(temp_meta, "w") as f:
+                json.dump(metadata, f)
+                f.flush()
+                os.fsync(f.fileno())
+            replacements[meta_path] = temp_meta
+        for final_path in (npz_path, meta_path):
+            if final_path in replacements:
+                os.replace(replacements[final_path], final_path)
+            elif os.path.exists(final_path):
+                os.remove(final_path)
+        files = {}
+        for path in (npz_path, meta_path):
+            if os.path.exists(path):
+                files[os.path.basename(path)] = _file_sha256(path)
+        temp_complete = f"{complete_path}.{uuid.uuid4().hex}.tmp"
+        temp_paths.append(temp_complete)
+        with open(temp_complete, "w") as f:
+            json.dump({"schema": 1, "files": files}, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_complete, complete_path)
+        os.remove(pending_path)
+    finally:
+        for path in temp_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
     total_bytes = sum(a.nbytes for a in np_arrays.values())
     print(f"  Checkpoint saved: {stage} ({total_bytes / 1e6:.1f} MB)", flush=True)
@@ -76,6 +111,8 @@ def load_checkpoint(checkpoint_dir: str, stage: str):
     Returns:
         dict of array name → numpy array, plus metadata from JSON.
     """
+    if not has_checkpoint(checkpoint_dir, stage):
+        raise ValueError(f"checkpoint {stage!r} invalid or missing in {checkpoint_dir}")
     result = {}
 
     # Load arrays
@@ -103,8 +140,158 @@ def load_checkpoint(checkpoint_dir: str, stage: str):
 
 def has_checkpoint(checkpoint_dir: str, stage: str) -> bool:
     """Check if a checkpoint exists for a stage."""
+    if os.path.exists(os.path.join(checkpoint_dir, f"{stage}.pending")):
+        return False
+    complete_path = os.path.join(checkpoint_dir, f"{stage}.complete.json")
+    if os.path.exists(complete_path):
+        try:
+            with open(complete_path) as f:
+                manifest = json.load(f)
+            files = manifest["files"]
+            if manifest.get("schema") != 1 or not files:
+                return False
+            actual = {
+                name for name in (f"{stage}.npz", f"{stage}.json")
+                if os.path.exists(os.path.join(checkpoint_dir, name))
+            }
+            if set(files) != actual:
+                return False
+            return all(
+                name in (f"{stage}.npz", f"{stage}.json")
+                and _file_sha256(os.path.join(checkpoint_dir, name)) == digest
+                for name, digest in files.items()
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    # Existing checkpoints predate completion manifests. They remain readable,
+    # but the resume planner must not mistake them for crash-safe stage inputs.
     return (os.path.exists(os.path.join(checkpoint_dir, f"{stage}.npz"))
             or os.path.exists(os.path.join(checkpoint_dir, f"{stage}.json")))
+
+
+def is_verified_checkpoint(checkpoint_dir: str, stage: str) -> bool:
+    """Whether a stage has a valid completion manifest, unlike legacy files."""
+    return (os.path.exists(os.path.join(checkpoint_dir, f"{stage}.complete.json"))
+            and has_checkpoint(checkpoint_dir, stage))
+
+
+def select_resume_stage(checkpoint_dir: str) -> str:
+    """Choose an implemented boundary or fail; never restart inference silently."""
+    if has_checkpoint(checkpoint_dir, "mesh_raw") and has_checkpoint(checkpoint_dir, "texture"):
+        return "finalize"
+    if is_verified_checkpoint(checkpoint_dir, "hr_flow_input"):
+        return "hr_flow_input"
+    available = list_checkpoints(checkpoint_dir)
+    raise ValueError(
+        "no supported resume boundary in "
+        f"{checkpoint_dir}; available stages: {available}. "
+        "This run will not restart from the image or random conditioning."
+    )
+
+
+def prepare_new_checkpoint_dir(checkpoint_dir: str) -> None:
+    """Claim one fresh run directory; existing stage files cannot be mixed in."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    existing = os.listdir(checkpoint_dir)
+    if existing:
+        raise ValueError(
+            f"checkpoint directory already contains checkpoint data or an "
+            f"active run: {checkpoint_dir} ({sorted(existing)[:4]})"
+        )
+    claim = os.path.join(checkpoint_dir, ".run-claimed")
+    try:
+        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as error:
+        raise ValueError(
+            f"checkpoint directory already contains checkpoint data or an "
+            f"active run: {checkpoint_dir}"
+        ) from error
+    with os.fdopen(fd, "w") as stream:
+        stream.write(f"pid={os.getpid()}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def claimed_by_this_process(checkpoint_dir: str) -> bool:
+    claim = os.path.join(checkpoint_dir, ".run-claimed")
+    try:
+        with open(claim) as stream:
+            return stream.read().strip() == f"pid={os.getpid()}"
+    except OSError:
+        return False
+
+
+def write_pipeline_failure(checkpoint_dir: str, error: Exception, *, argv,
+                           traceback_text: str | None = None) -> None:
+    """Publish a failure receipt even when the primary output was never made."""
+    control = os.path.join(checkpoint_dir, "_control")
+    os.makedirs(control, exist_ok=True)
+    target = os.path.join(control, "pipeline_failure.json")
+    temporary = f"{target}.{uuid.uuid4().hex}.tmp"
+    payload = {
+        "schema": 1,
+        "status": "failed",
+        "last_trustworthy_stages": list_checkpoints(checkpoint_dir),
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "argv": list(argv),
+        "traceback": traceback_text,
+    }
+    try:
+        with open(temporary, "w") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        _write_current_attempt(checkpoint_dir, {
+            "schema": 1,
+            "status": "failed",
+            "failure_receipt": "pipeline_failure.json",
+            "last_trustworthy_stages": payload["last_trustworthy_stages"],
+        })
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def write_hr_recovery_status(checkpoint_dir: str) -> None:
+    """Record that a prior failed attempt yielded shape_slat, not a mesh."""
+    if not is_verified_checkpoint(checkpoint_dir, "shape_slat"):
+        raise ValueError("cannot mark HR recovery without verified shape_slat")
+    _write_current_attempt(checkpoint_dir, {
+        "schema": 1,
+        "status": "hr_shape_recovered_only",
+        "produced_stage": "shape_slat",
+        "produced_mesh": False,
+        "prior_failure_receipts": [
+            name for name in ("failure.json", "pipeline_failure.json")
+            if os.path.exists(os.path.join(checkpoint_dir, "_control", name))
+        ],
+    })
+
+
+def _write_current_attempt(checkpoint_dir: str, payload: dict) -> None:
+    control = os.path.join(checkpoint_dir, "_control")
+    os.makedirs(control, exist_ok=True)
+    target = os.path.join(control, "current_attempt.json")
+    temporary = f"{target}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary, "w") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def inspect_checkpoints(checkpoint_dir: str):
@@ -149,11 +336,13 @@ def list_checkpoints(checkpoint_dir: str) -> list[str]:
         return []
     stages = set()
     for f in os.listdir(checkpoint_dir):
+        if f.endswith(".complete.json"):
+            continue
         if f.endswith(".npz"):
             stages.add(f[:-4])
         elif f.endswith(".json"):
             stages.add(f[:-5])
-    return sorted(stages)
+    return sorted(stage for stage in stages if has_checkpoint(checkpoint_dir, stage))
 
 
 if __name__ == "__main__":

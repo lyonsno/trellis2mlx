@@ -67,6 +67,8 @@ def flow_euler_sample(
     capture_steps: list[dict] | None = None,
     stop_after_first_step: bool = False,
     start_step_index: int = 0,
+    on_step_complete=None,
+    on_phase=None,
     sparse_block_injection=None,
     shape_block_injection=None,
     **model_kwargs,
@@ -115,8 +117,12 @@ def flow_euler_sample(
     pos_kv_cache = None
     neg_kv_cache = None
     if hasattr(model, 'build_cross_kv_cache'):
+        if on_phase is not None:
+            on_phase(None, "positive_cache_build")
         pos_kv_cache = model.build_cross_kv_cache(cond)
         if guidance_strength != 1.0:
+            if on_phase is not None:
+                on_phase(None, "negative_cache_build")
             neg_kv_cache = model.build_cross_kv_cache(neg_cond)
 
     # Build timestep schedule
@@ -129,6 +135,8 @@ def flow_euler_sample(
         )
 
     for step_idx, (t, t_prev) in enumerate(t_pairs[start_step_index:], start=start_step_index):
+        if on_phase is not None:
+            on_phase(step_idx, "step_start")
         if verbose:
             print(f"  Step {step_idx + 1}/{steps} (t={t:.4f}→{t_prev:.4f})", end="", flush=True)
 
@@ -155,6 +163,8 @@ def flow_euler_sample(
             )
             if pos_kv_cache is not None:
                 kw['cross_kv_cache'] = pos_kv_cache
+            if on_phase is not None:
+                on_phase(step_idx, "positive_forward")
             pred_pos = model(sample, t_tensor, cond, **kw)
             kw_neg = _branch_model_kwargs(
                 model_kwargs,
@@ -165,10 +175,16 @@ def flow_euler_sample(
             )
             if neg_kv_cache is not None:
                 kw_neg['cross_kv_cache'] = neg_kv_cache
+            if on_phase is not None:
+                on_phase(step_idx, "negative_forward")
             pred_neg = model(sample, t_tensor, neg_cond, **kw_neg)
+            if on_phase is not None:
+                on_phase(step_idx, "model_forward_eval")
             mx.eval(pred_pos, pred_neg)
 
             # CFG combination
+            if on_phase is not None:
+                on_phase(step_idx, "guidance")
             pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
             pred_cfg = pred
 
@@ -209,7 +225,11 @@ def flow_euler_sample(
             )
             if pos_kv_cache is not None:
                 kw['cross_kv_cache'] = pos_kv_cache
+            if on_phase is not None:
+                on_phase(step_idx, "positive_forward")
             pred = model(sample, t_tensor, cond, **kw)
+            if on_phase is not None:
+                on_phase(step_idx, "model_forward_eval")
             mx.eval(pred)
             pred_pos = pred
             pred_neg = pred
@@ -233,6 +253,8 @@ def flow_euler_sample(
                 x_0_rescaled = x_0
 
         # Euler step
+        if on_phase is not None:
+            on_phase(step_idx, "euler")
         euler_dt = np.float32(t - t_prev).item()
         euler_delta = euler_dt * pred
         mx.eval(euler_delta)
@@ -265,6 +287,8 @@ def flow_euler_sample(
                 mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
         mx.eval(sample)
+        if on_step_complete is not None:
+            on_step_complete(step_idx, sample)
 
         if verbose:
             print(f" done", flush=True)

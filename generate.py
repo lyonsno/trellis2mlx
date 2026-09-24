@@ -13,6 +13,7 @@ Usage:
 import argparse
 import gc
 import hashlib
+from importlib.metadata import version as package_version
 import json
 import os
 from pathlib import Path
@@ -550,6 +551,45 @@ def _resume_source_identity(checkpoint_dir):
                     "size_bytes": len(payload),
                 }
     return {"checkpoint_dir": str(root), "files": files}
+
+
+def _hr_runtime_identity(args, weights_path, shape_attention_route):
+    """The effective environment that must match for exact HR step replay."""
+    weights = Path(weights_path).resolve()
+    stat = weights.stat()
+    def digest_file(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    source_root = Path(__file__).resolve().parent
+    source_files = [source_root / "generate.py"] + sorted(
+        path for path in (source_root / "trellmlx").rglob("*")
+        if path.is_file() and path.suffix in {".py", ".metal"}
+    )
+    source_digest = hashlib.sha256()
+    for path in source_files:
+        source_digest.update(str(path.relative_to(source_root)).encode())
+        source_digest.update(bytes.fromhex(digest_file(path)))
+    effective_attention_route = _shape_flow_attention_route_from_env()
+    if shape_attention_route is not None and shape_attention_route != effective_attention_route:
+        raise ValueError("shape-flow attention route changed before HR checkpoint")
+    return {
+        "mlx_version": package_version("mlx"),
+        "weights_path": str(weights),
+        "weights_size_bytes": stat.st_size,
+        "weights_mtime_ns": stat.st_mtime_ns,
+        "weights_sha256": digest_file(weights),
+        "source_code_sha256": source_digest.hexdigest(),
+        "quantize": args.quantize,
+        "compile": bool(args.compile),
+        "shape_flow_layernorm_backend": get_shape_flow_layernorm_backend(),
+        "qk_norm_backend": get_qk_norm_backend(),
+        "rope_backend": get_rope_backend(),
+        "shape_attention_route": effective_attention_route,
+    }
 
 
 def _load_bound_resume_inputs(checkpoint_dir):
@@ -1571,7 +1611,11 @@ def main():
                         help="Cooperatively exit with a checkpoint-yield receipt if PATH exists "
                         "after a durable checkpoint boundary. Requires --save-checkpoints.")
     parser.add_argument("--resume", metavar="DIR",
-                        help="Resume from checkpoints in DIR (skips completed inference stages)")
+                        help="Resume a supported checkpoint boundary in DIR; fail rather than restart from scratch")
+    parser.add_argument("--recover-hr-only", action="store_true",
+                        help="With --resume, recover only the HR shape flow to shape_slat; does not produce a mesh or GLB")
+    parser.add_argument("--replay-hr-input", action="store_true",
+                        help="With --resume, --recover-hr-only, and a fresh --save-checkpoints DIR, start a new HR trajectory from saved input under the current route")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -1596,6 +1640,12 @@ def main():
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
     if args.stop_after_stage and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --stop-after-stage is set")
+    if args.resume and args.stop_after_stage:
+        parser.error("--resume and --stop-after-stage cannot be combined")
+    if args.recover_hr_only and not args.resume:
+        parser.error("--recover-hr-only requires --resume")
+    if args.replay_hr_input and not args.recover_hr_only:
+        parser.error("--replay-hr-input requires --resume and --recover-hr-only")
     if args.shape_slat_sample and args.stop_after_stage != "decoder_output":
         parser.error("--shape-slat-sample requires --stop-after-stage decoder_output")
     if args.shape_slat_support_sample and not args.no_cascade:
@@ -1870,11 +1920,101 @@ def main():
 
     # === Resume from checkpoints ===
     if args.resume:
-        from trellmlx.checkpoint import has_checkpoint, list_checkpoints
+        from trellmlx.checkpoint import (
+            load_checkpoint, list_checkpoints, save_checkpoint,
+            select_resume_stage,
+        )
         available = list_checkpoints(args.resume)
         print(f"Resuming from {args.resume} (stages: {', '.join(available)})", flush=True)
+        resume_stage = select_resume_stage(args.resume)
 
-        if has_checkpoint(args.resume, "texture") and has_checkpoint(args.resume, "mesh_raw"):
+        if resume_stage == "hr_flow_input":
+            if not args.recover_hr_only:
+                raise ValueError(
+                    "Only HR shape-flow recovery exists at this checkpoint. "
+                    "Use --recover-hr-only to write shape_slat; full mesh/export "
+                    "resume from this stage is not implemented."
+                )
+            if args.replay_hr_input:
+                if not args.save_checkpoints or Path(args.save_checkpoints).resolve() == Path(args.resume).resolve():
+                    parser.error("--replay-hr-input requires a different, fresh --save-checkpoints DIR")
+                from trellmlx.checkpoint import prepare_new_checkpoint_dir
+                prepare_new_checkpoint_dir(args.save_checkpoints)
+                hr_output_dir = args.save_checkpoints
+            else:
+                if args.save_checkpoints and Path(args.save_checkpoints).resolve() != Path(args.resume).resolve():
+                    parser.error("exact HR continuation writes into --resume DIR; "
+                                 "use --replay-hr-input for a new directory and trajectory")
+                hr_output_dir = args.resume
+            input_data = load_checkpoint(args.resume, "hr_flow_input")
+            required = {"quant_coords", "mesh_grid_size"}
+            if not required.issubset(input_data):
+                raise ValueError(
+                    "HR checkpoint lacks downstream mesh coordinates; "
+                    f"missing {sorted(required - set(input_data))}"
+                )
+            from trellmlx.models.slat_flow import SLatFlowModel
+            from trellmlx.weight_loader import load_weights
+            from trellmlx.cleanup import cleanup_model
+            from trellmlx.hr_recovery import resume_hr_flow, replay_hr_input
+
+            attention_baseline = _capture_attention_route_env()
+            shape_attention_route = _configure_shape_flow_attention_route(args)
+            hr_weights_path = os.path.expanduser(
+                "~/.cache/huggingface/hub/models--microsoft--TRELLIS.2-4B/"
+                "snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/"
+                "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors"
+            )
+            hr_model = SLatFlowModel.for_shape()
+            load_weights(hr_model, hr_weights_path, verbose=False)
+            if args.quantize:
+                from trellmlx.quantize import quantize_model
+                quantize_model(hr_model, bits=args.quantize)
+            if args.compile:
+                hr_model.compile()
+            hr_runtime = _hr_runtime_identity(
+                args, hr_weights_path, shape_attention_route
+            )
+            if args.replay_hr_input:
+                hr_slat = replay_hr_input(
+                    hr_model, args.resume, hr_output_dir, runtime=hr_runtime
+                )
+            else:
+                hr_slat = resume_hr_flow(
+                    hr_model, args.resume, expected_runtime=hr_runtime
+                )
+            # This is the exact input consumed by the HR sampler. In changed-
+            # route replay it lives in the new destination, not the source.
+            input_data = load_checkpoint(hr_output_dir, "hr_flow_input")
+            hr_slat = _denormalize_slat(hr_slat)
+            mx.eval(hr_slat)
+            cleanup_model(hr_model)
+            texture_attention_route = _restore_attention_route_env(attention_baseline)
+            save_checkpoint(
+                hr_output_dir, "shape_slat",
+                feats=np.array(hr_slat).astype(np.float32, copy=False),
+                coords=np.asarray(input_data["quant_coords"], dtype=np.int32),
+                coords_3d=np.asarray(input_data["coords"], dtype=np.int32),
+                mesh_grid_size=int(input_data["mesh_grid_size"]),
+                cascade=True,
+                shape_flow_attention_route_json=np.array(
+                    json.dumps(shape_attention_route, sort_keys=True)
+                ),
+                texture_attention_route_json=np.array(
+                    json.dumps(texture_attention_route or {}, sort_keys=True)
+                ),
+            )
+            from trellmlx.checkpoint import write_hr_recovery_status
+            write_hr_recovery_status(hr_output_dir)
+            if args.replay_hr_input:
+                print("New HR trajectory replayed from saved input to shape_slat only; no mesh or GLB was produced", flush=True)
+            else:
+                print("HR flow recovered to shape_slat only; no mesh or GLB was produced", flush=True)
+            return
+
+        if resume_stage == "finalize":
+            if args.recover_hr_only:
+                parser.error("--recover-hr-only requires an HR input checkpoint without a complete mesh/texture pair")
             mesh_data, tex_data, resume_source_identity = (
                 _load_bound_resume_inputs(args.resume)
             )
@@ -2015,11 +2155,10 @@ def main():
             print(f"\nResume total: {time.perf_counter()-t_total:.1f}s", flush=True)
             return
 
-        elif has_checkpoint(args.resume, "mesh_raw"):
-            print("  Only mesh checkpoint found — will re-run texture stages", flush=True)
-            # Could add partial resume here later
-        else:
-            print(f"  No usable checkpoints in {args.resume}, running full pipeline", flush=True)
+
+    if args.save_checkpoints:
+        from trellmlx.checkpoint import prepare_new_checkpoint_dir
+        prepare_new_checkpoint_dir(args.save_checkpoints)
 
     mx.random.seed(args.seed)
     n_steps = args.steps
@@ -3500,7 +3639,8 @@ def main():
         print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
 
         hr_slat_flow = SLatFlowModel.for_shape()
-        load_weights(hr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", verbose=False)
+        hr_weights_path = HF_4B + "slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors"
+        load_weights(hr_slat_flow, hr_weights_path, verbose=False)
         if args.quantize:
             quantize_model(hr_slat_flow, bits=args.quantize)
         if args.compile:
@@ -3509,12 +3649,27 @@ def main():
         hr_noise = mx.random.normal((num_tokens, 32))
 
         t0 = time.perf_counter()
-        hr_slat = flow_euler_sample(
-            hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
-            verbose=False,
-            coords=mx.array(hr_coords_3d),
-            **SHAPE_SAMPLER,
-        )
+        if args.save_checkpoints:
+            from trellmlx.hr_recovery import run_hr_flow
+
+            hr_slat = run_hr_flow(
+                hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond,
+                neg_cond, mx.array(hr_coords_3d),
+                checkpoint_dir=args.save_checkpoints,
+                sampler=SHAPE_SAMPLER,
+                runtime=_hr_runtime_identity(
+                    args, hr_weights_path, shape_flow_attention_route
+                ),
+                quant_coords=quant_coords,
+                mesh_grid_size=hr_resolution,
+            )
+        else:
+            hr_slat = flow_euler_sample(
+                hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+                verbose=False,
+                coords=mx.array(hr_coords_3d),
+                **SHAPE_SAMPLER,
+            )
         mx.eval(hr_slat)
         print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
 
@@ -3932,4 +4087,49 @@ def _extract_image_features(image_path, resolution=512):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        import sys
+        import traceback
+
+        from trellmlx.checkpoint import (
+            claimed_by_this_process, write_pipeline_failure,
+        )
+
+        arguments = sys.argv[1:]
+        checkpoint_dir = None
+        if "--save-checkpoints" in arguments:
+            index = arguments.index("--save-checkpoints")
+            if index + 1 < len(arguments):
+                checkpoint_dir = arguments[index + 1]
+        else:
+            for argument in arguments:
+                if argument.startswith("--save-checkpoints="):
+                    checkpoint_dir = argument.split("=", 1)[1]
+                    break
+        if checkpoint_dir and claimed_by_this_process(checkpoint_dir):
+            try:
+                write_pipeline_failure(
+                    checkpoint_dir, error, argv=sys.argv,
+                    traceback_text=traceback.format_exc(),
+                )
+            except Exception as report_error:
+                error.add_note(
+                    f"Could not write pipeline failure report: {report_error}"
+                )
+        elif "--resume" in arguments:
+            index = arguments.index("--resume")
+            if index + 1 < len(arguments):
+                resume_dir = arguments[index + 1]
+                if Path(resume_dir).is_dir():
+                    try:
+                        write_pipeline_failure(
+                            resume_dir, error, argv=sys.argv,
+                            traceback_text=traceback.format_exc(),
+                        )
+                    except Exception as report_error:
+                        error.add_note(
+                            f"Could not write resume failure report: {report_error}"
+                        )
+        raise

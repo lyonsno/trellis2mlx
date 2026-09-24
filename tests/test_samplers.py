@@ -2,6 +2,48 @@ import mlx.core as mx
 import numpy as np
 
 
+def test_step_checkpoint_hook_can_resume_from_last_completed_step():
+    from trellmlx.samplers import flow_euler_sample
+
+    class ConstantModel:
+        def __call__(self, sample, timestep, cond, **kwargs):
+            return mx.ones_like(sample)
+
+    model = ConstantModel()
+    noise = mx.array(np.full((3, 32), 2, dtype=np.float32))
+    cond = mx.zeros((1, 1, 4))
+    completed = []
+
+    def interrupt_after_first(index, sample):
+        completed.append((index, np.array(sample)))
+        if index == 0:
+            raise RuntimeError("interrupt")
+
+    try:
+        flow_euler_sample(
+            model, noise, cond, cond, steps=3,
+            guidance_strength=1.0, guidance_rescale=0.0,
+            coords=mx.zeros((3, 3), dtype=mx.int32),
+            on_step_complete=interrupt_after_first,
+            verbose=False,
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "interrupt"
+    assert completed[0][0] == 0
+    resumed = flow_euler_sample(
+        model, mx.array(completed[0][1]), cond, cond, steps=3,
+        guidance_strength=1.0, guidance_rescale=0.0,
+        coords=mx.zeros((3, 3), dtype=mx.int32),
+        start_step_index=1, verbose=False,
+    )
+    full = flow_euler_sample(
+        model, noise, cond, cond, steps=3,
+        guidance_strength=1.0, guidance_rescale=0.0,
+        coords=mx.zeros((3, 3), dtype=mx.int32), verbose=False,
+    )
+    np.testing.assert_array_equal(np.array(resumed), np.array(full))
+
+
 def _source_sparse_std_reference(values: np.ndarray) -> np.float32:
     values = np.asarray(values, dtype=np.float32)
     rows, channels = values.shape
