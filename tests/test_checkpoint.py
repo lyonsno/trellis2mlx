@@ -17,7 +17,88 @@ from trellmlx.checkpoint import (
     load_checkpoint,
     has_checkpoint,
     list_checkpoints,
+    select_resume_stage,
+    prepare_new_checkpoint_dir,
+    write_pipeline_failure,
+    write_hr_recovery_status,
 )
+
+
+def test_interrupted_save_is_not_resumable(tmp_path, monkeypatch):
+    import trellmlx.checkpoint as checkpoint
+
+    directory = str(tmp_path / "checkpoints")
+    original = checkpoint.np.savez_compressed
+
+    def fail_after_partial_write(stream, **arrays):
+        stream.write(b"partial npz")
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(checkpoint.np, "savez_compressed", fail_after_partial_write)
+    with pytest.raises(OSError, match="simulated full disk"):
+        save_checkpoint(directory, "hr_flow_input", sample=np.ones((2, 32)))
+    assert not has_checkpoint(directory, "hr_flow_input")
+    assert "hr_flow_input" not in list_checkpoints(directory)
+    monkeypatch.setattr(checkpoint.np, "savez_compressed", original)
+    save_checkpoint(directory, "hr_flow_input", sample=np.ones((2, 32)))
+    assert has_checkpoint(directory, "hr_flow_input")
+
+
+def test_corrupt_completed_checkpoint_fails_closed(tmp_path):
+    directory = str(tmp_path / "checkpoints")
+    save_checkpoint(directory, "hr_flow_input", sample=np.ones((2, 32)))
+    (tmp_path / "checkpoints" / "hr_flow_input.npz").write_bytes(b"corrupt")
+    assert not has_checkpoint(directory, "hr_flow_input")
+    with pytest.raises(ValueError, match="checkpoint.*invalid"):
+        load_checkpoint(directory, "hr_flow_input")
+
+
+def test_resume_never_restarts_on_partial_checkpoints(tmp_path):
+    directory = str(tmp_path / "checkpoints")
+    save_checkpoint(directory, "conditioning", cond=np.ones((1, 2, 3)))
+    save_checkpoint(directory, "sparse_coords", coords=np.zeros((2, 4)))
+    with pytest.raises(ValueError, match="no supported resume boundary"):
+        select_resume_stage(directory)
+    save_checkpoint(directory, "hr_flow_input", noise=np.ones((2, 32)))
+    assert select_resume_stage(directory) == "hr_flow_input"
+
+
+def test_new_run_rejects_existing_stage_files(tmp_path):
+    directory = str(tmp_path / "checkpoints")
+    prepare_new_checkpoint_dir(directory)
+    save_checkpoint(directory, "conditioning", cond=np.ones((1, 2, 3)))
+    with pytest.raises(ValueError, match="already contains checkpoint data"):
+        prepare_new_checkpoint_dir(directory)
+
+
+def test_failure_before_primary_output_has_durable_report(tmp_path):
+    import json
+    directory = str(tmp_path / "checkpoints")
+    prepare_new_checkpoint_dir(directory)
+    save_checkpoint(directory, "conditioning", cond=np.ones((1, 2, 3)))
+    write_pipeline_failure(directory, RuntimeError("GPU failed"),
+                           argv=["generate.py", "--save-checkpoints", directory])
+    with open(tmp_path / "checkpoints" / "_control" / "pipeline_failure.json") as f:
+        report = json.load(f)
+    assert report["status"] == "failed"
+    assert report["last_trustworthy_stages"] == ["conditioning"]
+    assert report["error_type"] == "RuntimeError"
+    assert report["error"] == "GPU failed"
+
+
+def test_successful_hr_only_recovery_does_not_hide_prior_failure(tmp_path):
+    import json
+    directory = str(tmp_path / "checkpoints")
+    prepare_new_checkpoint_dir(directory)
+    write_pipeline_failure(directory, RuntimeError("GPU failed"), argv=["generate.py"])
+    save_checkpoint(directory, "shape_slat", feats=np.ones((2, 32)))
+    write_hr_recovery_status(directory)
+    control = tmp_path / "checkpoints" / "_control"
+    assert json.loads((control / "pipeline_failure.json").read_text())["status"] == "failed"
+    current = json.loads((control / "current_attempt.json").read_text())
+    assert current["status"] == "hr_shape_recovered_only"
+    assert current["produced_stage"] == "shape_slat"
+    assert current["produced_mesh"] is False
 
 
 @pytest.fixture
