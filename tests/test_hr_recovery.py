@@ -39,6 +39,11 @@ class DoubleModel:
         return mx.ones_like(sample) * 2
 
 
+class MustNotRunModel:
+    def __call__(self, sample, timestep, cond, **kwargs):
+        raise AssertionError("HR Euler must not start")
+
+
 def _inputs():
     return (
         mx.array(np.full((3, 32), 2, dtype=np.float32)),
@@ -186,6 +191,20 @@ def test_changed_route_replays_saved_input_as_isolated_new_trajectory(tmp_path):
     assert provenance["source_runtime"] == {"route": "old"}
     assert provenance["new_runtime"] == {"route": "repaired"}
     assert not np.array_equal(load_checkpoint(destination, "hr_flow_step_000")["sample_next"], source_step)
+
+
+def test_stop_after_hr_input_saves_real_replay_boundary_before_euler(tmp_path):
+    noise, cond, coords = _inputs()
+    directory = str(tmp_path / "checkpoint")
+    result = run_hr_flow(
+        MustNotRunModel(), noise, cond, cond, coords,
+        checkpoint_dir=directory,
+        sampler={"steps": 2, "guidance_strength": 1.0},
+        runtime={"route": "test"}, stop_after_input=True,
+    )
+    assert result is None
+    assert has_checkpoint(directory, "hr_flow_input")
+    assert not has_checkpoint(directory, "hr_flow_step_000")
 
 
 def test_generate_cli_refuses_partial_resume_without_starting_inference(tmp_path):

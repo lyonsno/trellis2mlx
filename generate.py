@@ -1307,6 +1307,7 @@ def main():
             "shape_flow_step",
             "shape_flow_steps",
             "shape_flow_block_trace",
+            "hr_flow_input",
             "shape_slat",
             "decoder_output",
             "mesh_raw",
@@ -3662,7 +3663,11 @@ def main():
                 ),
                 quant_coords=quant_coords,
                 mesh_grid_size=hr_resolution,
+                stop_after_input=args.stop_after_stage == "hr_flow_input",
             )
+            if args.stop_after_stage == "hr_flow_input":
+                print("  Stop after stage: hr_flow_input (before first HR Euler step)", flush=True)
+                return
         else:
             hr_slat = flow_euler_sample(
                 hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,

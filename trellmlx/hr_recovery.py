@@ -95,7 +95,7 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
 
 def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
                 sampler, runtime, quant_coords=None, mesh_grid_size=None,
-                replay_provenance=None):
+                replay_provenance=None, stop_after_input=False):
     """Save exact input before sampling; do not infer it later from the seed."""
     state = {"last_complete_step": -1, "active_step": None,
              "active_phase": "saving_input"}
@@ -126,6 +126,8 @@ def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
         except Exception as report_error:
             error.add_note(f"Could not write HR failure report: {report_error}")
         raise
+    if stop_after_input:
+        return None
     # Consume the materialized bytes that were just saved, not a lazy random
     # expression whose value could be evaluated differently after a restart.
     return _sample(
