@@ -1,12 +1,14 @@
 """The real HTTP wire into generate.py, without requiring a GPU in these tests."""
 
 import base64
+import ast
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
 import struct
 import subprocess
+import socket
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -33,6 +35,35 @@ def test_generate_live_route_requires_real_sampler_stage(tmp_path):
     failure = json.loads((tmp_path / "terminal.json").read_text())
     assert failure["failurePhase"] == "local-preflight"
     assert failure["ok"] is False
+
+
+def test_live_route_replaces_stale_start_and_reports_early_cli_failure(tmp_path):
+    start = tmp_path / "start.json"
+    report = tmp_path / "terminal.json"
+    start.write_text('{"url":"http://127.0.0.1:1/conditioning"}')
+    report.write_text('{"ok":true}')
+    command = [__import__("sys").executable, str(GENERATE),
+               "--live-conditioning-listen", "127.0.0.1:0",
+               "--live-conditioning-start-receipt", str(start),
+               "--live-conditioning-report", str(report),
+               "--stop-after-stage", "sparse_flow_step"]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not start.exists(), "a prior listener URL must not survive a new invocation"
+    failure = json.loads(report.read_text())
+    assert failure["ok"] is False
+    assert failure["failurePhase"] == "local-preflight"
+
+
+def test_live_success_is_published_after_requested_checkpoint_save():
+    tree = ast.parse(GENERATE.read_text())
+    calls = [(node.lineno, ast.unparse(node.func)) for node in ast.walk(tree)
+             if isinstance(node, ast.Call)]
+    complete_lines = [line for line, call in calls if call == "_active_live_conditioning_receiver.complete"]
+    sparse_checkpoint_lines = [line for line, call in calls if call == "save_checkpoint" and 2800 < line < 2860]
+    assert len(complete_lines) == 1
+    assert len(sparse_checkpoint_lines) == 1
+    assert complete_lines[0] > sparse_checkpoint_lines[0]
 
 
 def _body():
@@ -156,6 +187,24 @@ def test_second_post_rejected_while_first_is_waiting(tmp_path):
             receiver.complete(mlx_device="gpu", cond_object_id=88, output_finite=True)
             assert pending.result(timeout=5).status == 200
     finally:
+        receiver.close()
+
+
+def test_partial_open_socket_does_not_occupy_only_admission_slot(tmp_path):
+    receiver = LiveConditioningReceiver(tmp_path / "start.json", tmp_path / "terminal.json",
+                                         source_revision="b" * 40).start()
+    sock = socket.create_connection(("127.0.0.1", int(receiver.url.split(":")[2].split("/")[0])))
+    try:
+        sock.sendall(("POST /conditioning HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      f"Content-Length: {BYTE_LENGTH}\r\n"
+                      "Content-Type: application/octet-stream\r\n\r\n").encode() + b"tiny")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(urlopen, _request(receiver.url, _body()))
+            assert receiver.wait().sha256 == hashlib.sha256(_body()).hexdigest()
+            receiver.complete(mlx_device="gpu", cond_object_id=88, output_finite=True)
+            assert pending.result(timeout=5).status == 200
+    finally:
+        sock.close()
         receiver.close()
 
 

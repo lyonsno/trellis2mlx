@@ -99,13 +99,16 @@ class LiveConditioningReceiver:
                             self.rfile.read(BYTE_LENGTH)
                         self._respond(409, {"ok": False, "failurePhase": "duplicate-conditioning-request"})
                         return
-                    receiver._claimed = True
                 try:
                     received = receiver._validate_and_read(self)
                 except (ValueError, UnicodeError, json.JSONDecodeError) as error:
-                    receiver._reject(str(error))
-                    self._respond(400, receiver._receipt)
+                    self._respond(400, receiver._reject(str(error)))
                     return
+                with receiver._lock:
+                    if receiver._claimed:
+                        self._respond(409, {"ok": False, "failurePhase": "duplicate-conditioning-request"})
+                        return
+                    receiver._claimed = True
                 receiver._received = received
                 receiver._received_event.set()
                 receiver._completed_event.wait()
@@ -182,6 +185,11 @@ class LiveConditioningReceiver:
         return ReceivedConditioning(body=body, envelope=envelope, sha256=sha)
 
     def _reject(self, error):
+        with self._lock:
+            if self._claimed:
+                return {"schema": RECEIPT_SCHEMA, "ok": False,
+                        "failurePhase": "duplicate-conditioning-request", "error": error}
+            self._claimed = True
         self._error = error
         self._receipt = {"schema": RECEIPT_SCHEMA, "ok": False,
                          "failurePhase": "validate-conditioning-request", "error": error,
@@ -194,6 +202,7 @@ class LiveConditioningReceiver:
         finally:
             self._received_event.set()
             self._completed_event.set()
+        return self._receipt
 
     def _receiver_identity(self):
         return {"pid": os.getpid(), "sessionId": self.session_id,

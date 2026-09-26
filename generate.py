@@ -25,6 +25,7 @@ import numpy as np
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
 
 _active_live_conditioning_receiver = None
+_active_live_conditioning_report_path = None
 from trellmlx.decoder_turing_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND as DECODER_CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_DECODER_LAYERNORM_BACKEND,
@@ -1599,6 +1600,13 @@ def main():
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
+    global _active_live_conditioning_report_path
+    if args.live_conditioning_listen and args.live_conditioning_report:
+        _active_live_conditioning_report_path = args.live_conditioning_report
+        # A prior invocation's URL and terminal result cannot describe this run.
+        if args.live_conditioning_start_receipt:
+            Path(args.live_conditioning_start_receipt).unlink(missing_ok=True)
+        Path(args.live_conditioning_report).unlink(missing_ok=True)
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
 
     def live_route_error(message):
@@ -2799,16 +2807,6 @@ def main():
                                 sparse_timestep_modulation_lut=sparse_timestep_modulation_lut)
         mx.eval(z_s)
 
-    if _active_live_conditioning_receiver is not None:
-        sampled_finite = bool(np.isfinite(np.array(z_s)).all())
-        _active_live_conditioning_receiver.complete(
-            mlx_device=mx.default_device(),
-            cond_object_id=live_cond_object_id,
-            output_finite=sampled_finite,
-        )
-        if not sampled_finite:
-            raise ValueError("live-conditioning sparse-flow step produced non-finite output")
-
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
 
     if args.save_checkpoints and args.stop_after_stage == "sparse_flow_step":
@@ -2879,6 +2877,15 @@ def main():
                 sparse_flow_cfg_rescale_std_json
             ),
         )
+        if _active_live_conditioning_receiver is not None:
+            sampled_finite = bool(np.isfinite(np.array(z_s)).all())
+            _active_live_conditioning_receiver.complete(
+                mlx_device=mx.default_device(),
+                cond_object_id=live_cond_object_id,
+                output_finite=sampled_finite,
+            )
+            if not sampled_finite:
+                raise ValueError("live-conditioning sparse-flow step produced non-finite output")
         print("  Stop after stage: sparse_flow_step", flush=True)
         return
 
@@ -4003,6 +4010,10 @@ if __name__ == "__main__":
     except BaseException as exc:
         if _active_live_conditioning_receiver is not None:
             _active_live_conditioning_receiver.fail("generate-runtime", exc)
+        elif _active_live_conditioning_report_path is not None:
+            from trellmlx.live_conditioning import write_live_preflight_failure
+            if not Path(_active_live_conditioning_report_path).exists():
+                write_live_preflight_failure(_active_live_conditioning_report_path, exc)
         raise
     finally:
         if _active_live_conditioning_receiver is not None:
