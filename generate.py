@@ -16,12 +16,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 
 import mlx.core as mx
 import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+
+_active_live_conditioning_receiver = None
 from trellmlx.decoder_turing_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND as DECODER_CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_DECODER_LAYERNORM_BACKEND,
@@ -1284,6 +1287,12 @@ def main():
                              "slat_noise_pool so shape SLat keeps the route's normal random noise.")
     parser.add_argument("--conditioning-sample", metavar="NPZ",
                         help="Diagnostic: load image conditioning from an NPZ containing cond and neg_cond.")
+    parser.add_argument("--live-conditioning-listen", metavar="127.0.0.1:0",
+                        help="Diagnostic: receive one current DINO F32 tensor through loopback HTTP.")
+    parser.add_argument("--live-conditioning-start-receipt", metavar="PATH",
+                        help="Write the bound live-conditioning URL and receiver identity to PATH.")
+    parser.add_argument("--live-conditioning-report", metavar="PATH",
+                        help="Write the receiver-owned terminal acceptance/failure report to PATH.")
     parser.add_argument("--shape-slat-sample", metavar="NPZ",
                         help="Diagnostic: load shape_slat NPZ containing feats and coords, then run "
                              "only the shape decoder to decoder_output.")
@@ -1591,6 +1600,24 @@ def main():
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
+
+    def live_route_error(message):
+        if args.live_conditioning_report:
+            from trellmlx.live_conditioning import write_live_preflight_failure
+            write_live_preflight_failure(args.live_conditioning_report, message)
+        parser.error(message)
+
+    if args.live_conditioning_listen:
+        if args.live_conditioning_listen != "127.0.0.1:0":
+            live_route_error("--live-conditioning-listen currently requires 127.0.0.1:0")
+        if not args.live_conditioning_start_receipt or not args.live_conditioning_report:
+            live_route_error("--live-conditioning-listen requires start-receipt and report paths")
+        if args.stop_after_stage != "sparse_flow_step":
+            live_route_error("--live-conditioning-listen requires --stop-after-stage sparse_flow_step")
+        if args.image or args.conditioning_sample or args.resume or args.edit_target:
+            live_route_error("live conditioning cannot be combined with image, NPZ conditioning, resume, or editing")
+    elif args.live_conditioning_start_receipt or args.live_conditioning_report:
+        live_route_error("live-conditioning receipt/report paths require --live-conditioning-listen")
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
         parser.error("--save-checkpoints is required when --checkpoint-stop-file is set")
@@ -2119,7 +2146,36 @@ def main():
         from trellmlx.quantize import quantize_model
 
     # === Image conditioning ===
-    if args.conditioning_sample:
+    if args.live_conditioning_listen:
+        from trellmlx.live_conditioning import LiveConditioningReceiver, SHAPE
+
+        global _active_live_conditioning_receiver
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+            text=True,
+        ).strip()
+        receiver = LiveConditioningReceiver(
+            args.live_conditioning_start_receipt,
+            args.live_conditioning_report,
+            source_revision=revision,
+            requested_stage=args.stop_after_stage,
+        ).start()
+        _active_live_conditioning_receiver = receiver
+        received = receiver.wait()
+        cond = mx.array(np.frombuffer(received.body, dtype="<f4").reshape(SHAPE).copy())
+        mx.eval(cond)
+        neg_cond = mx.zeros_like(cond)
+        mx.eval(neg_cond)
+        live_cond_object_id = id(cond)
+        conditioning_route = {
+            "schema": CONDITIONING_PROVENANCE_SCHEMA,
+            "route": "live-kaminos-node-loopback-http",
+            "request_id": received.envelope["requestId"],
+            "producer_session_id": received.envelope["producer"]["sessionId"],
+            "tensor_sha256": received.sha256,
+            "receiver_session_id": receiver.session_id,
+        }
+    elif args.conditioning_sample:
         conditioning_sample_npz = np.load(args.conditioning_sample)
         missing = {"cond", "neg_cond"} - set(conditioning_sample_npz.files)
         if missing:
@@ -2742,6 +2798,16 @@ def main():
                                 sparse_block_injection=sparse_block_injection,
                                 sparse_timestep_modulation_lut=sparse_timestep_modulation_lut)
         mx.eval(z_s)
+
+    if _active_live_conditioning_receiver is not None:
+        sampled_finite = bool(np.isfinite(np.array(z_s)).all())
+        _active_live_conditioning_receiver.complete(
+            mlx_device=mx.default_device(),
+            cond_object_id=live_cond_object_id,
+            output_finite=sampled_finite,
+        )
+        if not sampled_finite:
+            raise ValueError("live-conditioning sparse-flow step produced non-finite output")
 
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s", flush=True)
 
@@ -3932,4 +3998,12 @@ def _extract_image_features(image_path, resolution=512):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        if _active_live_conditioning_receiver is not None:
+            _active_live_conditioning_receiver.fail("generate-runtime", exc)
+        raise
+    finally:
+        if _active_live_conditioning_receiver is not None:
+            _active_live_conditioning_receiver.close()
