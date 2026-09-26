@@ -3097,7 +3097,16 @@ def main():
         print("  Stop after stage: sparse_internals", flush=True)
         return
 
-    cleanup_model(ss_flow, ss_dec)
+    sparse_active_before_release = mx.get_active_memory()
+    del ss_flow, ss_dec
+    cleanup()
+    print(
+        "  Sparse model release: MLX active "
+        f"{sparse_active_before_release:,} -> {mx.get_active_memory():,} bytes; "
+        f"cache={mx.get_cache_memory():,} bytes; "
+        f"peak={mx.get_peak_memory():,} bytes",
+        flush=True,
+    )
 
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
@@ -3682,6 +3691,14 @@ def main():
             hr_slat_flow.compile()
 
         hr_noise = mx.random.normal((num_tokens, 32))
+
+        print(
+            "  HR pre-flow MLX memory: "
+            f"active={mx.get_active_memory():,} bytes; "
+            f"cache={mx.get_cache_memory():,} bytes; "
+            f"peak={mx.get_peak_memory():,} bytes",
+            flush=True,
+        )
 
         t0 = time.perf_counter()
         if args.save_checkpoints:
