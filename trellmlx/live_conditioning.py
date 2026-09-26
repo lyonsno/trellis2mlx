@@ -187,9 +187,13 @@ class LiveConditioningReceiver:
                          "failurePhase": "validate-conditioning-request", "error": error,
                          "receiver": self._receiver_identity()}
         self._http_status = 400
-        _write_json(self.report_path, self._receipt)
-        self._received_event.set()
-        self._completed_event.set()
+        try:
+            _write_json(self.report_path, self._receipt)
+        except OSError as report_error:
+            self._receipt = {**self._receipt, "reportWriteError": str(report_error)}
+        finally:
+            self._received_event.set()
+            self._completed_event.set()
 
     def _receiver_identity(self):
         return {"pid": os.getpid(), "sessionId": self.session_id,
@@ -223,9 +227,20 @@ class LiveConditioningReceiver:
             "sampler": {"stage": "sparse_flow_step", "consumedCond": True,
                         "consumedNegCond": True, "outputFinite": True},
         }
-        self._http_status = 200
-        _write_json(self.report_path, self._receipt)
-        self._completed_event.set()
+        try:
+            _write_json(self.report_path, self._receipt)
+        except OSError as report_error:
+            self._error = f"terminal report write failed: {report_error}"
+            self._http_status = 500
+            self._receipt = {"schema": RECEIPT_SCHEMA, "ok": False,
+                             "failurePhase": "write-terminal-report", "error": self._error,
+                             "receiver": self._receiver_identity(),
+                             "lastTrustworthyEvidence": {"receivedTensorSha256": self._received.sha256}}
+            raise
+        else:
+            self._http_status = 200
+        finally:
+            self._completed_event.set()
 
     def fail(self, phase, error):
         if self._completed_event.is_set():
@@ -237,9 +252,13 @@ class LiveConditioningReceiver:
                          "lastTrustworthyEvidence": {"receivedTensorSha256": self._received.sha256}
                          if self._received else None}
         self._http_status = 500
-        _write_json(self.report_path, self._receipt)
-        self._received_event.set()
-        self._completed_event.set()
+        try:
+            _write_json(self.report_path, self._receipt)
+        except OSError as report_error:
+            self._receipt = {**self._receipt, "reportWriteError": str(report_error)}
+        finally:
+            self._received_event.set()
+            self._completed_event.set()
 
     def close(self):
         if self._server is None:

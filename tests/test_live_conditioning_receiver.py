@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from trellmlx.live_conditioning import BYTE_LENGTH, LiveConditioningReceiver
+import trellmlx.live_conditioning as live_conditioning
 
 
 GENERATE = Path(__file__).resolve().parents[1] / "generate.py"
@@ -155,4 +156,31 @@ def test_second_post_rejected_while_first_is_waiting(tmp_path):
             receiver.complete(mlx_device="gpu", cond_object_id=88, output_finite=True)
             assert pending.result(timeout=5).status == 200
     finally:
+        receiver.close()
+
+
+def test_terminal_report_write_failure_releases_waiter_without_http_success(tmp_path, monkeypatch):
+    report = tmp_path / "terminal.json"
+    receiver = LiveConditioningReceiver(tmp_path / "start.json", report,
+                                         source_revision="b" * 40).start()
+    original_write = live_conditioning._write_json
+
+    def fail_report_write(path, value):
+        if Path(path) == report:
+            raise OSError("report volume unavailable")
+        return original_write(path, value)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(urlopen, _request(receiver.url, _body()))
+            receiver.wait()
+            monkeypatch.setattr(live_conditioning, "_write_json", fail_report_write)
+            with pytest.raises(OSError, match="report volume unavailable"):
+                receiver.complete(mlx_device="gpu", cond_object_id=88, output_finite=True)
+            with pytest.raises(HTTPError) as error:
+                pending.result(timeout=5)
+        assert error.value.code == 500
+        assert not report.exists()
+    finally:
+        monkeypatch.setattr(live_conditioning, "_write_json", original_write)
         receiver.close()
