@@ -534,6 +534,7 @@ def _postprocess_route(args, exterior_surface_receipt):
         "source_native_python": args.source_native_python,
         "expected_source_native_commit": args.expected_source_native_commit,
         "uv_method": args.uv_method,
+        "texture_project_original": getattr(args, "texture_project_original", False),
     }
 
 
@@ -1232,6 +1233,9 @@ def main():
                         help="Texture map resolution (default: 1024, try 2048 or 4096 for higher quality)")
     parser.add_argument("--texture-backend", choices=["cpu", "gpu"], default="gpu",
                         help="Texture bake backend: gpu (MLX Metal, default) or cpu (numpy)")
+    parser.add_argument("--texture-project-original", action="store_true",
+                        help="Fetch texture attributes at closest points on the raw detailed "
+                             "mesh, without changing exported geometry (default: off)")
     parser.add_argument("--uv-method", choices=["auto", "lscm", "xatlas", "cube"], default="auto",
                         help="UV unwrap method: auto (xatlas, default), lscm, xatlas, or cube")
     parser.add_argument("--qem-simplify", action="store_true",
@@ -1881,6 +1885,8 @@ def main():
 
             vertices = mesh_data["vertices"]
             faces = mesh_data["faces"]
+            original_vertices = vertices.copy() if args.texture_project_original else None
+            original_faces = faces.copy() if args.texture_project_original else None
             mesh_grid_size = int(mesh_data["mesh_grid_size"])
             tex_np = tex_data["tex_np"]
             tex_coords_spatial = tex_data["tex_coords_spatial"]
@@ -1961,6 +1967,8 @@ def main():
                 tex_coords_spatial, tex_np, mesh_grid_size,
                 texture_size=args.texture_size,
                 backend=args.texture_backend,
+                original_vertices=original_vertices,
+                original_faces=original_faces,
             )
 
             # Export
@@ -3631,6 +3639,8 @@ def main():
             print("  Stop after stage: mesh_raw", flush=True)
             return
 
+    original_vertices = vertices.copy() if args.texture_project_original else None
+    original_faces = faces.copy() if args.texture_project_original else None
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
         faces,
@@ -3789,6 +3799,8 @@ def main():
         tex_coords_spatial, tex_np, mesh_grid_size,
         texture_size=args.texture_size,
         backend=args.texture_backend,
+        original_vertices=original_vertices,
+        original_faces=original_faces,
     )
 
     # === Export ===

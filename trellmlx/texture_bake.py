@@ -1043,9 +1043,47 @@ def inpaint_texture(image, mask, radius=3):
         return result
 
 
+def project_texture_positions(positions, original_vertices, original_faces):
+    """Find closest points on the detailed mesh, without altering either mesh.
+
+    Mirrors the original baker's unsigned BVH lookup before attribute sampling.
+    libigl's CPU AABB tree is already a project dependency. Winding does not
+    affect this distance query; the returned points can lie inside faces or on
+    edges/vertices. This is not nearest-vertex projection.
+    """
+    import igl
+
+    points = np.asarray(positions, dtype=np.float64)
+    vertices = np.asarray(original_vertices, dtype=np.float64)
+    faces = np.asarray(original_faces)
+    if (vertices.ndim != 2 or vertices.shape[1] != 3
+            or faces.ndim != 2 or faces.shape[1] != 3
+            or not len(vertices) or not len(faces)):
+        raise ValueError("original surface must contain vertices and triangle faces")
+    if not np.issubdtype(faces.dtype, np.integer):
+        raise ValueError("original surface face indices must be integers")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+        raise ValueError("original surface face indices are out of bounds")
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("texture positions must have shape (N, 3)")
+    if not np.isfinite(vertices).all() or not np.isfinite(points).all():
+        raise ValueError("original surface and texture positions must be finite")
+    if not len(points):
+        return points.copy()
+    faces = faces.astype(np.int64, copy=False)
+    tree = igl.AABB()
+    tree.init(vertices, faces)
+    distances, face_ids, projected = tree.squared_distance(vertices, faces, points)
+    if (np.any(face_ids < 0) or not np.isfinite(distances).all()
+            or not np.isfinite(projected).all()):
+        raise ValueError("closest original surface lookup failed")
+    return projected
+
+
 def bake_texture(vertices, faces, uvs, vmapping,
                  voxel_coords, voxel_attrs, grid_size,
-                 texture_size=1024, backend="gpu"):
+                 texture_size=1024, backend="gpu", *,
+                 original_vertices=None, original_faces=None):
     """Full texture baking pipeline.
 
     Args:
@@ -1059,6 +1097,9 @@ def bake_texture(vertices, faces, uvs, vmapping,
         texture_size: output texture resolution
         backend: "gpu" for MLX Metal rasterizer + vectorized sampler, "cpu"
                  for numpy reference
+        original_vertices, original_faces: Optional pair identifying the
+            detailed surface in the same world coordinates. Only texture lookup
+            positions are projected onto it; exported geometry is unchanged.
 
     Returns:
         base_color: [H, W, 4] uint8 RGBA
@@ -1070,6 +1111,8 @@ def bake_texture(vertices, faces, uvs, vmapping,
 
     if backend not in ("cpu", "gpu"):
         raise ValueError(f"backend must be 'cpu' or 'gpu', got {backend!r}")
+    if (original_vertices is None) != (original_faces is None):
+        raise ValueError("original_vertices and original_faces must be supplied together")
 
     rasterize_fn = rasterize_uv_mlx if backend == "gpu" else rasterize_uv
     sample_fn = sample_voxel_attrs_fast if backend == "gpu" else sample_voxel_attrs
@@ -1092,6 +1135,15 @@ def bake_texture(vertices, faces, uvs, vmapping,
                  b[:, 1:2] * tri_verts[fi, 1] +
                  b[:, 2:3] * tri_verts[fi, 2])  # [N, 3]
     print(f"    Interpolated {len(positions):,} positions ({time.perf_counter()-t0:.1f}s)", flush=True)
+
+    if original_vertices is not None:
+        t0 = time.perf_counter()
+        projected = project_texture_positions(positions, original_vertices, original_faces)
+        distances = np.linalg.norm(projected - positions, axis=1)
+        print(f"    Original-surface lookup (libigl CPU): {len(positions):,} points, "
+              f"max displacement {distances.max() if len(distances) else 0:.6g} "
+              f"({time.perf_counter()-t0:.1f}s)", flush=True)
+        positions = projected
 
     # Step 3: Sample PBR attrs from voxel grid
     t0 = time.perf_counter()
