@@ -52,6 +52,8 @@ def _write_failure(checkpoint_dir, *, state, error):
         "error_type": type(error).__name__,
         "error": str(error),
         "memory_bytes": _memory_reading(),
+        "synchronize_gpu": state.get("synchronize_gpu", False),
+        "last_completed_gpu_boundary": state.get("last_completed_gpu_boundary"),
     }
     try:
         with temporary.open("w") as stream:
@@ -64,10 +66,15 @@ def _write_failure(checkpoint_dir, *, state, error):
 
 
 def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
-            *, start_step_index, state, input_identity):
+            *, start_step_index, state, input_identity, synchronize_gpu=False):
+    state["synchronize_gpu"] = synchronize_gpu
+
     def on_phase(index, phase):
         state["active_step"] = index
         state["active_phase"] = phase
+
+    def on_execution_complete(index, phase):
+        state["last_completed_gpu_boundary"] = {"step": index, "phase": phase}
 
     def on_complete(index, value):
         state["active_phase"] = "saving_step_checkpoint"
@@ -83,6 +90,8 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
         return flow_euler_sample(
             model, sample, cond, neg_cond, coords=coords, verbose=False,
             start_step_index=start_step_index, on_phase=on_phase,
+            synchronize_gpu=synchronize_gpu,
+            on_execution_complete=on_execution_complete,
             on_step_complete=on_complete, **sampler,
         )
     except Exception as error:
@@ -95,10 +104,15 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
 
 def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
                 sampler, runtime, quant_coords=None, mesh_grid_size=None,
-                replay_provenance=None, stop_after_input=False):
+                replay_provenance=None, stop_after_input=False,
+                synchronize_gpu=False):
     """Save exact input before sampling; do not infer it later from the seed."""
     state = {"last_complete_step": -1, "active_step": None,
-             "active_phase": "saving_input"}
+             "active_phase": "saving_input", "synchronize_gpu": synchronize_gpu}
+    if synchronize_gpu:
+        runtime = {**runtime, "gpu_synchronization": "per-model-block-and-sampler-calculation"}
+        if replay_provenance is not None:
+            replay_provenance = {**replay_provenance, "new_runtime": runtime}
     try:
         noise_np = np.array(noise)
         cond_np = np.array(cond)
@@ -134,10 +148,11 @@ def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
         model, mx.array(noise_np), mx.array(cond_np), mx.array(neg_cond_np),
         mx.array(coords_np), checkpoint_dir, sampler,
         start_step_index=0, state=state, input_identity=input_identity,
+        synchronize_gpu=synchronize_gpu,
     )
 
 
-def replay_hr_input(model, source_dir, destination_dir, *, runtime):
+def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_gpu=False):
     """Start a new trajectory from verified saved inputs under a changed route.
 
     The caller must claim an empty destination first. No completed source step
@@ -157,6 +172,7 @@ def replay_hr_input(model, source_dir, destination_dir, *, runtime):
         checkpoint_dir=destination_dir, sampler=sampler, runtime=runtime,
         quant_coords=data.get("quant_coords"),
         mesh_grid_size=data.get("mesh_grid_size"),
+        synchronize_gpu=synchronize_gpu,
         replay_provenance={
             "kind": "new_trajectory_from_saved_input",
             "source_input_sha256": source_identity,

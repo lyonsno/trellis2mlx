@@ -387,7 +387,13 @@ class SLatFlowModel(nn.Module):
         shape_block_injection=None,
         shape_block_injection_branch: str | None = None,
         shape_timestep_modulation_lut=None,
+        execution_barrier=None,
+        on_execution_phase=None,
     ) -> mx.array:
+        if execution_barrier is not None and self._compiled:
+            raise ValueError("per-block GPU synchronization does not support compiled forward")
+        if on_execution_phase is not None:
+            on_execution_phase("prepare")
         input_dtype = x.dtype
         N = x.shape[0]
         B = t.shape[0] if len(t.shape) else 1
@@ -422,12 +428,18 @@ class SLatFlowModel(nn.Module):
         if coords is not None:
             rope_phases = self._coords_to_rope_phases(coords)
 
+        if execution_barrier is not None:
+            execution_barrier("prepare", x, mod, cond,
+                              *(() if rope_phases is None else (rope_phases,)))
+
         # Run through blocks (B=1 assumed)
         # KV cache is incompatible with compiled path (fixed function signature)
         if self._compiled and cross_kv_cache is None and shape_block_injection is None:
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
+                if on_execution_phase is not None:
+                    on_execution_phase(f"block.{i}")
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
                 block_injection = None
                 if shape_block_injection is not None:
@@ -445,9 +457,13 @@ class SLatFlowModel(nn.Module):
                         rope_phases=rope_phases,
                         cross_kv_cache=block_kv,
                     )
-                if (i + 1) % 6 == 0:
+                if execution_barrier is not None:
+                    execution_barrier(f"block.{i}", x)
+                elif (i + 1) % 6 == 0:
                     mx.eval(x)
 
+        if on_execution_phase is not None:
+            on_execution_phase("output")
         _, x = self._final_projection(x, input_dtype)
         return x
 
