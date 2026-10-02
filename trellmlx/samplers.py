@@ -69,6 +69,8 @@ def flow_euler_sample(
     start_step_index: int = 0,
     on_step_complete=None,
     on_phase=None,
+    synchronize_gpu: bool = False,
+    on_execution_complete=None,
     sparse_block_injection=None,
     shape_block_injection=None,
     **model_kwargs,
@@ -92,6 +94,34 @@ def flow_euler_sample(
         Final denoised sample, same shape as noise.
     """
     sample = noise
+
+    def barrier(index, phase, *values):
+        # Opt-in diagnosis: materialize this boundary, then finish outstanding
+        # GPU work before crediting it or constructing the next boundary.
+        if on_phase is not None:
+            on_phase(index, phase)
+        if values:
+            mx.eval(*values)
+        mx.synchronize()
+        if on_execution_complete is not None:
+            on_execution_complete(index, phase)
+
+    def forward(kw, conditioning, index, branch):
+        if synchronize_gpu:
+            kw["execution_barrier"] = lambda phase, *values: barrier(
+                index, f"{branch}_forward.{phase}", *values
+            )
+            if on_phase is not None:
+                kw["on_execution_phase"] = lambda phase: on_phase(
+                    index, f"{branch}_forward.{phase}"
+                )
+        prediction = model(sample, t_tensor, conditioning, **kw)
+        if synchronize_gpu:
+            barrier(index, f"{branch}_forward.output", prediction)
+        return prediction
+
+    if synchronize_gpu:
+        barrier(None, "initial_drain")
 
     if concat_cond is not None:
         model_kwargs['concat_cond'] = concat_cond
@@ -120,10 +150,14 @@ def flow_euler_sample(
         if on_phase is not None:
             on_phase(None, "positive_cache_build")
         pos_kv_cache = model.build_cross_kv_cache(cond)
+        if synchronize_gpu:
+            barrier(None, "positive_cache_build")
         if guidance_strength != 1.0:
             if on_phase is not None:
                 on_phase(None, "negative_cache_build")
             neg_kv_cache = model.build_cross_kv_cache(neg_cond)
+            if synchronize_gpu:
+                barrier(None, "negative_cache_build")
 
     # Build timestep schedule
     t_seq = np.linspace(1, 0, steps + 1)
@@ -165,7 +199,7 @@ def flow_euler_sample(
                 kw['cross_kv_cache'] = pos_kv_cache
             if on_phase is not None:
                 on_phase(step_idx, "positive_forward")
-            pred_pos = model(sample, t_tensor, cond, **kw)
+            pred_pos = forward(kw, cond, step_idx, "positive")
             kw_neg = _branch_model_kwargs(
                 model_kwargs,
                 sparse_block_injection=sparse_block_injection,
@@ -177,7 +211,7 @@ def flow_euler_sample(
                 kw_neg['cross_kv_cache'] = neg_kv_cache
             if on_phase is not None:
                 on_phase(step_idx, "negative_forward")
-            pred_neg = model(sample, t_tensor, neg_cond, **kw_neg)
+            pred_neg = forward(kw_neg, neg_cond, step_idx, "negative")
             if on_phase is not None:
                 on_phase(step_idx, "model_forward_eval")
             mx.eval(pred_pos, pred_neg)
@@ -187,6 +221,8 @@ def flow_euler_sample(
                 on_phase(step_idx, "guidance")
             pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
             pred_cfg = pred
+            if synchronize_gpu:
+                barrier(step_idx, "guidance.combine", pred)
 
             # CFG rescale (reduces overexposure)
             x_0_pos = None
@@ -200,9 +236,15 @@ def flow_euler_sample(
             if guidance_rescale > 0 or capture_this_step:
                 x_0_pos = _pred_to_xstart(sample, t, pred_pos, sigma_min)
                 x_0_cfg = _pred_to_xstart(sample, t, pred, sigma_min)
+                if synchronize_gpu:
+                    barrier(step_idx, "guidance.xstart", x_0_pos, x_0_cfg)
 
                 std_pos = _cfg_rescale_std(x_0_pos, sparse_tokens=sparse_token_rescale)
+                if synchronize_gpu:
+                    barrier(step_idx, "guidance.std_positive", std_pos)
                 std_cfg = _cfg_rescale_std(x_0_cfg, sparse_tokens=sparse_token_rescale)
+                if synchronize_gpu:
+                    barrier(step_idx, "guidance.std_cfg", std_cfg)
 
                 safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
                 ratio_raw = std_pos / safe_std_cfg
@@ -214,6 +256,8 @@ def flow_euler_sample(
                     pred = _xstart_to_pred(sample, t, x_0, sigma_min)
                 else:
                     x_0 = x_0_cfg
+                if synchronize_gpu:
+                    barrier(step_idx, "guidance.rescale", pred, x_0)
         else:
             # Single forward pass with positive conditioning
             kw = _branch_model_kwargs(
@@ -227,7 +271,7 @@ def flow_euler_sample(
                 kw['cross_kv_cache'] = pos_kv_cache
             if on_phase is not None:
                 on_phase(step_idx, "positive_forward")
-            pred = model(sample, t_tensor, cond, **kw)
+            pred = forward(kw, cond, step_idx, "positive")
             if on_phase is not None:
                 on_phase(step_idx, "model_forward_eval")
             mx.eval(pred)
@@ -257,7 +301,10 @@ def flow_euler_sample(
             on_phase(step_idx, "euler")
         euler_dt = np.float32(t - t_prev).item()
         euler_delta = euler_dt * pred
-        mx.eval(euler_delta)
+        if synchronize_gpu:
+            barrier(step_idx, "euler.delta", euler_delta)
+        else:
+            mx.eval(euler_delta)
         sample_next = sample - euler_delta
         if capture_this_step:
             step_payload = {
@@ -286,7 +333,10 @@ def flow_euler_sample(
                 capture_steps.append(step_payload)
                 mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
-        mx.eval(sample)
+        if synchronize_gpu:
+            barrier(step_idx, "euler.update", sample)
+        else:
+            mx.eval(sample)
         if on_step_complete is not None:
             on_step_complete(step_idx, sample)
 

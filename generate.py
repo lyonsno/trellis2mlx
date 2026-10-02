@@ -1617,6 +1617,8 @@ def main():
                         help="With --resume, recover only the HR shape flow to shape_slat; does not produce a mesh or GLB")
     parser.add_argument("--replay-hr-input", action="store_true",
                         help="With --resume, --recover-hr-only, and a fresh --save-checkpoints DIR, start a new HR trajectory from saved input under the current route")
+    parser.add_argument("--synchronize-gpu", action="store_true",
+                        help="Diagnostic HR input replay only: finish GPU work after every model block and sampler calculation")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -1647,6 +1649,8 @@ def main():
         parser.error("--recover-hr-only requires --resume")
     if args.replay_hr_input and not args.recover_hr_only:
         parser.error("--replay-hr-input requires --resume and --recover-hr-only")
+    if args.synchronize_gpu and (not args.replay_hr_input or args.compile):
+        parser.error("--synchronize-gpu requires --replay-hr-input and an uncompiled model")
     if args.shape_slat_sample and args.stop_after_stage != "decoder_output":
         parser.error("--shape-slat-sample requires --stop-after-stage decoder_output")
     if args.shape_slat_support_sample and not args.no_cascade:
@@ -1978,7 +1982,8 @@ def main():
             )
             if args.replay_hr_input:
                 hr_slat = replay_hr_input(
-                    hr_model, args.resume, hr_output_dir, runtime=hr_runtime
+                    hr_model, args.resume, hr_output_dir, runtime=hr_runtime,
+                    synchronize_gpu=args.synchronize_gpu,
                 )
             else:
                 hr_slat = resume_hr_flow(
