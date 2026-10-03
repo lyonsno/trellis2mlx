@@ -538,6 +538,49 @@ def _postprocess_route(args, exterior_surface_receipt):
     }
 
 
+def _validate_gpu_synchronization_route(parser, args):
+    if not args.synchronize_gpu:
+        return
+    natural_shape = (
+        args.image and not args.resume and not args.stop_after_stage
+        and not args.edit_target and not args.shape_slat_sample
+        and not args.shape_slat_support_sample
+    )
+    if any(getattr(args, field, None) for field in (
+        "shape_flow_block_injection_trace", "shape_flow_block_injection_manifest",
+        "shape_timestep_modulation_lut",
+    )):
+        parser.error("--synchronize-gpu does not support shape interventions")
+    if args.compile or not args.save_checkpoints or not (args.replay_hr_input or natural_shape):
+        parser.error(
+            "--synchronize-gpu requires checkpoints and an uncompiled natural "
+            "image generation or --replay-hr-input"
+        )
+
+
+def _sample_lr_shape(args, model, noise, cond, neg_cond, coords, *, sampler,
+                     weights_path, shape_attention_route, quant_coords,
+                     mesh_grid_size, **capture_kwargs):
+    if args.synchronize_gpu:
+        from trellmlx.hr_recovery import run_lr_flow
+
+        return run_lr_flow(
+            model, noise, cond, neg_cond, coords,
+            checkpoint_dir=args.save_checkpoints,
+            sampler=sampler,
+            runtime=_hr_runtime_identity(args, weights_path, shape_attention_route),
+            quant_coords=quant_coords,
+            mesh_grid_size=mesh_grid_size,
+            synchronize_gpu=True,
+        )
+    from trellmlx.samplers import flow_euler_sample
+
+    return flow_euler_sample(
+        model, noise, cond, neg_cond, coords=coords, verbose=False,
+        **capture_kwargs, **sampler,
+    )
+
+
 def _resume_source_identity(checkpoint_dir):
     root = Path(checkpoint_dir).resolve()
     files = {}
@@ -1618,7 +1661,7 @@ def main():
     parser.add_argument("--replay-hr-input", action="store_true",
                         help="With --resume, --recover-hr-only, and a fresh --save-checkpoints DIR, start a new HR trajectory from saved input under the current route")
     parser.add_argument("--synchronize-gpu", action="store_true",
-                        help="Diagnostic HR input replay only: finish GPU work after every model block and sampler calculation")
+                        help="Diagnostic: wait after each LR/HR shape model block and sampling calculation; requires checkpointed uncompiled generation or HR replay")
     parser.add_argument("--edit-target", metavar="IMAGE",
                         help="VS3D editing: target reference image showing desired appearance. "
                              "Requires --image (source). Stage 1 uses VS3D RASI+PMG guidance "
@@ -1649,8 +1692,7 @@ def main():
         parser.error("--recover-hr-only requires --resume")
     if args.replay_hr_input and not args.recover_hr_only:
         parser.error("--replay-hr-input requires --resume and --recover-hr-only")
-    if args.synchronize_gpu and (not args.replay_hr_input or args.compile):
-        parser.error("--synchronize-gpu requires --replay-hr-input and an uncompiled model")
+    _validate_gpu_synchronization_route(parser, args)
     if args.shape_slat_sample and args.stop_after_stage != "decoder_output":
         parser.error("--shape-slat-sample requires --stop-after-stage decoder_output")
     if args.shape_slat_support_sample and not args.no_cascade:
@@ -3131,7 +3173,8 @@ def main():
                        guidance_interval=(0.6, 0.9), rescale_t=3.0)
 
     lr_slat_flow = SLatFlowModel.for_shape()
-    load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
+    lr_weights_path = HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors"
+    load_weights(lr_slat_flow, lr_weights_path, verbose=False)
     if args.quantize:
         quantize_model(lr_slat_flow, bits=args.quantize)
     if args.compile:
@@ -3447,16 +3490,20 @@ def main():
         )
         return
 
-    lr_slat = flow_euler_sample(
+    lr_slat = _sample_lr_shape(
+        args,
         lr_slat_flow, lr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
-        verbose=False,
-        coords=mx.array(lr_coords),
+        mx.array(lr_coords),
+        sampler=SHAPE_SAMPLER,
+        weights_path=lr_weights_path,
+        shape_attention_route=shape_flow_attention_route,
+        quant_coords=lr_coords_4d,
+        mesh_grid_size=lr_resolution * 16,
         capture_first_step=shape_step_capture,
         capture_steps=shape_step_captures,
         stop_after_first_step=args.stop_after_stage == "shape_flow_step",
         shape_block_injection=shape_block_injection,
         shape_timestep_modulation_lut=shape_timestep_modulation_lut,
-        **SHAPE_SAMPLER,
     )
     mx.eval(lr_slat)
     print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({N_lr} tokens)", flush=True)
@@ -3686,6 +3733,7 @@ def main():
                 quant_coords=quant_coords,
                 mesh_grid_size=hr_resolution,
                 stop_after_input=args.stop_after_stage == "hr_flow_input",
+                synchronize_gpu=args.synchronize_gpu,
             )
             if args.stop_after_stage == "hr_flow_input":
                 print("  Stop after stage: hr_flow_input (before first HR Euler step)", flush=True)

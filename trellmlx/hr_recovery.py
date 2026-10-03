@@ -1,4 +1,4 @@
-"""Exact high-resolution flow replay after a failed TRELLIS generation.
+"""Saved shape-flow inputs and steps after a failed TRELLIS generation.
 
 This is deliberately a stage boundary, not a claim that every earlier pipeline
 stage can resume. The pre-flow input and each completed Euler step are saved
@@ -18,11 +18,11 @@ from trellmlx.checkpoint import has_checkpoint, load_checkpoint, save_checkpoint
 from trellmlx.samplers import flow_euler_sample
 
 
-def _input_identity(checkpoint_dir):
-    """Bind every flow step to the exact completed HR input manifest."""
-    if not has_checkpoint(checkpoint_dir, "hr_flow_input"):
-        raise ValueError("hr_flow_input checkpoint invalid or missing")
-    path = Path(checkpoint_dir) / "hr_flow_input.complete.json"
+def _input_identity(checkpoint_dir, *, stage="hr_flow"):
+    """Bind every flow step to its exact completed input manifest."""
+    if not has_checkpoint(checkpoint_dir, f"{stage}_input"):
+        raise ValueError(f"{stage}_input checkpoint invalid or missing")
+    path = Path(checkpoint_dir) / f"{stage}_input.complete.json"
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -45,7 +45,7 @@ def _write_failure(checkpoint_dir, *, state, error):
     temporary = control / f"failure.{uuid.uuid4().hex}.tmp"
     payload = {
         "schema": 1,
-        "stage": "hr_flow",
+        "stage": state.get("stage", "hr_flow"),
         "last_complete_step": state["last_complete_step"],
         "active_step": state["active_step"],
         "active_phase": state["active_phase"],
@@ -79,7 +79,7 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
     def on_complete(index, value):
         state["active_phase"] = "saving_step_checkpoint"
         save_checkpoint(
-            checkpoint_dir, f"hr_flow_step_{index:03d}",
+            checkpoint_dir, f"{state.get('stage', 'hr_flow')}_step_{index:03d}",
             sample_next=np.array(value), step_index=index,
             input_identity=input_identity,
         )
@@ -98,16 +98,16 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
         try:
             _write_failure(checkpoint_dir, state=state, error=error)
         except Exception as report_error:
-            error.add_note(f"Could not write HR failure report: {report_error}")
+            error.add_note(f"Could not write shape-flow failure report: {report_error}")
         raise
 
 
-def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
+def _run_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir, stage,
                 sampler, runtime, quant_coords=None, mesh_grid_size=None,
                 replay_provenance=None, stop_after_input=False,
                 synchronize_gpu=False):
     """Save exact input before sampling; do not infer it later from the seed."""
-    state = {"last_complete_step": -1, "active_step": None,
+    state = {"stage": stage, "last_complete_step": -1, "active_step": None,
              "active_phase": "saving_input", "synchronize_gpu": synchronize_gpu}
     if synchronize_gpu:
         runtime = {**runtime, "gpu_synchronization": "per-model-block-and-sampler-calculation"}
@@ -132,13 +132,13 @@ def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
             payload["replay_provenance_json"] = json.dumps(
                 replay_provenance, sort_keys=True
             )
-        save_checkpoint(checkpoint_dir, "hr_flow_input", **payload)
-        input_identity = _input_identity(checkpoint_dir)
+        save_checkpoint(checkpoint_dir, f"{stage}_input", **payload)
+        input_identity = _input_identity(checkpoint_dir, stage=stage)
     except Exception as error:
         try:
             _write_failure(checkpoint_dir, state=state, error=error)
         except Exception as report_error:
-            error.add_note(f"Could not write HR failure report: {report_error}")
+            error.add_note(f"Could not write shape-flow failure report: {report_error}")
         raise
     if stop_after_input:
         return None
@@ -150,6 +150,16 @@ def run_hr_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir,
         start_step_index=0, state=state, input_identity=input_identity,
         synchronize_gpu=synchronize_gpu,
     )
+
+
+def run_hr_flow(model, noise, cond, neg_cond, coords, **kwargs):
+    """Persist and sample the high-resolution shape-flow boundary."""
+    return _run_flow(model, noise, cond, neg_cond, coords, stage="hr_flow", **kwargs)
+
+
+def run_lr_flow(model, noise, cond, neg_cond, coords, **kwargs):
+    """Persist natural LR input and completed steps using the same save path."""
+    return _run_flow(model, noise, cond, neg_cond, coords, stage="lr_flow", **kwargs)
 
 
 def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_gpu=False):
