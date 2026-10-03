@@ -102,7 +102,7 @@ def test_cli_refuses_unsupported_sync_route_before_loading_weights(args):
          "--synchronize-gpu", *args], capture_output=True, text=True,
     )
     assert result.returncode != 0
-    assert "--synchronize-gpu requires --replay-hr-input and an uncompiled model" in result.stderr
+    assert "--synchronize-gpu requires checkpoints and an uncompiled natural image generation or --replay-hr-input" in result.stderr
     assert "Resuming from" not in result.stdout
 
 
