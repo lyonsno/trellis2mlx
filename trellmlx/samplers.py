@@ -68,6 +68,7 @@ def flow_euler_sample(
     stop_after_first_step: bool = False,
     start_step_index: int = 0,
     on_step_complete=None,
+    on_step_boundary=None,
     on_phase=None,
     synchronize_gpu: bool = False,
     on_execution_complete=None,
@@ -140,6 +141,10 @@ def flow_euler_sample(
                 "sparse-token sampling currently requires one conditioning batch; "
                 f"got cond={cond_batches}, neg_cond={neg_cond_batches}"
             )
+
+    # Cooperative control is outside model kwargs and precedes cache work.
+    if on_step_boundary is not None:
+        on_step_boundary(start_step_index - 1)
 
     # Build cross-attention KV caches if the model supports it.
     # The image conditioning doesn't change between steps, so KV projections
@@ -339,6 +344,8 @@ def flow_euler_sample(
             mx.eval(sample)
         if on_step_complete is not None:
             on_step_complete(step_idx, sample)
+        if on_step_boundary is not None:
+            on_step_boundary(step_idx)
 
         if verbose:
             print(f" done", flush=True)

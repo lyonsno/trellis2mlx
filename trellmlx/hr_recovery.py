@@ -66,7 +66,8 @@ def _write_failure(checkpoint_dir, *, state, error):
 
 
 def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
-            *, start_step_index, state, input_identity, synchronize_gpu=False):
+            *, start_step_index, state, input_identity, synchronize_gpu=False,
+            on_step_boundary=None):
     state["synchronize_gpu"] = synchronize_gpu
 
     def on_phase(index, phase):
@@ -92,6 +93,7 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
             start_step_index=start_step_index, on_phase=on_phase,
             synchronize_gpu=synchronize_gpu,
             on_execution_complete=on_execution_complete,
+            on_step_boundary=on_step_boundary,
             on_step_complete=on_complete, **sampler,
         )
     except Exception as error:
@@ -105,7 +107,7 @@ def _sample(model, sample, cond, neg_cond, coords, checkpoint_dir, sampler,
 def _run_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir, stage,
                 sampler, runtime, quant_coords=None, mesh_grid_size=None,
                 replay_provenance=None, stop_after_input=False,
-                synchronize_gpu=False):
+                synchronize_gpu=False, on_step_boundary=None):
     """Save exact input before sampling; do not infer it later from the seed."""
     state = {"stage": stage, "last_complete_step": -1, "active_step": None,
              "active_phase": "saving_input", "synchronize_gpu": synchronize_gpu}
@@ -149,6 +151,7 @@ def _run_flow(model, noise, cond, neg_cond, coords, *, checkpoint_dir, stage,
         mx.array(coords_np), checkpoint_dir, sampler,
         start_step_index=0, state=state, input_identity=input_identity,
         synchronize_gpu=synchronize_gpu,
+        on_step_boundary=on_step_boundary,
     )
 
 
@@ -162,7 +165,8 @@ def run_lr_flow(model, noise, cond, neg_cond, coords, **kwargs):
     return _run_flow(model, noise, cond, neg_cond, coords, stage="lr_flow", **kwargs)
 
 
-def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_gpu=False):
+def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_gpu=False,
+                    on_step_boundary=None):
     """Start a new trajectory from verified saved inputs under a changed route.
 
     The caller must claim an empty destination first. No completed source step
@@ -183,6 +187,7 @@ def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_
         quant_coords=data.get("quant_coords"),
         mesh_grid_size=data.get("mesh_grid_size"),
         synchronize_gpu=synchronize_gpu,
+        on_step_boundary=on_step_boundary,
         replay_provenance={
             "kind": "new_trajectory_from_saved_input",
             "source_input_sha256": source_identity,
@@ -195,7 +200,7 @@ def replay_hr_input(model, source_dir, destination_dir, *, runtime, synchronize_
     return result
 
 
-def resume_hr_flow(model, checkpoint_dir, *, expected_runtime):
+def resume_hr_flow(model, checkpoint_dir, *, expected_runtime, on_step_boundary=None):
     """Resume from the last verified step, checking the effective runtime."""
     if not has_checkpoint(checkpoint_dir, "hr_flow_input"):
         raise ValueError("hr_flow_input checkpoint invalid or missing")
@@ -258,4 +263,5 @@ def resume_hr_flow(model, checkpoint_dir, *, expected_runtime):
         mx.array(data["neg_cond"]), mx.array(coords), checkpoint_dir,
         sampler, start_step_index=next_step, state=state,
         input_identity=input_identity,
+        on_step_boundary=on_step_boundary,
     )
