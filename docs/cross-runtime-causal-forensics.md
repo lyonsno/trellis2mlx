@@ -104,6 +104,29 @@ metric values before it reaches the target face count.
 
 ## Current claim boundary
 
+### October 7: a cleanup deletion mechanism is isolated
+
+The later warrior and bear comparisons narrowed an important part of the
+remaining visual gap. Non-manifold repair left ordered triangle positions
+unchanged, but split a connected surface into small sheets. Area-based
+component deletion then removed those sheets. Across the saved 768 warrior,
+768 bear, and 512 bear, respectively 207,391, 40,230, and 17,685 triangles became
+eligible for deletion solely because of that connectivity change.
+
+The local default now filters original shared-edge components before splitting
+and does not repeat that filter on repair-created fragments. Replaying the
+production function on those saved post-simplification meshes reproduces the
+accepted experimental retained triangles exactly. Both filled and unfilled
+finished warrior/512-bear versions were visually inspected; the surface
+recovery is present in both. This addresses a named downstream defect rather
+than treating every final-output difference as an inference-basin problem.
+
+Reference CuMesh uses manifold-only adjacency and split-then-filter cleanup;
+the local preservation policy is an intentional difference. Its explicit
+reference-comparison route is unchanged. Filling remains optional because it
+can greatly increase delivered face count while making only a subtle visual
+difference. Historical comparisons below retain their original scope.
+
 The public evidence supports all of the following:
 
 - A fully MLX-native TRELLIS.2 route runs end to end on Apple Silicon.
@@ -113,8 +136,8 @@ The public evidence supports all of the following:
   sampling, but not every visible defect originates in inference.
 - Raw geometry, cleanup order, simplification, UV processing, and texture bake
   are independently testable causal surfaces.
-- At least one research-branch MLX result is visually strong through the full
-  textured GLB product.
+- Coherent textured warrior and bear outputs have been inspected, and a
+  reproducible cleanup defect deleting their fine surfaces is now repaired.
 
 It does **not** yet support these stronger claims:
 
@@ -124,8 +147,8 @@ It does **not** yet support these stronger claims:
 - promotion of every research-branch diagnostic or cleanup selector to public
   `main`.
 
-The featured README result is therefore labeled as a research-branch result,
-with its remaining one-sided and texture limitations stated beside it. The next
-proof surface can build directly on the case manifest and intervention atlas:
-raw mesh, waist checkpoint, final GLB, and source/MLX continuations can become
-linked interactive stages without changing the evidence model used here.
+The older featured character remains labeled with its research revision and
+settings. Current work can reuse saved raw meshes and appearance checkpoints
+to test cleanup changes without paying for inference again. The earlier
+numerical investigation remains evidence about numerical behavior, not a
+standing presumption that every new visual defect comes from inference.

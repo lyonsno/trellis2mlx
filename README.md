@@ -1,7 +1,7 @@
 # trellis2mlx
 
-MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) inference and
-cross-runtime causal forensics for Apple Silicon.
+MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D
+generation for Apple Silicon.
 
 Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac
 using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. The
@@ -9,12 +9,44 @@ end-to-end route includes native MLX DINOv3 conditioning, sparse/shape/texture
 flows, mesh extraction, simplification, UV unwrap, texture baking, PBR
 materials, and GLB export.
 
-> **Status:** the public `main` branch is a working technical preview. The
-> published research branch adds hash-bound CUDA/MPS/MLX replay and finalization
-> experiments. Output quality is still input-sensitive, and exact end-to-end
-> CUDA parity is not claimed.
+> **Status:** working image-to-textured-GLB pipeline. Local cleanup now preserves
+> fine surfaces that previously disappeared when non-manifold edge repair split
+> them into small pieces. Hole filling is separately selectable, so preserving
+> detail does not require adding hundreds of thousands of filling triangles.
 
-## Research result: coherent full MLX product
+## Current quality result: preserve the surface before filling holes
+
+Saved warrior and bear meshes exposed a specific cleanup bug: edge repair kept
+the triangles but disconnected fine sheets; the following small-component
+filter then deleted those sheets as if they were floating debris. The local
+route now filters genuinely separate small components **before** splitting,
+and does not reclassify the resulting fragments on later cleanup passes.
+This changes cleanup, not model inference or texture generation.
+
+The same saved inputs reproduce the accepted retained surfaces exactly, down
+to ordered triangle coordinates:
+
+| Saved case | Faces retained by the repaired filter | Previously deleted because splitting changed their connectivity |
+|---|---:|---:|
+| Warrior, 768, 1M simplification target | 961,732 | 207,391 |
+| Bear, 768, 1M simplification target | 988,661 | 40,230 |
+| Bear, 512, 200K simplification target | 194,018 | 17,685 |
+
+Visual inspection of the finished warrior and 512 bear confirmed recovery of
+the beard/fur surfaces. Filled and unfilled versions look very similar, but the
+warrior's filled export has 1,662,604 faces and is 147.8 MB, versus 961,732 faces
+and 103.1 MB without filling (both with 4K textures). Filling adds triangles; it
+does not generate new inferred detail. `--target-faces` is a simplification
+target, not a strict final face-count ceiling.
+
+Use `--simplify-first --no-hole-fill` for a lighter detailed mesh. Omit
+`--no-hole-fill` when filling small openings is worth the additional geometry.
+The explicit `--reference-cleanup` comparison retains its original
+split-then-filter semantics and cannot be combined with `--no-hole-fill`.
+This surface-preservation policy is deliberately different from reference
+CuMesh cleanup, not a claim that the reference already uses it.
+
+## Earlier full-pipeline witness
 
 <table>
 <tr>
@@ -40,7 +72,7 @@ measured M4 Max route.
 Cycles lighting and subsurface-scattering treatment improve presentation in
 these witnesses; the geometry and baked textures come from the recorded GLB.
 
-The result is visually strong, but it is not presented as topology-perfect.
+This earlier artifact predates the surface-preservation repair above.
 Localized one-sided failures remain around finely articulated crevices, and the
 rear hair/horn regions retain texture smearing. The case settings, measurements,
 asset hashes, and limitations are preserved in the
@@ -48,8 +80,8 @@ asset hashes, and limitations are preserved in the
 
 ## What the port uncovered
 
-Finishing the port exposed a more interesting systems problem than raw feature
-parity:
+The numerical investigation remains useful background, but it is no longer an
+undifferentiated explanation for every rough final mesh:
 
 1. **The backend authority map matters.** A frozen CUDA witness aligned more
    closely with MLX/CPU than with PyTorch MPS, so copying the existing Mac port's
@@ -60,7 +92,11 @@ parity:
    exactly.
 3. **Inference and finalization are separate causal surfaces.** Semantically
    coherent raw MLX geometry could be damaged or rescued by cleanup order, while
-   a six-case replay showed that neither cleanup order wins globally.
+   a six-case replay showed that neither older cleanup order won globally.
+   The newer warrior/bear replay isolates a concrete deletion mechanism and
+   repairs it without rerunning inference. Resolution, simplification budget,
+   filling, and texture resolution must still be distinguished when comparing
+   outputs.
 
 [Read the compact cross-runtime causal-forensics case study →](docs/cross-runtime-causal-forensics.md)
 
@@ -102,14 +138,19 @@ PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --
 # Premium preview texture (same geometry setting, nicer shaded inspection):
 PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --no-cascade --target-faces 100000 --texture-size 4096
 
-# Higher quality mesh topology (Metal-accelerated QEM simplification):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --qem-simplify
+# Detailed browser-facing mesh (preserve surfaces; avoid filling growth):
+PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --resolution 768 --target-faces 1000000 --texture-size 4096 --simplify-first --no-hole-fill --save-checkpoints checkpoints/run-01
+
+# Refinish the saved raw mesh and appearance without new inference:
+PYTHONPATH=. python generate.py --resume checkpoints/run-01 --output refinish.glb --target-faces 1000000 --texture-size 4096 --simplify-first --no-hole-fill
 
 # Stage 1+2 only (fast preview, colored voxels):
 PYTHONPATH=. python smoke_stage2.py --image photo.png
 ```
 
-The pipeline uses a two-pass architecture matching the TRELLIS.2 reference:
+The default pipeline uses a two-pass architecture matching the TRELLIS.2 reference.
+The optional local Metal QEM (`--qem-simplify`) remains an experimental alternative,
+not a demonstrated quality upgrade over the simplify-first route above.
 1. **Image conditioning** — native MLX DINOv3 ViT-L/16 features
 2. **Sparse Structure** — SparseStructureFlowModel (1.29B params) + decoder -> 64³ occupancy grid
 3. **LR Shape Latent** — SLatFlowModel (1.29B params) on sparse tokens
@@ -190,7 +231,7 @@ Output artifact from that run:
 
 Peak memory: ~3 GB for SLat flow, ~5 GB during decode on the M4 Max reference path.
 
-[trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 viability on Mac via PyTorch MPS. This MLX rewrite targets lower memory (~3-5 GB vs 40-55 GB) and faster inference by using MLX's native Flash Attention and Apple Silicon memory architecture.
+[trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 viability on Mac via PyTorch MPS. The figures above describe the measured shoe, not the memory or runtime ceiling for complex fur, higher resolutions, or million-face exports.
 
 ### Parity and quality status
 
@@ -216,7 +257,10 @@ These measurements remain useful, but the old conclusion that the entire
 divergence was monotonic BF16-to-FP16 accumulation was too strong. Controlled
 replays now show both smooth accumulation and discrete basin changes. Raw mesh,
 cleanup order, simplification, UV processing, and texture bake are tracked as
-separate causal surfaces. See
+separate causal surfaces. The repaired warrior/bear deletion described above
+is now attributed to cleanup rather than left as an unspecified inference
+residual. It does not require matching random seeds across different numerical
+backends. See
 [`docs/cross-runtime-causal-forensics.md`](docs/cross-runtime-causal-forensics.md)
 for the current evidence and claim boundary.
 
@@ -281,6 +325,7 @@ failure phase if the run stops early.
 - [x] Historical 12-step same-noise PyTorch comparator recorded
 - [x] CUDA/MPS/MLX authority split established with frozen witnesses and controlled replay
 - [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
+- [x] Pre-split component filtering preserves connected fine surfaces; `--no-hole-fill` avoids filling-induced mesh growth
 - [x] Metal-accelerated QEM mesh simplification (`--qem-simplify`) — topology-preserving edge collapse with normal-flip guard, adapted from [mtlmesh](https://github.com/pedronaugusto/trellis2-apple)
 - [x] Texture SLat flow + decoder → per-voxel PBR attributes
 - [x] UV unwrap (xatlas, `max_iterations=0`) + GPU texture baking (MLX Metal rasterizer + trilinear sample + cv2 inpaint)
@@ -302,7 +347,7 @@ failure phase if the run stops early.
 
 - **Memory:** MLX's SDPA is real Flash Attention — O(N) memory vs O(N²) for MPS SDPA. Handles 262K tokens at ~3 GB instead of 275 GB.
 - **Accessibility:** Validated on a 16 GB M2 Pro as well as an M4 Max; designed for Apple Silicon rather than CUDA-only workstations.
-- **Bus-friendly:** Periodic eval yields memory bus between GPU bursts, preventing beachballs during generation.
+- **Execution:** Periodic evaluation bounds deferred work. Large inference and mesh jobs still contend for unified memory and the GPU; serialize heavy workloads.
 - **No PyTorch:** Fully native MLX pipeline including DINOv3 image conditioning. No torch/torchvision/transformers dependency.
 
 ## Quick start
