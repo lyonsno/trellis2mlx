@@ -67,6 +67,93 @@ def _make_open_box():
     return verts, faces
 
 
+def _make_fine_surface_and_debris():
+    # Three sheets share an overloaded edge. Each sheet is below the area
+    # cutoff, but their original connected part is above it. A second edge
+    # with two incident faces ensures the real splitter exercises its unions.
+    vertices = np.array([
+        [0, 0, 0], [0.01, 0, 0], [0, 0.0012, 0],
+        [0, -0.0012, 0], [0, 0, 0.0012], [-0.001, 0, 0],
+        [1, 0, 0], [1.001, 0, 0], [1, 0.001, 0],
+    ], dtype=np.float32)
+    faces = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4],
+                      [0, 2, 5], [6, 7, 8]], dtype=np.int64)
+    return vertices, faces
+
+
+def test_cleanup_keeps_fine_surface_but_removes_detached_debris():
+    vertices, faces = _make_fine_surface_and_debris()
+    out_v, out_f = cleanup_mesh(
+        vertices, faces, max_hole_perimeter=0, do_fix_normals=False,
+        verbose=False,
+    )
+    np.testing.assert_array_equal(out_v[out_f], vertices[faces[:4]])
+
+
+def test_repeated_generation_cleanup_preserves_original_fine_surface():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices, faces = _make_fine_surface_and_debris()
+    out_v, out_f = _cleanup_and_simplify_mesh(
+        vertices, faces, target_faces=0, no_cleanup=False,
+        log=lambda *args, **kwargs: None,
+    )
+    # Every original surface triangle must still exist after both cleanup
+    # passes, independent of winding and any additional hole-fill triangles.
+    def triangles(v, f):
+        return {tuple(sorted(map(tuple, t))) for t in v[f]}
+    assert triangles(vertices, faces[:4]) <= triangles(out_v, out_f)
+    assert not triangles(vertices, faces[4:]) & triangles(out_v, out_f)
+
+
+def test_legacy_split_then_filter_remains_an_explicit_comparison():
+    vertices, faces = _make_fine_surface_and_debris()
+    out_v, out_f = cleanup_mesh(
+        vertices, faces, preserve_surface_parts=False,
+        max_hole_perimeter=0, do_fix_normals=False, verbose=False,
+    )
+    assert out_v.shape == (0, 3)
+    assert out_f.shape == (0, 3)
+
+
+@pytest.mark.parametrize("no_hole_fill", [False, True])
+def test_generator_hole_fill_is_optional_without_disabling_cleanup(no_hole_fill):
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices, faces = _make_open_box()
+    # Duplicate removal must still run even when filling is off.
+    duplicated = np.concatenate([faces, faces[:1]])
+    out_v, out_f = _cleanup_and_simplify_mesh(
+        vertices, duplicated, target_faces=0, no_cleanup=False,
+        no_hole_fill=no_hole_fill, log=lambda *a, **k: None,
+    )
+    # Existing filling inserts a centroid and four fan triangles.
+    assert len(out_f) == (10 if no_hole_fill else 14)
+    assert np.isfinite(out_v).all()
+
+
+def test_no_fill_does_not_silently_change_reference_route():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices, faces = _make_open_box()
+    with pytest.raises(ValueError, match="no_hole_fill.*reference_cleanup"):
+        _cleanup_and_simplify_mesh(
+            vertices, faces, target_faces=2, no_cleanup=False,
+            no_hole_fill=True, reference_cleanup=True,
+        )
+
+
+def test_no_fill_cannot_be_silently_ignored_by_injected_cleanup():
+    from generate import _cleanup_and_simplify_mesh
+
+    vertices, faces = _make_open_box()
+    with pytest.raises(ValueError, match="injected cleanup_mesh"):
+        _cleanup_and_simplify_mesh(
+            vertices, faces, target_faces=0, no_cleanup=False,
+            no_hole_fill=True, cleanup_mesh=lambda v, f, **kw: (v, f),
+        )
+
+
 class TestRemoveDuplicateFaces:
     def test_removes_exact_duplicates(self):
         verts, faces = _make_tetrahedron()

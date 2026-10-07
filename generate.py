@@ -525,6 +525,12 @@ def _apply_exterior_surface_repair(
 def _postprocess_route(args, exterior_surface_receipt):
     return {
         "reference_cleanup": bool(args.reference_cleanup),
+        "component_filter": (
+            "disabled" if args.no_cleanup else
+            "post_split_each_pass" if args.reference_cleanup else
+            "pre_split_once"
+        ),
+        "hole_fill": not (args.no_cleanup or args.no_hole_fill),
         "qem_simplify": bool(args.qem_simplify),
         "qem_backend": args.qem_backend,
         "repair_exterior_surface": bool(args.repair_exterior_surface),
@@ -606,6 +612,7 @@ def _cleanup_and_simplify_mesh(
     *,
     target_faces,
     no_cleanup,
+    no_hole_fill=False,
     keep_largest=False,
     simplify_first=False,
     reference_cleanup=False,
@@ -714,6 +721,8 @@ def _cleanup_and_simplify_mesh(
 
     if qem_simplify and qem_backend not in {"mlx", "source-native"}:
         raise ValueError(f"unknown qem_backend: {qem_backend}")
+    if reference_cleanup and no_hole_fill:
+        raise ValueError("no_hole_fill changes the reference_cleanup pipeline; use the local route")
 
     local_cleanup_override = cleanup_mesh is not None
 
@@ -780,7 +789,26 @@ def _cleanup_and_simplify_mesh(
 
     if not no_cleanup:
         if cleanup_mesh is None:
-            from trellmlx.mesh_cleanup import cleanup_mesh
+            from trellmlx.mesh_cleanup import cleanup_mesh as local_cleanup
+
+            component_filter_applied = False
+
+            def cleanup_mesh(vertices, faces, **kwargs):
+                nonlocal component_filter_applied
+                if reference_cleanup:
+                    kwargs["preserve_surface_parts"] = False
+                elif component_filter_applied:
+                    # The first pass has already split legitimate surfaces.
+                    # Do not reinterpret those fragments as new debris later.
+                    kwargs["min_component_area"] = 0
+                    kwargs["keep_largest"] = False
+                if no_hole_fill:
+                    kwargs["max_hole_perimeter"] = 0
+                result = local_cleanup(vertices, faces, **kwargs)
+                component_filter_applied = True
+                return result
+        elif no_hole_fill:
+            raise ValueError("no_hole_fill cannot control an injected cleanup_mesh callback")
 
     if reference_cleanup and not no_cleanup and target_faces and len(faces) > target_faces:
         if qem_simplify and qem_backend != "source-native":
@@ -1204,6 +1232,9 @@ def main():
                         help="Skip background removal (rembg) preprocessing")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Skip mesh cleanup entirely (no dedup, no repair, no hole fill)")
+    parser.add_argument("--no-hole-fill", action="store_true",
+                        help="Preserve existing surface detail without adding hole-fill triangles; "
+                             "smaller browser assets, local cleanup only")
     parser.add_argument(
         "--repair-exterior-surface",
         action="store_true",
@@ -1590,6 +1621,8 @@ def main():
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
     args = parser.parse_args()
+    if args.no_hole_fill and args.reference_cleanup:
+        parser.error("--no-hole-fill changes --reference-cleanup; use the local cleanup route")
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
 
     if args.checkpoint_stop_file and not args.save_checkpoints:
@@ -1895,6 +1928,7 @@ def main():
                 vertices, faces,
                 target_faces=args.target_faces,
                 no_cleanup=args.no_cleanup,
+                no_hole_fill=args.no_hole_fill,
                 keep_largest=args.keep_largest,
                 simplify_first=args.simplify_first,
                 reference_cleanup=args.reference_cleanup,
@@ -3636,6 +3670,7 @@ def main():
         faces,
         target_faces=args.target_faces,
         no_cleanup=args.no_cleanup,
+        no_hole_fill=args.no_hole_fill,
         keep_largest=args.keep_largest,
         simplify_first=args.simplify_first,
         reference_cleanup=args.reference_cleanup,
