@@ -20,6 +20,7 @@ def cleanup_mesh(
     max_hole_perimeter: float = 3e-2,
     keep_largest: bool = False,
     min_component_area: float = 1e-5,
+    preserve_surface_parts: bool = True,
     do_fix_normals: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -27,10 +28,10 @@ def cleanup_mesh(
 
     Pipeline:
     1. Remove duplicate faces
-    2. Repair non-manifold edges
-    3. Remove small connected components (area threshold, matching
-       reference ``cumesh.remove_small_connected_components(1e-5)``), or
-       keep only the largest if ``keep_largest=True``
+    2. Remove small connected components using their original shared edges,
+       or keep only the largest if ``keep_largest=True``
+    3. Repair non-manifold edges without reclassifying the resulting fragments
+       as detached debris
     4. Fill small holes
     5. Fix normals/winding consistency (optional, skip for intermediate passes)
 
@@ -42,7 +43,12 @@ def cleanup_mesh(
         keep_largest: If True, discard all components except the largest.
             Overrides min_component_area.
         min_component_area: Remove components whose summed face area is below this
-            absolute threshold. Default 1e-5 matches the reference pipeline.
+            absolute threshold. Default 1e-5 uses the reference area threshold,
+            but the local default applies it before splitting non-manifold edges.
+            Set to zero to skip area filtering on later passes of the same mesh.
+        preserve_surface_parts: Filter before splitting (default). False retains
+            the legacy split-then-filter order for explicit reference comparisons.
+            This is a surface-preservation policy, not exact CUDA cleanup parity.
         do_fix_normals: Run winding unification. The reference only does this once
             at the end, so callers can skip it for intermediate cleanup passes
             before simplification.
@@ -58,16 +64,23 @@ def cleanup_mesh(
     # Step 1: Remove duplicate faces
     vertices, faces = remove_duplicate_faces(vertices, faces, verbose)
 
-    # Step 2: Repair non-manifold edges
-    vertices, faces = repair_non_manifold_edges(vertices, faces, verbose)
+    def filter_components(vertices, faces):
+        if keep_largest:
+            return keep_largest_component(vertices, faces, verbose)
+        if min_component_area > 0:
+            return remove_small_components(
+                vertices, faces, min_area=min_component_area, verbose=verbose,
+            )
+        return vertices, faces
 
-    # Step 3: Component removal
-    if keep_largest:
-        vertices, faces = keep_largest_component(vertices, faces, verbose)
-    else:
-        vertices, faces = remove_small_components(
-            vertices, faces, min_area=min_component_area, verbose=verbose,
-        )
+    # Splitting preserves triangles but changes connectivity. Decide which
+    # original parts to discard first; otherwise attached fine detail becomes
+    # many tiny "floaters" and is incorrectly deleted.
+    if preserve_surface_parts:
+        vertices, faces = filter_components(vertices, faces)
+    vertices, faces = repair_non_manifold_edges(vertices, faces, verbose)
+    if not preserve_surface_parts:
+        vertices, faces = filter_components(vertices, faces)
 
     # Step 4: Fill small holes on the remaining mesh
     vertices, faces = fill_small_holes(
@@ -125,8 +138,9 @@ def remove_small_components(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Remove connected components whose summed face area is below min_area.
 
-    Matches the reference ``cumesh.remove_small_connected_components(1e-5)``.
-    Pure summed-area thresholding only — no shape heuristics.
+    Uses the reference area threshold, with connectivity defined by all shared
+    edges in the supplied mesh. Reference CuMesh uses manifold adjacency;
+    splitting first reproduces that distinction. No shape heuristics.
     """
     if len(faces) == 0:
         return vertices, faces
@@ -194,7 +208,7 @@ def fill_small_holes(
     Uses a perimeter-based threshold in world-space units, matching the
     reference cumesh ``fill_holes(max_hole_perimeter=3e-2)``.
     """
-    if len(faces) == 0:
+    if len(faces) == 0 or max_hole_perimeter <= 0:
         return vertices, faces
 
     # Find boundary edges (edges that appear in only one face)
