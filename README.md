@@ -1,356 +1,36 @@
 # trellis2mlx
 
-MLX-native [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D
-generation for Apple Silicon.
+**Turn an image into a textured 3D model on your Mac.**
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 3D generation on Mac
-using [MLX](https://github.com/ml-explore/mlx). No NVIDIA GPU required. The
-end-to-end route includes native MLX DINOv3 conditioning, sparse/shape/texture
-flows, mesh extraction, simplification, UV unwrap, texture baking, PBR
-materials, and GLB export.
-
-> **Status:** working image-to-textured-GLB pipeline. Local cleanup now preserves
-> fine surfaces that previously disappeared when non-manifold edge repair split
-> them into small pieces. Hole filling is separately selectable, so preserving
-> detail does not require adding hundreds of thousands of filling triangles.
-
-## Current quality result: preserve the surface before filling holes
-
-Saved warrior and bear meshes exposed a specific cleanup bug: edge repair kept
-the triangles but disconnected fine sheets; the following small-component
-filter then deleted those sheets as if they were floating debris. The local
-route now filters genuinely separate small components **before** splitting,
-and does not reclassify the resulting fragments on later cleanup passes.
-This changes cleanup, not model inference or texture generation.
-
-The same saved inputs reproduce the accepted retained surfaces exactly, down
-to ordered triangle coordinates:
-
-| Saved case | Faces retained by the repaired filter | Previously deleted because splitting changed their connectivity |
-|---|---:|---:|
-| Warrior, 768, 1M simplification target | 961,732 | 207,391 |
-| Bear, 768, 1M simplification target | 988,661 | 40,230 |
-| Bear, 512, 200K simplification target | 194,018 | 17,685 |
-
-Visual inspection of the finished warrior and 512 bear confirmed recovery of
-the beard/fur surfaces. Filled and unfilled versions look very similar, but the
-warrior's filled export has 1,662,604 faces and is 147.8 MB, versus 961,732 faces
-and 103.1 MB without filling (both with 4K textures). Filling adds triangles; it
-does not generate new inferred detail. `--target-faces` is a simplification
-target, not a strict final face-count ceiling.
-
-Use `--simplify-first --no-hole-fill` for a lighter detailed mesh. Omit
-`--no-hole-fill` when filling small openings is worth the additional geometry.
-The explicit `--reference-cleanup` comparison retains its original
-split-then-filter semantics and cannot be combined with `--no-hole-fill`.
-This surface-preservation policy is deliberately different from reference
-CuMesh cleanup, not a claim that the reference already uses it.
-
-## Earlier full-pipeline witness
+An [MLX](https://github.com/ml-explore/mlx)-native port of
+[TRELLIS.2](https://github.com/microsoft/TRELLIS.2) for Apple Silicon.
+It runs image conditioning, shape and material generation locally, then
+simplifies the mesh, unwraps it, bakes PBR textures, and exports a GLB.
+No NVIDIA GPU or PyTorch is required for the native route.
 
 <table>
 <tr>
-<td><img src="assets/research/feature-animation-input.png" width="260" alt="Stylized horned character input"></td>
-<td><img src="assets/research/feature-animation-mlx-front.png" width="340" alt="Front Cycles beauty render of the MLX-generated textured GLB"></td>
-<td><img src="assets/research/feature-animation-mlx-oblique.png" width="340" alt="Oblique Cycles beauty render of the MLX-generated textured GLB"></td>
+<td><img src="assets/examples/warrior-768.png" width="320" alt="Textured warrior with braided beard, fur cloak, metal armor and lantern, generated at 768 resolution"></td>
+<td><img src="assets/examples/bear-512-front.png" width="320" alt="Textured spiked bear on a circular base, generated at 512 resolution"></td>
+<td><img src="assets/examples/kiln-500k.png" width="320" alt="Textured steel kiln with open refractory-lined door and articulated side pipework, generated at 768 resolution"></td>
 </tr>
 <tr>
-<td align="center"><em>Input</em></td>
-<td align="center"><em>MLX result, front</em></td>
-<td align="center"><em>MLX result, oblique</em></td>
+<td align="center">Warrior · 768 · 4K maps</td>
+<td align="center">Bear · 512 · 1K maps</td>
+<td align="center">Kiln · 768 · 4K maps</td>
 </tr>
 </table>
 
-These are Blender/Cycles beauty renders of one MLX-generated GLB from the
-[`cc/pixal9-capture-contract-r9-0821`](https://github.com/lyonsno/trellis2mlx/tree/cc/pixal9-capture-contract-r9-0821)
-research route at commit
-[`e1d987d`](https://github.com/lyonsno/trellis2mlx/commit/e1d987d12c9dc3ed668af5f96d0d525a801bdb6f):
-seed 81414, 512 resolution, 8 steps, no cascade, 100K target faces, 512 texture,
-and source-ordered cleanup. The exact product completed in 158.4 seconds on the
-measured M4 Max route.
-
-Cycles lighting and subsurface-scattering treatment improve presentation in
-these witnesses; the geometry and baked textures come from the recorded GLB.
-
-This earlier artifact predates the surface-preservation repair above.
-Localized one-sided failures remain around finely articulated crevices, and the
-rear hair/horn regions retain texture smearing. The case settings, measurements,
-asset hashes, and limitations are preserved in the
-[`feature-animation-81412` manifest](docs/research/feature-animation-81412.json).
-
-## What the port uncovered
-
-The numerical investigation remains useful background, but it is no longer an
-undifferentiated explanation for every rough final mesh:
-
-1. **The backend authority map matters.** A frozen CUDA witness aligned more
-   closely with MLX/CPU than with PyTorch MPS, so copying the existing Mac port's
-   discrepancy would have moved MLX away from source behavior.
-2. **Local correctness is contextual.** Source-correct tensors could still
-   cross a different decoded separatrix when inserted into the wrong residual
-   neighborhood; residual-complete joins could recover the source continuation
-   exactly.
-3. **Inference and finalization are separate causal surfaces.** Semantically
-   coherent raw MLX geometry could be damaged or rescued by cleanup order, while
-   a six-case replay showed that neither older cleanup order won globally.
-   The newer warrior/bear replay isolates a concrete deletion mechanism and
-   repairs it without rerunning inference. Resolution, simplification budget,
-   filling, and texture resolution must still be distinguished when comparing
-   outputs.
-
-[Read the compact cross-runtime causal-forensics case study →](docs/cross-runtime-causal-forensics.md)
-
-Claim boundary: this is the first fully working MLX-native end-to-end TRELLIS.2
-pipeline we know of, validated locally on Apple Silicon with native DINO
-conditioning and coherent textured GLB output. It is not a claim to be the first
-TRELLIS.2 project on Mac, nor a claim that every MLX seed reproduces source CUDA.
-
-## Validation snapshot
-
-Validated end-to-end on Apple Silicon:
-
-| Machine | OS | Result | Wall time | Peak RSS |
-|---|---|---|---:|---:|
-| M2 Pro, 16 GB | macOS 26.5.1 / Tahoe | Coherent textured GLB from `assets/shoe_input.png` | 21m05s | 6.75 GB |
-| M4 Max, 128 GB | macOS | Full textured shoe pipeline | ~8.6 min | ~5 GB during decode |
-
-See [docs/validation.md](docs/validation.md) for recorded commands, artifact hashes, structural GLB inspection, and the GLB witness renderer.
-
-The M2 Pro run is the hardware proof: native MLX DINOv3 features, full TRELLIS.2 cascade, textured GLB export, structural GLB inspection, and visually inspected coherent output. Hero images and demos may use the best Apple Silicon output available, but hardware provenance should be labeled honestly.
-
-Claim boundary:
-
-> The first fully working MLX-native end-to-end TRELLIS.2 pipeline we know of: native DINO conditioning, sparse/shape/texture stages, mesh extraction, texture bake, and coherent textured GLB output locally on Apple Silicon, validated on a 16 GB M2 Pro.
-
-This is not a claim to be the first TRELLIS.2 project on Mac. [trellis-mac](https://github.com/shivampkumar/trellis-mac) proved the important prior Mac viability path via PyTorch MPS and should be credited.
-
-## What works now
-
-Full pipeline: image → textured GLB with PBR materials.
-
-```bash
-# Full pipeline (two-pass cascade, high quality):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb
-
-# Visual preview (single-pass, 8 steps; preserves objectness much better than 4-step plumbing checks):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --no-cascade --target-faces 100000 --texture-size 512
-
-# Premium preview texture (same geometry setting, nicer shaded inspection):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --steps 8 --no-cascade --target-faces 100000 --texture-size 4096
-
-# Detailed browser-facing mesh (preserve surfaces; avoid filling growth):
-PYTHONPATH=. python generate.py --image photo.png --output mesh.glb --resolution 768 --target-faces 1000000 --texture-size 4096 --simplify-first --no-hole-fill --save-checkpoints checkpoints/run-01
-
-# Refinish the saved raw mesh and appearance without new inference:
-PYTHONPATH=. python generate.py --resume checkpoints/run-01 --output refinish.glb --target-faces 1000000 --texture-size 4096 --simplify-first --no-hole-fill
-
-# Stage 1+2 only (fast preview, colored voxels):
-PYTHONPATH=. python smoke_stage2.py --image photo.png
-```
-
-The default pipeline uses a two-pass architecture matching the TRELLIS.2 reference.
-The optional local Metal QEM (`--qem-simplify`) remains an experimental alternative,
-not a demonstrated quality upgrade over the simplify-first route above.
-1. **Image conditioning** — native MLX DINOv3 ViT-L/16 features
-2. **Sparse Structure** — SparseStructureFlowModel (1.29B params) + decoder -> 64³ occupancy grid
-3. **LR Shape Latent** — SLatFlowModel (1.29B params) on sparse tokens
-4. **Upsample** — decoder subdivision predictions -> high-res coordinate structure
-5. **HR Shape Latent** — SLatFlowModel again at 1024 cascade resolution
-6. **Shape decode + mesh extraction** — sparse UNet decoder -> `flexible_dual_grid_to_mesh`
-7. **Texture SLat + decode** — per-voxel PBR attributes
-8. **UV unwrap + bake** — xatlas unwrap (`max_iterations=0`), MLX Metal rasterizer, trilinear voxel sampling, seam inpaint, GLB export
-
-### Preview vs final-quality modes
-
-The cheapest route that exits successfully is not necessarily a useful visual
-preview. In a 2026-06-27 M4 Max matrix on an isolated mechanical object, 4-step
-no-cascade output finished quickly but produced a shredded false baseline, while
-8-step no-cascade preserved the object envelope well enough for candidate triage.
-Treat these numbers as a starting heuristic rather than a machine-independent
-benchmark; Apple Silicon timing is sensitive to thermal state and other GPU work.
-
-| Mode | Command shape | Measured total | Use |
-|---|---|---:|---|
-| Plumbing check | `--steps 4 --no-cascade --target-faces 100000 --texture-size 512` | ~62s | Route smoke only; do not judge visual quality from this. |
-| Recommended preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 512` | ~187s | Default search/triage mode; good objectness/cost balance in the measured matrix. |
-| Premium preview | `--steps 8 --no-cascade --target-faces 100000 --texture-size 4096` | texture bake +~22-24s measured; wall-clock noisy | Same geometry as preview, better shaded viewport/readback. Use after shape passes. |
-| No-cascade higher step | `--steps 10/12 --no-cascade --target-faces 100000 --texture-size 512` | ~296-347s in matrix | More expensive; not clearly better than 8-step for preview on the measured input. |
-| Full/final | default cascade, `--target-faces 200000 --texture-size 4096` | ~6-9 min on M4 Max-class runs | Standard final-quality smoke; best objectness and texture read, not a cheap search mode or detail-parity ceiling. |
-| Source-detail check | explicit Greenroom `--smoke-profile source-quality` or `--target-faces 500000` | 2026-07-07 checkpoint resume: 129s, xatlas 21.5s on a hard-surface object | Use for reference/detail-retention comparison when 200k postprocess would hide retained raw geometry. |
-
-Texture-size note: in the 8-step no-cascade comparison, `texture-size=512` and
-`texture-size=4096` produced identical geometry (120,947 vertices / 107,216
-faces). The 4k texture raised GLB size from ~5.9 MB to ~34.8 MB and improved
-surface sampling, but did not materially change the yes/no coherence decision in
-the deterministic witness. Use 512 during search and reserve 4096 for premium
-preview or final presentation.
-
-### Performance: M2 Pro validation run
-
-Full native-DINO shoe run on M2 Pro / 16 GB / macOS 26.5.1:
-
-```bash
-PYTHONPATH=. python generate.py --image assets/shoe_input.png --output /tmp/trellis2mlx-tahoe-shoe-full-native.glb
-```
-
-| Stage | Time | Notes |
-|-------|------|-------|
-| Native DINOv3 | loaded 412 arrays | features `(1, 1029, 1024)` |
-| Sparse structure | 116.9s | 2,977 sparse voxels |
-| LR SLat | 80.0s | 2,977 tokens |
-| Upsample -> HR coords | 15.6s | 761,916 voxels, 12,043 HR tokens |
-| HR SLat | 518.0s | 12,043 tokens |
-| Shape decode | 63.2s | 3,040,506 voxels |
-| Mesh extraction + simplify | 6.0s | 6,016,550 raw faces -> 199,999 faces |
-| Texture SLat | 290.6s | 12,043 tokens |
-| Texture decode | 60.1s | 6-channel PBR |
-| UV unwrap + texture bake | 97.9s | unwrap, raster, voxel sample, seam inpaint |
-| **Total** | **1264.4s** | 1265.04s wall-clock |
-
-Output artifact from that run:
-
-- GLB: `/tmp/trellis2mlx-tahoe-shoe-full-native.glb`
-- SHA256: `608f1c3487a02b3545c8d54b4f02fedaa7deb5dd736c0020129e1a86a1033882`
-- Structure: 264,350 vertices, 199,999 faces, `TextureVisuals`, `PBRMaterial`, base color texture present
-- Visual result: recognizable red shoe with white swoosh/upper structure, plus expected single-image reconstruction debris and red background fragments
-
-### Performance: M4 Max reference run
-
-| Stage | Time | Notes |
-|-------|------|-------|
-| Sparse structure (12 steps) | ~34s | 1.29B param DiT on 16³ grid |
-| LR SLat (1.7K tokens, 12 steps) | ~14s | |
-| Upsample → HR coords | ~6s | 463K voxels |
-| HR SLat (7.2K tokens, 12 steps) | ~2 min | 1024 cascade model |
-| Shape decode (1.9M voxels) | ~73s | 474M param sparse UNet |
-| Mesh extraction + simplify | ~3s | 3.7M → 200K faces |
-| Texture SLat (7.2K tokens, 12 steps) | ~1.3 min | No CFG (single pass) |
-| Texture decode (1.9M voxels) | ~29s | 6-channel PBR |
-| UV unwrap + texture bake | ~2.2 min | xatlas + trilinear sample |
-| **Total** | **~8.6 min** | |
-
-Peak memory: ~3 GB for SLat flow, ~5 GB during decode on the M4 Max reference path.
-
-[trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 viability on Mac via PyTorch MPS. The figures above describe the measured shoe, not the memory or runtime ceiling for complex fur, higher resolutions, or million-face exports.
-
-### Parity and quality status
-
-Native MLX model components track a same-weight PyTorch comparator closely in
-direct checks, but that historical comparator is not a universal source
-authority. CUDA, PyTorch MPS, CPU, and MLX can form different numerical islands;
-on a frozen block-7 witness, source CUDA was materially closer to MLX/CPU than to
-PyTorch MPS. Treat the current release as a working end-to-end MLX pipeline, not
-a promise that every seed/input matches source CUDA or another Mac route
-visually.
-
-Historical 12-step same-weight, same-noise PyTorch comparator:
-
-| Step | Correlation | Max diff |
-|------|-------------|----------|
-| 1 | 0.999999 | 0.009 |
-| 3 | 0.999991 | 0.020 |
-| 6 | 0.999938 | 0.051 |
-| 9 | 0.998852 | 0.434 |
-| 12 | 0.968466 | 2.128 |
-
-These measurements remain useful, but the old conclusion that the entire
-divergence was monotonic BF16-to-FP16 accumulation was too strong. Controlled
-replays now show both smooth accumulation and discrete basin changes. Raw mesh,
-cleanup order, simplification, UV processing, and texture bake are tracked as
-separate causal surfaces. The repaired warrior/bear deletion described above
-is now attributed to cleanup rather than left as an unspecified inference
-residual. It does not require matching random seeds across different numerical
-backends. See
-[`docs/cross-runtime-causal-forensics.md`](docs/cross-runtime-causal-forensics.md)
-for the current evidence and claim boundary.
-
-### Quantization (experimental)
-
-`generate.py --quantize 4` uses MLX INT4 quantization on the four flow models
-(sparse structure, LR shape SLat, HR shape SLat, and texture SLat). This reduces
-flow-model weight memory by about 6.4x, which is useful for packaging and tighter memory
-budgets, but there was no speedup on the measured M2 Pro route.
-
-| | FP16 | INT4 |
-|---|---|---|
-| Weight memory | 5.17 GB | 0.81 GB |
-| Forward pass | works | works |
-
-M2 Pro / MLX 0.31.2 stage benchmark, one warmup step plus two timed sampler
-steps:
-
-| Stage | FP16 | INT8 | INT4 |
-|---|---:|---:|---:|
-| Sparse-structure flow, 16³ grid | 9.56s/step | 10.62s/step | 10.70s/step |
-| SLat flow, 12,043 tokens | 47.57s/step | 49.94s/step | 52.35s/step |
-
-So the current tradeoff is memory/packaging only: INT8 and INT4 were slower than
-FP16 in this benchmark. Further speedups likely need fewer sampler steps,
-stage/model reuse, batching, or fused kernels rather than weight-only
-quantization.
-
-To rerun the flow-stage benchmark:
-
-```bash
-PYTHONPATH=. python scripts/bench_quantization.py \
-  --image assets/shoe_input.png \
-  --variants fp16,int8,int4 \
-  --stages ss-flow,slat-flow
-```
-
-The table above was recorded before the reusable harness was committed. The command
-reruns the same sparse flow plus synthetic 512-shape-SLat stress benchmark for
-future reports; it is not a full four-flow `generate.py --quantize` rerun.
-
-The script writes an incremental JSON report and records the effective repo
-head, checkpoint files, host/MLX identity, asset route, variants, stages, and
-failure phase if the run stops early.
-
-### Roadmap
-
-- [x] SparseStructureFlowModel (1.29B param DiT) — numerically verified
-- [x] SparseStructureDecoder (73.7M param Conv U-Net)
-- [x] SLatFlowModel (1.29B param sparse token DiT)
-- [x] ShapeSLatDecoder (474M param sparse UNet)
-- [x] Two-pass architecture (LR SLat → upsample → HR SLat → decode)
-- [x] `flexible_dual_grid_to_mesh` mesh extraction
-- [x] SLat denormalization (pipeline.json mean/std)
-- [x] Weight loading (640/640 + 74/74 + 640/640 + 292/292 params)
-- [x] Flow Euler sampler with CFG + guidance interval + rescale
-- [x] 3D RoPE position embedding (dynamic, computed from input shape)
-- [x] Image conditioning via DINOv3 (native MLX — no PyTorch required)
-- [x] MLX Flash Attention (`mx.fast.scaled_dot_product_attention`)
-- [x] Periodic eval to prevent memory bus starvation
-- [x] INT4 quantization utility
-- [x] Historical 12-step same-noise PyTorch comparator recorded
-- [x] CUDA/MPS/MLX authority split established with frozen witnesses and controlled replay
-- [x] Mesh simplification via fast-simplification (3.7M → 200K faces in ~1s)
-- [x] Pre-split component filtering preserves connected fine surfaces; `--no-hole-fill` avoids filling-induced mesh growth
-- [x] Metal-accelerated QEM mesh simplification (`--qem-simplify`) — topology-preserving edge collapse with normal-flip guard, adapted from [mtlmesh](https://github.com/pedronaugusto/trellis2-apple)
-- [x] Texture SLat flow + decoder → per-voxel PBR attributes
-- [x] UV unwrap (xatlas, `max_iterations=0`) + GPU texture baking (MLX Metal rasterizer + trilinear sample + cv2 inpaint)
-- [x] xatlas chart optimization bypass: 56x faster UV unwrap, <1% quality difference ([docs/uv-unwrap.md](docs/uv-unwrap.md))
-- [x] Full pipeline: image → textured GLB with PBR materials (~8.6 min)
-- [x] 1024 cascade architecture (LR 512 model + HR 1024 model)
-- [x] `--no-cascade` + `--steps` flags for speed/quality control (4-step route smoke, 8-step visual preview)
-- [x] Cross-attention KV cache (eliminates redundant KV projection across ODE steps)
-- [x] Sparse conv neighbor map caching (313x cache hit speedup)
-- [x] M2 Pro / macOS 26 full native-DINO smoke (21m05s, 6.75 GB peak RSS)
-- [ ] Public demo polish and seed/input curation
-- [x] M2 Pro INT4/INT8 flow-stage speed benchmark (no speedup measured)
-- [x] `mx.compile` investigation (no speedup — eager dispatch is already optimal for 30-block DiT)
-- [ ] Native macOS/iOS app (PyObjC/SwiftUI shell first, MLX Swift route later)
-
-## Why MLX
-
-[trellis-mac](https://github.com/shivampkumar/trellis-mac) demonstrated that TRELLIS.2 can run on Mac via PyTorch MPS, and [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) contributed Metal modules for the ecosystem. This project rewrites the inference stack in MLX to take full advantage of Apple Silicon:
-
-- **Memory:** MLX's SDPA is real Flash Attention — O(N) memory vs O(N²) for MPS SDPA. Handles 262K tokens at ~3 GB instead of 275 GB.
-- **Accessibility:** Validated on a 16 GB M2 Pro as well as an M4 Max; designed for Apple Silicon rather than CUDA-only workstations.
-- **Execution:** Periodic evaluation bounds deferred work. Large inference and mesh jobs still contend for unified memory and the GPU; serialize heavy workloads.
-- **No PyTorch:** Fully native MLX pipeline including DINOv3 image conditioning. No torch/torchvision/transformers dependency.
+Actual GLBs rendered in Kaminos, without geometry retouching. The warrior and
+bear use the surface-preservation experiment that became the current cleanup
+rule; the kiln uses the landed implementation. [Settings and provenance](docs/examples.json).
 
 ## Quick start
+
+You need an Apple Silicon Mac, Python 3.11 or newer, and
+[uv](https://docs.astral.sh/uv/). A complete textured shoe has been generated on
+a **16 GB M2 Pro**; complex high-resolution objects can need considerably more
+memory. See the [measured runtimes](#runtime-and-memory) below.
 
 ```bash
 git clone https://github.com/lyonsno/trellis2mlx.git
@@ -359,25 +39,145 @@ uv venv .venv --python python3.11
 source .venv/bin/activate
 uv pip install -e .
 
-# Hugging Face auth (needed for gated DINOv3 weights):
+# Authenticate after obtaining access to the gated DINOv3 weights:
+# https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
 hf auth login
-# Request access: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
 
-# Download model weights (~5 GB total):
 hf download microsoft/TRELLIS.2-4B
 hf download microsoft/TRELLIS-image-large
 hf download facebook/dinov3-vitl16-pretrain-lvd1689m
-
-# Full pipeline (image → textured mesh):
-PYTHONPATH=. python generate.py --image your_image.png
-
-# Quick preview (stages 1+2 only, no texture):
-PYTHONPATH=. python smoke_stage2.py
-
-open /tmp/trellis-mlx-mesh.glb
 ```
 
-Without `--image`, runs with random conditioning (abstract shapes, useful for verifying the pipeline works without downloading DINOv3 weights).
+Start with a single-object image and an eight-step preview:
+
+```bash
+PYTHONPATH=. python generate.py \
+  --image your_image.png --output preview.glb \
+  --seed 42 --steps 8 --no-cascade \
+  --target-faces 100000 --texture-size 512 \
+  --simplify-first --no-hole-fill --repair-exterior-surface \
+  --save-checkpoints checkpoints/preview-01
+```
+
+Open `preview.glb` in a GLB viewer or Blender. Keep the checkpoint directory:
+it lets you change simplification and texture-map resolution after a successful
+run without paying for inference again. Four-step runs are useful for checking
+the pipeline, but were too destructive to use as a visual quality baseline.
+
+## More detail, then cheaper iteration
+
+For a detailed 768 cascade with 4K texture maps:
+
+```bash
+PYTHONPATH=. python generate.py \
+  --image your_image.png --output detailed.glb \
+  --seed 42 --resolution 768 --steps 12 \
+  --target-faces 500000 --texture-size 4096 \
+  --simplify-first --no-hole-fill --repair-exterior-surface \
+  --save-checkpoints checkpoints/detail-01
+```
+
+Then try a smaller export from the **same saved raw mesh and appearance**:
+
+```bash
+PYTHONPATH=. python generate.py \
+  --resume checkpoints/detail-01 --output detailed-200k.glb \
+  --target-faces 200000 --texture-size 4096 \
+  --simplify-first --no-hole-fill --repair-exterior-surface \
+  --save-checkpoints checkpoints/detail-200k
+```
+
+Use a completed checkpoint set containing raw mesh **and decoded texture
+attributes**. A directory with only conditioning or sparse coordinates is not
+a supported finishing resume. Keep each run's outputs in a separate directory.
+
+The recipes above deliberately select simplify-first and skip hole filling.
+Without overrides, the CLI requests a 1024 cascade, 12 steps, a 200K face
+target, 1K maps, and hole filling. Check `python generate.py --help` for all
+options; the token budget can reduce the effective cascade resolution.
+
+### Which control changes what?
+
+| Control | What it buys |
+|---|---|
+| `--no-cascade` | Single-pass 512 generation; useful for previewing an input or seed. |
+| `--resolution 768` / `1024` | Higher-resolution cascade geometry and appearance. More inference work and memory. |
+| `--steps` | Sampling work per stage. Start at 8 for previews; the detailed recipe uses 12. |
+| `--target-faces` | Detail retained during simplification. Increasing it does not rerun or improve inference. |
+| `--texture-size` | Baked atlas resolution. 4K maps can improve surface appearance, but cannot restore deleted geometry. |
+| `--no-hole-fill` | Avoids adding filling triangles. Omit it to fill small openings, at the cost of a potentially much larger mesh. |
+| `--repair-exterior-surface` | Enables the exterior-orientation repair used in the examples. It is separate from surface retention. |
+| `--save-checkpoints` / `--resume` | Save inference products and reuse them for finishing experiments. |
+
+A face target is **not a strict final face-count ceiling**. Filling can add
+substantial geometry: the saved warrior grows from 962K faces / 103 MB without
+filling to 1.66M faces / 148 MB with filling, with only a subtle visible change
+in the inspected views. Million-face, UV-expanded exports can also be heavy
+in a browser. Start below that budget unless the object's detail warrants it.
+
+## Runtime and memory
+
+These are measured examples, not fixed completion times. Object complexity,
+resolution, thermal state and competing workloads matter.
+
+| Machine and case | Scope | Measured time |
+|---|---|---:|
+| M4 Max, mechanical object, 512 / 8 steps / 100K / 512 maps | Full generation, historical preview matrix | ~3m07s |
+| M4 Max, textured shoe, cascade | Full generation, historical reference run | ~8m36s |
+| M2 Pro, 16 GB, textured shoe, cascade | Full generation; 6.75 GB peak RSS | 21m05s |
+| M4 Max, saved warrior 768 / 1M / 4K, no fill | Finishing only, surface-preservation experiment | 3m49s |
+| M4 Max, saved bear 512 / 200K / 1K, no fill | Finishing only, surface-preservation experiment | 37s |
+
+The shoe demonstrates a useful 16 GB route, not a memory ceiling for every
+asset. A separate 768 warrior generation reached **63.8 GiB peak process
+footprint**. Serialize heavy GPU work; this is not a background workload to
+assume will leave the machine unaffected. [Benchmark details and limits](docs/validation.md).
+
+Experimental `--quantize 4` reduces flow-model weight memory by about 6.4×.
+It did **not** speed up the measured M2 Pro flow-stage benchmark.
+[Quantization measurements and rerun command](docs/validation.md#quantization-experimental).
+
+## What changed in mesh quality
+
+Fine beard and fur surfaces were being lost during cleanup, even when the raw
+model output contained them. Repairing non-manifold edges split attached
+surfaces into small pieces; a later small-component filter mistook those pieces
+for removable debris.
+
+The local cleanup now decides which small components to remove **before**
+splitting and preserves that decision through later passes. This recovered
+visible surfaces on the warrior and both bear resolutions, without rerunning
+inference. Hole filling remains a separate choice: keeping existing detail and
+patching openings are different operations.
+
+[Before/after counts, filled/unfilled costs, and the reference-policy distinction](docs/validation.md#surface-preservation).
+
+## Limits and useful next checks
+
+- A coherent output is not guaranteed for every image or seed. Inspect a preview
+  before spending on higher resolution.
+- Higher face budgets preserve more detail but increase file size, UV work and
+  viewer cost. Inspect the exported GLB, not just the requested target.
+- Cleanup, inference resolution and texture-map size affect different parts of
+  quality. Saved checkpoints let you test finishing changes independently.
+- Metal command-buffer failures have occurred on complex runs. Preserve completed
+  checkpoints and the failure log; an interrupted directory is not automatically
+  resumable.
+- `--qem-simplify` remains an experimental alternative. The explicit
+  `--reference-cleanup` comparison retains reference split-then-filter behavior
+  and cannot be combined with `--no-hole-fill`.
+
+## How it works
+
+Native MLX DINOv3 conditioning → sparse structure → low-resolution shape flow
+→ optional high-resolution cascade → mesh extraction and cleanup → texture
+flow/decode → UV unwrap, PBR bake and GLB export.
+
+The technical investigation separated numerical differences from damage
+introduced after inference. A rough final mesh was not, by itself, evidence of
+a broken model port. See the
+[cross-runtime causal-forensics case study](docs/cross-runtime-causal-forensics.md),
+[historical porting map](docs/architecture-map.md) and [UV unwrap notes](docs/uv-unwrap.md).
 
 ## Tests
 
@@ -386,36 +186,17 @@ uv run --with pytest python -m pytest tests/ -v
 ```
 
 Test suite covers core modules, onboarding contracts, and witness renderer behavior.
-
-## Architecture
-
-See [docs/architecture-map.md](docs/architecture-map.md) for the full TRELLIS.2-4B architecture reference.
-
-```
-trellmlx/
-├── models/
-│   ├── sparse_structure_flow.py   # 1.29B param DiT (30 blocks, 3D RoPE, adaLN-Zero)
-│   ├── sparse_structure_decoder.py # 73.7M param Conv3d U-Net (pixel shuffle upsample)
-│   ├── slat_flow.py               # 1.29B param sparse token DiT (shape detail)
-│   └── shape_slat_decoder.py      # 474M param sparse UNet (Channel2Spatial upsample)
-├── modules/
-│   ├── attention.py               # mx.fast.scaled_dot_product_attention + MultiHeadRMSNorm
-│   ├── rope.py                    # 3D Rotary Position Embedding
-│   ├── norm.py                    # LayerNorm32 (fp32 accumulation)
-│   └── sparse_conv.py             # Submanifold sparse 3D convolution (gather-scatter)
-├── mesh_extract.py                # flexible_dual_grid_to_mesh (numpy)
-├── samplers.py                    # Flow Euler sampler with CFG + guidance interval
-├── weight_loader.py               # Checkpoint loading (key remap, Conv3d permute, bf16/fp16)
-└── quantize.py                    # INT4/INT8 quantization utility
-```
+The [validation guide](docs/validation.md#witness-renderer) also includes a
+GLB witness renderer that does not rerun inference.
 
 ## Credits
 
-- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) by Microsoft Research — the model
-- [trellis-mac](https://github.com/shivampkumar/trellis-mac) by Shivam Kumar — proved Mac viability
-- [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) by Pedro Naugusto — Metal modules
-- [MLX](https://github.com/ml-explore/mlx) by Apple — the framework
+- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) by Microsoft Research — the model.
+- [trellis-mac](https://github.com/shivampkumar/trellis-mac) by Shivam Kumar — the earlier PyTorch MPS route that proved Mac viability.
+- [trellis2-apple](https://github.com/pedronaugusto/trellis2-apple) by Pedro Naugusto — Metal modules.
+- [MLX](https://github.com/ml-explore/mlx) by Apple — the inference framework.
 
 ## License
 
-MIT (porting code). Upstream model weights are subject to their own licenses — see [trellis-mac](https://github.com/shivampkumar/trellis-mac#license) for details.
+MIT for the porting code. Model weights retain their respective upstream
+licenses; see the model repositories linked in the installation instructions.

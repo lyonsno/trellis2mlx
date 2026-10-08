@@ -142,9 +142,12 @@ def test_readme_tests_section_avoids_stale_exact_count():
     assert "Test suite covers core modules" in tests_section
 
 
-def test_readme_quantization_section_states_measured_tradeoff():
-    text = Path("README.md").read_text()
-    quant_section = text.split("### Quantization (experimental)", 1)[1].split("### Roadmap", 1)[0]
+def test_linked_quantization_evidence_states_measured_tradeoff():
+    # Detailed benchmark provenance belongs in validation, linked from onboarding.
+    # Keep the evidence contract without freezing the README's section hierarchy.
+    assert "docs/validation.md#quantization-experimental" in Path("README.md").read_text()
+    text = Path("docs/validation.md").read_text()
+    quant_section = text.split("## Quantization (experimental)", 1)[1].split("\n## ", 1)[0]
 
     assert "6.4" in quant_section
     assert "M2 Pro" in quant_section

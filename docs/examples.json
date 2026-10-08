@@ -1,0 +1,260 @@
+{
+  "schema": "trellis2mlx.examples.v1",
+  "note": "Warrior and bear are experimental finalizations whose retained ordered triangles were replayed exactly through the production preservation rule; the full GLBs are not claimed byte-identical to production regeneration. Kiln is a production refinish. Capture is presentation-only. No output is a cross-backend identity claim.",
+  "examples": [
+    {
+      "id": "warrior-768",
+      "image": "assets/examples/warrior-768.png",
+      "image_sha256": "4a92565d140108def968133bc58a6ab7c98e57620399608f6207fd3733f59f99",
+      "input": "official TRELLIS.2 warrior example image",
+      "generation": {
+        "resolution": 768,
+        "seed": 80301,
+        "steps": 12,
+        "cascade": true
+      },
+      "finishing": {
+        "route": "experimental retained-surface override",
+        "source_revision": "0e9c127f757febef86a18673643e9c722d91a90a",
+        "production_retention_revision": "d642ab65315e211b5e4fe90f34a2e76b0d8b85c4",
+        "target_faces": 1000000,
+        "texture_size": 4096,
+        "hole_fill": false,
+        "exterior_orientation_repair": true,
+        "new_inference": false
+      },
+      "output": {
+        "sha256": "a69f6830e5d3bd455bcbda574d0003855e729a6253613cff4c769108601c6c49",
+        "bytes": 103111900,
+        "faces": 961732,
+        "uv_vertices": 1619599,
+        "texture_images": [
+          {
+            "mime": "image/png",
+            "width": 4096,
+            "height": 4096
+          },
+          {
+            "mime": "image/png",
+            "width": 4096,
+            "height": 4096
+          }
+        ]
+      },
+      "presentation": {
+        "renderer": "Kaminos",
+        "revision": "7b1abab4544b76efde0763bb571fec6897ad3c6f",
+        "browser": "Chrome for Testing 154.0.8037.92",
+        "capture_date": "2026-10-07 America/New_York",
+        "route_verified": true,
+        "asset_registration_verified": true,
+        "ui_hidden": true,
+        "gizmo_visible": false,
+        "geometry_retouching": false,
+        "material_retouching": false,
+        "pose": null
+      }
+    },
+    {
+      "id": "bear-512",
+      "image": "assets/examples/bear-512-front.png",
+      "image_sha256": "63444dd80c31f464ba0a2f826d653d9ab25582ce940c33b3433a2104c0f929ce",
+      "input": "official TRELLIS.2 bear example image",
+      "generation": {
+        "resolution": 512,
+        "seed": 80301,
+        "steps": 12,
+        "cascade": false
+      },
+      "finishing": {
+        "route": "experimental retained-surface override",
+        "source_revision": "0e9c127f757febef86a18673643e9c722d91a90a",
+        "production_retention_revision": "d642ab65315e211b5e4fe90f34a2e76b0d8b85c4",
+        "target_faces": 200000,
+        "texture_size": 1024,
+        "hole_fill": false,
+        "exterior_orientation_repair": true,
+        "new_inference": false
+      },
+      "output": {
+        "sha256": "55d0ce81775a64f0f1306aca56d8878ae44a9843ed7b22c5c2b107bcd38c8b57",
+        "bytes": 13421300,
+        "faces": 194018,
+        "uv_vertices": 260139,
+        "texture_images": [
+          {
+            "mime": "image/png",
+            "width": 1024,
+            "height": 1024
+          },
+          {
+            "mime": "image/png",
+            "width": 1024,
+            "height": 1024
+          }
+        ]
+      },
+      "presentation": {
+        "renderer": "Kaminos",
+        "revision": "7b1abab4544b76efde0763bb571fec6897ad3c6f",
+        "browser": "Chrome for Testing 154.0.8037.92",
+        "capture_date": "2026-10-07 America/New_York",
+        "route_verified": true,
+        "asset_registration_verified": true,
+        "ui_hidden": true,
+        "gizmo_visible": false,
+        "geometry_retouching": false,
+        "material_retouching": false,
+        "pose": {
+          "position": [
+            0,
+            0.14999999999999986,
+            2.7999999999999994
+          ],
+          "target": [
+            0,
+            0,
+            0
+          ],
+          "projectionMatrix": [
+            3.0222251614000846,
+            0,
+            0,
+            0,
+            0,
+            2.7474774194546225,
+            0,
+            0,
+            0,
+            0,
+            -1.0001000100010002,
+            -1,
+            0,
+            0,
+            -0.010001000100010001,
+            0
+          ],
+          "matrixWorldInverse": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0.998568132270089,
+            0.053494721371611896,
+            0,
+            0,
+            -0.053494721371611896,
+            0.998568132270089,
+            0,
+            0,
+            5.551115123125784e-17,
+            -2.80401497856199,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "id": "kiln-768-500k",
+      "image": "assets/examples/kiln-500k.png",
+      "image_sha256": "03da6a267eabbe37b149635e22dac42b73a65955f8f5a56c82ea3e95305ba552",
+      "input": "refractory-lined steel kiln source image",
+      "generation": {
+        "resolution": 768,
+        "seed": 42,
+        "steps": null,
+        "cascade": true,
+        "steps_note": "Saved 768 source reused; no inference in this finishing run."
+      },
+      "finishing": {
+        "route": "production checkpoint resume",
+        "source_revision": "1201553c339008eb5e10ab6131acc11ab7cd0158",
+        "production_retention_revision": "d642ab65315e211b5e4fe90f34a2e76b0d8b85c4",
+        "target_faces": 500000,
+        "texture_size": 4096,
+        "hole_fill": false,
+        "exterior_orientation_repair": true,
+        "new_inference": false
+      },
+      "output": {
+        "sha256": "4f3a0900f57a6c4f72547f8863a019436aa3344e31068d4b9d15477ac7336619",
+        "bytes": 69166644,
+        "faces": 485111,
+        "uv_vertices": 636562,
+        "texture_images": [
+          {
+            "mime": "image/png",
+            "width": 4096,
+            "height": 4096
+          },
+          {
+            "mime": "image/png",
+            "width": 4096,
+            "height": 4096
+          }
+        ]
+      },
+      "presentation": {
+        "renderer": "Kaminos",
+        "revision": "7b1abab4544b76efde0763bb571fec6897ad3c6f",
+        "browser": "Chrome for Testing 154.0.8037.92",
+        "capture_date": "2026-10-07 America/New_York",
+        "route_verified": true,
+        "asset_registration_verified": true,
+        "ui_hidden": true,
+        "gizmo_visible": false,
+        "geometry_retouching": false,
+        "material_retouching": false,
+        "pose": {
+          "position": [
+            1.6499999999999997,
+            0.6,
+            2
+          ],
+          "target": [
+            0,
+            -0.04,
+            0
+          ],
+          "projectionMatrix": [
+            3.0222251614000846,
+            0,
+            0,
+            0,
+            0,
+            2.7474774194546225,
+            0,
+            0,
+            0,
+            0,
+            -1.0001000100010002,
+            -1,
+            0,
+            0,
+            -0.010001000100010001,
+            0
+          ],
+          "matrixWorldInverse": [
+            0.7713732785400771,
+            -0.15250700799821568,
+            0.6178388767840404,
+            0,
+            2.7755575615628914e-17,
+            0.9708601905947016,
+            0.23964659463138538,
+            0,
+            -0.6363829547955637,
+            -0.1848569793917766,
+            0.7488956082230792,
+            0,
+            2.3592239273284576e-16,
+            0.03883440762378802,
+            -2.661013319918656,
+            1
+          ]
+        }
+      }
+    }
+  ]
+}
