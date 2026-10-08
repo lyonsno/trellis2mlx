@@ -170,6 +170,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--report', type=Path, required=True)
     args = parser.parse_args()
+    if args.output.resolve() == args.report.resolve():
+        parser.error('output and report must be distinct paths')
     if args.report.exists():
         raise FileExistsError(args.report)
     report = dict(status='started', phase='input', argv=sys.argv, backend='CPU/numpy/trimesh',

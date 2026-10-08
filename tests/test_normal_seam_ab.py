@@ -57,6 +57,22 @@ def test_missing_input_writes_failure_report_without_output(tmp_path):
     assert not output.exists()
 
 
+def test_output_report_alias_rejected_before_any_write(tmp_path):
+    data,v,f,uvv,uvf,mapping=fixture()
+    source=tmp_path/'source.glb'
+    source.write_bytes(data)
+    np.savez(tmp_path/'mesh_clean.npz',vertices=v,faces=f)
+    np.savez(tmp_path/'mesh_uv.npz',vertices=uvv,faces=uvf,vmapping=mapping)
+    destination=tmp_path/'result.glb'
+    result=subprocess.run([sys.executable,ab.__file__,'--glb',str(source),
+        '--checkpoints',str(tmp_path),'--output',str(destination),
+        '--report',str(tmp_path/'nested'/'..'/'result.glb')],capture_output=True,text=True)
+    assert result.returncode != 0, 'report overwrote GLB despite successful result'
+    assert 'output and report must be distinct' in result.stderr
+    assert not destination.exists()
+    assert source.read_bytes()==data
+
+
 def test_normal_bounds_update_preserves_every_other_metadata_and_binary_byte(monkeypatch):
     data,v,f,uvv,uvf,mapping=fixture()
     monkeypatch.setattr(ab,'mapped_normals',lambda *a:np.tile(np.array([1,0,0],dtype='<f4'),(6,1)))
