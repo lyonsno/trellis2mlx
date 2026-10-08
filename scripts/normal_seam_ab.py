@@ -85,7 +85,7 @@ def canonical_faces(faces):
     return rotated[np.lexsort(rotated.T[::-1])]
 
 
-def patch_asset(data, vertices, faces, uv_vertices, uv_faces, vmapping):
+def patch_asset(data, vertices, faces, uv_vertices, uv_faces, vmapping, *, source_normals=None, estimator=None):
     vmapping = np.asarray(vmapping)
     if vmapping.ndim != 1 or vmapping.dtype.kind not in 'iu' or len(vmapping) != len(uv_vertices):
         raise ValueError('invalid UV vertex mapping')
@@ -122,7 +122,15 @@ def patch_asset(data, vertices, faces, uv_vertices, uv_faces, vmapping):
         raise ValueError('GLB positions do not match UV checkpoint')
     if not np.array_equal(idx.reshape(-1,3), uv_faces):
         raise ValueError('GLB faces do not match UV checkpoint')
-    new = mapped_normals(vertices, faces, uv_vertices, uv_faces, vmapping)
+    if source_normals is None:
+        new = mapped_normals(vertices, faces, uv_vertices, uv_faces, vmapping)
+    else:
+        source_normals = np.asarray(source_normals)
+        if source_normals.shape != vertices.shape or not np.isfinite(source_normals).all():
+            raise ValueError('invalid source normals')
+        if not estimator:
+            raise ValueError('explicit source normals require estimator identity')
+        new = np.asarray(export_axes(source_normals)[vmapping], dtype='<f4')
     if new.shape != old.shape or not np.isfinite(new).all():
         raise ValueError('invalid candidate normals')
     bounds_changed = False
@@ -152,13 +160,13 @@ def patch_asset(data, vertices, faces, uv_vertices, uv_faces, vmapping):
         only_normal_data_and_bounds_changed=True, only_normal_bytes_changed=not bounds_changed,
         normal_bounds_metadata_updated=bounds_changed, vertices=len(pos), faces=len(uv_faces),
         normal_byte_span=[begin,end], changed_normal_vectors=int(np.any(new!=old,axis=1).sum()),
-        angle_degrees_percentiles=dict(zip(['p50','p90','p99','max'],map(float,np.percentile(angles,[50,90,99,100])))),
+        angle_degrees_percentiles=(dict(zip(['p50','p90','p99','max'],map(float,np.percentile(angles,[50,90,99,100])))) if len(angles) else None),
         zero_candidate_normals=int((np.linalg.norm(new,axis=1)<1e-10).sum()),
         zero_original_normals=int((np.linalg.norm(old,axis=1)<1e-10).sum()),
         protected_prefix_sha256=digest(data[:begin]), protected_suffix_sha256=digest(data[end:]),
         original_sha256=digest(data), candidate_sha256=digest(output),
-        normal_estimator='Trimesh angle-weighted on clean topology, mapped through saved UV vmapping',
-        claim_limit='UV seam normal connectivity only; no CuMesh estimator parity or geometry repair claim',
+        normal_estimator=estimator or 'Trimesh angle-weighted on clean topology, mapped through saved UV vmapping',
+        claim_limit='Normals-only intervention; external estimator provenance belongs to the caller; no geometry repair claim',
     )
     return output, report
 

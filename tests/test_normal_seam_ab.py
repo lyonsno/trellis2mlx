@@ -24,6 +24,25 @@ def fixture():
     return mesh.export(file_type='glb',include_normals=True),vertices,faces,uvv,uvf,mapping
 
 
+def test_explicit_source_normals_only_change_normals():
+    data,v,f,uvv,uvf,mapping=fixture()
+    source=np.tile([0.,0.,1.],(len(v),1)).astype(np.float32)
+    patched,report=ab.patch_asset(data,v,f,uvv,uvf,mapping,source_normals=source,
+                                estimator='test explicit source')
+    doc,prim,start,size=ab.read_glb(patched)
+    actual,_,_=ab.accessor(patched,doc,start,size,prim['attributes']['NORMAL'])
+    np.testing.assert_array_equal(actual,ab.export_axes(source)[mapping])
+    assert report['only_normal_data_and_bounds_changed']
+    assert report['normal_estimator']=='test explicit source'
+
+
+def test_nonfinite_explicit_source_normals_rejected():
+    data,v,f,uvv,uvf,mapping=fixture()
+    source=np.full_like(v,np.nan)
+    with pytest.raises(ValueError,match='source normals'):
+        ab.patch_asset(data,v,f,uvv,uvf,mapping,source_normals=source,estimator='test')
+
+
 def test_uv_split_copies_share_pre_uv_normal_and_other_bytes_are_unchanged():
     data,v,f,uvv,uvf,mapping=fixture()
     patched,report=ab.patch_asset(data,v,f,uvv,uvf,mapping)
