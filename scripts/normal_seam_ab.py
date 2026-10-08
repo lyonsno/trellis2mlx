@@ -125,20 +125,36 @@ def patch_asset(data, vertices, faces, uv_vertices, uv_faces, vmapping):
     new = mapped_normals(vertices, faces, uv_vertices, uv_faces, vmapping)
     if new.shape != old.shape or not np.isfinite(new).all():
         raise ValueError('invalid candidate normals')
+    bounds_changed = False
     for key, value in [('min',new.min(axis=0)),('max',new.max(axis=0))]:
         if key in normal_accessor and not np.array_equal(value, np.asarray(normal_accessor[key], dtype='<f4')):
-            raise ValueError('normal min/max would require JSON changes')
-    output = data[:begin] + new.tobytes() + data[end:]
-    if len(output) != len(data) or output[:begin] != data[:begin] or output[end:] != data[end:]:
+            normal_accessor[key] = value.tolist()
+            bounds_changed = True
+    patched = data[:begin] + new.tobytes() + data[end:]
+    if len(patched) != len(data) or patched[:begin] != data[:begin] or patched[end:] != data[end:]:
         raise AssertionError('protected GLB bytes changed')
+    output = patched
+    if bounds_changed:
+        encoded = json.dumps(doc,separators=(',',':')).encode()
+        encoded += b' ' * (-len(encoded)%4)
+        output = (struct.pack('<4sII',b'glTF',2,12+8+len(encoded)+8+bin_length)
+            + struct.pack('<II',len(encoded),0x4e4f534a) + encoded
+            + struct.pack('<II',bin_length,0x004e4942) + patched[bin_start:])
+        actual, _, new_start, _ = read_glb(output)
+        original_doc, _, _, _ = read_glb(data)
+        actual['accessors'][attrs['NORMAL']] = original_doc['accessors'][attrs['NORMAL']]
+        if actual != original_doc or output[new_start:] != patched[bin_start:]:
+            raise AssertionError('non-normal metadata or binary payload changed')
     lengths = np.linalg.norm(new, axis=1)*np.linalg.norm(old,axis=1)
     valid = lengths > 1e-10
     angles = np.degrees(np.arccos(np.clip(np.einsum('ij,ij->i',old[valid],new[valid])/lengths[valid],-1,1)))
     report = dict(
-        only_normal_bytes_changed=True, vertices=len(pos), faces=len(uv_faces),
+        only_normal_data_and_bounds_changed=True, only_normal_bytes_changed=not bounds_changed,
+        normal_bounds_metadata_updated=bounds_changed, vertices=len(pos), faces=len(uv_faces),
         normal_byte_span=[begin,end], changed_normal_vectors=int(np.any(new!=old,axis=1).sum()),
         angle_degrees_percentiles=dict(zip(['p50','p90','p99','max'],map(float,np.percentile(angles,[50,90,99,100])))),
         zero_candidate_normals=int((np.linalg.norm(new,axis=1)<1e-10).sum()),
+        zero_original_normals=int((np.linalg.norm(old,axis=1)<1e-10).sum()),
         protected_prefix_sha256=digest(data[:begin]), protected_suffix_sha256=digest(data[end:]),
         original_sha256=digest(data), candidate_sha256=digest(output),
         normal_estimator='Trimesh angle-weighted on clean topology, mapped through saved UV vmapping',

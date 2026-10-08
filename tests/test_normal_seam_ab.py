@@ -55,3 +55,20 @@ def test_missing_input_writes_failure_report_without_output(tmp_path):
     assert json.loads(report.read_text())['phase']=='input'
     assert json.loads(report.read_text())['status']=='failed'
     assert not output.exists()
+
+
+def test_normal_bounds_update_preserves_every_other_metadata_and_binary_byte(monkeypatch):
+    data,v,f,uvv,uvf,mapping=fixture()
+    monkeypatch.setattr(ab,'mapped_normals',lambda *a:np.tile(np.array([1,0,0],dtype='<f4'),(6,1)))
+    output,report=ab.patch_asset(data,v,f,uvv,uvf,mapping)
+    assert report['normal_bounds_metadata_updated']
+    old,old_prim,old_start,_=ab.read_glb(data)
+    new,new_prim,new_start,_=ab.read_glb(output)
+    index=old_prim['attributes']['NORMAL']
+    _,begin,end=ab.accessor(data,old,old_start,len(data)-old_start,index)
+    new_a=new['accessors'][index]
+    assert new_a['min']==new_a['max']==[1,0,0]
+    new['accessors'][index]=old['accessors'][index]
+    assert new==old
+    assert output[new_start:new_start+begin-old_start]==data[old_start:begin]
+    assert output[new_start+end-old_start:]==data[end:]
