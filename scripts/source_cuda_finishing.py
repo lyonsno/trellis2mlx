@@ -201,6 +201,13 @@ def bootstrap(args, report):
     report["postprocess_sha256"] = verify_source(root / "TRELLIS.2/o-voxel/o_voxel/postprocess.py")
 
 
+def finishing_settings(args):
+    return dict(grid_size=args.grid_size, aabb=[[-.5, -.5, -.5], [.5, .5, .5]],
+                decimation_target=args.target_faces, texture_size=args.texture_size,
+                remesh=args.arm == "remesh", remesh_band=1,
+                remesh_project=args.remesh_project, verbose=True, use_tqdm=False)
+
+
 def run_arm(args, report):
     import torch
     import cumesh
@@ -216,10 +223,7 @@ def run_arm(args, report):
     spec = importlib.util.spec_from_file_location("original_trellis_postprocess", source_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    settings = dict(grid_size=args.grid_size, aabb=[[-.5, -.5, -.5], [.5, .5, .5]],
-                    decimation_target=args.target_faces, texture_size=args.texture_size,
-                    remesh=args.arm == "remesh", remesh_band=1, remesh_project=0,
-                    verbose=True, use_tqdm=False)
+    settings = finishing_settings(args)
     report["effective_route"] = {
         "entry_boundary": "saved-mlx-raw-mesh-and-decoded-appearance-before-local-cleanup",
         "finishing": "unmodified-official-to_glb",
@@ -295,13 +299,14 @@ def run_both(args, report):
     bootstrap(args, report)
     report["phase"] = "finishing_arms"
     report["arms"] = {}
-    for arm in ("non-remesh", "remesh"):
+    for arm in args.arms:
         argv = [sys.executable, "-u", str(Path(__file__).resolve()),
                 "--mesh", str(args.mesh.resolve()), "--appearance", str(args.appearance.resolve()),
                 "--mesh-sha", args.mesh_sha, "--appearance-sha", args.appearance_sha,
                 "--grid-size", str(args.grid_size), "--target-faces", str(args.target_faces),
                 "--texture-size", str(args.texture_size), "--runtime", str(args.runtime.resolve()),
-                "--output-dir", str(args.output_dir.resolve()), "--arm", arm]
+                "--output-dir", str(args.output_dir.resolve()),
+                "--remesh-project", str(args.remesh_project), "--arm", arm]
         log_path = args.output_dir / f"{arm}.log"
         with log_path.open("w") as stream:
             result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
@@ -316,7 +321,7 @@ def run_both(args, report):
     report["bundle"] = {"path": str(bundle), "sha256": digest(bundle), "size_bytes": bundle.stat().st_size}
     if any(a["exit_code"] != 0 or a["report"].get("status") != "completed" for a in report["arms"].values()):
         raise RuntimeError("one or more finishing arms failed; partial evidence retained")
-    report["last_trustworthy_phase"] = "both-official-finishing-arms-exported"
+    report["last_trustworthy_phase"] = "selected-official-finishing-arms-exported"
 
 
 def parser():
@@ -328,6 +333,9 @@ def parser():
     p.add_argument("--grid-size", type=int, required=True)
     p.add_argument("--target-faces", type=int, default=1000000)
     p.add_argument("--texture-size", type=int, default=4096)
+    p.add_argument("--remesh-project", type=float, default=0)
+    p.add_argument("--arms", nargs="+", choices=("non-remesh", "remesh"),
+                   default=["non-remesh", "remesh"])
     p.add_argument("--runtime", type=Path, default=Path("/kaggle/working/cuda-finishing-runtime"))
     p.add_argument("--output-dir", type=Path, default=Path("/kaggle/working/finishing"))
     p.add_argument("--output-json", type=Path, default=Path("/kaggle/working/finishing-report.json"))

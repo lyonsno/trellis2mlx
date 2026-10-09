@@ -105,6 +105,7 @@ def test_both_arms_run_even_when_first_fails(tmp_path, monkeypatch):
     args = SimpleNamespace(mesh=tmp_path / "mesh", appearance=tmp_path / "tex",
                            mesh_sha="mesh", appearance_sha="tex", grid_size=768,
                            target_faces=1000000, texture_size=4096,
+                           remesh_project=0, arms=["non-remesh", "remesh"],
                            runtime=tmp_path / "runtime", output_dir=tmp_path / "finishing",
                            output_json=tmp_path / "report.json")
     monkeypatch.setattr(m, "load_inputs", lambda *a: {})
@@ -121,3 +122,53 @@ def test_both_arms_run_even_when_first_fails(tmp_path, monkeypatch):
         m.run_both(args, {})
     assert seen == ["non-remesh", "remesh"]
     assert (tmp_path / "finishing-bundle.tar").is_file()
+
+
+def test_projection_control_reaches_actual_finishing_settings():
+    args = m.parser().parse_args([
+        "--mesh", "mesh_raw.npz", "--appearance", "texture.npz",
+        "--mesh-sha", "mesh", "--appearance-sha", "texture",
+        "--grid-size", "768", "--arms", "remesh",
+        "--arm", "remesh", "--remesh-project", "0.9",
+    ])
+    assert args.arms == ["remesh"]
+    settings = m.finishing_settings(args)
+    assert settings["remesh"] is True
+    assert settings["remesh_project"] == 0.9
+    assert settings["remesh_band"] == 1
+    assert settings["grid_size"] == 768
+    assert settings["decimation_target"] == 1000000
+    assert settings["texture_size"] == 4096
+
+
+def test_selected_arm_and_projection_reach_child(tmp_path, monkeypatch):
+    args = SimpleNamespace(mesh=tmp_path / "mesh", appearance=tmp_path / "tex",
+                           mesh_sha="mesh", appearance_sha="tex", grid_size=768,
+                           target_faces=1000000, texture_size=4096,
+                           remesh_project=0.9, arms=["remesh"],
+                           runtime=tmp_path / "runtime", output_dir=tmp_path / "finishing",
+                           output_json=tmp_path / "report.json")
+    monkeypatch.setattr(m, "load_inputs", lambda *a: {})
+    monkeypatch.setattr(m, "bootstrap", lambda *a: None)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        m.write_json(args.output_dir / f"{argv[-1]}-report.json", {"status": "completed"})
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    report = {}
+    m.run_both(args, report)
+    assert len(calls) == 1
+    assert calls[0][-1] == "remesh"
+    assert calls[0][calls[0].index("--remesh-project") + 1] == "0.9"
+    assert set(report["arms"]) == {"remesh"}
+    assert (tmp_path / "finishing-bundle.tar").is_file()
+
+
+def test_original_two_arm_zero_projection_defaults_are_preserved():
+    args = m.parser().parse_args([
+        "--mesh", "mesh_raw.npz", "--appearance", "texture.npz",
+        "--mesh-sha", "mesh", "--appearance-sha", "texture", "--grid-size", "768",
+    ])
+    assert args.arms == ["non-remesh", "remesh"]
+    assert args.remesh_project == 0
