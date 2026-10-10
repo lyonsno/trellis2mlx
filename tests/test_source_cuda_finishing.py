@@ -257,3 +257,132 @@ def test_resolution_control_reaches_child_without_changing_grid(tmp_path, monkey
 def test_invalid_reconstruction_resolution_rejected_before_native_call():
     with pytest.raises(ValueError, match="positive"):
         m.observe_remesher(lambda *a, **kw: pytest.fail("native called"), 0, lambda r: None)
+
+
+class TensorLike(np.ndarray):
+    """CPU arithmetic fixture; actual CUDA conformance is a separate live gate."""
+    def long(self):
+        return self.astype(np.int64)
+
+    def unsqueeze(self, axis):
+        return np.expand_dims(self, axis)
+
+    def sum(self, axis=None, dim=None, **kwargs):
+        return super().sum(axis=dim if dim is not None else axis, **kwargs)
+
+    def clone(self):
+        return self.copy()
+
+
+def tensor(value, dtype=np.float32):
+    return np.array(value, dtype=dtype).view(TensorLike)
+
+
+def test_batched_projection_keeps_every_row_and_original_arithmetic():
+    original = tensor([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    faces = tensor([[0, 1, 2]], np.int32)
+    points = tensor([[i / 10, i / 20, .1] for i in range(11)])
+    baseline = points.copy()
+    weights = tensor([[.2, .3, .5]] * len(points))
+    expected = baseline - .9 * (baseline - (original[faces[tensor([0] * 11, np.int64)]] * weights.unsqueeze(-1)).sum(axis=1))
+    seen = []
+    class BVH:
+        def unsigned_distance(self, batch, return_uvw):
+            assert return_uvw is True
+            seen.append(batch.copy())
+            return tensor([0] * len(batch)), tensor([0] * len(batch), np.int64), tensor([[.2, .3, .5]] * len(batch))
+    receipt = m.project_vertices_batched(points, original, faces, BVH(), .9, 4)
+    np.testing.assert_array_equal(points, expected)
+    np.testing.assert_array_equal(np.concatenate(seen), baseline)
+    assert receipt == {"vertices": 11, "processed_vertices": 11, "batch_vertices": 4, "batches": 3, "project_back": .9}
+
+
+def test_deferred_projection_releases_native_temporaries_before_query():
+    import weakref
+    refs, calls, records = [], [], []
+    points = tensor([[0, 0, .1], [1, 0, .1]])
+    faces = tensor([[0, 1, 2]], np.int32)
+    vertices = tensor([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    class BVH:
+        def unsigned_distance(self, batch, return_uvw):
+            assert refs[0]() is None
+            return tensor([0] * len(batch)), tensor([0] * len(batch), np.int64), tensor([[1, 0, 0]] * len(batch))
+    bvh = BVH()
+    def native(vertices, faces, *, project_back, bvh, resolution):
+        temporary = np.zeros(100)
+        refs.append(weakref.ref(temporary))
+        calls.append((project_back, bvh, resolution))
+        return points, faces
+    out, triangles = m.defer_remesh_projection(native, 1, records.append)(vertices, faces, project_back=.9, bvh=bvh, resolution=1024)
+    assert triangles is faces and out is points
+    assert calls == [(0, bvh, 1024)]
+    assert records[0]["processed_vertices"] == 2
+    assert records[0]["native_project_back"] == 0
+    assert records[0]["project_back"] == .9
+
+
+def test_memory_batch_size_invalid_and_missing_bvh_fail_loud():
+    with pytest.raises(ValueError, match="positive"):
+        m.defer_remesh_projection(lambda: None, 0, lambda record: None)
+    def native(vertices, faces, *, project_back, bvh=None):
+        pytest.fail("native must not run without a reusable BVH")
+    with pytest.raises(ValueError, match="BVH"):
+        m.defer_remesh_projection(native, 10, lambda record: None)(None, None, project_back=.9)
+
+
+def test_zero_projection_retains_native_route():
+    token = object()
+    def native(vertices, faces, *, project_back=0, bvh=None):
+        assert project_back == 0
+        return token
+    assert m.defer_remesh_projection(native, 10, lambda record: None)(None, None) is token
+
+
+def test_memory_control_reaches_child_without_mutating_scientific_settings(tmp_path, monkeypatch):
+    args = m.parser().parse_args([
+        "--mesh", str(tmp_path / "mesh"), "--appearance", str(tmp_path / "tex"),
+        "--mesh-sha", "mesh", "--appearance-sha", "tex", "--grid-size", "768",
+        "--arms", "remesh", "--remesh-project", "0.9", "--remesh-resolution", "1024",
+        "--projection-batch-vertices", "262144", "--runtime", str(tmp_path / "runtime"),
+        "--output-dir", str(tmp_path / "finishing"), "--output-json", str(tmp_path / "report.json"),
+    ])
+    monkeypatch.setattr(m, "load_inputs", lambda *a: {})
+    monkeypatch.setattr(m, "bootstrap", lambda *a: None)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        m.write_json(args.output_dir / f"{argv[-1]}-report.json", {"status": "completed"})
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    m.run_both(args, {})
+    assert calls[0][calls[0].index("--projection-batch-vertices") + 1] == "262144"
+    assert m.finishing_settings(args)["grid_size"] == 768
+    assert m.finishing_settings(args)["remesh_project"] == .9
+
+
+def test_projection_conformance_detects_batch_dependent_backend():
+    vertices = tensor([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    faces = tensor([[0, 1, 2]], np.int32)
+    queries = tensor([[.2, .3, .1]] * 11)
+    class BVH:
+        def unsigned_distance(self, batch, return_uvw):
+            weights = [.2, .3, .5] if len(batch) == 11 else [.3, .2, .5]
+            return tensor([0] * len(batch)), tensor([0] * len(batch), np.int64), tensor([weights] * len(batch))
+    with pytest.raises(ValueError, match="equivalence"):
+        m.projection_conformance(queries, vertices, faces, BVH(), .9, 4,
+                                 lambda x, y: np.array_equal(x, y))
+
+
+def test_projection_conformance_preserves_input_and_exact_outputs():
+    vertices = tensor([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    faces = tensor([[0, 1, 2]], np.int32)
+    queries = tensor([[.2, .3, .1]] * 11)
+    before = queries.copy()
+    class BVH:
+        def unsigned_distance(self, batch, return_uvw):
+            return tensor([0] * len(batch)), tensor([0] * len(batch), np.int64), tensor([[.2, .3, .5]] * len(batch))
+    expected, actual, receipt = m.projection_conformance(
+        queries, vertices, faces, BVH(), .9, 4, lambda x, y: np.array_equal(x, y))
+    np.testing.assert_array_equal(queries, before)
+    np.testing.assert_array_equal(expected, actual)
+    assert receipt["exact_equal"] is True and receipt["processed_vertices"] == 11

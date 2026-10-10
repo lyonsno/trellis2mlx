@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import importlib.util
 import io
+import inspect
 import json
 import os
 from pathlib import Path
@@ -232,6 +233,73 @@ def finishing_settings(args):
                 remesh_project=args.remesh_project, verbose=True, use_tqdm=False)
 
 
+def project_vertices_batched(mesh_vertices, vertices, faces, bvh, project_back, batch_vertices):
+    """Apply the pinned native interpolation, retaining every query and output row."""
+    if batch_vertices <= 0:
+        raise ValueError("projection batch size must be positive")
+    processed = batches = 0
+    for start in range(0, len(mesh_vertices), batch_vertices):
+        batch = mesh_vertices[start:start + batch_vertices]
+        distance, face_id, uvw = bvh.unsigned_distance(batch, return_uvw=True)
+        orig_tri_verts = vertices[faces[face_id.long()]]
+        projected_verts = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+        batch -= project_back * (batch - projected_verts)
+        processed += len(batch)
+        batches += 1
+        # Release the previous batch before the next query allocates its outputs.
+        del distance, face_id, uvw, orig_tri_verts, projected_verts, batch
+    return dict(vertices=len(mesh_vertices), processed_vertices=processed,
+                batch_vertices=batch_vertices, batches=batches, project_back=project_back)
+
+
+def projection_conformance(queries, vertices, faces, bvh, project_back, batch_vertices,
+                           equal, capture=None):
+    """Compare the actual BVH's batched query against the pinned full-query formula."""
+    expected = queries.clone()
+    distance, face_id, uvw = bvh.unsigned_distance(expected, return_uvw=True)
+    orig_tri_verts = vertices[faces[face_id.long()]]
+    projected_verts = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+    expected -= project_back * (expected - projected_verts)
+    del distance, face_id, uvw, orig_tri_verts, projected_verts
+    actual = queries.clone()
+    receipt = project_vertices_batched(actual, vertices, faces, bvh, project_back, batch_vertices)
+    receipt["exact_equal"] = bool(equal(expected, actual))
+    if capture is not None:
+        capture(queries, expected, actual, receipt)
+    if not receipt["exact_equal"]:
+        raise ValueError("CUDA projection batch equivalence failed; reconstruction not launched")
+    return expected, actual, receipt
+
+
+def defer_remesh_projection(native, batch_vertices, capture, verify=None):
+    """Return from unchanged native reconstruction before its optional projection."""
+    if batch_vertices <= 0:
+        raise ValueError("projection batch size must be positive")
+    signature = inspect.signature(native)
+
+    def call(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        project_back = bound.arguments.get("project_back", 0)
+        if project_back <= 0:
+            return native(*args, **kwargs)
+        bvh = bound.arguments.get("bvh")
+        if bvh is None:
+            raise ValueError("deferred projection requires the original reusable BVH")
+        vertices, faces = bound.arguments["vertices"], bound.arguments["faces"]
+        if verify is not None:
+            verify(vertices, faces, bvh, project_back, batch_vertices)
+        bound.arguments["project_back"] = 0
+        mesh_vertices, mesh_triangles = native(*bound.args, **bound.kwargs)
+        # The native function frame and its reconstruction temporaries are now gone.
+        receipt = project_vertices_batched(mesh_vertices, vertices, faces, bvh,
+                                           project_back, batch_vertices)
+        receipt["native_project_back"] = 0
+        capture(receipt)
+        return mesh_vertices, mesh_triangles
+    return call
+
+
 def run_arm(args, report):
     import torch
     import cumesh
@@ -249,8 +317,11 @@ def run_arm(args, report):
     spec.loader.exec_module(module)
     settings = finishing_settings(args)
     resolution_override = getattr(args, "remesh_resolution", None)
+    batch_vertices = getattr(args, "projection_batch_vertices", None)
     if args.arm != "remesh" and resolution_override is not None:
         raise ValueError("reconstruction override requires the remesh arm")
+    if batch_vertices is not None and (args.arm != "remesh" or batch_vertices <= 0):
+        raise ValueError("positive projection batch size requires the remesh arm")
     report["effective_route"] = {
         "entry_boundary": "saved-mlx-raw-mesh-and-decoded-appearance-before-local-cleanup",
         "finishing": ("official-to_glb-with-reconstruction-resolution-override"
@@ -269,6 +340,14 @@ def run_arm(args, report):
         "appearance_grid_size": args.grid_size,
         "calls": [],
     }
+    if batch_vertices is not None:
+        report["effective_route"]["finishing"] = "official-to_glb-with-deferred-batched-projection"
+        report["effective_route"]["projection_memory"] = {
+            "batch_vertices": batch_vertices, "all_vertices_required": True,
+            "native_reconstruction_project_back": 0,
+            "final_project_back": args.remesh_project, "calls": [],
+            "execution": "unchanged-native-reconstruction-return-then-original-BVH-interpolation",
+        }
     directory = args.output_dir / args.arm
     directory.mkdir(parents=True, exist_ok=False)
     report["stages"] = []
@@ -297,7 +376,47 @@ def run_arm(args, report):
         report["last_trustworthy_phase"] = "native-remesher-call-settings-captured"
         write_json(report_path, report)
 
-    observed_remesher = observe_remesher(native_remesher, resolution_override, capture_remesher)
+    remesher = native_remesher
+    if batch_vertices is not None:
+        memory = report["effective_route"]["projection_memory"]
+
+        def verify_projection(vertices, faces, bvh, project_back, batch_size):
+            report["phase"] = "cuda_projection_conformance"
+            write_json(report_path, report)
+            # Explicit diagnostic fixture spanning two full batches plus a tail.
+            # This selects calibration queries, never limits reconstructed output.
+            query_count = min(len(vertices), 2 * batch_size + 17)
+            queries = vertices[:query_count].clone()
+            queries += vertices.new_tensor([-.00071, .00043, .00029])
+
+            def save_conformance(queries, expected, actual, receipt):
+                torch.cuda.synchronize()
+                path = directory / "projection-conformance.npz"
+                np.savez_compressed(path, queries=queries.cpu().numpy(),
+                                    original_formula=expected.cpu().numpy(),
+                                    batched_formula=actual.cpu().numpy())
+                memory["conformance"] = dict(receipt, path=str(path), sha256=digest(path),
+                    fixture="retained-source-vertices-prefix-with-fixed-offset",
+                    criterion="bitwise-equal-full-query-vs-batched-on-actual-CUDA-BVH",
+                    claim_ceiling="calibration-query equivalence, not independent reconstruction parity")
+                write_json(report_path, report)
+
+            expected, actual, receipt = projection_conformance(
+                queries, vertices, faces, bvh, project_back, batch_size,
+                torch.equal, save_conformance)
+            del expected, actual, queries
+            report["last_trustworthy_phase"] = "actual-CUDA-projection-calibration-exact"
+            report["phase"] = "official_to_glb"
+            write_json(report_path, report)
+
+        def capture_projection(receipt):
+            memory["calls"].append(receipt)
+            report["last_trustworthy_phase"] = "all-reconstructed-vertices-projected"
+            write_json(report_path, report)
+
+        remesher = defer_remesh_projection(native_remesher, batch_vertices,
+                                            capture_projection, verify_projection)
+    observed_remesher = observe_remesher(remesher, resolution_override, capture_remesher)
     cumesh.CuMesh = observe_mesh_class(native_class, capture)
     cumesh.remeshing.remesh_narrow_band_dc = observed_remesher
     torch.cuda.reset_peak_memory_stats()
@@ -336,6 +455,14 @@ def run_arm(args, report):
         expected_resolution = resolution_override if resolution_override is not None else args.grid_size
         if len(remesh_calls) != 1 or remesh_calls[0]["effective_resolution"] != expected_resolution:
             raise ValueError("effective reconstruction resolution mismatch or missing native call")
+        if batch_vertices is not None and args.remesh_project > 0:
+            memory = report["effective_route"]["projection_memory"]
+            calls = memory["calls"]
+            reconstructed = report["stages"][2]["arrays"]["vertices"]["shape"][0]
+            if (memory.get("conformance", {}).get("exact_equal") is not True or
+                    len(calls) != 1 or calls[0]["processed_vertices"] != reconstructed or
+                    calls[0]["vertices"] != reconstructed):
+                raise ValueError("missing projection equivalence or incomplete reconstructed output")
     elif remesh_calls:
         raise ValueError("unexpected reconstruction call in non-remesh arm")
     report["last_trustworthy_phase"] = "glb-and-stage-order-validated"
@@ -355,6 +482,9 @@ def run_both(args, report):
         resolution_override = getattr(args, "remesh_resolution", None)
         reconstruction_args = (["--remesh-resolution", str(resolution_override)]
                                if arm == "remesh" and resolution_override is not None else [])
+        batch_vertices = getattr(args, "projection_batch_vertices", None)
+        if arm == "remesh" and batch_vertices is not None:
+            reconstruction_args += ["--projection-batch-vertices", str(batch_vertices)]
         argv = [sys.executable, "-u", str(Path(__file__).resolve()),
                 "--mesh", str(args.mesh.resolve()), "--appearance", str(args.appearance.resolve()),
                 "--mesh-sha", args.mesh_sha, "--appearance-sha", args.appearance_sha,
@@ -391,6 +521,8 @@ def parser():
     p.add_argument("--remesh-project", type=float, default=0)
     p.add_argument("--remesh-resolution", type=int,
                    help="Override reconstruction resolution only; appearance keeps --grid-size")
+    p.add_argument("--projection-batch-vertices", type=int,
+                   help="Memory-only deferred projection, all vertices retained; remesh arm only")
     p.add_argument("--arms", nargs="+", choices=("non-remesh", "remesh"),
                    default=["non-remesh", "remesh"])
     p.add_argument("--runtime", type=Path, default=Path("/kaggle/working/cuda-finishing-runtime"))
