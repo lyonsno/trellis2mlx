@@ -386,3 +386,205 @@ def test_projection_conformance_preserves_input_and_exact_outputs():
     np.testing.assert_array_equal(queries, before)
     np.testing.assert_array_equal(expected, actual)
     assert receipt["exact_equal"] is True and receipt["processed_vertices"] == 11
+
+
+def checkpoint_fixture(tmp_path):
+    checkpoint = tmp_path / "rebuilt.npz"
+    filled = tmp_path / "filled.npz"
+    arrays = {"vertices": np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+              "faces": np.array([[0, 1, 2]], np.int32)}
+    np.savez_compressed(checkpoint, **arrays)
+    np.savez_compressed(filled, **arrays)
+    args = m.parser().parse_args([
+        "--mesh", "raw", "--appearance", "appearance", "--mesh-sha", "raw-sha",
+        "--appearance-sha", "appearance-sha", "--grid-size", "768",
+        "--remesh-project", ".9", "--remesh-resolution", "1024", "--arm", "remesh"])
+    report = {"source_pins": m.SOURCES, "requested": vars(args).copy(),
+        "effective_route": {"postprocess_sha256": m.POSTPROCESS_SHA,
+            "model_inference": False, "local_cleanup": False, "device": "Tesla T4",
+            "capability": [7, 5], "settings": m.finishing_settings(args),
+            "reconstruction": {"appearance_grid_size": 768, "calls": [{
+                "source_resolution": 768, "effective_resolution": 1024,
+                "source_scale": 771 / 768, "effective_scale": 1027 / 1024,
+                "band": 1, "project_back": .9, "resolution_override": True}]}},
+        "stages": [{"label": "init"}, {"label": "fill_holes", "sha256": m.digest(filled)},
+                   {"label": "init", "sha256": m.digest(checkpoint), "arrays": {
+                       k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in arrays.items()}}]}
+    report["requested"] = {k: str(v) if isinstance(v, Path) else v
+                           for k, v in report["requested"].items()}
+    path = tmp_path / "origin.json"
+    m.write_json(path, report)
+    args.resume_rebuilt, args.resume_filled = checkpoint, filled
+    args.resume_report, args.resume_report_sha = path, m.digest(path)
+    return args, report, arrays
+
+
+def test_checkpoint_admission_binds_origin_and_complete_geometry(tmp_path):
+    args, _, arrays = checkpoint_fixture(tmp_path)
+    loaded, filled, receipt = m.load_reconstruction_checkpoint(args)
+    np.testing.assert_array_equal(loaded["faces"], arrays["faces"])
+    np.testing.assert_array_equal(filled["vertices"], arrays["vertices"])
+    assert receipt["rebuilt_sha256"] == m.digest(args.resume_rebuilt)
+    assert receipt["origin_report_sha256"] == args.resume_report_sha
+    assert receipt["reconstruction_executed_this_run"] is False
+
+
+@pytest.mark.parametrize("change", ["wrong-origin", "wrong-appearance", "wrong-grid", "wrong-stage",
+                                   "wrong-reconstruction", "missing-calibration", "partial-projection"])
+def test_checkpoint_rejects_wrong_or_partial_source(tmp_path, change):
+    args, origin, _ = checkpoint_fixture(tmp_path)
+    if change == "wrong-origin":
+        args.resume_report_sha = "0" * 64
+    else:
+        if change == "wrong-appearance": origin["requested"]["appearance_sha"] = "other"
+        if change == "wrong-grid": origin["effective_route"]["settings"]["grid_size"] = 1024
+        if change == "wrong-stage": origin["stages"][2]["label"] = "simplify"
+        if change == "wrong-reconstruction": origin["effective_route"]["reconstruction"]["calls"][0]["effective_resolution"] = 768
+        if change in {"missing-calibration", "partial-projection"}:
+            origin["effective_route"]["projection_memory"] = {
+                "conformance": {"exact_equal": change != "missing-calibration"},
+                "calls": [{"vertices": 3, "processed_vertices": 2, "project_back": .9}]}
+        m.write_json(args.resume_report, origin)
+        args.resume_report_sha = m.digest(args.resume_report)
+    with pytest.raises(ValueError): m.load_reconstruction_checkpoint(args)
+
+
+def test_resume_remesher_checks_original_surface_and_never_reconstructs(tmp_path):
+    args, origin, arrays = checkpoint_fixture(tmp_path)
+    _, _, receipt = m.load_reconstruction_checkpoint(args)
+    records = []
+    call = m.resume_remesher(arrays, arrays, receipt, lambda value: value, np.array_equal, records.append)
+    output = call(arrays["vertices"], arrays["faces"], resolution=1024,
+                  scale=1027 / 1024, band=1, project_back=.9, bvh=object())
+    assert output[0] is arrays["vertices"] and output[1] is arrays["faces"]
+    assert records[0]["original_surface_exact"] is True
+    with pytest.raises(ValueError, match="original surface"):
+        call(arrays["vertices"] + 1, arrays["faces"], resolution=1024,
+             scale=1027 / 1024, band=1, project_back=.9, bvh=object())
+
+
+def test_native_failure_keeps_memory_snapshots_and_releases_only_unused_cache(tmp_path):
+    events = []
+    class CUDA:
+        def synchronize(self): events.append("sync")
+        def mem_get_info(self): return (100, 1000)
+        def memory_allocated(self): return 200
+        def memory_reserved(self): return 400
+        def max_memory_allocated(self): return 300
+        def empty_cache(self): events.append("empty-cache")
+    torch = SimpleNamespace(cuda=CUDA())
+    report = {"stages": []}
+    hook = m.memory_boundary(torch, report, tmp_path / "memory.json", True)
+    class Native:
+        def simplify(self, target):
+            events.append("native")
+            raise RuntimeError("native CUDA allocation failure")
+    mesh = m.observe_mesh_class(Native, lambda *a: pytest.fail("no success capture"), hook)()
+    with pytest.raises(RuntimeError, match="allocation failure"): mesh.simplify(1000000)
+    saved = json.loads((tmp_path / "memory.json").read_text())
+    assert [row["boundary"] for row in saved["cuda_memory"]] == [
+        "before-simplify", "after-empty-cache-before-simplify", "failed-simplify"]
+    assert events.index("empty-cache") < events.index("native")
+    assert saved["cuda_memory"][-1]["torch_reserved_unused_bytes"] == 200
+    assert saved["phase"] == "native_simplify"
+
+
+def test_checkpoint_flags_and_cache_release_reach_independent_child(tmp_path, monkeypatch):
+    args, _, _ = checkpoint_fixture(tmp_path)
+    args.arm = None
+    args.arms = ["remesh"]
+    args.output_dir, args.output_json = tmp_path / "finish", tmp_path / "finish.json"
+    args.runtime = tmp_path / "runtime"
+    args.release_torch_cache_before_simplify = True
+    monkeypatch.setattr(m, "load_inputs", lambda *a: {})
+    monkeypatch.setattr(m, "bootstrap", lambda *a: None)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        m.write_json(args.output_dir / "remesh-report.json", {"status": "completed"})
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    m.run_both(args, {})
+    for flag in ("--resume-rebuilt", "--resume-filled", "--resume-report", "--resume-report-sha",
+                 "--release-torch-cache-before-simplify"):
+        assert flag in calls[0]
+
+
+def test_checkpoint_can_replay_observed_legacy_unmodified_source_route(tmp_path):
+    args, report, _ = checkpoint_fixture(tmp_path)
+    args.remesh_resolution = None
+    report["requested"]["remesh_resolution"] = None
+    report["effective_route"].pop("reconstruction")
+    report["effective_route"]["finishing"] = "unmodified-official-to_glb"
+    m.write_json(args.resume_report, report)
+    args.resume_report_sha = m.digest(args.resume_report)
+    _, _, receipt = m.load_reconstruction_checkpoint(args)
+    assert receipt["origin_reconstruction"]["effective_resolution"] == 768
+    assert receipt["origin_reconstruction"]["effective_scale"] == 771 / 768
+    assert receipt["origin_call_evidence"] == "pinned-unmodified-to_glb-derived-settings"
+
+
+def test_replay_gate_requires_live_success_original_surface_and_exact_reduction(tmp_path):
+    reference = tmp_path / "reference.npz"
+    actual = tmp_path / "actual.npz"
+    np.savez_compressed(reference, vertices=np.ones((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.int32))
+    np.savez_compressed(actual, vertices=np.ones((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.int32))
+    report = {"status": "completed", "effective_route": {
+        "device": "Tesla T4", "capability": [7, 5],
+        "finishing": "official-to_glb-with-saved-reconstruction-continuation",
+        "checkpoint_continuation": {"original_surface_exact": True}},
+        "stages": [{"label": "init"}, {"label": "fill_holes"}, {"label": "init"},
+                   {"label": "simplify", "path": str(actual), "sha256": m.digest(actual)},
+                   {"label": "uv_unwrap"}, {"label": "compute_vertex_normals"}],
+        "glb": {"image_sizes": [[4096, 4096], [4096, 4096]]}}
+    record = m.check_replay_gate(report, reference, m.digest(reference))
+    assert record["reduced_arrays_exact"] is True
+    for field, value in (("status", "failed"), ("status", "running")):
+        broken = dict(report, **{field: value})
+        with pytest.raises(ValueError): m.check_replay_gate(broken, reference, m.digest(reference))
+    report["effective_route"]["device"] = "CPU"
+    with pytest.raises(ValueError): m.check_replay_gate(report, reference, m.digest(reference))
+    report["effective_route"]["device"] = "Tesla T4"
+    np.savez_compressed(actual, vertices=np.zeros((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.int32))
+    report["stages"][3]["sha256"] = m.digest(actual)
+    with pytest.raises(ValueError, match="reduced"): m.check_replay_gate(report, reference, m.digest(reference))
+
+
+def test_checkpoint_rejects_missing_projection_account(tmp_path):
+    args, origin, _ = checkpoint_fixture(tmp_path)
+    origin["effective_route"]["finishing"] = "official-to_glb-with-deferred-batched-projection"
+    m.write_json(args.resume_report, origin)
+    args.resume_report_sha = m.digest(args.resume_report)
+    with pytest.raises(ValueError, match="projection"): m.load_reconstruction_checkpoint(args)
+
+
+def test_control_failure_prevents_target_and_keeps_failed_bundle(tmp_path, monkeypatch):
+    args, origin, arrays = checkpoint_fixture(tmp_path)
+    args.arm = None
+    args.output_dir, args.output_json = tmp_path / "finish", tmp_path / "report.json"
+    args.control_rebuilt, args.control_filled = args.resume_rebuilt, args.resume_filled
+    args.control_report, args.control_report_sha = args.resume_report, args.resume_report_sha
+    args.control_reduced = tmp_path / "reduced.npz"
+    np.savez_compressed(args.control_reduced, **arrays)
+    origin["status"] = "completed"
+    origin["stages"].append({"label": "simplify", "sha256": m.digest(args.control_reduced)})
+    m.write_json(args.resume_report, origin)
+    args.resume_report_sha = args.control_report_sha = m.digest(args.resume_report)
+    monkeypatch.setattr(m, "load_inputs", lambda *a: {})
+    monkeypatch.setattr(m, "load_reconstruction_checkpoint", lambda *a: None)
+    monkeypatch.setattr(m, "bootstrap", lambda *a: None)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        directory = Path(argv[argv.index("--output-dir") + 1])
+        m.write_json(directory / "remesh-report.json", {"status": "failed", "failure_phase": "native_simplify"})
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    report = {"phase": "start"}
+    assert m.run_reported(args.output_json, report, lambda r: m.run_checkpoint_suite(args, r)) == 1
+    assert len(calls) == 1
+    assert not (args.output_dir / "target-1024").exists()
+    assert (tmp_path / "finishing-bundle.tar").is_file()
+    saved = json.loads(args.output_json.read_text())
+    assert saved["failure_phase"] == "control-768"
+    assert saved["continuations"]["control-768"]["report"]["failure_phase"] == "native_simplify"

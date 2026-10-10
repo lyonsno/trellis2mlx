@@ -8,6 +8,7 @@ and intermediate arrays and do not suppress the other arm.
 """
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import io
@@ -124,7 +125,7 @@ def validate_glb(path, texture_size):
             "vertices": sum(doc["accessors"][p["attributes"]["POSITION"]]["count"] for p in primitives)}
 
 
-def observe_mesh_class(native_class, capture):
+def observe_mesh_class(native_class, capture, boundary=None):
     class Observed:
         def __init__(self, *args, **kwargs):
             self._native = native_class(*args, **kwargs)
@@ -135,7 +136,16 @@ def observe_mesh_class(native_class, capture):
                 return original
 
             def call(*args, **kwargs):
-                result = original(*args, **kwargs)
+                if boundary:
+                    boundary(name, "before")
+                try:
+                    result = original(*args, **kwargs)
+                except Exception:
+                    if boundary:
+                        boundary(name, "failed")
+                    raise
+                if boundary:
+                    boundary(name, "after")
                 if name in MUTATIONS:
                     vertices, faces = self._native.read()
                     capture(name, {"vertices": vertices, "faces": faces})
@@ -233,6 +243,124 @@ def finishing_settings(args):
                 remesh_project=args.remesh_project, verbose=True, use_tqdm=False)
 
 
+def load_reconstruction_checkpoint(args):
+    """Admit a saved post-projection mesh, not an arbitrary replacement mesh."""
+    if args.arm != "remesh" or getattr(args, "projection_batch_vertices", None) is not None:
+        raise ValueError("checkpoint continuation requires remesh without fresh projection")
+    if digest(args.resume_report) != args.resume_report_sha:
+        raise ValueError("checkpoint origin report digest mismatch")
+    origin = json.loads(args.resume_report.read_text())
+    if origin.get("source_pins") != {k: list(v) for k, v in SOURCES.items()}:
+        raise ValueError("checkpoint source pins mismatch")
+    requested, route = origin["requested"], origin["effective_route"]
+    if (route.get("postprocess_sha256") != POSTPROCESS_SHA or
+            route.get("model_inference") is not False or route.get("local_cleanup") is not False or
+            route.get("device") != "Tesla T4" or route.get("capability") != [7, 5]):
+        raise ValueError("checkpoint effective source route mismatch")
+    for field in ("mesh_sha", "appearance_sha", "grid_size", "target_faces", "texture_size", "remesh_project"):
+        if requested.get(field) != getattr(args, field):
+            raise ValueError(f"checkpoint requested {field} mismatch")
+    if route.get("settings") != finishing_settings(args):
+        raise ValueError("checkpoint effective finishing settings mismatch")
+    reconstruction = route.get("reconstruction")
+    call_evidence = "producer-observed-remesher-call"
+    if reconstruction is None:
+        if (route.get("finishing") != "unmodified-official-to_glb" or
+                requested.get("remesh_resolution") is not None or
+                requested.get("projection_batch_vertices") is not None):
+            raise ValueError("missing observed reconstruction identity")
+        reconstruction = {"appearance_grid_size": args.grid_size, "calls": [{
+            "source_resolution": args.grid_size, "effective_resolution": args.grid_size,
+            "source_scale": (args.grid_size + 3) / args.grid_size,
+            "effective_scale": (args.grid_size + 3) / args.grid_size,
+            "band": 1, "project_back": args.remesh_project, "resolution_override": False}]}
+        call_evidence = "pinned-unmodified-to_glb-derived-settings"
+    calls = reconstruction["calls"]
+    resolution = args.remesh_resolution or args.grid_size
+    if (reconstruction["appearance_grid_size"] != args.grid_size or len(calls) != 1 or
+            calls[0]["source_resolution"] != args.grid_size or calls[0]["effective_resolution"] != resolution or
+            calls[0]["band"] != 1 or calls[0]["project_back"] != args.remesh_project):
+        raise ValueError("checkpoint reconstruction settings mismatch")
+    stages = origin["stages"]
+    if [s["label"] for s in stages[:3]] != ["init", "fill_holes", "init"]:
+        raise ValueError("checkpoint stage boundary mismatch")
+    arrays = []
+    for path, stage in ((args.resume_rebuilt, stages[2]), (args.resume_filled, stages[1])):
+        if digest(path) != stage["sha256"]:
+            raise ValueError("checkpoint geometry digest mismatch")
+        with np.load(path, allow_pickle=False) as data:
+            values = {key: data[key] for key in ("vertices", "faces")}
+        vertices, faces = values["vertices"], values["faces"]
+        if (vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0 or
+                vertices.dtype != np.float32 or not np.isfinite(vertices).all() or
+                faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0 or
+                faces.dtype != np.int32 or faces.min() < 0 or faces.max() >= len(vertices)):
+            raise ValueError("invalid complete checkpoint geometry")
+        arrays.append(values)
+    for key, value in arrays[0].items():
+        if stages[2]["arrays"][key] != {"shape": list(value.shape), "dtype": str(value.dtype)}:
+            raise ValueError("checkpoint shape differs from producer receipt")
+    memory = route.get("projection_memory")
+    if route.get("finishing") == "official-to_glb-with-deferred-batched-projection" and memory is None:
+        raise ValueError("missing checkpoint projection account")
+    if memory is not None:
+        projected = memory.get("calls", [])
+        count = len(arrays[0]["vertices"])
+        if (memory.get("conformance", {}).get("exact_equal") is not True or len(projected) != 1 or
+                projected[0].get("processed_vertices") != count or projected[0].get("vertices") != count or
+                projected[0].get("project_back") != args.remesh_project):
+            raise ValueError("checkpoint projection incomplete or unverified")
+    receipt = {"origin_report_sha256": args.resume_report_sha,
+               "rebuilt_sha256": stages[2]["sha256"], "filled_sha256": stages[1]["sha256"],
+               "reconstruction_executed_this_run": False, "origin_reconstruction": calls[0],
+               "origin_call_evidence": call_evidence,
+               "vertices": len(arrays[0]["vertices"]), "faces": len(arrays[0]["faces"])}
+    return arrays[0], arrays[1], receipt
+
+
+def resume_remesher(rebuilt, filled, receipt, to_cuda, equal, capture):
+    def call(vertices, faces, **kwargs):
+        source = receipt["origin_reconstruction"]
+        for key, expected in (("resolution", source["effective_resolution"]),
+                              ("scale", source["effective_scale"]), ("band", source["band"]),
+                              ("project_back", source["project_back"])):
+            if kwargs.get(key) != expected:
+                raise ValueError(f"checkpoint effective remesher {key} mismatch")
+        if kwargs.get("bvh") is None:
+            raise ValueError("checkpoint continuation missing original BVH")
+        for key, value in (("vertices", vertices), ("faces", faces)):
+            current = value.detach().cpu().numpy() if hasattr(value, "detach") else value
+            if not equal(current, filled[key]):
+                raise ValueError("checkpoint original surface differs before BVH reuse")
+        capture(dict(receipt, original_surface_exact=True))
+        return to_cuda(rebuilt["vertices"]), to_cuda(rebuilt["faces"])
+    return call
+
+
+def memory_boundary(torch, report, path, release_unused):
+    def snapshot(boundary):
+        try:
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+            row = {"boundary": boundary, "global_free_bytes": free, "global_total_bytes": total,
+                   "torch_allocated_bytes": allocated, "torch_reserved_bytes": reserved,
+                   "torch_reserved_unused_bytes": reserved - allocated,
+                   "torch_peak_allocated_bytes": torch.cuda.max_memory_allocated()}
+        except Exception as exc:
+            row = {"boundary": boundary, "measurement_error": f"{type(exc).__name__}: {exc}"}
+        report.setdefault("cuda_memory", []).append(row)
+        write_json(path, report)
+
+    def boundary(name, state):
+        report["phase"] = f"native_{name}"
+        snapshot(f"{state}-{name}")
+        if name == "simplify" and state == "before" and release_unused:
+            torch.cuda.empty_cache()
+            snapshot("after-empty-cache-before-simplify")
+    return boundary
+
+
 def project_vertices_batched(mesh_vertices, vertices, faces, bvh, project_back, batch_vertices):
     """Apply the pinned native interpolation, retaining every query and output row."""
     if batch_vertices <= 0:
@@ -322,6 +450,10 @@ def run_arm(args, report):
         raise ValueError("reconstruction override requires the remesh arm")
     if batch_vertices is not None and (args.arm != "remesh" or batch_vertices <= 0):
         raise ValueError("positive projection batch size requires the remesh arm")
+    resume_fields = (args.resume_rebuilt, args.resume_filled, args.resume_report, args.resume_report_sha)
+    if any(v is not None for v in resume_fields) and not all(v is not None for v in resume_fields):
+        raise ValueError("checkpoint continuation requires rebuilt, filled and hash-bound origin report")
+    checkpoint = load_reconstruction_checkpoint(args) if all(v is not None for v in resume_fields) else None
     report["effective_route"] = {
         "entry_boundary": "saved-mlx-raw-mesh-and-decoded-appearance-before-local-cleanup",
         "finishing": ("official-to_glb-with-reconstruction-resolution-override"
@@ -377,6 +509,18 @@ def run_arm(args, report):
         write_json(report_path, report)
 
     remesher = native_remesher
+    if checkpoint is not None:
+        rebuilt, filled, receipt = checkpoint
+        report["effective_route"]["finishing"] = "official-to_glb-with-saved-reconstruction-continuation"
+        report["effective_route"]["checkpoint_continuation"] = receipt
+
+        def capture_resume(record):
+            report["effective_route"]["checkpoint_continuation"] = record
+            report["last_trustworthy_phase"] = "checkpoint-and-original-BVH-surface-admitted"
+            write_json(report_path, report)
+
+        remesher = resume_remesher(rebuilt, filled, receipt,
+            lambda value: torch.as_tensor(value, device="cuda"), np.array_equal, capture_resume)
     if batch_vertices is not None:
         memory = report["effective_route"]["projection_memory"]
 
@@ -417,7 +561,9 @@ def run_arm(args, report):
         remesher = defer_remesh_projection(native_remesher, batch_vertices,
                                             capture_projection, verify_projection)
     observed_remesher = observe_remesher(remesher, resolution_override, capture_remesher)
-    cumesh.CuMesh = observe_mesh_class(native_class, capture)
+    report["effective_route"]["release_unused_torch_cache_before_simplify"] = args.release_torch_cache_before_simplify
+    cumesh.CuMesh = observe_mesh_class(native_class, capture,
+        memory_boundary(torch, report, report_path, args.release_torch_cache_before_simplify))
     cumesh.remeshing.remesh_narrow_band_dc = observed_remesher
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
@@ -432,6 +578,9 @@ def run_arm(args, report):
     finally:
         cumesh.CuMesh = native_class
         cumesh.remeshing.remesh_narrow_band_dc = native_remesher
+        report["finishing_seconds_including_stage_capture"] = time.perf_counter() - started
+        report["torch_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+        write_json(report_path, report)
     torch.cuda.synchronize()
     report["finishing_seconds_including_stage_capture"] = time.perf_counter() - started
     report["torch_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
@@ -455,6 +604,9 @@ def run_arm(args, report):
         expected_resolution = resolution_override if resolution_override is not None else args.grid_size
         if len(remesh_calls) != 1 or remesh_calls[0]["effective_resolution"] != expected_resolution:
             raise ValueError("effective reconstruction resolution mismatch or missing native call")
+        if checkpoint is not None:
+            if report["effective_route"]["checkpoint_continuation"].get("original_surface_exact") is not True:
+                raise ValueError("missing original surface checkpoint conformance")
         if batch_vertices is not None and args.remesh_project > 0:
             memory = report["effective_route"]["projection_memory"]
             calls = memory["calls"]
@@ -468,6 +620,26 @@ def run_arm(args, report):
     report["last_trustworthy_phase"] = "glb-and-stage-order-validated"
 
 
+def child_command(args, arm):
+    options = []
+    for flag, field in (("--remesh-resolution", "remesh_resolution"),
+                        ("--projection-batch-vertices", "projection_batch_vertices"),
+                        ("--resume-rebuilt", "resume_rebuilt"), ("--resume-filled", "resume_filled"),
+                        ("--resume-report", "resume_report"), ("--resume-report-sha", "resume_report_sha")):
+        value = getattr(args, field, None)
+        if arm == "remesh" and value is not None:
+            options += [flag, str(value)]
+    if getattr(args, "release_torch_cache_before_simplify", False):
+        options += ["--release-torch-cache-before-simplify"]
+    return [sys.executable, "-u", str(Path(__file__).resolve()),
+            "--mesh", str(args.mesh.resolve()), "--appearance", str(args.appearance.resolve()),
+            "--mesh-sha", args.mesh_sha, "--appearance-sha", args.appearance_sha,
+            "--grid-size", str(args.grid_size), "--target-faces", str(args.target_faces),
+            "--texture-size", str(args.texture_size), "--runtime", str(args.runtime.resolve()),
+            "--output-dir", str(args.output_dir.resolve()),
+            "--remesh-project", str(args.remesh_project), *options, "--arm", arm]
+
+
 def run_both(args, report):
     report["phase"] = "input_admission"
     arrays = load_inputs(args.mesh, args.appearance, args.mesh_sha, args.appearance_sha, args.grid_size)
@@ -479,19 +651,7 @@ def run_both(args, report):
     report["phase"] = "finishing_arms"
     report["arms"] = {}
     for arm in args.arms:
-        resolution_override = getattr(args, "remesh_resolution", None)
-        reconstruction_args = (["--remesh-resolution", str(resolution_override)]
-                               if arm == "remesh" and resolution_override is not None else [])
-        batch_vertices = getattr(args, "projection_batch_vertices", None)
-        if arm == "remesh" and batch_vertices is not None:
-            reconstruction_args += ["--projection-batch-vertices", str(batch_vertices)]
-        argv = [sys.executable, "-u", str(Path(__file__).resolve()),
-                "--mesh", str(args.mesh.resolve()), "--appearance", str(args.appearance.resolve()),
-                "--mesh-sha", args.mesh_sha, "--appearance-sha", args.appearance_sha,
-                "--grid-size", str(args.grid_size), "--target-faces", str(args.target_faces),
-                "--texture-size", str(args.texture_size), "--runtime", str(args.runtime.resolve()),
-                "--output-dir", str(args.output_dir.resolve()),
-                "--remesh-project", str(args.remesh_project), *reconstruction_args, "--arm", arm]
+        argv = child_command(args, arm)
         log_path = args.output_dir / f"{arm}.log"
         with log_path.open("w") as stream:
             result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
@@ -509,6 +669,84 @@ def run_both(args, report):
     report["last_trustworthy_phase"] = "selected-official-finishing-arms-exported"
 
 
+def check_replay_gate(child, reference, reference_sha):
+    route = child.get("effective_route", {})
+    if (child.get("status") != "completed" or route.get("device") != "Tesla T4" or
+            route.get("capability") != [7, 5] or
+            route.get("finishing") != "official-to_glb-with-saved-reconstruction-continuation" or
+            route.get("checkpoint_continuation", {}).get("original_surface_exact") is not True):
+        raise ValueError("768 continuation replay route failed or unverified")
+    if [s["label"] for s in child["stages"]] != ["init", "fill_holes", "init", "simplify", "uv_unwrap", "compute_vertex_normals"]:
+        raise ValueError("768 continuation replay stage order mismatch")
+    if child.get("glb", {}).get("image_sizes") != [[4096, 4096], [4096, 4096]]:
+        raise ValueError("768 continuation replay missing full 4K output")
+    stage = child["stages"][3]
+    if digest(reference) != reference_sha or digest(stage["path"]) != stage["sha256"]:
+        raise ValueError("768 continuation replay reduced geometry digest mismatch")
+    with np.load(reference, allow_pickle=False) as expected, np.load(stage["path"], allow_pickle=False) as actual:
+        if not all(np.array_equal(expected[key], actual[key]) for key in ("vertices", "faces")):
+            raise ValueError("768 continuation reduced arrays differ from saved native control; target deferred")
+    return {"reduced_arrays_exact": True, "reference_sha256": reference_sha,
+            "replayed_reduction_sha256": stage["sha256"],
+            "claim_ceiling": "same reduced geometry and original finishing route; not bitwise UV/bake parity or visual closure"}
+
+
+def run_checkpoint_suite(args, report):
+    """Reuse one native build; gate the large continuation on a known replay."""
+    report["phase"] = "checkpoint_suite_input_admission"
+    raw = load_inputs(args.mesh, args.appearance, args.mesh_sha, args.appearance_sha, args.grid_size)
+    del raw
+    control = copy.copy(args)
+    control.arm, control.remesh_resolution = "remesh", None
+    control.resume_rebuilt, control.resume_filled = args.control_rebuilt, args.control_filled
+    control.resume_report, control.resume_report_sha = args.control_report, args.control_report_sha
+    target = copy.copy(args)
+    target.arm = "remesh"
+    for selected in (control, target):
+        admitted = load_reconstruction_checkpoint(selected)
+        del admitted
+    origin = json.loads(control.resume_report.read_text())
+    if origin.get("status") != "completed" or origin["stages"][3]["label"] != "simplify":
+        raise ValueError("768 replay source lacks a completed native reduction")
+    reference_sha = origin["stages"][3]["sha256"]
+    if digest(args.control_reduced) != reference_sha:
+        raise ValueError("768 replay reference digest mismatch")
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    bootstrap(args, report)
+    report["continuations"] = {}
+    try:
+        for name, selected in (("control-768", control), ("target-1024", target)):
+            report["phase"] = name
+            selected.output_dir = args.output_dir / name
+            selected.output_dir.mkdir(exist_ok=False)
+            argv = child_command(selected, "remesh")
+            report["continuations"][name] = {"command": argv, "status": "running"}
+            write_json(args.output_json, report)
+            with (selected.output_dir / "remesh.log").open("w") as stream:
+                result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
+            path = selected.output_dir / "remesh-report.json"
+            child = json.loads(path.read_text()) if path.is_file() else {"status": "missing-report"}
+            report["continuations"][name].update(exit_code=result.returncode, report=child, status=child["status"])
+            write_json(args.output_json, report)
+            if result.returncode or child["status"] != "completed":
+                raise RuntimeError(f"{name} failed; stage and memory evidence retained")
+            if (child["script_sha256"] != digest(__file__) or
+                    child["effective_route"]["postprocess_sha256"] != POSTPROCESS_SHA or
+                    child["requested"]["resume_report_sha"] != selected.resume_report_sha):
+                raise ValueError("continuation producer identity mismatch")
+            if name == "control-768":
+                report["phase"] = "control-768-replay-conformance"
+                report["replay_gate"] = check_replay_gate(child, args.control_reduced, reference_sha)
+                write_json(args.output_json, report)
+    finally:
+        bundle = args.output_dir.parent / "finishing-bundle.tar"
+        with tarfile.open(bundle, "x") as archive:
+            archive.add(args.output_dir, arcname="finishing")
+        report["bundle"] = {"path": str(bundle), "sha256": digest(bundle), "size_bytes": bundle.stat().st_size}
+        write_json(args.output_json, report)
+    report["last_trustworthy_phase"] = "768-replay-exact-and-1024-checkpoint-finished"
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mesh", type=Path, required=True)
@@ -523,6 +761,17 @@ def parser():
                    help="Override reconstruction resolution only; appearance keeps --grid-size")
     p.add_argument("--projection-batch-vertices", type=int,
                    help="Memory-only deferred projection, all vertices retained; remesh arm only")
+    p.add_argument("--resume-rebuilt", type=Path)
+    p.add_argument("--resume-filled", type=Path)
+    p.add_argument("--resume-report", type=Path)
+    p.add_argument("--resume-report-sha")
+    p.add_argument("--release-torch-cache-before-simplify", action="store_true")
+    p.add_argument("--checkpoint-suite", action="store_true")
+    p.add_argument("--control-rebuilt", type=Path)
+    p.add_argument("--control-filled", type=Path)
+    p.add_argument("--control-report", type=Path)
+    p.add_argument("--control-report-sha")
+    p.add_argument("--control-reduced", type=Path)
     p.add_argument("--arms", nargs="+", choices=("non-remesh", "remesh"),
                    default=["non-remesh", "remesh"])
     p.add_argument("--runtime", type=Path, default=Path("/kaggle/working/cuda-finishing-runtime"))
@@ -541,7 +790,7 @@ def main():
               "requested": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "script_sha256": digest(__file__), "source_pins": SOURCES}
     path = args.output_dir / f"{args.arm}-report.json" if args.arm else args.output_json
-    operation = run_arm if args.arm else run_both
+    operation = run_arm if args.arm else run_checkpoint_suite if args.checkpoint_suite else run_both
     return run_reported(path, report, lambda r: operation(args, r))
 
 
