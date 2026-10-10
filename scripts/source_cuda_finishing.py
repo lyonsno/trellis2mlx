@@ -1,6 +1,8 @@
-"""Run unmodified, pinned official to_glb on saved raw mesh/appearance.
+"""Run pinned official to_glb on saved raw mesh/appearance.
 
 No inference or local cleanup. Stage observers forward native calls unchanged.
+An optional, explicitly reported reconstruction override changes only the
+remesher's resolution and padded scale, preserving the appearance grid.
 Each finishing arm has an independent CUDA process; failures preserve reports
 and intermediate arrays and do not suppress the other arm.
 """
@@ -145,6 +147,28 @@ def observe_mesh_class(native_class, capture):
     return Observed
 
 
+def observe_remesher(native, resolution_override, capture):
+    if resolution_override is not None and resolution_override <= 0:
+        raise ValueError("reconstruction resolution must be positive")
+
+    def call(*args, **kwargs):
+        source_resolution = kwargs["resolution"]
+        source_scale = kwargs["scale"]
+        band = kwargs.get("band", 1)
+        effective = dict(kwargs)
+        if resolution_override is not None:
+            domain_scale = source_scale / ((source_resolution + 3 * band) / source_resolution)
+            effective["resolution"] = resolution_override
+            effective["scale"] = domain_scale * ((resolution_override + 3 * band) / resolution_override)
+        capture({"source_resolution": source_resolution,
+                 "effective_resolution": effective["resolution"],
+                 "source_scale": source_scale, "effective_scale": effective["scale"],
+                 "band": band, "project_back": kwargs.get("project_back", 0),
+                 "resolution_override": resolution_override is not None})
+        return native(*args, **effective)
+    return call
+
+
 def run_reported(path, report, operation):
     started = time.perf_counter()
     write_json(path, report)
@@ -224,9 +248,13 @@ def run_arm(args, report):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     settings = finishing_settings(args)
+    resolution_override = getattr(args, "remesh_resolution", None)
+    if args.arm != "remesh" and resolution_override is not None:
+        raise ValueError("reconstruction override requires the remesh arm")
     report["effective_route"] = {
         "entry_boundary": "saved-mlx-raw-mesh-and-decoded-appearance-before-local-cleanup",
-        "finishing": "unmodified-official-to_glb",
+        "finishing": ("official-to_glb-with-reconstruction-resolution-override"
+                      if resolution_override is not None else "unmodified-official-to_glb"),
         "model_inference": False, "local_cleanup": False,
         "postprocess_path": str(source_path), "postprocess_sha256": source_sha,
         "torch": torch.__version__, "cuda": torch.version.cuda,
@@ -235,6 +263,11 @@ def run_arm(args, report):
         "cumesh_module": str(Path(cumesh.__file__).resolve()),
         "flex_gemm_module": str(Path(flex_gemm.__file__).resolve()),
         "nvdiffrast_module": str(Path(nvdiffrast.torch.__file__).resolve()),
+    }
+    report["effective_route"]["reconstruction"] = {
+        "requested_resolution_override": resolution_override,
+        "appearance_grid_size": args.grid_size,
+        "calls": [],
     }
     directory = args.output_dir / args.arm
     directory.mkdir(parents=True, exist_ok=False)
@@ -255,7 +288,18 @@ def run_arm(args, report):
 
     report["phase"] = "official_to_glb"
     native_class = cumesh.CuMesh
+    native_remesher = cumesh.remeshing.remesh_narrow_band_dc
+
+    def capture_remesher(record):
+        if record["source_resolution"] != args.grid_size:
+            raise ValueError("source remesher resolution differs from appearance grid")
+        report["effective_route"]["reconstruction"]["calls"].append(record)
+        report["last_trustworthy_phase"] = "native-remesher-call-settings-captured"
+        write_json(report_path, report)
+
+    observed_remesher = observe_remesher(native_remesher, resolution_override, capture_remesher)
     cumesh.CuMesh = observe_mesh_class(native_class, capture)
+    cumesh.remeshing.remesh_narrow_band_dc = observed_remesher
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     try:
@@ -268,6 +312,7 @@ def run_arm(args, report):
                          "roughness": slice(4, 5), "alpha": slice(5, 6)}, **settings)
     finally:
         cumesh.CuMesh = native_class
+        cumesh.remeshing.remesh_narrow_band_dc = native_remesher
     torch.cuda.synchronize()
     report["finishing_seconds_including_stage_capture"] = time.perf_counter() - started
     report["torch_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
@@ -286,6 +331,13 @@ def run_arm(args, report):
                  "uv_unwrap", "compute_vertex_normals"])
     if labels != expected:
         raise ValueError(f"effective stage order mismatch: {labels}")
+    remesh_calls = report["effective_route"]["reconstruction"]["calls"]
+    if args.arm == "remesh":
+        expected_resolution = resolution_override if resolution_override is not None else args.grid_size
+        if len(remesh_calls) != 1 or remesh_calls[0]["effective_resolution"] != expected_resolution:
+            raise ValueError("effective reconstruction resolution mismatch or missing native call")
+    elif remesh_calls:
+        raise ValueError("unexpected reconstruction call in non-remesh arm")
     report["last_trustworthy_phase"] = "glb-and-stage-order-validated"
 
 
@@ -300,13 +352,16 @@ def run_both(args, report):
     report["phase"] = "finishing_arms"
     report["arms"] = {}
     for arm in args.arms:
+        resolution_override = getattr(args, "remesh_resolution", None)
+        reconstruction_args = (["--remesh-resolution", str(resolution_override)]
+                               if arm == "remesh" and resolution_override is not None else [])
         argv = [sys.executable, "-u", str(Path(__file__).resolve()),
                 "--mesh", str(args.mesh.resolve()), "--appearance", str(args.appearance.resolve()),
                 "--mesh-sha", args.mesh_sha, "--appearance-sha", args.appearance_sha,
                 "--grid-size", str(args.grid_size), "--target-faces", str(args.target_faces),
                 "--texture-size", str(args.texture_size), "--runtime", str(args.runtime.resolve()),
                 "--output-dir", str(args.output_dir.resolve()),
-                "--remesh-project", str(args.remesh_project), "--arm", arm]
+                "--remesh-project", str(args.remesh_project), *reconstruction_args, "--arm", arm]
         log_path = args.output_dir / f"{arm}.log"
         with log_path.open("w") as stream:
             result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
@@ -334,6 +389,8 @@ def parser():
     p.add_argument("--target-faces", type=int, default=1000000)
     p.add_argument("--texture-size", type=int, default=4096)
     p.add_argument("--remesh-project", type=float, default=0)
+    p.add_argument("--remesh-resolution", type=int,
+                   help="Override reconstruction resolution only; appearance keeps --grid-size")
     p.add_argument("--arms", nargs="+", choices=("non-remesh", "remesh"),
                    default=["non-remesh", "remesh"])
     p.add_argument("--runtime", type=Path, default=Path("/kaggle/working/cuda-finishing-runtime"))
