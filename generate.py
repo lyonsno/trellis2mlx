@@ -548,7 +548,7 @@ def _validate_gpu_synchronization_route(parser, args):
     if not args.synchronize_gpu:
         return
     natural_shape = (
-        args.image and not args.resume and not args.stop_after_stage
+        args.image and not args.resume and args.stop_after_stage in (None, "shape_slat")
         and not args.edit_target and not args.shape_slat_sample
         and not args.shape_slat_support_sample
     )

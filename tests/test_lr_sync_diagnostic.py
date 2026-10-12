@@ -116,9 +116,10 @@ def route_args(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_cli_validation_admits_checkpointed_natural_shape_and_existing_hr_replay():
+@pytest.mark.parametrize("stop_after_stage", [None, "shape_slat"])
+def test_cli_validation_admits_checkpointed_natural_shape_and_existing_hr_replay(stop_after_stage):
     parser = argparse.ArgumentParser()
-    generate._validate_gpu_synchronization_route(parser, route_args())
+    generate._validate_gpu_synchronization_route(parser, route_args(stop_after_stage=stop_after_stage))
     generate._validate_gpu_synchronization_route(parser, route_args(replay_hr_input=True, resume="saved", image=None))
 
 
