@@ -16,7 +16,7 @@ import uuid
 
 import numpy as np
 
-from trellmlx.source_metal_remesh import load_backend, to_glb
+from trellmlx.source_metal_remesh import load_backend, to_glb, verify_deep_bvh_traversal
 
 
 def digest(path):
@@ -175,6 +175,10 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
             write_report(report_path, report)
             print(json.dumps(record), flush=True)
 
+        set_phase("deep_bvh_preflight")
+        report["deep_bvh_preflight"] = verify_deep_bvh_traversal(backend)
+        report["last_trustworthy_phase"] = "deep_bvh_preflight"
+        write_report(report_path, report)
         vertices, faces, attrs, coords = [backend.torch.from_numpy(v) for v in arrays]
         with backend.torch.no_grad():
             mesh = finalizer(vertices, faces, attrs, coords, backend=backend,

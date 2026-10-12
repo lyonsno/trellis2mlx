@@ -48,12 +48,18 @@ natural-input command on the same source revision, backend manifest, complete
 small-witness configuration/stages and still-matching output digest. Failed or
 missing composition stops before backend dispatch and leaves a failure report.
 
-The small composition witness alone does not exercise a deep BVH. Immediately
-after building the original-surface BVH, the runner queries every
+The runner now also builds the upstream regression's 498,002-face nonplanar
+grid with the selected Metal BVH and checks 2,000 deterministic on-surface
+queries **before** dispatching either the small composition exporter or a
+natural-input exporter. The known stale 24-slot traversal shader fails this
+preflight; the isolated current 64-slot shader passes. The phase-bearing report
+records the effective backend identity and the maximum observed distance.
+This is a targeted dependency admission check, not a general BVH certificate.
+Immediately after building the natural input's original-surface BVH, the runner queries every
 face-referenced vertex against that same BVH and refuses reconstruction if
 any unsigned distance exceeds `1e-6`, is nonfinite, or the result is incomplete.
 Unreferenced vertices are excluded because they need not lie on a triangle.
-This is a guard against positive-distance misses at source vertices, not a
+That second check is a guard against positive-distance misses at source vertices, not a
 general BVH correctness check: this backend can also return a zero-distance
 sentinel after failing to find a triangle, and the guard does not test
 off-surface queries or projected coordinates. It is not a claim that the

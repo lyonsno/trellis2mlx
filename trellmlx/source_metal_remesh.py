@@ -82,6 +82,42 @@ def verify_bvh_source_surface(vertices, faces, bvh):
             f"(maximum {float(distances.max()):.9g})")
 
 
+def verify_deep_bvh_traversal(backend):
+    """Exercise the upstream deep-tree on-surface regression before production.
+
+    This catches the known 24-slot shader's positive-distance misses. It is
+    deliberately not a certificate for arbitrary BVH queries or mesh quality.
+    """
+    n = 500
+    xs, ys = np.meshgrid(np.linspace(-1, 1, n).astype(np.float32),
+                         np.linspace(-1, 1, n).astype(np.float32), indexing="ij")
+    zs = (0.3 * np.sin(4 * xs) * np.cos(4 * ys)).astype(np.float32)
+    vertices = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1)
+    i, j = np.meshgrid(np.arange(n - 1), np.arange(n - 1), indexing="ij")
+    v00, v01 = (i * n + j).ravel(), (i * n + j + 1).ravel()
+    v10, v11 = ((i + 1) * n + j).ravel(), ((i + 1) * n + j + 1).ravel()
+    faces = np.concatenate([np.stack([v00, v10, v11], axis=1),
+                            np.stack([v00, v11, v01], axis=1)]).astype(np.int32)
+    rng = np.random.default_rng(0)
+    sample = rng.choice(len(vertices), size=2000, replace=False)
+    torch = backend.torch
+    bvh = backend.bvh(torch.from_numpy(vertices), torch.from_numpy(faces))
+    distances, face_ids, _ = bvh.unsigned_distance(torch.from_numpy(vertices[sample]))
+    if (len(distances) != len(sample) or len(face_ids) != len(sample)
+            or not torch.isfinite(distances).all() or not (face_ids >= 0).all()
+            or not (face_ids < len(faces)).all()):
+        raise RuntimeError("deep source-surface BVH preflight returned incomplete/nonfinite/invalid hits")
+    bad = distances.abs() > 1e-4
+    if bad.any():
+        raise RuntimeError(
+            "deep source-surface BVH preflight failed: "
+            f"{int(bad.sum())}/{len(sample)} sampled vertices exceed 1e-4 "
+            f"(maximum {float(distances.abs().max()):.9g})")
+    return {"fixture": "upstream 500x500 nonplanar grid", "faces": len(faces),
+            "sampled_vertices": len(sample), "maximum_absolute_distance": float(distances.abs().max()),
+            "distance_tolerance": 1e-4, "status": "passed"}
+
+
 def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,
                     band=1., project_back=.9, capture=None, phase=None, verbose=False):
     """Prefill→original BVH→DC/project→direct reduction; no cleanup loop."""

@@ -390,6 +390,71 @@ def test_dependent_run_requires_composition_before_backend(tmp_path, monkeypatch
     assert "backend must not run" not in result["error"]
 
 
+def test_deep_bvh_preflight_rejects_known_bad_traversal_before_finalizer(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from scripts import source_metal_remesh_finishing as runner
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda argv, **kw: "expected" if argv[-1] == "HEAD" else "")
+    monkeypatch.setattr(runner, "load_inputs", lambda *a: [np.zeros((1, 3))] * 4)
+    monkeypatch.setattr(runner, "verify_backend", lambda *a: {"accelerator": "Metal custom kernels"})
+    called = []
+
+    class BadBVH:
+        def __init__(self, vertices, faces):
+            called.append("bvh")
+
+        def unsigned_distance(self, query):
+            distances = torch.zeros(len(query))
+            distances[0] = .003
+            return distances, torch.zeros(len(query), dtype=torch.long), None
+
+    backend = SimpleNamespace(torch=torch, bvh=BadBVH)
+    np.savez(tmp_path / "texture.npz", mesh_grid_size=768)
+    (tmp_path / "backend.json").write_text("bound test backend")
+    args = Namespace(output_dir=tmp_path / "new", expected_revision="expected", checkpoints=tmp_path,
+                     mesh_sha256="mesh", texture_sha256="texture", grid_size=768,
+                     require_composition_report=None, backend_manifest=tmp_path / "backend.json",
+                     target_faces=1000000, texture_size=4096, band=1., project_back=.9)
+    result = runner.run(args, backend_loader=lambda: backend,
+                        finalizer=lambda *a, **kw: called.append("finalizer"))
+    assert result["status"] == "failed"
+    assert result["failure_phase"] == "deep_bvh_preflight"
+    assert "source-surface" in result["error"]
+    assert called == ["bvh"]
+    assert (args.output_dir / "report.json").exists()
+
+
+@pytest.mark.parametrize("defect", [None, "partial", "nonfinite", "invalid_face"])
+def test_deep_bvh_preflight_fixture_and_false_pass_guards(defect):
+    from trellmlx.source_metal_remesh import verify_deep_bvh_traversal
+
+    class BVH:
+        def __init__(self, vertices, faces):
+            assert vertices.shape == (250000, 3)
+            assert faces.shape == (498002, 3)
+
+        def unsigned_distance(self, query):
+            assert query.shape == (2000, 3)
+            distances = torch.zeros(len(query))
+            face_ids = torch.zeros(len(query), dtype=torch.long)
+            if defect == "partial":
+                return distances[:-1], face_ids[:-1], None
+            if defect == "nonfinite":
+                distances[0] = float("nan")
+            if defect == "invalid_face":
+                face_ids[0] = -1
+            return distances, face_ids, None
+
+    backend = SimpleNamespace(torch=torch, bvh=BVH)
+    if defect:
+        with pytest.raises(RuntimeError, match="incomplete/nonfinite/invalid"):
+            verify_deep_bvh_traversal(backend)
+    else:
+        receipt = verify_deep_bvh_traversal(backend)
+        assert receipt == {"fixture": "upstream 500x500 nonplanar grid", "faces": 498002,
+                           "sampled_vertices": 2000, "maximum_absolute_distance": 0.,
+                           "distance_tolerance": 1e-4, "status": "passed"}
+
+
 @pytest.mark.parametrize("defect", [None, "revision", "manifest", "status", "grid", "backend", "partial", "asset"])
 def test_composition_admission_rejects_false_closure(tmp_path, defect):
     import json
