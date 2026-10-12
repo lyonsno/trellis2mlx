@@ -53,11 +53,14 @@ after building the original-surface BVH, the runner queries every
 face-referenced vertex against that same BVH and refuses reconstruction if
 any unsigned distance exceeds `1e-6`, is nonfinite, or the result is incomplete.
 Unreferenced vertices are excluded because they need not lie on a triangle.
-This is a source-surface correctness check, not a claim that the rebuilt mesh
-is watertight or CUDA-equivalent. It adds an all-referenced-vertex distance
-query before remeshing; cost depends on input size. The check was motivated
-by an installed mtlbvh shader whose 24-entry traversal stack missed more than
-4.6 million referenced vertices on the saved 768 warrior while a current
+This is a guard against positive-distance misses at source vertices, not a
+general BVH correctness check: this backend can also return a zero-distance
+sentinel after failing to find a triangle, and the guard does not test
+off-surface queries or projected coordinates. It is not a claim that the
+rebuilt mesh is watertight or CUDA-equivalent. It adds an all-referenced-vertex
+distance query before remeshing; cost depends on input size. The check was
+motivated by an installed mtlbvh shader whose 24-entry traversal stack missed
+more than 4.6 million referenced vertices on the saved 768 warrior while a current
 64-entry build missed none. Keep the effective backend manifest and this
 natural-input check together; an old manifest can faithfully attest an old,
 broken shader.
