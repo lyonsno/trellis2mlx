@@ -115,7 +115,14 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
     phase, owns_output = "output_admission", False
     report_path = args.output_dir / "report.json"
     try:
-        args.output_dir.mkdir(parents=True, exist_ok=False)
+        # Completion supervisors may create the artifact parent before launch.
+        # Empty scaffolding is not prior evidence; anything left by a previous
+        # producer (including its atomic ownership marker) remains protected.
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        if any(args.output_dir.iterdir()):
+            raise FileExistsError(f"finishing output contains previous state: {args.output_dir}")
+        with (args.output_dir / ".finishing-owner.json").open("x") as ownership:
+            ownership.write(json.dumps(report["requested"], sort_keys=True) + "\n")
         owns_output = True
         write_report(report_path, report)
         phase = "source_identity"

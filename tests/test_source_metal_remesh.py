@@ -215,6 +215,33 @@ def test_early_failure_has_durable_report_without_overwriting_previous_output(tm
     assert json.loads(reports[0].read_text())["last_trustworthy_phase"] == "request"
 
 
+def test_supervisor_precreated_empty_output_is_not_previous_evidence(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from scripts import source_metal_remesh_finishing as runner
+    output = tmp_path / "finishing"
+    # Observed live route: job_supervisor.py creates the primary artifact's
+    # parent before spawning the watcher; all three 1011 jobs hit this path.
+    (output / "output.glb").parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **kw: "wrong revision")
+    result = runner.run(Namespace(output_dir=output, expected_revision="expected"),
+                        backend_loader=lambda: pytest.fail("must not dispatch"))
+    assert result["status"] == "failed"
+    assert result["failure_phase"] == "source_identity"
+    assert (output / "report.json").is_file()
+
+
+def test_previous_ownership_marker_is_never_reused(tmp_path):
+    from argparse import Namespace
+    from scripts.source_metal_remesh_finishing import run
+    output = tmp_path / "finishing"
+    output.mkdir()
+    marker = output / ".finishing-owner.json"
+    marker.write_text("previous run ownership")
+    result = run(Namespace(output_dir=output), backend_loader=lambda: pytest.fail("must not dispatch"))
+    assert result["failure_phase"] == "output_admission"
+    assert marker.read_text() == "previous run ownership"
+
+
 def test_non_macos_route_fails_loud(monkeypatch):
     from trellmlx.source_metal_remesh import load_backend
     monkeypatch.setattr("platform.system", lambda: "Linux")

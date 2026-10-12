@@ -32,7 +32,9 @@ The checkpoint must contain `mesh_raw.npz` and `texture.npz` with decoded six
 channel appearance. A recorded `mesh_grid_size` must match; older checkpoints
 without that field use the explicitly declared grid, labeled as such in the
 report. Recover that setting from the original run, not the mesh bounds. The output directory
-must be new. The explicit backend manifest maps every module returned by
+must be new or empty (a completion supervisor may create its parent directory).
+An atomic ownership marker prevents two producers from claiming the same empty
+directory; any previous state is refused without overwrite. The explicit backend manifest maps every module returned by
 `load_backend().identity` to its resolved path and SHA256 and lists selected
 native `.so` and `.metallib` files under `binaries`, also with path and SHA256.
 Use the same manifest for the small `scripts/source_metal_remesh_smoke.py`
@@ -47,7 +49,7 @@ small-witness configuration/stages and still-matching output digest. Failed or
 missing composition stops before backend dispatch and leaves a failure report.
 
 Outputs include all six mesh/UV/normal stages, an opaque one-sided PBR GLB,
-and a phase-bearing `report.json`, including on failure. An existing output
+and a phase-bearing `report.json`, including on failure. A nonempty existing output
 is preserved and refusal is recorded in a separate sibling failure report.
 Reopen/texture checks are structural admission, not visual-quality acceptance;
 inspect the GLB in the same viewer and camera as its comparison.
