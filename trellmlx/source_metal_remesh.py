@@ -11,6 +11,7 @@ import importlib
 import inspect
 import math
 import platform
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,14 +37,32 @@ def load_backend():
     if not sample_module.kernels.cuda.__name__.endswith(".metal") or not sample_module.kernels.triton.__name__.endswith(".metal"):
         raise RuntimeError("FlexGEMM did not select Metal sparse sampling")
     # The caller records these effective files and their digests before compute.
-    modules = {name: importlib.import_module(name) for name in (
+    names = {
         "cumesh", "cumesh._C", "cumesh.metal_backend", "cumesh.metal_remeshing",
         "mtlbvh", "mtldiffrast.torch", "flex_gemm.ops.grid_sample",
-        "flex_gemm.kernels.metal")}
+        "flex_gemm.kernels.metal", "cumesh._xatlas", "mtlbvh._C",
+        "mtldiffrast._C", "flex_gemm.kernels.metal._C"}
+    # Follow defining modules rather than hashing package wrappers alone.
+    names.update(obj.__module__ for obj in (
+        cumesh.CuMesh, cumesh.cuBVH, remesh_module.remesh_narrow_band_dc,
+        dr.rasterize, dr.interpolate, grid_sample_3d, sample_module.GridSample3dFunction))
+    modules = {name: importlib.import_module(name) for name in sorted(names)}
     identity = {name: inspect.getfile(module) for name, module in modules.items()}
+    native_libraries = sorted({str(Path(path).resolve()) for path in identity.values()
+                               if Path(path).suffix in {".so", ".dylib"}})
+    # Source-side adjacent shader files are useful provenance, but no runtime
+    # loader API authenticates the library object. Do not promote that claim.
+    declared_metallibs = sorted(str(Path(identity[name]).resolve().parent / filename)
+                               for name, filename in (
+                                   ("cumesh._C", "cumesh.metallib"),
+                                   ("mtlbvh._C", "mtlbvh.metallib"),
+                                   ("mtldiffrast._C", "mtldiffrast.metallib"),
+                                   ("flex_gemm.kernels.metal._C", "flex_gemm.metallib")))
     return SimpleNamespace(torch=torch, mesh=cumesh.CuMesh, bvh=cumesh.cuBVH,
                            remesh=remesh_module.remesh_narrow_band_dc,
-                           dr=dr, sample=grid_sample_3d, identity=identity)
+                           dr=dr, sample=grid_sample_3d, identity=identity,
+                           native_libraries=native_libraries,
+                           declared_metallibs=declared_metallibs)
 
 
 def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,

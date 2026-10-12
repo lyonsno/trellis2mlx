@@ -38,6 +38,13 @@ native `.so` and `.metallib` files under `binaries`, also with path and SHA256.
 Use the same manifest for the small `scripts/source_metal_remesh_smoke.py`
 composition witness and the natural input runs. Record its bytes with the
 execution request. The runtime validates these identities before computation.
+Imported native extensions are bound through their effective module paths;
+shader-library hashes are labeled adjacent-file provenance, not authentication
+of the runtime's loaded library object. For automatic sequential runs, add
+`--require-composition-report /path/to/smoke/finishing/report.json` to gate a
+natural-input command on the same source revision, backend manifest, complete
+small-witness configuration/stages and still-matching output digest. Failed or
+missing composition stops before backend dispatch and leaves a failure report.
 
 Outputs include all six mesh/UV/normal stages, an opaque one-sided PBR GLB,
 and a phase-bearing `report.json`, including on failure. An existing output

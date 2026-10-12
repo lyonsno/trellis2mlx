@@ -4,12 +4,12 @@ The solid cube is intentionally plain: this proves composition, not asset qualit
 Run under Greenroom with the same backend manifest as the natural inputs.
 """
 import argparse
+import json
 from pathlib import Path
+import traceback
+import uuid
 
-import numpy as np
-import trimesh
-
-from scripts.source_metal_remesh_finishing import digest, run
+from scripts.source_metal_remesh_finishing import digest, run, write_report
 
 
 def main():
@@ -18,6 +18,29 @@ def main():
     parser.add_argument("--backend-manifest", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     args = parser.parse_args()
+    report = {"schema": "trellis2mlx.metal-remesh-composition.v1", "status": "failed",
+              "failure_phase": "input_preparation", "last_trustworthy_phase": "request",
+              "requested": {key: str(value) for key, value in vars(args).items()}}
+    args.root.mkdir(parents=True, exist_ok=True)
+    report_path = args.root / "smoke-report.json"
+    if report_path.exists():
+        report_path = args.root / f"smoke-report-{uuid.uuid4().hex}.json"
+    write_report(report_path, report)
+    try:
+        result = prepare_and_run(args)
+        report.update(status=result["status"], failure_phase=result["failure_phase"],
+                      last_trustworthy_phase=result["last_trustworthy_phase"],
+                      finishing_report=str(args.root / "finishing" / "report.json"))
+    except Exception as exc:
+        report.update(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+    write_report(report_path, report)
+    print(json.dumps({"status": report["status"], "report": str(report_path)}), flush=True)
+    return 0 if report["status"] == "complete" else 1
+
+
+def prepare_and_run(args):
+    import numpy as np
+    import trimesh
     inputs = args.root / "inputs"
     inputs.mkdir(parents=True, exist_ok=False)
     cube = trimesh.creation.box(extents=[.6] * 3)
@@ -35,7 +58,7 @@ def main():
                                  backend_manifest=args.backend_manifest,
                                  expected_revision=args.expected_revision, grid_size=grid_size,
                                  target_faces=2000, texture_size=64, band=1., project_back=.9)
-    return 0 if run(request)["status"] == "complete" else 1
+    return run(request)
 
 
 if __name__ == "__main__":

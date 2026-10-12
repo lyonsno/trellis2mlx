@@ -220,3 +220,131 @@ def test_non_macos_route_fails_loud(monkeypatch):
     monkeypatch.setattr("platform.system", lambda: "Linux")
     with pytest.raises(RuntimeError, match="requires macOS"):
         load_backend()
+
+
+def test_missing_actual_native_library_cannot_validate(tmp_path):
+    import json
+    from scripts.source_metal_remesh_finishing import digest, verify_backend
+    module = tmp_path / "implementation.py"
+    module.write_text("observed implementation")
+    actual = tmp_path / "actual.so"
+    actual.write_bytes(b"actually imported library")
+    unrelated = tmp_path / "other.so"
+    unrelated.write_bytes(b"not imported")
+    manifest = tmp_path / "backend.json"
+    manifest.write_text(json.dumps({"modules": {"implementation": {"path": str(module), "sha256": digest(module)}},
+                                   "binaries": [{"path": str(unrelated), "sha256": digest(unrelated)}]}))
+    backend = SimpleNamespace(identity={"implementation": str(module)},
+                              native_libraries=[str(actual)], declared_metallibs=[])
+    with pytest.raises(ValueError, match="native library set"):
+        verify_backend(backend, manifest)
+
+
+def test_smoke_preparation_refusal_is_reported_without_dispatch(tmp_path, monkeypatch):
+    import json
+    from scripts import source_metal_remesh_smoke as smoke
+    (tmp_path / "inputs").mkdir()
+    marker = tmp_path / "inputs" / "previous.npz"
+    marker.write_bytes(b"previous evidence")
+    monkeypatch.setattr("sys.argv", ["smoke", "--root", str(tmp_path),
+                                    "--backend-manifest", str(tmp_path / "backend.json"),
+                                    "--expected-revision", "expected"])
+    monkeypatch.setattr(smoke, "run", lambda *a, **kw: pytest.fail("must not dispatch"))
+    assert smoke.main() == 1
+    reports = list(tmp_path.glob("smoke-report*.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report["status"] == "failed"
+    assert report["failure_phase"] == "input_preparation"
+    assert report["last_trustworthy_phase"] == "request"
+    assert marker.read_bytes() == b"previous evidence"
+
+
+def test_implementation_mutation_and_imported_extension_path_mismatch(tmp_path):
+    import json
+    from scripts.source_metal_remesh_finishing import digest, verify_backend
+    implementation = tmp_path / "sampler.py"
+    implementation.write_text("original sampling implementation")
+    extension = tmp_path / "imported.so"
+    extension.write_bytes(b"imported extension")
+    record = {"path": str(implementation), "sha256": digest(implementation)}
+    backend = SimpleNamespace(identity={"sampler": str(implementation)},
+                              native_libraries=[str(extension)], declared_metallibs=[])
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"modules": {"sampler": record},
+                                   "binaries": [{"path": str(extension), "sha256": digest(extension)}]}))
+    verify_backend(backend, manifest)
+    implementation.write_text("changed sampling implementation")
+    with pytest.raises(ValueError, match="source identity"):
+        verify_backend(backend, manifest)
+    implementation.write_text("original sampling implementation")
+    backend.native_libraries = [str(tmp_path / "other-imported.so")]
+    with pytest.raises(ValueError, match="native library set"):
+        verify_backend(backend, manifest)
+
+
+def test_smoke_preparation_write_failure_has_report(tmp_path, monkeypatch):
+    import json
+    from scripts import source_metal_remesh_smoke as smoke
+    monkeypatch.setattr("sys.argv", ["smoke", "--root", str(tmp_path),
+                                    "--backend-manifest", str(tmp_path / "backend.json"),
+                                    "--expected-revision", "expected"])
+    monkeypatch.setattr("numpy.savez_compressed", lambda *a, **kw: (_ for _ in ()).throw(OSError("write failed")))
+    monkeypatch.setattr(smoke, "run", lambda *a, **kw: pytest.fail("must not dispatch"))
+    assert smoke.main() == 1
+    report = json.loads((tmp_path / "smoke-report.json").read_text())
+    assert report["failure_phase"] == "input_preparation"
+    assert report["last_trustworthy_phase"] == "request"
+    assert "write failed" in report["error"]
+
+
+def test_dependent_run_requires_composition_before_backend(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from scripts import source_metal_remesh_finishing as runner
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda argv, **kw: "expected" if argv[-1] == "HEAD" else "")
+    monkeypatch.setattr(runner, "load_inputs", lambda *a: [np.zeros((1, 3))] * 4)
+    args = Namespace(output_dir=tmp_path / "new", expected_revision="expected", checkpoints=tmp_path,
+                     mesh_sha256="mesh", texture_sha256="texture", grid_size=768,
+                     require_composition_report=tmp_path / "missing-smoke.json", backend_manifest=tmp_path / "backend.json")
+    result = runner.run(args, backend_loader=lambda: (_ for _ in ()).throw(RuntimeError("backend must not run")))
+    assert result["status"] == "failed"
+    assert result["failure_phase"] == "composition_admission"
+    assert "backend must not run" not in result["error"]
+
+
+@pytest.mark.parametrize("defect", [None, "revision", "manifest", "status", "grid", "backend", "partial", "asset"])
+def test_composition_admission_rejects_false_closure(tmp_path, defect):
+    import json
+    from scripts.source_metal_remesh_finishing import digest, validate_composition
+    manifest = tmp_path / "backend.json"
+    manifest.write_text("bound backend manifest")
+    asset = tmp_path / "output.glb"
+    asset.write_bytes(b"structural output admitted by its producer")
+    report = {"schema": "trellis2mlx.original-metal-remesh.v1", "status": "complete",
+              "source": {"revision": "expected"}, "backend_manifest_sha256": digest(manifest),
+              "effective": {"accelerator": "Metal custom kernels", "host_tensors": "torch-cpu",
+                            "grid_size": 32, "target_faces": 2000, "texture_size": 64,
+                            "band": 1., "project_back": .9, "alpha_mode": "OPAQUE", "double_sided": False},
+              "stages": [{"name": name} for name in ("raw", "filled_original", "rebuilt", "reduced", "uv", "normals")],
+              "output": {"path": str(asset), "sha256": digest(asset)}}
+    if defect == "revision":
+        report["source"]["revision"] = "old"
+    elif defect == "manifest":
+        report["backend_manifest_sha256"] = "old"
+    elif defect == "status":
+        report["status"] = "failed"
+    elif defect == "grid":
+        report["effective"]["grid_size"] = 16
+    elif defect == "backend":
+        report["effective"]["accelerator"] = "CPU fallback"
+    elif defect == "partial":
+        report["stages"].pop()
+    elif defect == "asset":
+        asset.write_bytes(b"changed asset")
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    if defect:
+        with pytest.raises(ValueError):
+            validate_composition(path, "expected", manifest)
+    else:
+        assert validate_composition(path, "expected", manifest)["output_sha256"] == digest(asset)

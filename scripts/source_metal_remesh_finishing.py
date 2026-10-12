@@ -69,13 +69,40 @@ def verify_backend(backend, manifest_path):
             raise ValueError(f"backend source identity mismatch: {name}")
         observed[name] = record
     binaries = manifest["binaries"]
-    if not binaries:
-        raise ValueError("backend manifest has no native libraries")
+    required = set(backend.native_libraries) | set(backend.declared_metallibs)
+    if {record["path"] for record in binaries} != required or len(binaries) != len(required):
+        raise ValueError("backend native library set mismatch")
     for record in binaries:
         if digest(record["path"]) != record["sha256"]:
             raise ValueError(f"backend library identity mismatch: {record['path']}")
-    return {"modules": observed, "binaries": binaries, "host_tensors": "torch-cpu",
+    return {"modules": observed,
+            "imported_native_libraries": [r for r in binaries if r["path"] in backend.native_libraries],
+            "declared_metallibs": [r for r in binaries if r["path"] in backend.declared_metallibs],
+            "metallib_authority": "adjacent-file provenance; runtime loader object not authenticated",
+            "host_tensors": "torch-cpu",
             "accelerator": "Metal custom kernels", "python": sys.executable}
+
+
+def validate_composition(path, revision, backend_manifest):
+    """Gate queued natural runs on the same-revision live primitive witness."""
+    witness = json.loads(path.read_text())
+    if (witness.get("schema") != "trellis2mlx.original-metal-remesh.v1"
+            or witness.get("status") != "complete"
+            or witness.get("source", {}).get("revision") != revision
+            or witness.get("backend_manifest_sha256") != digest(backend_manifest)):
+        raise ValueError("missing or mismatched complete composition witness")
+    effective = witness.get("effective", {})
+    expected = {"accelerator": "Metal custom kernels", "host_tensors": "torch-cpu",
+                "grid_size": 32, "target_faces": 2000, "texture_size": 64,
+                "band": 1., "project_back": .9, "alpha_mode": "OPAQUE", "double_sided": False}
+    if any(effective.get(key) != value for key, value in expected.items()):
+        raise ValueError("composition effective configuration mismatch")
+    if [s["name"] for s in witness.get("stages", [])] != ["raw", "filled_original", "rebuilt", "reduced", "uv", "normals"]:
+        raise ValueError("composition stages incomplete")
+    output = witness["output"]
+    if digest(output["path"]) != output["sha256"]:
+        raise ValueError("composition asset digest mismatch")
+    return {"report": str(path), "sha256": digest(path), "output_sha256": output["sha256"]}
 
 
 def run(args, *, backend_loader=load_backend, finalizer=to_glb):
@@ -98,6 +125,11 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
         if revision != args.expected_revision or dirty:
             raise ValueError("finishing worktree must be clean at the expected revision")
         report["source"] = {"root": str(source_root), "revision": revision}
+        if getattr(args, "require_composition_report", None):
+            phase = "composition_admission"
+            report["composition"] = validate_composition(
+                args.require_composition_report, revision, args.backend_manifest)
+            report["last_trustworthy_phase"] = phase
         phase = "input_validation"
         arrays = load_inputs(args.checkpoints, args.mesh_sha256, args.texture_sha256, args.grid_size)
         report["last_trustworthy_phase"] = phase
@@ -183,6 +215,8 @@ def main():
     parser.add_argument("--texture-sha256", required=True)
     parser.add_argument("--backend-manifest", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
+    parser.add_argument("--require-composition-report", type=Path,
+                        help="Require the same-revision cube32/2000/64 live witness before a queued natural run")
     parser.add_argument("--grid-size", type=int, required=True)
     parser.add_argument("--target-faces", type=int, default=1000000)
     parser.add_argument("--texture-size", type=int, default=4096)
