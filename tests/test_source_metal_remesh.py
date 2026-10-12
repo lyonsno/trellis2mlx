@@ -58,7 +58,9 @@ def geometry_fixture():
     def bvh(v, f):
         events.append("bvh")
         assert torch.equal(v, filled_v)
-        return SimpleNamespace(original_vertices=v, original_faces=f)
+        return SimpleNamespace(original_vertices=v, original_faces=f,
+                               unsigned_distance=lambda query: (
+                                   torch.zeros(len(query)), torch.zeros(len(query), dtype=torch.long), None))
 
     def remesh(v, f, **kwargs):
         events.append("remesh")
@@ -103,6 +105,53 @@ def test_original_remesh_geometry_order_and_original_surface():
     assert events == ["init", "fill", "bvh", "remesh", "init", "simplify"]
 
 
+def test_bvh_self_distance_rejects_stale_traversal_before_remesh():
+    from trellmlx.source_metal_remesh import rebuild_surface
+    vertices, faces, backend, events, _ = geometry_fixture()
+
+    class StaleBVH:
+        def __init__(self, vertices, faces):
+            self.original_vertices = vertices
+            self.original_faces = faces
+
+        def unsigned_distance(self, query):
+            assert len(query) == 3
+            return torch.tensor([0., .003, 0.]), torch.zeros(3, dtype=torch.long), None
+
+    backend.bvh = StaleBVH
+    with pytest.raises(RuntimeError, match="source-surface BVH self-distance"):
+        rebuild_surface(vertices, faces, backend=backend, grid_size=768, target_faces=17)
+    assert "remesh" not in events
+
+    class CurrentBVH(StaleBVH):
+        def unsigned_distance(self, query):
+            return torch.tensor([0., 3.6e-9, 0.]), torch.zeros(3, dtype=torch.long), None
+
+    backend.bvh = CurrentBVH
+    rebuild_surface(vertices, faces, backend=backend, grid_size=768, target_faces=17)
+
+
+def test_bvh_self_distance_ignores_unreferenced_vertices_but_not_partial_results():
+    from trellmlx.source_metal_remesh import verify_bvh_source_surface
+    vertices = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.],
+                             [9., 9., 9.]])
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+
+    class BVH:
+        def unsigned_distance(self, query):
+            assert len(query) == 3
+            return torch.zeros(3), torch.zeros(3, dtype=torch.long), None
+
+    verify_bvh_source_surface(vertices, faces, BVH())
+
+    class PartialBVH(BVH):
+        def unsigned_distance(self, query):
+            return torch.zeros(2), torch.zeros(2, dtype=torch.long), None
+
+    with pytest.raises(RuntimeError, match="incomplete/nonfinite"):
+        verify_bvh_source_surface(vertices, faces, PartialBVH())
+
+
 def texture_backend(blank=False, fail_sample=False):
     v, f, backend, events, filled = geometry_fixture()
     parent = backend.mesh
@@ -128,6 +177,8 @@ def texture_backend(blank=False, fail_sample=False):
             self.original_vertices, self.original_faces = v, f
 
         def unsigned_distance(self, query, **kwargs):
+            if not kwargs:
+                return torch.zeros(len(query)), torch.zeros(len(query), dtype=torch.long), None
             assert kwargs == {"return_uvw": True}
             return torch.zeros(len(query)), torch.zeros(len(query), dtype=torch.long), torch.tensor([[1., 0., 0.]]).expand(len(query), -1)
 

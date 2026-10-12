@@ -65,6 +65,23 @@ def load_backend():
                            declared_metallibs=declared_metallibs)
 
 
+def verify_bvh_source_surface(vertices, faces, bvh):
+    """Reject a BVH that misses vertices actually referenced by its own mesh."""
+    import torch
+
+    referenced = torch.zeros(len(vertices), dtype=torch.bool, device=vertices.device)
+    referenced[faces.reshape(-1).long()] = True
+    distances, _, _ = bvh.unsigned_distance(vertices[referenced])
+    if len(distances) != int(referenced.sum()) or not torch.isfinite(distances).all():
+        raise RuntimeError("source-surface BVH self-distance returned incomplete/nonfinite results")
+    bad = distances > 1e-6
+    if bad.any():
+        raise RuntimeError(
+            "source-surface BVH self-distance failed: "
+            f"{int(bad.sum())}/{len(distances)} referenced vertices exceed 1e-6 "
+            f"(maximum {float(distances.max()):.9g})")
+
+
 def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,
                     band=1., project_back=.9, capture=None, phase=None, verbose=False):
     """Prefill→original BVH→DC/project→direct reduction; no cleanup loop."""
@@ -85,6 +102,8 @@ def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,
         capture("filled_original", {"vertices": original_v, "faces": original_f})
     notify("bvh")
     bvh = backend.bvh(original_v, original_f)
+    notify("bvh_self_distance")
+    verify_bvh_source_surface(original_v, original_f, bvh)
     # AABB is the model's fixed [-.5,.5]^3 domain, not the mesh's bounding box.
     center = vertices.new_zeros(3)
     notify("remesh")

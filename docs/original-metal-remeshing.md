@@ -48,6 +48,20 @@ natural-input command on the same source revision, backend manifest, complete
 small-witness configuration/stages and still-matching output digest. Failed or
 missing composition stops before backend dispatch and leaves a failure report.
 
+The small composition witness alone does not exercise a deep BVH. Immediately
+after building the original-surface BVH, the runner queries every
+face-referenced vertex against that same BVH and refuses reconstruction if
+any unsigned distance exceeds `1e-6`, is nonfinite, or the result is incomplete.
+Unreferenced vertices are excluded because they need not lie on a triangle.
+This is a source-surface correctness check, not a claim that the rebuilt mesh
+is watertight or CUDA-equivalent. It adds an all-referenced-vertex distance
+query before remeshing; cost depends on input size. The check was motivated
+by an installed mtlbvh shader whose 24-entry traversal stack missed more than
+4.6 million referenced vertices on the saved 768 warrior while a current
+64-entry build missed none. Keep the effective backend manifest and this
+natural-input check together; an old manifest can faithfully attest an old,
+broken shader.
+
 Outputs include all six mesh/UV/normal stages, an opaque one-sided PBR GLB,
 and a phase-bearing `report.json`, including on failure. A nonempty existing output
 is preserved and refusal is recorded in a separate sibling failure report.
