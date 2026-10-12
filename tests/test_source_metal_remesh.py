@@ -419,8 +419,14 @@ def test_deep_bvh_preflight_rejects_known_bad_traversal_before_finalizer(tmp_pat
     assert result["status"] == "failed"
     assert result["failure_phase"] == "deep_bvh_preflight"
     assert "source-surface" in result["error"]
+    assert result["deep_bvh_preflight"] == {
+        "fixture": "upstream 500x500 nonplanar grid", "faces": 498002,
+        "sampled_vertices": 2000, "distance_tolerance": 1e-4,
+        "maximum_absolute_distance": pytest.approx(.003),
+        "bad_vertices": 1, "status": "failed", "reason": "positive-distance miss"}
     assert called == ["bvh"]
-    assert (args.output_dir / "report.json").exists()
+    import json
+    assert json.loads((args.output_dir / "report.json").read_text())["deep_bvh_preflight"] == result["deep_bvh_preflight"]
 
 
 @pytest.mark.parametrize("defect", [None, "partial", "nonfinite", "invalid_face"])
@@ -452,7 +458,7 @@ def test_deep_bvh_preflight_fixture_and_false_pass_guards(defect):
         receipt = verify_deep_bvh_traversal(backend)
         assert receipt == {"fixture": "upstream 500x500 nonplanar grid", "faces": 498002,
                            "sampled_vertices": 2000, "maximum_absolute_distance": 0.,
-                           "distance_tolerance": 1e-4, "status": "passed"}
+                           "distance_tolerance": 1e-4, "bad_vertices": 0, "status": "passed"}
 
 
 @pytest.mark.parametrize("defect", [None, "revision", "manifest", "status", "grid", "backend", "partial", "asset"])

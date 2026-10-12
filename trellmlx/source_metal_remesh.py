@@ -82,13 +82,17 @@ def verify_bvh_source_surface(vertices, faces, bvh):
             f"(maximum {float(distances.max()):.9g})")
 
 
-def verify_deep_bvh_traversal(backend):
+def verify_deep_bvh_traversal(backend, receipt=None):
     """Exercise the upstream deep-tree on-surface regression before production.
 
     This catches the known 24-slot shader's positive-distance misses. It is
     deliberately not a certificate for arbitrary BVH queries or mesh quality.
     """
+    receipt = {} if receipt is None else receipt
     n = 500
+    receipt.update(fixture="upstream 500x500 nonplanar grid", faces=498002,
+                   sampled_vertices=2000, distance_tolerance=1e-4,
+                   maximum_absolute_distance=None, bad_vertices=None, status="running")
     xs, ys = np.meshgrid(np.linspace(-1, 1, n).astype(np.float32),
                          np.linspace(-1, 1, n).astype(np.float32), indexing="ij")
     zs = (0.3 * np.sin(4 * xs) * np.cos(4 * ys)).astype(np.float32)
@@ -106,16 +110,18 @@ def verify_deep_bvh_traversal(backend):
     if (len(distances) != len(sample) or len(face_ids) != len(sample)
             or not torch.isfinite(distances).all() or not (face_ids >= 0).all()
             or not (face_ids < len(faces)).all()):
+        receipt.update(status="failed", reason="incomplete/nonfinite/invalid hits")
         raise RuntimeError("deep source-surface BVH preflight returned incomplete/nonfinite/invalid hits")
     bad = distances.abs() > 1e-4
+    receipt.update(maximum_absolute_distance=float(distances.abs().max()),
+                   bad_vertices=int(bad.sum()), status="failed" if bad.any() else "passed")
     if bad.any():
+        receipt["reason"] = "positive-distance miss"
         raise RuntimeError(
             "deep source-surface BVH preflight failed: "
             f"{int(bad.sum())}/{len(sample)} sampled vertices exceed 1e-4 "
             f"(maximum {float(distances.abs().max()):.9g})")
-    return {"fixture": "upstream 500x500 nonplanar grid", "faces": len(faces),
-            "sampled_vertices": len(sample), "maximum_absolute_distance": float(distances.abs().max()),
-            "distance_tolerance": 1e-4, "status": "passed"}
+    return receipt
 
 
 def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,

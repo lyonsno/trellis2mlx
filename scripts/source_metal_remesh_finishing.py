@@ -176,7 +176,8 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
             print(json.dumps(record), flush=True)
 
         set_phase("deep_bvh_preflight")
-        report["deep_bvh_preflight"] = verify_deep_bvh_traversal(backend)
+        report["deep_bvh_preflight"] = {}
+        verify_deep_bvh_traversal(backend, receipt=report["deep_bvh_preflight"])
         report["last_trustworthy_phase"] = "deep_bvh_preflight"
         write_report(report_path, report)
         vertices, faces, attrs, coords = [backend.torch.from_numpy(v) for v in arrays]
