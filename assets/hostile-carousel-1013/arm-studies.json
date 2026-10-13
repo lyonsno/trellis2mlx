@@ -1,0 +1,48 @@
+{
+  "owner": "hostile-stunt-department",
+  "image_route": "built-in image_gen",
+  "source_thread": "01a13718-2be7-7dd0-85bf-480b2138ab15",
+  "assets": [
+    {
+      "name": "arm-curved",
+      "image": "assets/hostile-carousel-1013/arm-curved.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-9d59b03c-55a9-4e76-8c74-d0874a4066eb.png",
+      "prompt": "Use case: stylized-concept. Reference image supplies metalwork and burner design. Generate one standalone articulated burner arm as a complete coherent mechanical object, mounted upright by its root joint on a small plain round maquette dais with a short support post. Two substantial arm segments, a large elbow pivot, visible hydraulic piston, and one unlit burner cup at the tip. Dark cast iron with worn bronze joints, readable solid geometry and clear gaps. Entire single arm and dais visible in three-quarter studio view on light gray background, even lighting. No other arms, carousel body, flame, smoke, labels or interface.\nPose and shape: gracefully curved rising arm, elbow open, cup held upright high above the root. Broad pierced cast segments like the sweeping arms in the reference.",
+      "reference": "carousel-ring.png",
+      "selected_for_reconstruction": true
+    },
+    {
+      "name": "arm-folded",
+      "image": "assets/hostile-carousel-1013/arm-folded.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-89f13801-d1e4-495a-bf4f-0246237e7c48.png",
+      "prompt": "Use case: stylized-concept. Reference image supplies metalwork and burner design. Generate one standalone articulated burner arm as a complete coherent mechanical object, mounted upright by its root joint on a small plain round maquette dais with a short support post. Two substantial arm segments, a large elbow pivot, visible hydraulic piston, and one unlit burner cup at the tip. Dark cast iron with worn bronze joints, readable solid geometry and clear gaps. Entire single arm and dais visible in three-quarter studio view on light gray background, even lighting. No other arms, carousel body, flame, smoke, labels or interface.\nPose and shape: compact folded arm, lower segment rising almost vertically and upper segment extending obliquely outward; substantial industrial boom with two clear pivots and one exposed piston.",
+      "reference": "carousel-ring.png",
+      "selected_for_reconstruction": false
+    },
+    {
+      "name": "arm-twisted",
+      "image": "assets/hostile-carousel-1013/arm-twisted.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-252f78df-9a02-4c7e-ac2a-b8593e4198b6.png",
+      "prompt": "Use case: stylized-concept. Reference image supplies metalwork and burner design. Generate one standalone articulated burner arm as a complete coherent mechanical object, mounted upright by its root joint on a small plain round maquette dais with a short support post. Two substantial arm segments, a large elbow pivot, visible hydraulic piston, and one unlit burner cup at the tip. Dark cast iron with worn bronze joints, readable solid geometry and clear gaps. Entire single arm and dais visible in three-quarter studio view on light gray background, even lighting. No other arms, carousel body, flame, smoke, labels or interface.\nPose and shape: a sculptural arm with broad gently twisted cast segments winding upward and sideways, visible circular elbow hinge and piston; burner cup tilted slightly outward. Keep joints and attachments clear.",
+      "reference": "carousel-ring.png",
+      "selected_for_reconstruction": false
+    },
+    {
+      "name": "arm-boom",
+      "image": "assets/hostile-carousel-1013/arm-boom.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-95598b4f-a8cb-4264-90cf-c11266771d81.png",
+      "prompt": "Use case: stylized-concept. One standalone articulated burner arm displayed on a small plain round maquette dais. A stout straight lower link stands vertically, a large circular elbow joins a straight upper link extending nearly horizontally, and a bronze burner cup sits upright at its end. A visible diagonal hydraulic ram connects the two links. Clear angular L-shaped silhouette, substantial machine geometry, dark cast iron and worn bronze; readable separated links and joints. Whole single object, three-quarter studio view, light gray background, even lighting. Unlit; no fire, smoke, other arms or text.",
+      "reference": null,
+      "selected_for_reconstruction": true
+    },
+    {
+      "name": "arm-winding",
+      "image": "assets/hostile-carousel-1013/arm-winding.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-3d6e96a5-0843-4cbb-bdbb-8787c0d7ec39.png",
+      "prompt": "Use case: stylized-concept. One standalone sculptural mechanical burner arm displayed upright on a small plain round maquette dais. Two thick broad cast-metal links twist obliquely through space like offset spiral stair segments, joined at a large exposed circular elbow pivot. A chunky hydraulic ram braces the joint. The rising arm winds sideways then back toward its root, ending in a slightly outward tilted bronze burner cup. Strong twisting silhouette with visible depth, dark cast iron, worn bronze bearings, coherent solid mechanical object. Full single object in three-quarter studio view, light gray background and even lighting. Unlit; no flame, smoke, other arms or text.",
+      "reference": null,
+      "selected_for_reconstruction": true
+    }
+  ],
+  "inspection": "First three strongly preserve the reference arm architecture; subsequent unconditioned angular boom and winding arm provide distinct shapes. Curved, boom and winding selected for rough reconstruction. Dais is a mounting aid, not verified separate geometry."
+}
