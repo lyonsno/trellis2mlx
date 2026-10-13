@@ -71,6 +71,7 @@ from trellmlx.sparse_flow_attention import (
     DEFAULT_BACKEND as DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND,
     SUPPORTED_BACKENDS as SPARSE_FLOW_ATTENTION_BACKENDS,
     configure_sparse_flow_attention_backend,
+    get_sparse_flow_attention_backend,
     sparse_flow_attention_backend_identity,
 )
 from trellmlx.sparse_flow_rope import (
@@ -291,7 +292,12 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
         "shape_flow_attention_backend_effective": backend_effective,
         "shape_flow_fast_attention_query_chunk_size_effective": (
             get_fast_attention_query_chunk_size()
-            if backend_effective == "fast" else 0
+            if (
+                backend_effective == "fast"
+                and get_sparse_flow_attention_backend()
+                == DEFAULT_SPARSE_FLOW_ATTENTION_BACKEND
+            )
+            else 0
         ),
         "shape_flow_attention_softmax_backend_requested": softmax_requested,
         "shape_flow_attention_softmax_backend_effective": softmax_effective,
@@ -1646,6 +1652,8 @@ def main():
 
 def _generate(args, parser, pause_control):
     from trellmlx.greenroom_pause import pause_boundary
+    # Only this process's HR sampler may activate the HR-only diagnostic.
+    os.environ.pop("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE", None)
     if args.no_hole_fill and args.reference_cleanup:
         parser.error("--no-hole-fill changes --reference-cleanup; use the local cleanup route")
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
@@ -3554,6 +3562,7 @@ def _generate(args, parser, pause_control):
 
     from trellmlx.models.shape_slat_decoder import SLatDecoder
 
+    hr_shape_attention_route = None
     if args.no_cascade:
         # No-cascade mode: use LR SLat directly for decoding.
         # Skips upsample + HR SLat pass. Much faster but lower quality.
@@ -3611,13 +3620,23 @@ def _generate(args, parser, pause_control):
         hr_noise = mx.random.normal((num_tokens, 32))
 
         t0 = time.perf_counter()
-        hr_slat = flow_euler_sample(
-            hr_slat_flow, hr_noise, cond_tgt_hr if vs3d_mode else cond_hr, neg_cond_hr,
-            verbose=False,
-            coords=mx.array(hr_coords_3d),
-            **SHAPE_SAMPLER,
-        )
-        mx.eval(hr_slat)
+        os.environ["TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE"] = "1"
+        try:
+            hr_shape_attention_route = _shape_flow_attention_route_from_env()
+            print(
+                "  HR fast-attention query chunk: "
+                f"{hr_shape_attention_route['shape_flow_fast_attention_query_chunk_size_effective']}",
+                flush=True,
+            )
+            hr_slat = flow_euler_sample(
+                hr_slat_flow, hr_noise, cond_tgt_hr if vs3d_mode else cond_hr, neg_cond_hr,
+                verbose=False,
+                coords=mx.array(hr_coords_3d),
+                **SHAPE_SAMPLER,
+            )
+            mx.eval(hr_slat)
+        finally:
+            os.environ.pop("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE", None)
         print(f"  Sampled: {time.perf_counter()-t0:.1f}s ({num_tokens:,} tokens)", flush=True)
 
         hr_slat = _denormalize_slat(hr_slat)
@@ -3646,6 +3665,9 @@ def _generate(args, parser, pause_control):
             cascade=not args.no_cascade,
             shape_flow_attention_route_json=np.array(
                 json.dumps(shape_flow_attention_route or {}, sort_keys=True)
+            ),
+            hr_shape_attention_route_json=np.array(
+                json.dumps(hr_shape_attention_route or {}, sort_keys=True)
             ),
             texture_attention_route_json=np.array(
                 json.dumps(texture_attention_route or {}, sort_keys=True)
@@ -3957,6 +3979,11 @@ def _generate(args, parser, pause_control):
                     "shape_flow_attention_route_json": np.asarray(
                         json.dumps(
                             shape_flow_attention_route or {}, sort_keys=True
+                        )
+                    ),
+                    "hr_shape_attention_route_json": np.asarray(
+                        json.dumps(
+                            hr_shape_attention_route or {}, sort_keys=True
                         )
                     ),
                     "sparse_flow_layernorm_backend": np.asarray(

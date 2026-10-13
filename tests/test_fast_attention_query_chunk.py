@@ -85,3 +85,44 @@ def test_shape_flow_route_records_effective_query_chunk(monkeypatch):
     route = _shape_flow_attention_route_from_env()
 
     assert route["shape_flow_fast_attention_query_chunk_size_effective"] == 2048
+
+
+def test_shape_flow_route_does_not_certify_chunk_for_sparse_override(monkeypatch):
+    from generate import _shape_flow_attention_route_from_env
+    from trellmlx.sparse_flow_attention import configure_sparse_flow_attention_backend
+
+    monkeypatch.setenv("TRELLIS2MLX_ATTENTION_BACKEND", "fast")
+    monkeypatch.setenv("TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE", "2048")
+    configure_sparse_flow_attention_backend("source-cuda-math-turing-t4")
+    try:
+        route = _shape_flow_attention_route_from_env()
+        assert route["shape_flow_fast_attention_query_chunk_size_effective"] == 0
+    finally:
+        configure_sparse_flow_attention_backend("inherit")
+
+
+def test_hr_shape_query_chunk_override_only_when_hr_active(monkeypatch):
+    q = mx.zeros((1, 1, 11, 16), dtype=mx.float32)
+    original = mx.fast.scaled_dot_product_attention
+    dispatches = []
+
+    def record_dispatch(query, keys, values, *, scale, mask=None):
+        dispatches.append(query.shape[-2])
+        return original(query, keys, values, scale=scale, mask=mask)
+
+    monkeypatch.setenv("TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE", "0")
+    monkeypatch.setenv("TRELLIS2MLX_HR_SHAPE_FAST_ATTENTION_QUERY_CHUNK_SIZE", "4")
+    monkeypatch.setattr(attention.mx.fast, "scaled_dot_product_attention", record_dispatch)
+
+    monkeypatch.delenv("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE", raising=False)
+    attention.scaled_dot_product_attention_for_backend(
+        q, q, q, backend="fast", softmax_backend="mlx-softmax", value_backend="mlx-matmul"
+    )
+    assert dispatches == [11]
+
+    dispatches.clear()
+    monkeypatch.setenv("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE", "1")
+    attention.scaled_dot_product_attention_for_backend(
+        q, q, q, backend="fast", softmax_backend="mlx-softmax", value_backend="mlx-matmul"
+    )
+    assert dispatches == [4, 4, 3]

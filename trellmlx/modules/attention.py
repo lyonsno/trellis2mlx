@@ -29,16 +29,22 @@ _source_cuda_warp_softmax_kernel = None
 
 
 def get_fast_attention_query_chunk_size() -> int:
-    setting = os.environ.get("TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE", "0")
+    setting_key = "TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE"
+    if (
+        os.environ.get("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE") == "1"
+        and "TRELLIS2MLX_HR_SHAPE_FAST_ATTENTION_QUERY_CHUNK_SIZE" in os.environ
+    ):
+        setting_key = "TRELLIS2MLX_HR_SHAPE_FAST_ATTENTION_QUERY_CHUNK_SIZE"
+    setting = os.environ.get(setting_key, "0")
     try:
         size = int(setting)
     except ValueError as exc:
         raise ValueError(
-            "TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE must be a nonnegative integer"
+            f"{setting_key} must be a nonnegative integer"
         ) from exc
     if size < 0:
         raise ValueError(
-            "TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE must be a nonnegative integer"
+            f"{setting_key} must be a nonnegative integer"
         )
     return size
 
