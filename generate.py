@@ -3295,6 +3295,7 @@ def main():
             trace_block_index=np.array(shape_trace_block_index, dtype=np.int32),
             trace_block_indices=np.asarray(shape_trace_block_indices, dtype=np.int32),
             shape_flow_trace_step_index=np.array(shape_trace_step_index, dtype=np.int32),
+            lr_shape_sync_every_block=np.array(lr_shape_sync_every_block_effective),
             shape_flow_trace_requested_keys=np.array(requested_trace_keys, dtype=str),
             shape_flow_trace_selected_keys=np.array(effective_trace_keys, dtype=str),
             shape_flow_trace_sample_identity_json=np.array(
