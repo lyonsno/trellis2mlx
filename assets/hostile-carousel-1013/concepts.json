@@ -1,0 +1,23 @@
+{
+  "owner": "hostile-stunt-department",
+  "source_thread": "01a13718-2be7-7dd0-85bf-480b2138ab15",
+  "image_route": "built-in image_gen",
+  "purpose": "Rough reconstruction of three flame carousel organ concepts; authored joints, pistons and emitter motion will be built with proxies.",
+  "assets": [
+    {
+      "name": "carousel-drum",
+      "image": "assets/hostile-carousel-1013/carousel-drum.png",
+      "prompt": "Use case: stylized-concept. A flame carousel organ: a sculptural mechanical apparatus with a rotating hub, three articulated burner arms, visible pistons and substantial swiveling joints. Each arm ends in an unlit burner cup. Rich cast metal and machined surfaces, broad readable forms and distinct moving segments. Isolated complete object, three-quarter view on plain light gray studio background; even lighting, all extremities inside frame. This is a source image for rough 3D reconstruction: show the solid machinery clearly, with empty space between arms. No flame, smoke, text or interface.\nLayout: a heavy squat central drum on a round plinth, three stout two-segment arms reaching upward and outward at different heights. A curious industrial instrument, ceremonious and slightly absurd; iron body, warm worn bronze joints."
+    },
+    {
+      "name": "carousel-tower",
+      "image": "assets/hostile-carousel-1013/carousel-tower.png",
+      "prompt": "Use case: stylized-concept. A flame carousel organ: a sculptural mechanical apparatus with a rotating hub, three articulated burner arms, visible pistons and substantial swiveling joints. Each arm ends in an unlit burner cup. Rich cast metal and machined surfaces, broad readable forms and distinct moving segments. Isolated complete object, three-quarter view on plain light gray studio background; even lighting, all extremities inside frame. This is a source image for rough 3D reconstruction: show the solid machinery clearly, with empty space between arms. No flame, smoke, text or interface.\nLayout: a tall narrow central column with three articulated arms at staggered heights wrapping obliquely around it, like a helical mechanical flower. Each arm has a visible thick piston; dark steel, pale ceramic burner cups, restrained sculptural proportions."
+    },
+    {
+      "name": "carousel-ring",
+      "image": "assets/hostile-carousel-1013/carousel-ring.png",
+      "prompt": "Use case: stylized-concept. A flame carousel organ: a sculptural mechanical apparatus with a rotating hub, three articulated burner arms, visible pistons and substantial swiveling joints. Each arm ends in an unlit burner cup. Rich cast metal and machined surfaces, broad readable forms and distinct moving segments. Isolated complete object, three-quarter view on plain light gray studio background; even lighting, all extremities inside frame. This is a source image for rough 3D reconstruction: show the solid machinery clearly, with empty space between arms. No flame, smoke, text or interface.\nLayout: a low broad rotating annular base, three inward-curving articulated arms arching toward a shared empty center at unequal heights. A monumental tabletop kinetic sculpture with chunky hydraulic pistons, dark cast iron and burnished metal. Strong open silhouette."
+    }
+  ]
+}
