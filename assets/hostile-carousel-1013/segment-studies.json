@@ -1,0 +1,30 @@
+{
+  "owner": "hostile-stunt-department",
+  "image_route": "built-in image_gen",
+  "source_thread": "01a13718-2be7-7dd0-85bf-480b2138ab15",
+  "assets": [
+    {
+      "name": "segment-lower",
+      "image": "assets/hostile-carousel-1013/segment-lower.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-dd5d1f14-7b37-4e83-863f-1105b4ec6ff2.png",
+      "prompt": "Use case: stylized-concept. Use the reference arm for design and metalwork. Show ONLY its LOWER cast-metal arm link as one disassembled solid component: a thick curved pierced link with a large round root bearing at one end, a round elbow bearing at the other, and a substantial side lug for a piston attachment. Dark cast iron and worn bronze bearing collars. Stand this single link upright on a small plain round maquette dais, supported at the root bearing by a short simple post. Complete isolated component, three-quarter studio view, light gray background, even lighting. Upper link, burner, pistons and the rest of the machine absent. No text.",
+      "reference": "arm-curved.png"
+    },
+    {
+      "name": "segment-upper",
+      "image": "assets/hostile-carousel-1013/segment-upper.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-6503ec03-5a3d-40f5-82e4-b61d3745878f.png",
+      "prompt": "Use case: stylized-concept. Use the reference arm for design and metalwork. Show ONLY its UPPER cast-metal arm link as one disassembled solid component: an elongated gently curved pierced link, a large circular elbow bearing at its lower end, a smaller round burner-wrist bearing at the tip, and a solid piston attachment lug on its side. Dark cast iron and worn bronze collars. Stand the component diagonally upward on a small plain round maquette dais with a short support post attached to the elbow bearing. Complete isolated component, three-quarter studio view, light gray background, even lighting. Lower link, burner cup, pistons and carousel absent. No text.",
+      "reference": "arm-curved.png"
+    },
+    {
+      "name": "segment-burner",
+      "image": "assets/hostile-carousel-1013/segment-burner.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-194d06a4-9d17-46ab-be31-27cf1f52a79d.png",
+      "prompt": "Use case: stylized-concept. Use the reference arm for design and metalwork. Show ONLY its burner head as one standalone solid module: a broad shallow bronze brazier cup with a perforated rim, thick iron underside, and short cylindrical mounting neck ending in a clear collar. Display upright on a small plain round maquette dais with a short support pin under the neck. Complete isolated component, three-quarter studio view slightly from above so the cup interior is visible, light gray background, even lighting. All arms and pistons absent. Unlit; no flame, smoke or text.",
+      "reference": "arm-curved.png"
+    }
+  ],
+  "purpose": "Standalone lower arm link, upper arm link and burner module staged on maquette daises for rough reconstruction and authored assembly.",
+  "assembly_authority": "Images describe parts and attachment features; fitted pivots and linkage validity are authored later."
+}
