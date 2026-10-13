@@ -28,6 +28,21 @@ _source_cuda_register_softmax_4096_kernel = None
 _source_cuda_warp_softmax_kernel = None
 
 
+def get_fast_attention_query_chunk_size() -> int:
+    setting = os.environ.get("TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE", "0")
+    try:
+        size = int(setting)
+    except ValueError as exc:
+        raise ValueError(
+            "TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE must be a nonnegative integer"
+        ) from exc
+    if size < 0:
+        raise ValueError(
+            "TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE must be a nonnegative integer"
+        )
+    return size
+
+
 def get_qk_norm_backend() -> str:
     backend = os.environ.get(
         "TRELLIS2MLX_QK_NORM_BACKEND", LIBRARY_DEFAULT_QK_NORM_BACKEND
@@ -563,7 +578,27 @@ def scaled_dot_product_attention_for_backend(
     softmax_backend = softmax_backend.lower()
     value_backend = value_backend.lower()
     if backend in {"fast", "mlx-fast"}:
-        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        query_chunk_size = get_fast_attention_query_chunk_size()
+        if query_chunk_size == 0 or q.shape[-2] <= query_chunk_size:
+            return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+        outputs = []
+        for start in range(0, q.shape[-2], query_chunk_size):
+            stop = min(start + query_chunk_size, q.shape[-2])
+            if mask is None or mask.shape[-2] == 1:
+                query_mask = mask
+            elif mask.shape[-2] == q.shape[-2]:
+                query_mask = mask[..., start:stop, :]
+            else:
+                raise ValueError("fast attention mask query axis must be 1 or match q")
+            output = mx.fast.scaled_dot_product_attention(
+                q[..., start:stop, :], k, v, scale=scale, mask=query_mask
+            )
+            # Keep each Metal dispatch bounded rather than compiling a large
+            # lazy graph containing every query tile at once.
+            mx.eval(output)
+            outputs.append(output)
+        return mx.concatenate(outputs, axis=-2)
     if backend in {"manual", "mlx-manual"}:
         return _manual_scaled_dot_product_attention(
             q,

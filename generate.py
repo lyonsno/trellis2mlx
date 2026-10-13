@@ -39,6 +39,7 @@ from trellmlx.decoder_turing_silu import (
 from trellmlx.modules.attention import (
     DEFAULT_QK_NORM_BACKEND,
     SUPPORTED_QK_NORM_BACKENDS,
+    get_fast_attention_query_chunk_size,
     get_qk_norm_backend,
 )
 from trellmlx.modules.rope import (
@@ -288,6 +289,10 @@ def _shape_flow_attention_route_from_env() -> dict[str, str]:
     return {
         "shape_flow_attention_backend_requested": backend_requested,
         "shape_flow_attention_backend_effective": backend_effective,
+        "shape_flow_fast_attention_query_chunk_size_effective": (
+            get_fast_attention_query_chunk_size()
+            if backend_effective == "fast" else 0
+        ),
         "shape_flow_attention_softmax_backend_requested": softmax_requested,
         "shape_flow_attention_softmax_backend_effective": softmax_effective,
         "shape_flow_attention_value_backend_requested": value_requested,
