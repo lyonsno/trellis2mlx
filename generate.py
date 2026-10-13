@@ -2970,7 +2970,10 @@ def main():
         print("  Stop after stage: sparse_internals", flush=True)
         return
 
-    cleanup_model(ss_flow, ss_dec)
+    # cleanup_model() cannot unbind references held by this frame. Release
+    # Stage 1 weights before loading the LR shape model into the same process.
+    del ss_flow, ss_dec
+    cleanup()
 
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
