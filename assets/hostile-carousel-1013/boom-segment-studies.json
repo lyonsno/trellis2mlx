@@ -1,0 +1,23 @@
+{
+  "owner": "hostile-stunt-department",
+  "source_thread": "01a13718-2be7-7dd0-85bf-480b2138ab15",
+  "route": "built-in image_gen",
+  "assets": [
+    {
+      "name": "boom-lower-link",
+      "image": "assets/hostile-carousel-1013/boom-lower-link.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-ec0e0c1a-a9d6-4688-92f8-d9d1c40980cf.png",
+      "prompt": "Use case: stylized-concept. Reference supplies the angular boom's cast iron and bronze design. Produce ONLY its disassembled LOWER UPRIGHT LINK as a standalone rigid component: a broad stout straight rectangular iron casting, large bronze-lined circular root bearing at the bottom, large bronze-lined circular elbow bearing at the top, and a smaller piston mounting lug on the side. No articulated elbow attached: this entire piece is one rigid link. Stand on a small plain maquette dais with a short simple support. Complete isolated part in three-quarter studio view, light gray background, even lighting. Upper link, piston and burner absent. No text.",
+      "reference": "arm-boom.png"
+    },
+    {
+      "name": "boom-upper-link",
+      "image": "assets/hostile-carousel-1013/boom-upper-link.png",
+      "source": "/Users/noahlyons/.codex/generated_images/01a13718-2be7-7dd0-85bf-480b2138ab15/exec-d5e87473-6310-4984-bdee-7c2b27123201.png",
+      "prompt": "Use case: stylized-concept. Reference supplies the angular boom's cast iron and bronze design. Produce ONLY its disassembled UPPER HORIZONTAL LINK as a standalone rigid component: a broad stout straight elongated iron beam with a large bronze-lined circular elbow eye at one end, smaller burner-wrist eye at the other, and a substantial piston mounting lug beneath its middle. This whole object is one rigid beam. Display obliquely upward on a small plain maquette dais and simple short support, showing both ends clearly. Complete isolated part in three-quarter studio view, light gray background, even lighting. Lower upright, piston and burner absent. No text.",
+      "reference": "arm-boom.png"
+    }
+  ],
+  "inspection": "Each output isolates one stout straight rigid link with two bearing eyes and one piston attachment. Lower stands upright in a small support cradle; upper rests on a thin post attached near its side lug. These are source images, not reconstructed or fitted assembly parts.",
+  "reconstruction": "Not submitted: keep subsequent 768 cascade generations sparse and select useful source images first."
+}
