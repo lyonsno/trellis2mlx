@@ -1411,6 +1411,10 @@ def main():
         ),
     )
     parser.add_argument(
+        "--lr-shape-sync-every-block", action="store_true",
+        help="Experimental: evaluate after each LR shape transformer block instead of every six.",
+    )
+    parser.add_argument(
         "--shape-flow-attention-softmax-backend",
         choices=["mlx-softmax", "source-cuda-turing"],
         help=(
@@ -1668,6 +1672,8 @@ def main():
         )
     if (args.shape_flow_block_injection_trace or args.shape_flow_block_injection_manifest) and args.compile:
         parser.error("--compile is not supported with shape-flow block injection")
+    if args.lr_shape_sync_every_block and args.compile:
+        parser.error("--compile is not supported with --lr-shape-sync-every-block")
     trace_sample_args = (
         args.shape_flow_trace_sample,
         args.expected_shape_flow_trace_sample_sha256,
@@ -3010,7 +3016,14 @@ def main():
     TEX_SAMPLER = dict(steps=n_steps, guidance_strength=1.0, guidance_rescale=0.0,
                        guidance_interval=(0.6, 0.9), rescale_t=3.0)
 
-    lr_slat_flow = SLatFlowModel.for_shape()
+    lr_slat_flow = SLatFlowModel.for_shape(
+        lr_sync_every_block=args.lr_shape_sync_every_block
+    )
+    lr_shape_sync_every_block_effective = lr_slat_flow.lr_sync_every_block
+    print(
+        f"  LR shape block sync: every {'1' if lr_slat_flow.lr_sync_every_block else '6'} blocks",
+        flush=True,
+    )
     load_weights(lr_slat_flow, HF_4B + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", verbose=False)
     if args.quantize:
         quantize_model(lr_slat_flow, bits=args.quantize)
@@ -3579,6 +3592,7 @@ def main():
             shape_flow_attention_route_json=np.array(
                 json.dumps(shape_flow_attention_route or {}, sort_keys=True)
             ),
+            lr_shape_sync_every_block=np.array(lr_shape_sync_every_block_effective),
             texture_attention_route_json=np.array(
                 json.dumps(texture_attention_route or {}, sort_keys=True)
             ),

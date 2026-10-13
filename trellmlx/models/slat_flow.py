@@ -307,6 +307,7 @@ class SLatFlowModel(nn.Module):
         mlp_hidden: int = 8192,
         context_channels: int = 1024,
         shape_flow_layernorm: bool = False,
+        lr_sync_every_block: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -315,6 +316,9 @@ class SLatFlowModel(nn.Module):
         self.num_heads = num_heads
         self.head_dim = model_channels // num_heads
         self.shape_flow_layernorm = shape_flow_layernorm
+        if lr_sync_every_block and not shape_flow_layernorm:
+            raise ValueError("per-block LR sync is only valid for shape flow")
+        self.lr_sync_every_block = lr_sync_every_block
 
         # Timestep embedder
         self.t_embedder = TimestepEmbedder(model_channels)
@@ -445,7 +449,7 @@ class SLatFlowModel(nn.Module):
                         rope_phases=rope_phases,
                         cross_kv_cache=block_kv,
                     )
-                if (i + 1) % 6 == 0:
+                if self.lr_sync_every_block or (i + 1) % 6 == 0:
                     mx.eval(x)
 
         _, x = self._final_projection(x, input_dtype)
@@ -719,6 +723,8 @@ class SLatFlowModel(nn.Module):
 
     def compile(self):
         """Enable mx.compile for the transformer block loop."""
+        if self.lr_sync_every_block:
+            raise ValueError("per-block LR sync is incompatible with compiled blocks")
         self._compiled = True
         self._run_blocks = mx.compile(self._run_blocks_impl)
 
