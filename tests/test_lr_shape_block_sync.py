@@ -42,3 +42,11 @@ def test_shape_flow_per_block_sync_is_opt_in(monkeypatch):
     assert [item for item in observed if item == ((2, 24),)] == [((2, 24),)] * 3
     with pytest.raises(ValueError, match="incompatible with compiled blocks"):
         per_block_model.compile()
+
+    observed.clear()
+    per_block_model.trace_block(*inputs, block_index=2)
+    assert [item for item in observed if item == ((2, 24),)] == [((2, 24),)] * 2
+
+    observed.clear()
+    per_block_model.trace_block_boundaries(*inputs, block_indices=(2,))
+    assert [item for item in observed if item == ((2, 24),)] == [((2, 24),)] * 3

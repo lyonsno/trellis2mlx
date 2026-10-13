@@ -625,7 +625,7 @@ class SLatFlowModel(nn.Module):
                     rope_phases=rope_phases,
                     cross_kv_cache=block_kv,
                 )
-            if (i + 1) % 6 == 0:
+            if self.lr_sync_every_block or (i + 1) % 6 == 0:
                 mx.eval(x)
         mx.eval(*trace.values())
         return trace
@@ -710,7 +710,7 @@ class SLatFlowModel(nn.Module):
                 )
             if i in selected_set:
                 trace[f"block{i}_after_mlp"] = x
-            if (i + 1) % 6 == 0:
+            if self.lr_sync_every_block or (i + 1) % 6 == 0:
                 mx.eval(x)
 
         trace["final_input"] = x
