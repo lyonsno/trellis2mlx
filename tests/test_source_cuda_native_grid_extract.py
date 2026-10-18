@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 import json
+import hashlib
+from pathlib import Path
 
 from scripts.source_cuda_native_grid_extract import (
     NativeRouteError,
@@ -119,3 +121,36 @@ def test_single_file_kaggle_entrypoint_runs_without_sibling_script(tmp_path, mon
     assert receipt["status"] == "done"
     assert calls[0][calls[0].index("--input-npz") + 1] == str(mounted / "cuda_decoder_state.npz")
     assert calls[0][calls[0].index("--expected-sha256") + 1] == assay.EXPECTED_DECODER_SHA256
+    work_dir = Path(calls[0][calls[0].index("--work-dir") + 1])
+    assert not work_dir.is_relative_to(output), "temporary source checkout must not become Kaggle output"
+
+
+def test_native_bootstrap_installs_required_import_before_child(tmp_path, monkeypatch):
+    from scripts import source_cuda_native_grid_extract as assay
+
+    decoder = tmp_path / "decoder.npz"
+    decoder.write_bytes(b"saved decoder fixture")
+    source_root = tmp_path / "work" / "TRELLIS.2" / "o-voxel"
+    source_root.mkdir(parents=True)
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[:3] == ["git", "rev-parse", "HEAD"]:
+            return assay.TRELLIS_COMMIT
+        if command[:3] == ["git", "status", "--porcelain"]:
+            return ""
+        if command[:4] == [assay.sys.executable, "-m", "pip", "install"]:
+            raise RuntimeError("stop before build")
+        return ""
+
+    monkeypatch.setattr(assay, "_run", fake_run)
+    assert assay.main([
+        "--input-npz", str(decoder),
+        "--expected-sha256", hashlib.sha256(decoder.read_bytes()).hexdigest(),
+        "--output-npz", str(tmp_path / "mesh.npz"),
+        "--report", str(tmp_path / "report.json"),
+        "--work-dir", str(tmp_path / "work"),
+    ]) == 1
+    pip_commands = [command for command in commands if command[:4] == [assay.sys.executable, "-m", "pip", "install"]]
+    assert pip_commands and "trimesh" in pip_commands[0]

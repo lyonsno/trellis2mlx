@@ -154,7 +154,7 @@ def _parent(args: argparse.Namespace) -> int:
         report["source_clean_before_build"] = not bool(_run(["git", "status", "--porcelain"], cwd=args.source_root))
         if report["source_head"] != TRELLIS_COMMIT or not report["source_clean_before_build"]:
             raise NativeRouteError("pinned source checkout is missing or dirty before build")
-        _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "ninja"])
+        _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "ninja", "trimesh"])
         _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", "-e", str(args.source_root / "o-voxel")])
         report["phase"] = "native_child"
         write_report(args.report, report)
@@ -228,7 +228,7 @@ def kaggle_main(*, mount: Path = Path("/kaggle/input"), out: Path = Path("/kaggl
             "--input-npz", str(decoder), "--expected-sha256", EXPECTED_DECODER_SHA256,
             "--output-npz", str(out / "native_grid_mesh.npz"),
             "--report", str(report_path),
-            "--work-dir", str(out / "native-grid-work"),
+            "--work-dir", str(out.parent / "temp" / "native-grid-work"),
             "--child-report", str(out / "native_grid_child.json"),
             "--child-stdout", str(out / "native_grid_child.stdout.log"),
             "--child-stderr", str(out / "native_grid_child.stderr.log"),
