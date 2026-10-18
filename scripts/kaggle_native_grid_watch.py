@@ -32,18 +32,19 @@ def write_report(path: Path, report: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--kernel-id", default=KERNEL_ID)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     args = parser.parse_args()
     report = {"schema": "trellis2mlx.kaggle_native_grid_watch.v1", "status": "running",
-              "phase": "status", "kernel_id": KERNEL_ID, "output_dir": str(args.output_dir)}
+              "phase": "status", "kernel_id": args.kernel_id, "output_dir": str(args.output_dir)}
     write_report(args.report, report)
     try:
         if args.poll_seconds <= 0:
             raise ValueError("poll interval must be positive")
         while True:
-            observed = subprocess.run(["kaggle", "kernels", "status", KERNEL_ID],
+            observed = subprocess.run(["kaggle", "kernels", "status", args.kernel_id],
                                       capture_output=True, text=True, check=False)
             if observed.returncode:
                 raise RuntimeError(f"Kaggle status exited {observed.returncode}: {observed.stderr}")
@@ -56,7 +57,7 @@ def main() -> int:
         report["phase"] = "download"
         write_report(args.report, report)
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        download = subprocess.run(["kaggle", "kernels", "output", KERNEL_ID, "--path", str(args.output_dir), "--force"],
+        download = subprocess.run(["kaggle", "kernels", "output", args.kernel_id, "--path", str(args.output_dir), "--force"],
                                   capture_output=True, text=True, check=False)
         report.update(download_returncode=download.returncode, download_stdout=download.stdout,
                       download_stderr=download.stderr)

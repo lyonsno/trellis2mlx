@@ -48,13 +48,10 @@ def test_missing_input_preserves_failure_report_before_mesh(tmp_path):
 
 
 def test_kaggle_mount_miss_cannot_look_like_success(tmp_path, monkeypatch):
-    from scripts import run_kaggle_native_grid_extract as kernel
+    from scripts import source_cuda_native_grid_extract as assay
 
-    monkeypatch.setattr(kernel, "MOUNT", tmp_path / "empty-input")
-    monkeypatch.setattr(kernel, "OUT", tmp_path)
-    monkeypatch.setattr(kernel, "RECEIPT", tmp_path / "receipt.json")
-    assert kernel.main() == 0  # kernel publishes diagnostics even on failure
-    saved = json.loads(kernel.RECEIPT.read_text())
+    assert assay.kaggle_main(mount=tmp_path / "empty-input", out=tmp_path) == 0
+    saved = json.loads((tmp_path / "native_grid_kernel_receipt.json").read_text())
     assert saved["status"] == "failed"
     assert saved["failure_phase"] == "mount_preflight"
     assert "expected one mounted" in saved["error"]
@@ -80,7 +77,8 @@ def test_native_grid_watch_rejects_unknown_status_and_blank_terminal_output(tmp_
     with pytest.raises(ValueError, match="unrecognized"):
         watch.status_from_text('kernel is maybe done')
 
-    monkeypatch.setattr(sys, "argv", ["watch", "--output-dir", str(tmp_path / "output"),
+    monkeypatch.setattr(sys, "argv", ["watch", "--kernel-id", watch.KERNEL_ID + "/2",
+                                      "--output-dir", str(tmp_path / "output"),
                                       "--report", str(tmp_path / "watch.json")])
     calls = []
 
@@ -97,3 +95,27 @@ def test_native_grid_watch_rejects_unknown_status_and_blank_terminal_output(tmp_
     assert saved["failure_phase"] == "download"
     assert "without its durable receipt" in saved["error"]
     assert [call[2] for call in calls] == ["status", "output"]
+    assert all(call[3] == watch.KERNEL_ID + "/2" for call in calls)
+
+
+def test_single_file_kaggle_entrypoint_runs_without_sibling_script(tmp_path, monkeypatch):
+    from scripts import source_cuda_native_grid_extract as assay
+
+    mounted = tmp_path / "input" / "notebooks" / "noahboo" / "t2mlx-kiln-1024-exact-slat-cuda-decode"
+    mounted.mkdir(parents=True)
+    (mounted / "cuda_decoder_state.npz").write_bytes(b"saved decoder fixture")
+    output = tmp_path / "working"
+    output.mkdir()
+    calls = []
+
+    def fake_parent(argv):
+        calls.append(argv)
+        (output / "native_grid_report.json").write_text(json.dumps({"status": "done"}))
+        return 0
+
+    monkeypatch.setattr(assay, "main", fake_parent)
+    assert assay.kaggle_main(mount=tmp_path / "input", out=output) == 0
+    receipt = json.loads((output / "native_grid_kernel_receipt.json").read_text())
+    assert receipt["status"] == "done"
+    assert calls[0][calls[0].index("--input-npz") + 1] == str(mounted / "cuda_decoder_state.npz")
+    assert calls[0][calls[0].index("--expected-sha256") + 1] == assay.EXPECTED_DECODER_SHA256

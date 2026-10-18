@@ -23,6 +23,8 @@ import numpy as np
 TRELLIS_REPOSITORY = "https://github.com/microsoft/TRELLIS.2.git"
 TRELLIS_COMMIT = "5565d240c4a494caaf9ece7a554542b76ffa36d3"
 SCHEMA = "trellis2mlx.source_cuda_native_grid_extract.v1"
+EXPECTED_DECODER_SHA256 = "ddd8cfd389c73e30e254df3066b09d9043bc06929e1df901f9ee61e69940cad5"
+EXPECTED_KERNEL_SLUG = "t2mlx-kiln-1024-exact-slat-cuda-decode"
 
 
 class NativeRouteError(RuntimeError):
@@ -201,5 +203,50 @@ def main(argv: list[str] | None = None) -> int:
     return _native_child(args) if args.child else _parent(args)
 
 
+def kaggle_main(*, mount: Path = Path("/kaggle/input"), out: Path = Path("/kaggle/working")) -> int:
+    """Single-file Kaggle entrypoint; preserve a receipt even before native setup."""
+    out.mkdir(parents=True, exist_ok=True)
+    receipt_path = out / "native_grid_kernel_receipt.json"
+    report_path = out / "native_grid_report.json"
+    receipt = {
+        "schema": "trellis2mlx.kaggle_native_grid_extract_receipt.v2",
+        "status": "failed", "failure_phase": "mount_preflight",
+        "requested_route": "pinned-official-o-voxel-native-CUDA-on-saved-source-decoder-field",
+        "expected_input_sha256": EXPECTED_DECODER_SHA256,
+        "expected_kernel_slug": EXPECTED_KERNEL_SLUG,
+        "native_report": str(report_path),
+    }
+    write_report(receipt_path, receipt)
+    try:
+        candidates = sorted(mount.rglob("cuda_decoder_state.npz"))
+        if len(candidates) != 1 or EXPECTED_KERNEL_SLUG not in candidates[0].parts:
+            raise ValueError(f"expected one mounted prior-kernel decoder state under {EXPECTED_KERNEL_SLUG}, found {candidates}")
+        decoder = candidates[0]
+        receipt.update(mounted_input=str(decoder), failure_phase="native_assay")
+        write_report(receipt_path, receipt)
+        result = main([
+            "--input-npz", str(decoder), "--expected-sha256", EXPECTED_DECODER_SHA256,
+            "--output-npz", str(out / "native_grid_mesh.npz"),
+            "--report", str(report_path),
+            "--work-dir", str(out / "native-grid-work"),
+            "--child-report", str(out / "native_grid_child.json"),
+            "--child-stdout", str(out / "native_grid_child.stdout.log"),
+            "--child-stderr", str(out / "native_grid_child.stderr.log"),
+            "--resolution", "1024",
+        ])
+        receipt["assay_returncode"] = result
+        native = json.loads(report_path.read_text()) if report_path.exists() else None
+        receipt["native_status"] = native.get("status") if native else "missing-report"
+        if result or native is None or native.get("status") != "done":
+            raise RuntimeError(f"native assay failed: process={result}, phase={native.get('failure_phase') if native else 'missing-report'}")
+        receipt.update(status="done", failure_phase=None)
+        write_report(receipt_path, receipt)
+    except BaseException as exc:
+        receipt.update(status="failed", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+        write_report(receipt_path, receipt)
+    # Kaggle publishes diagnostics for native crashes rather than dropping the run.
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(kaggle_main() if len(sys.argv) == 1 else main())
