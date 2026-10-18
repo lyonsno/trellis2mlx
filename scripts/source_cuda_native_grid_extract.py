@@ -154,7 +154,11 @@ def _parent(args: argparse.Namespace) -> int:
         report["source_clean_before_build"] = not bool(_run(["git", "status", "--porcelain"], cwd=args.source_root))
         if report["source_head"] != TRELLIS_COMMIT or not report["source_clean_before_build"]:
             raise NativeRouteError("pinned source checkout is missing or dirty before build")
-        _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "ninja", "trimesh"])
+        _run([
+            sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+            "ninja", "trimesh", "plyfile", "easydict", "imageio",
+            "imageio-ffmpeg", "zstandard", "opencv-python-headless",
+        ])
         _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", "-e", str(args.source_root / "o-voxel")])
         report["phase"] = "native_child"
         write_report(args.report, report)

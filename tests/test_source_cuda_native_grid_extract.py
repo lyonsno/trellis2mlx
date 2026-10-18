@@ -153,4 +153,4 @@ def test_native_bootstrap_installs_required_import_before_child(tmp_path, monkey
         "--work-dir", str(tmp_path / "work"),
     ]) == 1
     pip_commands = [command for command in commands if command[:4] == [assay.sys.executable, "-m", "pip", "install"]]
-    assert pip_commands and "trimesh" in pip_commands[0]
+    assert pip_commands and {"ninja", "trimesh", "plyfile"}.issubset(pip_commands[0])
