@@ -156,6 +156,12 @@ patching openings are different operations.
 
 - A coherent output is not guaranteed for every image or seed. Inspect a preview
   before spending on higher resolution.
+- Higher resolution is not a guaranteed repair for a poor mesh. One saved 1024
+  kiln prediction was already fragmented at raw mesh extraction; extra faces,
+  texture resolution, and cleanup could not make that prediction coherent.
+  Inspect the raw or preview mesh before spending on finishing. This is one
+  observed case, not a measured 1024 failure rate or a size threshold.
+  [What the CUDA comparison established](docs/validation.md#fragmented-1024-kiln-raw-mesh).
 - Higher face budgets preserve more detail but increase file size, UV work and
   viewer cost. Inspect the exported GLB, not just the requested target.
 - Cleanup, inference resolution and texture-map size affect different parts of

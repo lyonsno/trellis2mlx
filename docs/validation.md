@@ -250,6 +250,36 @@ A separate full768 warrior run at source3a006bc, seed80301,12steps,200K requeste
 
 ## Numerical comparison context
 
+### Fragmented 1024 kiln raw mesh
+
+One saved 1024 kiln prediction produced a kiln-shaped cloud of disconnected
+surface flakes **before** simplification, hole filling, UV work, or texturing.
+The accepted 768 kiln prediction produced a coherent raw mesh in the same
+texture-free inspection. These are different predictions, not a controlled
+resolution sweep, and this observation does not estimate how often 1024 fails.
+
+To check the extraction boundary, the saved 1024 shape latent was decoded with
+the official CUDA decoder. The official CUDA grid converter on a T4 and the
+local extractor then consumed that **same saved CUDA decoder field**. Their
+raw vertices and faces matched byte-for-byte: 3,834,752 vertices and 5,592,038
+triangles. The raw mesh had 1,842,843 boundary edges and 112,158 nonmanifold
+edges; the inspected render was the same fragmented flake cloud. The MLX
+decoder field from the saved latent yielded a similarly fragmented raw mesh.
+This rules out a local grid-extraction mismatch or later mesh cleanup as the
+cause of this particular raw failure. It does **not** establish that official
+CUDA image-to-shape sampling would have generated this latent, that 1024 is
+generally unreliable, or that lowering resolution repairs the same sample.
+
+The practical diagnostic is to inspect the raw/preview surface before trying
+larger face budgets or texture maps. When it is already fragmented, those
+finishing controls cannot restore the absent continuity; another seed or a
+different resolution is a new prediction to test, not a known cure.
+
+Exact same-field comparison receipt:
+`/Users/noahlyons/.local/state/gpu-greenroom/done/ecdc1612a218/`.
+Saved decoder fields, extracted meshes, route receipts, and inspected frames:
+`/Users/noahlyons/.local/state/trellis-metal-remesh-20261011/kiln-1024-source-cuda-decoder-1017-r1/`.
+
 
 Native MLX model components track a same-weight PyTorch comparator closely in
 direct checks, but that historical comparator is not a universal source
