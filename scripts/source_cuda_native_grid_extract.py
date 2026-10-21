@@ -22,9 +22,17 @@ import numpy as np
 
 TRELLIS_REPOSITORY = "https://github.com/microsoft/TRELLIS.2.git"
 TRELLIS_COMMIT = "5565d240c4a494caaf9ece7a554542b76ffa36d3"
+CUMESH_REPOSITORY = "https://github.com/JeffreyXiang/CuMesh.git"
+CUMESH_COMMIT = "c4ad6125924fcedfd13f0bd61520ca2d24eb7a87"
+FLEX_GEMM_REPOSITORY = "https://github.com/JeffreyXiang/FlexGEMM.git"
+FLEX_GEMM_COMMIT = "6dd94a859c26ee8246888502eada3dd8ad85532e"
+NVDIFFRAST_REPOSITORY = "https://github.com/NVlabs/nvdiffrast.git"
+NVDIFFRAST_COMMIT = "253ac4fcea7de5f396371124af597e6cc957bfae"
 SCHEMA = "trellis2mlx.source_cuda_native_grid_extract.v1"
 EXPECTED_DECODER_SHA256 = "ddd8cfd389c73e30e254df3066b09d9043bc06929e1df901f9ee61e69940cad5"
 EXPECTED_KERNEL_SLUG = "t2mlx-kiln-1024-exact-slat-cuda-decode"
+ASSAY_ID = "kiln-1024-full-cuda-grid-r6-20261021"
+KERNEL_ID = "noahboo/t2mlx-kiln-1024-native-cuda-grid-r6-1021"
 
 
 class NativeRouteError(RuntimeError):
@@ -79,6 +87,16 @@ def _run(command: list[str], *, cwd: Path | None = None) -> str:
     return result.stdout.strip()
 
 
+def native_runtime_sources(work_dir: Path) -> dict[str, tuple[str, str, Path]]:
+    """Exact native package pins from the previously authenticated CUDA witness."""
+    return {
+        "trellis": (TRELLIS_REPOSITORY, TRELLIS_COMMIT, work_dir / "TRELLIS.2"),
+        "cumesh": (CUMESH_REPOSITORY, CUMESH_COMMIT, work_dir / "CuMesh"),
+        "flex_gemm": (FLEX_GEMM_REPOSITORY, FLEX_GEMM_COMMIT, work_dir / "FlexGEMM"),
+        "nvdiffrast": (NVDIFFRAST_REPOSITORY, NVDIFFRAST_COMMIT, work_dir / "nvdiffrast"),
+    }
+
+
 def _native_child(args: argparse.Namespace) -> int:
     import torch
     import torch.nn.functional as F
@@ -98,6 +116,12 @@ def _native_child(args: argparse.Namespace) -> int:
     spec = importlib.util.find_spec("o_voxel._C")
     if spec is None or not spec.origin or not Path(spec.origin).is_file():
         raise NativeRouteError("compiled native o_voxel._C extension is unavailable")
+    if args.preflight_only:
+        child_report.update(status="done", phase="native_import_preflight_complete", cuda_device=device,
+                            torch=torch.__version__, o_voxel_path=str(Path(o_voxel.__file__).resolve()),
+                            convert_path=str(Path(convert_path).resolve()), extension_path=str(Path(spec.origin).resolve()))
+        write_report(args.child_report, child_report)
+        return 0
     child_report.update(phase="load_decoder", cuda_device=device, torch=torch.__version__, o_voxel_path=str(Path(o_voxel.__file__).resolve()), convert_path=str(Path(convert_path).resolve()), extension_path=str(Path(spec.origin).resolve()))
     write_report(args.child_report, child_report)
     with np.load(args.input_npz, allow_pickle=False) as saved:
@@ -145,24 +169,48 @@ def _parent(args: argparse.Namespace) -> int:
         report["phase"] = "source_setup"
         write_report(args.report, report)
         args.work_dir.mkdir(parents=True, exist_ok=True)
-        if not args.source_root.exists():
-            _run(["git", "clone", "--filter=blob:none", TRELLIS_REPOSITORY, str(args.source_root)])
-        _run(["git", "checkout", "--detach", TRELLIS_COMMIT], cwd=args.source_root)
-        _run(["git", "submodule", "update", "--init", "o-voxel"], cwd=args.source_root)
-        report["source_head"] = _run(["git", "rev-parse", "HEAD"], cwd=args.source_root)
+        sources = native_runtime_sources(args.work_dir)
+        source_heads = {}
+        for name, (repository, commit, root) in sources.items():
+            if not root.exists():
+                _run(["git", "clone", "--filter=blob:none", repository, str(root)])
+            _run(["git", "checkout", "--detach", commit], cwd=root)
+            _run(["git", "submodule", "update", "--init", "--recursive"], cwd=root)
+            source_heads[name] = _run(["git", "rev-parse", "HEAD"], cwd=root)
+            if source_heads[name] != commit:
+                raise NativeRouteError(f"{name} source commit mismatch")
+        report["source_head"] = source_heads["trellis"]
+        report["native_source_heads"] = source_heads
         report["o_voxel_head"] = _run(["git", "rev-parse", "HEAD"], cwd=args.source_root / "o-voxel")
         report["source_clean_before_build"] = not bool(_run(["git", "status", "--porcelain"], cwd=args.source_root))
         if report["source_head"] != TRELLIS_COMMIT or not report["source_clean_before_build"]:
             raise NativeRouteError("pinned source checkout is missing or dirty before build")
+        report["phase"] = "runtime_build"
+        write_report(args.report, report)
         _run([
             sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-            "ninja", "trimesh", "plyfile", "easydict", "imageio",
-            "imageio-ffmpeg", "zstandard", "opencv-python-headless",
+            "ninja", "trimesh", "plyfile", "easydict", "imageio", "imageio-ffmpeg",
+            "zstandard", "opencv-python-headless", "tqdm", "transformers",
+            "huggingface-hub", "kornia", "timm",
         ])
+        for root in (sources["cumesh"][2], sources["flex_gemm"][2], sources["nvdiffrast"][2]):
+            _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", str(root)])
         _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-build-isolation", "--no-deps", "-e", str(args.source_root / "o-voxel")])
-        report["phase"] = "native_child"
+        report["phase"] = "native_import_preflight"
         write_report(args.report, report)
         command = [sys.executable, str(Path(__file__).resolve()), "--child", "--input-npz", str(args.input_npz), "--expected-sha256", args.expected_sha256, "--output-npz", str(args.output_npz), "--report", str(args.report), "--child-report", str(args.child_report), "--work-dir", str(args.work_dir), "--resolution", str(args.resolution)]
+        preflight_command = command + ["--preflight-only"]
+        with args.child_stdout.open("w") as stdout, args.child_stderr.open("w") as stderr:
+            preflight = subprocess.run(preflight_command, cwd=args.work_dir, stdout=stdout, stderr=stderr)
+        report["preflight_returncode"] = preflight.returncode
+        if preflight.returncode:
+            raise NativeRouteError(f"native import preflight exited {preflight.returncode}; see child report and stderr")
+        preflight_report = json.loads(args.child_report.read_text())
+        if preflight_report.get("status") != "done" or preflight_report.get("phase") != "native_import_preflight_complete":
+            raise NativeRouteError("native import preflight did not validate")
+        report["preflight_route"] = {key: preflight_report[key] for key in ("cuda_device", "torch", "o_voxel_path", "convert_path", "extension_path")}
+        report["phase"] = "native_child"
+        write_report(args.report, report)
         with args.child_stdout.open("w") as stdout, args.child_stderr.open("w") as stderr:
             result = subprocess.run(command, cwd=args.work_dir, stdout=stdout, stderr=stderr)
         report["child_returncode"] = result.returncode
@@ -184,6 +232,7 @@ def _parent(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--input-npz", type=Path, required=True)
     parser.add_argument("--expected-sha256", required=True)
     parser.add_argument("--output-npz", type=Path, required=True)
@@ -218,6 +267,9 @@ def kaggle_main(*, mount: Path = Path("/kaggle/input"), out: Path = Path("/kaggl
         "requested_route": "pinned-official-o-voxel-native-CUDA-on-saved-source-decoder-field",
         "expected_input_sha256": EXPECTED_DECODER_SHA256,
         "expected_kernel_slug": EXPECTED_KERNEL_SLUG,
+        "kernel_id": KERNEL_ID,
+        "kernel_source_sha256": sha256_file(Path(__file__).resolve()),
+        "assay_id": ASSAY_ID,
         "native_report": str(report_path),
     }
     write_report(receipt_path, receipt)
