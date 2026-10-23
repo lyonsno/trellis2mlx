@@ -72,7 +72,7 @@ def validate_completion(report):
         raise ValueError("effective device is not the requested T4")
     if route.get("source_commit") != SOURCE_COMMIT or route.get("resolution") != 1024:
         raise ValueError("effective source/resolution mismatch")
-    if route.get("attention") != "sdpa" or route.get("sparse_attention") != "sdpa" or route.get("sparse_conv") != "flex_gemm":
+    if route.get("attention") != "sdpa" or route.get("sparse_attention") != "xformers" or route.get("sparse_conv") != "flex_gemm":
         raise ValueError("effective source backend mismatch")
     if report.get("pipeline_run_calls") != 1 or report.get("sampler_calls") != {"sparse": 1, "shape": 2, "texture": 1}:
         raise ValueError("incomplete official 1024 cascade")
@@ -80,6 +80,75 @@ def validate_completion(report):
         raise ValueError("missing complete inference or GLB artifact")
     if report.get("glb", {}).get("faces", 0) <= 0:
         raise ValueError("empty final geometry")
+
+
+def phase_observer(original, phase, report, memory):
+    def observed(*args, **kwargs):
+        previous = report["phase"]
+        report["phase"] = phase
+        memory(phase + "-begin")
+        result = original(*args, **kwargs)
+        report["last_completed_stage"] = phase
+        report["phase"] = previous
+        memory(phase + "-end")
+        return result
+    return observed
+
+
+def sampler_observer(original, name, report, memory, save_arrays, tensor_arrays):
+    def observed(model, noise, *args, **kwargs):
+        previous = report["phase"]
+        index = report["sampler_calls"].get(name, 0) + 1
+        report["sampler_calls"][name] = index
+        phase = f"{name}-sampler-{index}"
+        report["phase"] = phase + ":capture_input"
+        arrays = tensor_arrays(noise, "noise")
+        for key in ("cond", "neg_cond", "concat_cond"):
+            arrays.update(tensor_arrays(kwargs.get(key), key))
+        save_arrays(phase + "-input.npz", **arrays)
+        report["phase"] = phase
+        memory(phase + "-begin")
+        result = original(model, noise, *args, **kwargs)
+        report["phase"] = phase + ":capture_output"
+        save_arrays(phase + "-terminal.npz", **tensor_arrays(result.samples, "sample"))
+        report["last_completed_stage"] = phase
+        report["phase"] = previous
+        memory(phase + "-end")
+        return result
+    return observed
+
+
+def attention_preflight(report_path):
+    """Exercise the actual source sparse-attention primitive/dtype on T4."""
+    report = {"schema": "trellis2mlx.t4-bf16-xformers-preflight.v1", "status": "running",
+              "phase": "attention_import",
+              "requested_dtype": "bfloat16", "shape": [1, 32, 12, 128]}
+    write_json(report_path, report)
+    try:
+        import torch
+        import xformers
+        import xformers.ops as xops
+        report.update(torch=torch.__version__, xformers=xformers.__version__, phase="device")
+        if not torch.cuda.is_available() or torch.cuda.get_device_name(0) != "Tesla T4":
+            raise ValueError("requested Tesla T4 is unavailable")
+        report["device"] = torch.cuda.get_device_name(0)
+        report["capability"] = list(torch.cuda.get_device_capability(0))
+        report["phase"] = "source_sparse_bf16_attention"
+        write_json(report_path, report)
+        q = torch.zeros((1, 32, 12, 128), dtype=torch.bfloat16, device="cuda")
+        mask = xops.fmha.BlockDiagonalMask.from_seqlens([32], [32])
+        result = xops.memory_efficient_attention(q, q, q, mask)
+        torch.cuda.synchronize()
+        if result.shape != q.shape or result.dtype != q.dtype or not torch.isfinite(result).all().item():
+            raise ValueError("attention output changed shape/dtype or is nonfinite")
+        report.update(status="completed", phase="completed")
+        return 0
+    except Exception as exc:
+        report.update(status="failed", failure_phase=report["phase"], error=str(exc), traceback=traceback.format_exc())
+        traceback.print_exc()
+        return 1
+    finally:
+        write_json(report_path, report)
 
 
 def run_child(request_path, output, runtime):
@@ -137,12 +206,14 @@ def run_child(request_path, output, runtime):
     try:
         if not torch.cuda.is_available() or torch.cuda.get_device_name(0) != "Tesla T4":
             raise ValueError("requested Tesla T4 is unavailable")
-        os.environ.update(ATTN_BACKEND="sdpa", SPARSE_ATTN_BACKEND="sdpa", SPARSE_CONV_BACKEND="flex_gemm")
+        os.environ.update(ATTN_BACKEND="sdpa", SPARSE_ATTN_BACKEND="xformers", SPARSE_CONV_BACKEND="flex_gemm")
         sys.path.insert(0, str(runtime / "TRELLIS.2"))
         import o_voxel
         from trellis2.pipelines import Trellis2ImageTo3DPipeline
         from trellis2.modules.attention import config as attention_config
         from trellis2.modules.sparse import config as sparse_config
+        if (attention_config.BACKEND, sparse_config.ATTN, sparse_config.CONV) != ("sdpa", "xformers", "flex_gemm"):
+            raise ValueError("source backend admission failed before model download")
         report["effective_route"] = {"cuda_device": torch.cuda.get_device_name(0),
             "capability": list(torch.cuda.get_device_capability(0)), "torch": torch.__version__,
             "cuda": torch.version.cuda, "source_commit": SOURCE_COMMIT,
@@ -184,46 +255,46 @@ def run_child(request_path, output, runtime):
 
         # Observers only retain inputs/results and query memory; native calls own arithmetic.
         for name, sampler in (("sparse", pipeline.sparse_structure_sampler), ("shape", pipeline.shape_slat_sampler), ("texture", pipeline.tex_slat_sampler)):
-            original = sampler.sample
-            def observe(model, noise, *args, _original=original, _name=name, **kwargs):
-                index = report["sampler_calls"].get(_name, 0) + 1
-                report["sampler_calls"][_name] = index
-                phase = f"{_name}-sampler-{index}"
-                report["phase"] = phase
-                arrays = tensor_arrays(noise, "noise")
-                for key in ("cond", "neg_cond"):
-                    arrays.update(tensor_arrays(kwargs.get(key), key))
-                save_arrays(phase + "-input.npz", **arrays)
-                memory(phase + "-begin")
-                result = _original(model, noise, *args, **kwargs)
-                save_arrays(phase + "-terminal.npz", **tensor_arrays(result.samples, "sample"))
-                report["last_completed_stage"] = phase
-                memory(phase + "-end")
-                return result
-            sampler.sample = observe
+            sampler.sample = sampler_observer(sampler.sample, name, report, memory, save_arrays, tensor_arrays)
+        for obj, name, phase in (
+            (pipeline, "get_cond", "conditioning"),
+            (pipeline, "sample_sparse_structure", "sparse_structure"),
+            (pipeline, "sample_shape_slat_cascade", "shape_cascade"),
+            (pipeline, "sample_tex_slat", "texture_slat"),
+            (pipeline.models["sparse_structure_decoder"], "forward", "sparse_decoder"),
+            (pipeline.models["shape_slat_decoder"], "upsample", "shape_upsample"),
+            (pipeline.models["shape_slat_decoder"], "forward", "shape_decoder"),
+            (pipeline.models["tex_slat_decoder"], "forward", "texture_decoder"),
+        ):
+            setattr(obj, name, phase_observer(getattr(obj, name), phase, report, memory))
 
         original_preprocess = pipeline.preprocess_image
         def preprocess(image):
+            previous = report["phase"]
             report["phase"] = "official_preprocess"
             memory("preprocess-begin")
             result = original_preprocess(image)
+            report["phase"] = "official_preprocess:capture_output"
             path = output / "preprocessed.png"
             result.save(path)
             artifact(path)
             report["last_completed_stage"] = "official_preprocess"
+            report["phase"] = previous
             return result
         pipeline.preprocess_image = preprocess
         original_decode = pipeline.decode_latent
         def decode(shape, texture, resolution):
-            report["phase"] = "decode_latent"
+            report["phase"] = "decode_latent:capture_inputs"
             report["effective_route"]["resolution"] = resolution
             save_arrays("shape_terminal.npz", **tensor_arrays(shape, "shape"))
             save_arrays("texture_terminal.npz", **tensor_arrays(texture, "texture"))
+            report["phase"] = "decode_latent"
             memory("decode-begin")
             result = original_decode(shape, texture, resolution)
             if len(result) != 1:
                 raise ValueError("expected one official decoded mesh")
             mesh = result[0]
+            report["phase"] = "decode_latent:capture_raw_mesh"
             save_arrays("raw_mesh.npz", vertices=mesh.vertices.detach().cpu().numpy(), faces=mesh.faces.detach().cpu().numpy(),
                 attrs=mesh.attrs.detach().cpu().numpy(), coords=mesh.coords.detach().cpu().numpy(), voxel_size=mesh.voxel_size)
             report["raw_counts"] = {"vertices": len(mesh.vertices), "faces": len(mesh.faces)}
@@ -276,8 +347,11 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("/kaggle/working/full1024"))
     parser.add_argument("--runtime", type=Path, default=Path("/kaggle/working/full1024-runtime"))
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--attention-preflight", action="store_true")
     args = parser.parse_args(argv)
     output, runtime = args.output_dir, args.runtime
+    if args.attention_preflight:
+        return attention_preflight(args.output_json)
     if args.child:
         return run_child(find_request(args.request), output, runtime)
     report = {"schema": "trellis2mlx.full1024-source-parent.v1", "status": "running", "phase": "input_admission", "producer_sha256": digest(__file__)}
@@ -305,6 +379,14 @@ def main(argv=None):
         helper.command = command
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5")
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        report["phase"] = "attention_backend_install"
+        command([sys.executable, "-m", "pip", "install", "--no-deps", "xformers==0.0.35"], report)
+        report["phase"] = "attention_preflight"
+        write_json(args.output_json, report)
+        # A separate process leaves no CUDA allocation resident in the parent.
+        preflight = subprocess.run([sys.executable, "-u", str(Path(__file__).resolve()), "--attention-preflight", "--output-json", str(output / "attention-preflight.json")])
+        if preflight.returncode:
+            raise RuntimeError("source BF16 sparse attention is unavailable; see attention-preflight.json")
         helper.bootstrap(SimpleNamespace(runtime=runtime), report)
         command([sys.executable, "-m", "pip", "install", "transformers", "huggingface-hub", "kornia", "timm", "scipy", "zstandard", "imageio", "imageio-ffmpeg", "lpips", "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"], report)
         command(["git", "submodule", "update", "--init", "--recursive"], report, runtime / "TRELLIS.2")
@@ -329,9 +411,13 @@ def main(argv=None):
         # Includes partial arrays and failure report even after a child signal.
         if owned_output:
             bundle = args.output_json.with_suffix(".evidence.tar")
-            with tarfile.open(bundle, "x") as archive:
-                archive.add(output, arcname="full1024")
-            report["bundle"] = {"path": str(bundle), "sha256": digest(bundle), "bytes": bundle.stat().st_size}
+            try:
+                with tarfile.open(bundle, "x") as archive:
+                    archive.add(output, arcname="full1024")
+                report["bundle"] = {"path": str(bundle), "sha256": digest(bundle), "bytes": bundle.stat().st_size}
+            except Exception as exc:
+                report.update(status="failed", bundle_error=str(exc))
+                code = 1
         report["elapsed_seconds"] = time.monotonic() - started
         write_json(args.output_json, report)
     return code
