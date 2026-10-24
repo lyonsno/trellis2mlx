@@ -99,9 +99,15 @@ def main():
             raise ValueError('invalid conditioning')
         if rng.dtype != np.uint32 or rng.shape != (1, 2):
             raise ValueError('invalid saved MLX random state')
+        remaining = manifest.get('remaining_steps', False)
+        if type(remaining) is not bool:
+            raise ValueError('remaining_steps must be boolean')
+        if remaining and not manifest.get('capture_first_step', False):
+            raise ValueError('remaining-step diagnostic requires Euler capture')
+        report['claim_limit'] = ('Retained LR continuation with Euler capture in a fresh process. No full inference, cause or mesh-quality conclusion.' if remaining else report['claim_limit'])
         report['effective'] = {'source_revision': actual, 'mlx_version': version('mlx'),
                                'device': str(mx.default_device()), 'sample_shape': list(sample.shape),
-                               'start_step_index': start, 'stop_after_first_step': True,
+                               'start_step_index': start, 'stop_after_first_step': not remaining,
                                'lr_query_tile': effective['lr_query_tile'], 'shape_block_sync': 1,
                                'qk_norm': get_qk_norm_backend(), 'parameters': params}
         if effective['shape_block_sync'] != 1:
@@ -114,15 +120,18 @@ def main():
         report['phase'] = 'lr_step'
         write()
         capture = {} if manifest.get('capture_first_step', False) else None
+        captures = [] if remaining else None
         result = samplers.flow_euler_sample(model, mx.array(sample), mx.array(cond), mx.array(neg),
                                             coords=mx.array(coords), start_step_index=start,
-                                            stop_after_first_step=True, capture_first_step=capture, **params)
+                                            stop_after_first_step=not remaining, capture_first_step=capture,
+                                            capture_steps=captures, **params)
         mx.eval(result, *mx.random.state)
         values = np.asarray(result)
         if values.shape != sample.shape or not np.isfinite(values).all():
             raise ValueError('invalid replay result')
-        output = out / f'lr_shape_step_{start + 1:02d}.npz'
-        np.savez_compressed(output, sample=values, coords=coords, next_step_index=np.array(start + 1),
+        final_step = params['steps'] if remaining else start + 1
+        output = out / f'lr_shape_step_{final_step:02d}.npz'
+        np.savez_compressed(output, sample=values, coords=coords, next_step_index=np.array(final_step),
                             rng_state=np.stack([np.asarray(key) for key in mx.random.state]),
                             parameters_json=np.array(json.dumps(params)))
         report['output_equals_input'] = bool(np.array_equal(values, sample))
@@ -135,8 +144,21 @@ def main():
                 'arrays': {key: {'shape': list(value.shape), 'finite': bool(np.isfinite(value).all()),
                                  'min': float(value.min()), 'max': float(value.max()),
                                  'nonzero': int(np.count_nonzero(value))} for key, value in payload.items()}}
-        report.update(status='passed', phase='one_lr_step_complete',
-                      output={'path': str(output), 'sha256': sha(output), 'next_step_index': start + 1})
+        if captures is not None:
+            if len(captures) != params['steps'] - start:
+                raise ValueError('partial remaining-step capture')
+            report['step_captures'] = []
+            for index, step_capture in enumerate(captures, start=start + 1):
+                payload = {key: np.array(value) for key, value in step_capture.items() if value is not None}
+                path = out / f'euler_step_{index:02d}.npz'
+                np.savez_compressed(path, **payload)
+                report['step_captures'].append({'step': index, 'path': str(path), 'sha256': sha(path)})
+                report['last_trustworthy_evidence'] = str(path)
+                write()
+            if not np.array_equal(np.array(captures[-1]['sample_next']), values):
+                raise ValueError('terminal capture differs from returned sample')
+        report.update(status='passed', phase='remaining_lr_steps_complete' if remaining else 'one_lr_step_complete',
+                      output={'path': str(output), 'sha256': sha(output), 'next_step_index': final_step})
         write()
     except BaseException as exc:
         report.update(status='failed', error=str(exc), error_type=type(exc).__name__, traceback=traceback.format_exc())
