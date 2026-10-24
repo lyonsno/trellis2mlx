@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 import unittest
 import tempfile
+import json
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('fresh_assay', ROOT / 'scripts/fresh_prepared_inference.py')
@@ -49,11 +51,52 @@ class FreshAdmissionTests(unittest.TestCase):
             r = self.complete_report()
             with self.assertRaisesRegex(ValueError, 'missing or empty'):
                 assay.require_complete(r, cp)
-            for stage in ('conditioning','sparse_coords','shape_slat','decoder_output','mesh_raw','texture'):
-                (cp / (stage + '.npz')).write_bytes(b'x')
+            self.valid_checkpoints(cp)
             r['conditioning_backend'] = 'torch'
             with self.assertRaisesRegex(ValueError, 'native MLX'):
                 assay.require_complete(r, cp)
+
+    def valid_checkpoints(self, cp):
+        coords = np.zeros((3, 4), np.int32)
+        fixtures = {
+            'conditioning': {'cond': np.zeros((1,1029,1024)), 'neg_cond': np.zeros((1,1029,1024))},
+            'sparse_coords': {'coords': coords},
+            'shape_slat': {'coords': coords, 'feats': np.zeros((3,32))},
+            'decoder_output': {'coords': coords, 'feats': np.zeros((3,7))},
+            'mesh_raw': {'vertices': np.eye(3), 'faces': np.array([[0,1,2]],np.int32)},
+            'texture': {'tex_np': np.ones((3,6)), 'tex_coords_spatial': coords[:,1:]},
+        }
+        for stage, values in fixtures.items():
+            np.savez(cp / (stage + '.npz'), **values)
+            if stage in ('shape_slat','decoder_output','mesh_raw','texture'):
+                (cp / (stage + '.json')).write_text(json.dumps({'mesh_grid_size':1024}))
+
+    def test_decoded_output_payload_refusal(self):
+        cases = {
+            'empty_geometry': ('mesh_raw', {'vertices':np.empty((0,3)), 'faces':np.empty((0,3),np.int32)}),
+            'nonfinite_texture': ('texture', {'tex_np':np.full((3,6),np.nan), 'tex_coords_spatial':np.zeros((3,3),np.int32)}),
+            'invalid_indices': ('mesh_raw', {'vertices':np.eye(3), 'faces':np.array([[0,1,99]],np.int32)}),
+            'missing_keys': ('mesh_raw', {'unrelated':np.ones(3)}),
+            'mismatched_texture_rows': ('texture', {'tex_np':np.ones((3,6)), 'tex_coords_spatial':np.zeros((2,3),np.int32)}),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            cp=Path(d)
+            for name,(stage,values) in cases.items():
+                with self.subTest(name=name):
+                    self.valid_checkpoints(cp)
+                    np.savez(cp/(stage+'.npz'),**values)
+                    with self.assertRaises(ValueError):
+                        assay.require_complete(self.complete_report(),cp)
+            self.valid_checkpoints(cp)
+            (cp/'mesh_raw.json').write_text(json.dumps({'mesh_grid_size':768}))
+            with self.assertRaisesRegex(ValueError,'grid'):
+                assay.require_complete(self.complete_report(),cp)
+            self.valid_checkpoints(cp)
+            (cp/'texture.npz').write_bytes(b'not an archive')
+            with self.assertRaises(ValueError):
+                assay.require_complete(self.complete_report(),cp)
+            self.valid_checkpoints(cp)
+            assay.require_complete(self.complete_report(),cp)
 
     def test_missing_image_fails_with_durable_admission_report(self):
         import subprocess, json, sys

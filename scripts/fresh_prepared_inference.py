@@ -49,6 +49,8 @@ def evaluated_step_line(fn):
 
 
 def require_complete(report, checkpoint_dir):
+    import numpy as np
+
     if [x['stage'] for x in report['samplers']] != list(STAGES):
         raise ValueError('expected all four fresh sampler calls')
     for sampler in report['samplers']:
@@ -60,6 +62,42 @@ def require_complete(report, checkpoint_dir):
             raise ValueError('missing or empty output: ' + stage)
     if report.get('conditioning_backend') != 'mlx':
         raise ValueError('native MLX conditioning was not observed')
+    for stage in ('conditioning', 'sparse_coords', 'shape_slat', 'decoder_output', 'mesh_raw', 'texture'):
+        with np.load(checkpoint_dir / (stage + '.npz'), allow_pickle=False) as data:
+            def array(key, ndim, width=None, integer=False):
+                if key not in data:
+                    raise ValueError(f'{stage}: missing {key}')
+                value = data[key]
+                if value.ndim != ndim or not value.size or (width is not None and value.shape[-1] != width):
+                    raise ValueError(f'{stage}: invalid {key} shape {value.shape}')
+                if not np.issubdtype(value.dtype, np.number) or not np.isfinite(value).all():
+                    raise ValueError(f'{stage}: nonnumeric or nonfinite {key}')
+                if integer and not np.issubdtype(value.dtype, np.integer):
+                    raise ValueError(f'{stage}: {key} must contain integers')
+                return value
+
+            if stage == 'conditioning':
+                if array('cond', 3).shape != array('neg_cond', 3).shape:
+                    raise ValueError('conditioning: positive/negative shapes differ')
+            elif stage == 'mesh_raw':
+                vertices, faces = array('vertices', 2, 3), array('faces', 2, 3, integer=True)
+                if faces.min() < 0 or faces.max() >= len(vertices):
+                    raise ValueError('mesh_raw: face indices outside vertex array')
+            elif stage == 'texture':
+                if len(array('tex_np', 2, 6)) != len(array('tex_coords_spatial', 2, 3, integer=True)):
+                    raise ValueError('texture: feature/coordinate rows differ')
+            else:
+                coords = array('coords', 2, 4, integer=True)
+                if stage != 'sparse_coords' and len(array('feats', 2)) != len(coords):
+                    raise ValueError(f'{stage}: feature/coordinate rows differ')
+            if stage in ('shape_slat', 'decoder_output', 'mesh_raw', 'texture'):
+                metadata_path = checkpoint_dir / (stage + '.json')
+                metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+                grids = [metadata['mesh_grid_size']] if 'mesh_grid_size' in metadata else []
+                if 'mesh_grid_size' in data:
+                    grids.append(data['mesh_grid_size'].item())
+                if not grids or any(grid != 1024 for grid in grids):
+                    raise ValueError(f'{stage}: missing, inconsistent, or non-1024 grid')
 
 
 class InferenceComplete(Exception):
