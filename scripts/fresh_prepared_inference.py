@@ -120,6 +120,8 @@ def main():
     p.add_argument('--image-sha256', required=True)
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--completed-lr-manifest', type=Path)
+    p.add_argument('--retain-euler-steps', action='store_true',
+                   help='Retain every guidance operand through the sampler capture hook, including fresh stages.')
     args = p.parse_args()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -172,6 +174,7 @@ def main():
                                'shape_block_sync': 1, 'qk_norm': 'source-cuda-warp32',
                                'cleanup': 'disabled; separate Metal finisher consumes raw and texture',
                                'sampler_sha256': sha(samplers.__file__)}
+        report['trajectory'] = 'fresh'
         retained = None
         if args.completed_lr_manifest:
             from retained_lr_prefix import load_completed_lr
@@ -179,6 +182,8 @@ def main():
             report.update(trajectory='retained_lr', retained_prefix_verified=True,
                           retained_prefix=provenance, conditioning_backend='retained_native_mlx',
                           claim_limit='Recovered MLX trajectory from completed retained LR and exact RNG. HR and texture newly executed; no uninterrupted-run or mesh-quality claim.')
+        report['effective']['sampler_observation'] = (
+            'full_euler_capture' if retained or args.retain_euler_steps else 'evaluated_sample_trace')
         cp = out / 'checkpoints'
         cp.mkdir()
         if retained:
@@ -222,7 +227,7 @@ def main():
                 extra['concat_cond'] = np.asarray(kw['concat_cond'])
             extra['parameters_json'] = np.array(json.dumps(parameters))
             save_sample(samples / (stage + '_noise.npz'), pos[1], **extra)
-            if retained:
+            if retained or args.retain_euler_steps:
                 class EulerRecords(list):
                     def append(self, payload):
                         super().append(payload)
@@ -237,12 +242,13 @@ def main():
                         row['last_sample'] = str(sample_path)
                         report['last_trustworthy_evidence'] = str(sample_path)
                         write()
-                        print(f'Recovered assay saved {stage} step {step}/12', flush=True)
+                        print(f'Full Euler assay saved {stage} step {step}/12', flush=True)
                 records = EulerRecords()
                 if kw.get('capture_steps') is not None:
                     raise ValueError('unexpected competing sampler capture')
                 kw['capture_steps'] = records
-                row['observation_route'] = 'sampler_capture_steps_retained_euler'
+                row['observation_route'] = ('sampler_capture_steps_retained_euler' if retained
+                                            else 'sampler_capture_steps_full_euler')
                 return original_sampler(*pos, **kw)
             def trace_step(frame, event, arg):
                 if event == 'line' and frame.f_lineno == capture_line:
