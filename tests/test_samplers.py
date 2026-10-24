@@ -1,5 +1,6 @@
 import mlx.core as mx
 import numpy as np
+import pytest
 
 
 def _source_sparse_std_reference(values: np.ndarray) -> np.float32:
@@ -46,6 +47,57 @@ def test_sparse_cfg_rescale_std_matches_source_reduction_topology():
         ).reshape(())
 
         assert actual.view(np.uint32) == expected.view(np.uint32)
+
+
+@pytest.mark.parametrize("channels", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("rows", [1, 127, 129])
+def test_sparse_cfg_rescale_std_channel_and_dispatch_boundaries(rows, channels):
+    from trellmlx.samplers import _source_sparse_cfg_rescale_std
+
+    values = np.random.default_rng(42).normal(size=(rows, channels)).astype(np.float32)
+    actual = np.asarray(_source_sparse_cfg_rescale_std(mx.array(values)))
+    expected = _source_sparse_std_reference(values)
+
+    assert actual.shape == ()
+    assert actual.dtype == np.float32
+    assert actual.view(np.uint32) == expected.view(np.uint32)
+
+
+def test_sparse_cfg_rescale_std_preserves_large_lazy_operand_reductions():
+    from trellmlx.samplers import _source_sparse_cfg_rescale_std
+
+    # Token/channel shape of the observed kiln HR failure. Keep both lazy
+    # reductions alive until joint evaluation, as the CFG sampler does.
+    rng = np.random.default_rng(42)
+    values = rng.normal(size=(24578, 32)).astype(np.float32)
+    offsets = rng.normal(size=values.shape).astype(np.float32)
+    operands = [mx.array(values) + mx.array(offsets),
+                mx.array(values) - mx.array(offsets)]
+    results = [_source_sparse_cfg_rescale_std(x) for x in operands]
+    mx.eval(*operands, *results)
+
+    for operand, result in zip(operands, results):
+        expected = _source_sparse_std_reference(np.asarray(operand))
+        actual = np.asarray(result)
+        assert actual.view(np.uint32) == expected.view(np.uint32)
+
+
+@pytest.mark.parametrize("channels", [3, 64])
+def test_sparse_cfg_rescale_std_preserves_native_fallback(channels):
+    from trellmlx.samplers import _source_sparse_cfg_rescale_std
+
+    values = mx.array(np.random.default_rng(42).normal(size=(129, channels)))
+    actual = _source_sparse_cfg_rescale_std(values)
+    expected = mx.sqrt(mx.var(values))
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize("shape", [(0, 32), (1, 0), (32,), (1, 1, 32)])
+def test_sparse_cfg_rescale_std_rejects_invalid_shapes(shape):
+    from trellmlx.samplers import _source_sparse_cfg_rescale_std
+
+    with pytest.raises(ValueError, match="sparse CFG rescale"):
+        _source_sparse_cfg_rescale_std(mx.zeros(shape))
 
 
 def test_dense_cfg_rescale_std_matches_source_cuda_welford_topology():

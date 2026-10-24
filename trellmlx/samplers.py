@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 
 
+_source_sparse_cfg_row_stats_kernel = None
 _source_sparse_cfg_std_kernel = None
 _source_cuda_dense_cfg_std_kernel = None
 
@@ -487,7 +488,7 @@ def _source_cuda_dense_cfg_rescale_std(x_0: mx.array) -> mx.array:
 
 def _source_sparse_cfg_rescale_std(x_0: mx.array) -> mx.array:
     """Reproduce SparseTensor.std's CUDA row-tree and segment reduction order."""
-    global _source_sparse_cfg_std_kernel
+    global _source_sparse_cfg_row_stats_kernel, _source_sparse_cfg_std_kernel
 
     if x_0.ndim != 2:
         raise ValueError(f"sparse CFG rescale expects [tokens, channels], got {x_0.shape}")
@@ -497,58 +498,73 @@ def _source_sparse_cfg_rescale_std(x_0: mx.array) -> mx.array:
     if channels > 32 or channels & (channels - 1):
         return mx.sqrt(mx.var(x_0))
 
+    if _source_sparse_cfg_row_stats_kernel is None:
+        # Rows are independent. Keeping their channel trees in one invocation
+        # each avoids doing every token's channel work inside one GPU thread.
+        source = r"""
+            uint row = thread_position_in_grid.x;
+            if (row >= rows[0]) return;
+            uint channel_count = channels[0];
+            float values[32];
+            float squares[32];
+            uint row_offset = row * channel_count;
+            for (uint channel = 0; channel < 32; ++channel) {
+                float value = channel < channel_count
+                    ? static_cast<float>(inp[row_offset + channel])
+                    : 0.0f;
+                values[channel] = value;
+                squares[channel] = value * value;
+            }
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                for (uint channel = 0; channel < offset; ++channel) {
+                    values[channel] = values[channel] + values[channel + offset];
+                    squares[channel] = squares[channel] + squares[channel + offset];
+                }
+            }
+            float inverse_channels = 1.0f / static_cast<float>(channel_count);
+            stats[2 * row] = values[0] * inverse_channels;
+            stats[2 * row + 1] = squares[0] * inverse_channels;
+        """
+        _source_sparse_cfg_row_stats_kernel = mx.fast.metal_kernel(
+            name="cfg_rescale_source_sparse_row_tree_fp32",
+            input_names=["inp", "rows", "channels"],
+            output_names=["stats"],
+            source=source,
+        )
+
     if _source_sparse_cfg_std_kernel is None:
+        # Preserve the source's serial row order; a parallel sum changes its
+        # floating-point result and therefore the subsequent CFG trajectory.
         source = r"""
             uint row_count = rows[0];
-            uint channel_count = channels[0];
             float mean_sum = 0.0f;
             float mean2_sum = 0.0f;
-
             for (uint row = 0; row < row_count; ++row) {
-                float values[32];
-                float squares[32];
-                uint row_offset = row * channel_count;
-                for (uint channel = 0; channel < 32; ++channel) {
-                    float value = channel < channel_count
-                        ? static_cast<float>(inp[row_offset + channel])
-                        : 0.0f;
-                    values[channel] = value;
-                    squares[channel] = value * value;
-                }
-                for (uint offset = 16; offset > 0; offset >>= 1) {
-                    for (uint channel = 0; channel < offset; ++channel) {
-                        values[channel] =
-                            values[channel] + values[channel + offset];
-                        squares[channel] =
-                            squares[channel] + squares[channel + offset];
-                    }
-                }
-                float inverse_channels = 1.0f / static_cast<float>(channel_count);
-                float row_mean = values[0] * inverse_channels;
-                float row_mean2 = squares[0] * inverse_channels;
-                mean_sum = mean_sum + row_mean;
-                mean2_sum = mean2_sum + row_mean2;
+                mean_sum = mean_sum + stats[2 * row];
+                mean2_sum = mean2_sum + stats[2 * row + 1];
             }
-
             float mean = mean_sum / static_cast<float>(row_count);
             float mean2 = mean2_sum / static_cast<float>(row_count);
             float variance = mean2 - mean * mean;
             out[0] = metal::precise::sqrt(variance);
         """
         _source_sparse_cfg_std_kernel = mx.fast.metal_kernel(
-            name="cfg_rescale_source_sparse_row_tree_segment_fp32",
-            input_names=["inp", "rows", "channels"],
+            name="cfg_rescale_source_sparse_segment_fp32",
+            input_names=["stats", "rows"],
             output_names=["out"],
             source=source,
         )
 
+    row_count = mx.array([rows], dtype=mx.uint32)
+    stats = _source_sparse_cfg_row_stats_kernel(
+        inputs=[x_0, row_count, mx.array([channels], dtype=mx.uint32)],
+        grid=(rows, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, 2)],
+        output_dtypes=[mx.float32],
+    )[0]
     out = _source_sparse_cfg_std_kernel(
-        inputs=[
-            x_0,
-            mx.array([rows], dtype=mx.uint32),
-            mx.array([channels], dtype=mx.uint32),
-        ],
-        template=[("T", x_0.dtype)],
+        inputs=[stats, row_count],
         grid=(1, 1, 1),
         threadgroup=(1, 1, 1),
         output_shapes=[(1,)],
