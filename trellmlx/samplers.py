@@ -535,7 +535,10 @@ def _source_sparse_cfg_rescale_std(x_0: mx.array) -> mx.array:
     if _source_sparse_cfg_std_kernel is None:
         # Preserve the source's serial row order; a parallel sum changes its
         # floating-point result and therefore the subsequent CFG trajectory.
+        # SparseTensor.std rounds mean**2 before subtraction. Contracting that
+        # pair into an FMA can give a constant input nonzero or negative variance.
         source = r"""
+            #pragma METAL fp contract(off)
             uint row_count = rows[0];
             float mean_sum = 0.0f;
             float mean2_sum = 0.0f;
