@@ -25,11 +25,15 @@ def sha(path):
     return h.hexdigest()
 
 
-def instrument_source(source):
+def instrument_source(source, retained_lr=False):
     anchor = '        hr_slat_flow = SLatFlowModel.for_shape()\n'
     if source.count(anchor) != 1:
         raise ValueError('HR constructor is missing or ambiguous')
-    return source.replace(anchor, '        hr_slat_flow = SLatFlowModel.for_shape(lr_sync_every_block=True)\n', 1)
+    source = source.replace(anchor, '        hr_slat_flow = SLatFlowModel.for_shape(lr_sync_every_block=True)\n', 1)
+    if retained_lr:
+        from retained_lr_prefix import splice_completed_lr
+        source = splice_completed_lr(source)
+    return source
 
 
 def evaluated_step_line(fn):
@@ -51,7 +55,11 @@ def evaluated_step_line(fn):
 def require_complete(report, checkpoint_dir):
     import numpy as np
 
-    if [x['stage'] for x in report['samplers']] != list(STAGES):
+    retained = report.get('trajectory') == 'retained_lr'
+    if retained and not report.get('retained_prefix_verified'):
+        raise ValueError('unverified retained prefix')
+    expected = STAGES[2:] if retained else STAGES
+    if [x['stage'] for x in report['samplers']] != list(expected):
         raise ValueError('expected all four fresh sampler calls')
     for sampler in report['samplers']:
         if sampler['completed_steps'] != list(range(1, 13)):
@@ -60,7 +68,7 @@ def require_complete(report, checkpoint_dir):
         path = checkpoint_dir / (stage + '.npz')
         if not path.is_file() or path.stat().st_size == 0:
             raise ValueError('missing or empty output: ' + stage)
-    if report.get('conditioning_backend') != 'mlx':
+    if report.get('conditioning_backend') != ('retained_native_mlx' if retained else 'mlx'):
         raise ValueError('native MLX conditioning was not observed')
     for stage in ('conditioning', 'sparse_coords', 'shape_slat', 'decoder_output', 'mesh_raw', 'texture'):
         with np.load(checkpoint_dir / (stage + '.npz'), allow_pickle=False) as data:
@@ -111,6 +119,7 @@ def main():
     p.add_argument('--image', type=Path, required=True)
     p.add_argument('--image-sha256', required=True)
     p.add_argument('--output-dir', type=Path, required=True)
+    p.add_argument('--completed-lr-manifest', type=Path)
     args = p.parse_args()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -163,8 +172,23 @@ def main():
                                'shape_block_sync': 1, 'qk_norm': 'source-cuda-warp32',
                                'cleanup': 'disabled; separate Metal finisher consumes raw and texture',
                                'sampler_sha256': sha(samplers.__file__)}
+        retained = None
+        if args.completed_lr_manifest:
+            from retained_lr_prefix import load_completed_lr
+            retained, provenance = load_completed_lr(args.completed_lr_manifest, report)
+            report.update(trajectory='retained_lr', retained_prefix_verified=True,
+                          retained_prefix=provenance, conditioning_backend='retained_native_mlx',
+                          claim_limit='Recovered MLX trajectory from completed retained LR and exact RNG. HR and texture newly executed; no uninterrupted-run or mesh-quality claim.')
         cp = out / 'checkpoints'
         cp.mkdir()
+        if retained:
+            import shutil
+            for stage in ('conditioning', 'sparse_coords'):
+                for suffix in ('.npz', '.json'):
+                    path = Path(retained['checkpoint_dir']) / (stage + suffix)
+                    if path.exists():
+                        shutil.copyfile(path, cp / path.name)
+            report['stage_outputs'].extend(['conditioning', 'sparse_coords'])
         samples = out / 'samplers'
         samples.mkdir()
         original_sampler = samplers.flow_euler_sample
@@ -178,9 +202,10 @@ def main():
             np.savez_compressed(path, **payload)
         def sampled(*pos, **kw):
             index = len(report['samplers'])
-            if index >= len(STAGES):
+            stages = STAGES[2:] if retained else STAGES
+            if index >= len(stages):
                 raise ValueError('unexpected additional sampler call')
-            stage = STAGES[index]
+            stage = stages[index]
             row = {'stage': stage, 'completed_steps': [], 'model': type(pos[0]).__name__}
             report['samplers'].append(row)
             report['phase'] = stage
@@ -197,6 +222,28 @@ def main():
                 extra['concat_cond'] = np.asarray(kw['concat_cond'])
             extra['parameters_json'] = np.array(json.dumps(parameters))
             save_sample(samples / (stage + '_noise.npz'), pos[1], **extra)
+            if retained:
+                class EulerRecords(list):
+                    def append(self, payload):
+                        super().append(payload)
+                        step = len(self)
+                        mx.eval(*[v for v in payload.values() if v is not None])
+                        snapshot = {k: np.array(v) for k, v in payload.items() if v is not None}
+                        path = samples / f'{stage}_euler_{step:02d}.npz'
+                        np.savez_compressed(path, **snapshot)
+                        sample_path = samples / f'{stage}_step_{step:02d}.npz'
+                        save_sample(sample_path, payload['sample_next'], next_step_index=np.array(step), **extra)
+                        row['completed_steps'].append(step)
+                        row['last_sample'] = str(sample_path)
+                        report['last_trustworthy_evidence'] = str(sample_path)
+                        write()
+                        print(f'Recovered assay saved {stage} step {step}/12', flush=True)
+                records = EulerRecords()
+                if kw.get('capture_steps') is not None:
+                    raise ValueError('unexpected competing sampler capture')
+                kw['capture_steps'] = records
+                row['observation_route'] = 'sampler_capture_steps_retained_euler'
+                return original_sampler(*pos, **kw)
             def trace_step(frame, event, arg):
                 if event == 'line' and frame.f_lineno == capture_line:
                     step = int(frame.f_locals['step_idx']) + 1
@@ -226,7 +273,9 @@ def main():
         samplers.flow_euler_sample = sampled
         checkpoint.save_checkpoint = saved
         namespace = {'__name__': '_fresh_assay_generator', '__file__': str(generator)}
-        exec(compile(instrument_source(generator.read_text()), str(generator), 'exec'), namespace)
+        if retained:
+            namespace['_retained_lr'] = retained
+        exec(compile(instrument_source(generator.read_text(), bool(retained)), str(generator), 'exec'), namespace)
         def native_features(path, resolution=512):
             from trellmlx.models.dinov3 import extract_features
             report['phase'] = 'native_mlx_conditioning'
@@ -239,6 +288,8 @@ def main():
         namespace['_extract_image_features'] = native_features
         old_argv = sys.argv
         sys.argv = [str(generator), '--image', str(args.image), '--no-rembg', '--seed', '42', '--resolution', '1024', '--steps', '12', '--target-faces', '0', '--no-cleanup', '--save-checkpoints', str(cp), '--output', str(out / 'unused.glb'), '--shape-flow-attention-backend', 'fast', '--qk-norm-backend', 'source-cuda-warp32', '--lr-shape-sync-every-block']
+        if retained:
+            sys.argv += ['--conditioning-sample', str(cp / 'conditioning.npz')]
         report['generator_argv'] = sys.argv
         write()
         try:
@@ -250,7 +301,7 @@ def main():
             sys.argv = old_argv
             samplers.flow_euler_sample = original_sampler
             checkpoint.save_checkpoint = original_checkpoint
-        report.update(status='passed', phase='fresh_raw_and_texture_complete',
+        report.update(status='passed', phase='recovered_raw_and_texture_complete' if retained else 'fresh_raw_and_texture_complete',
                       artifacts={p.name: {'sha256': sha(p), 'bytes': p.stat().st_size} for p in cp.iterdir() if p.is_file()})
         write()
         return 0

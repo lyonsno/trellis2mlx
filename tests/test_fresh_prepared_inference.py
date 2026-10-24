@@ -4,6 +4,9 @@ import importlib.util
 from pathlib import Path
 import unittest
 import tempfile
+import symtable
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import json
 import numpy as np
 
@@ -28,6 +31,15 @@ class FreshAdmissionTests(unittest.TestCase):
         self.assertTrue(next(k.value.value for k in after.keywords if k.arg == 'lr_sync_every_block'))
         self.assertEqual(len(source.splitlines()), len(assay.instrument_source(source).splitlines()))
         compile(assay.instrument_source(source), 'generate.py', 'exec')
+
+    def test_retained_splice_keeps_downstream_dependencies_local(self):
+        source = (ROOT / 'generate.py').read_text()
+        transformed = assay.instrument_source(source, retained_lr=True)
+        def globals_in_main(text):
+            table = symtable.symtable(text, 'generate.py', 'exec')
+            return set(next(child for child in table.get_children() if child.get_name() == 'main').get_globals())
+        self.assertEqual(globals_in_main(transformed) - globals_in_main(source), {'_retained_lr'})
+        compile(transformed, 'generate.py', 'exec')
 
     def test_changed_source_anchor_refuses(self):
         with self.assertRaisesRegex(ValueError, 'missing or ambiguous'):
@@ -97,6 +109,20 @@ class FreshAdmissionTests(unittest.TestCase):
                 assay.require_complete(self.complete_report(),cp)
             self.valid_checkpoints(cp)
             assay.require_complete(self.complete_report(),cp)
+
+    def test_explicit_retained_lr_completion_counts_only_executed_stages(self):
+        with tempfile.TemporaryDirectory() as d:
+            cp = Path(d)
+            self.valid_checkpoints(cp)
+            report = self.complete_report()
+            report['trajectory'] = 'retained_lr'
+            report['conditioning_backend'] = 'retained_native_mlx'
+            report['retained_prefix_verified'] = True
+            report['samplers'] = report['samplers'][2:]
+            assay.require_complete(report, cp)
+            report['retained_prefix_verified'] = False
+            with self.assertRaisesRegex(ValueError, 'retained prefix'):
+                assay.require_complete(report, cp)
 
     def test_missing_image_fails_with_durable_admission_report(self):
         import subprocess, json, sys
