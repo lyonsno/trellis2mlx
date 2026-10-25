@@ -72,11 +72,15 @@ def inspect_arrays(a, params, index, std):
             'relations': relations}
 
 
-def audit_stage(directory, stage, std):
+def audit_stage(directory, stage, std, completed_steps):
     noise_path = directory / f'{stage}_noise.npz'
     with np.load(noise_path, allow_pickle=False) as z:
         params = json.loads(z['parameters_json'].item())
         prior = z['sample'].copy()
+    if type(params['steps']) is not int or params['steps'] <= 0:
+        raise ValueError('step count must be a positive integer: ' + stage)
+    if completed_steps != list(range(1, params['steps'] + 1)):
+        raise ValueError('producer completed-step sequence differs from captured parameters: ' + stage)
     expected_paths = [directory / f'{stage}_euler_{i:02d}.npz' for i in range(1, params['steps'] + 1)]
     if set(directory.glob(f'{stage}_euler_*.npz')) != set(expected_paths):
         raise ValueError('missing or extra Euler captures: ' + stage)
@@ -126,10 +130,10 @@ def main():
         report.update(producer_sha256=sha(producer_path), effective=producer['effective'], source=producer['source'],
                       reference_sha256=sha(args.reference_source), driver_sha256=sha(__file__))
         std = sparse_reference(args.reference_source)
-        for stage in args.stages:
+        for stage, observed in zip(args.stages, producer['samplers']):
             report['phase'] = stage
             write()
-            report['stages'].append(audit_stage(args.run / 'samplers', stage, std))
+            report['stages'].append(audit_stage(args.run / 'samplers', stage, std, observed['completed_steps']))
             write()
         report.update(status='completed', phase='audit_complete',
                       checked_relations_passed=all(row['checked_relations_passed'] for row in report['stages']))

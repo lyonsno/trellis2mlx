@@ -59,7 +59,7 @@ def test_missing_capture_refused_before_partial_pass(tmp_path):
     a,p=unguided_fixture()
     np.savez(tmp_path/'texture_noise.npz',sample=a['sample_in'],parameters_json=json.dumps(p))
     with pytest.raises(ValueError,match='missing or extra'):
-        audit.audit_stage(tmp_path,'texture',std)
+        audit.audit_stage(tmp_path,'texture',std,[1,2])
 
 
 def test_wrong_route_has_durable_failure_report(tmp_path):
@@ -72,3 +72,32 @@ def test_wrong_route_has_durable_failure_report(tmp_path):
     assert run.returncode != 0
     report=json.loads(output.read_text())
     assert report['status']=='failed' and report['phase']=='admission' and report['stages']==[]
+
+
+@pytest.mark.parametrize('steps,completed,error', [
+    (0, [], 'positive integer'),
+    (-1, [], 'positive integer'),
+    (2, [1], 'completed-step sequence'),
+    (2, [2, 1], 'completed-step sequence'),
+    (2, None, 'completed-step sequence'),
+])
+def test_incomplete_sequence_has_durable_cli_failure(tmp_path, steps, completed, error):
+    producer = {'source': {'revision': 'pinned'}, 'effective': {
+        'sampler_sha256': 'pinned', 'sampler_observation': 'full_euler_capture'},
+        'samplers': [{'stage': 'texture', 'completed_steps': completed}]}
+    (tmp_path/'report.json').write_text(json.dumps(producer))
+    captures = tmp_path/'samplers'
+    captures.mkdir()
+    np.savez(captures/'texture_noise.npz', sample=np.ones((1, 2), np.float32),
+             parameters_json=json.dumps({'steps': steps}))
+    output = tmp_path/'audit.json'
+    run = subprocess.run([sys.executable, str(ROOT/'scripts/audit_captured_sampler.py'),
+        '--run', str(tmp_path), '--expected-revision', 'pinned',
+        '--expected-sampler-sha256', 'pinned', '--stages', 'texture',
+        '--reference-source', str(ROOT/'tests/test_samplers.py'),
+        '--output', str(output)], capture_output=True, text=True)
+    report = json.loads(output.read_text())
+    assert run.returncode != 0, report
+    assert report['status'] == 'failed' and report['phase'] == 'texture'
+    assert error in report['error']
+    assert not report.get('checked_relations_passed', False)
