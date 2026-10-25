@@ -25,6 +25,23 @@ def shape_sync_calls(source):
 
 
 class FreshAdmissionTests(unittest.TestCase):
+    def test_saved_shape_continuation_skips_sampling_and_restores_rng_before_decoder(self):
+        source = (ROOT / 'generate.py').read_text()
+        transformed = assay.instrument_source(source, retained_shape=True)
+        begin = transformed.index('    # Exact completed shape prefix')
+        end = transformed.index('    # === Stage 3: Shape Decode ===')
+        setup = transformed[begin:end]
+        self.assertIn('mx.random.state =', setup)
+        self.assertIn("_retained_shape['feats']", setup)
+        self.assertNotIn('Stage 1: Sparse Structure', transformed)
+        self.assertNotIn('Stage 2c: HR Shape Latent', transformed)
+        self.assertIn('tex_slat = flow_euler_sample(', transformed)
+        self.assertEqual(transformed[end:], source[source.index('    # === Stage 3: Shape Decode ==='):])
+        def globals_in_main(text):
+            table = symtable.symtable(text, 'generate.py', 'exec')
+            return set(next(child for child in table.get_children() if child.get_name() == 'main').get_globals())
+        self.assertEqual(globals_in_main(transformed)-globals_in_main(source), {'_retained_shape'})
+
     def capture_wrapper(self, directory, *, retained=None, fail_at=None):
         """Exercise the driver's actual nested recorder without a model or GPU."""
         import inspect
@@ -212,6 +229,18 @@ class FreshAdmissionTests(unittest.TestCase):
             report['retained_prefix_verified'] = False
             with self.assertRaisesRegex(ValueError, 'retained prefix'):
                 assay.require_complete(report, cp)
+
+    def test_explicit_retained_shape_completion_counts_only_texture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cp=Path(d)
+            self.valid_checkpoints(cp)
+            report=self.complete_report()
+            report.update(trajectory='retained_shape', conditioning_backend='retained_native_mlx',
+                          retained_prefix_verified=True, samplers=report['samplers'][3:])
+            assay.require_complete(report,cp)
+            report['samplers'][0]['completed_steps'].pop()
+            with self.assertRaisesRegex(ValueError,'incomplete sampler'):
+                assay.require_complete(report,cp)
 
     def test_missing_image_fails_with_durable_admission_report(self):
         import subprocess, json, sys

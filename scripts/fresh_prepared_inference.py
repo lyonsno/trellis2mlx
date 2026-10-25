@@ -25,7 +25,9 @@ def sha(path):
     return h.hexdigest()
 
 
-def instrument_source(source, retained_lr=False):
+def instrument_source(source, retained_lr=False, retained_shape=False):
+    if retained_lr and retained_shape:
+        raise ValueError('choose exactly one retained prefix')
     anchor = '        hr_slat_flow = SLatFlowModel.for_shape()\n'
     if source.count(anchor) != 1:
         raise ValueError('HR constructor is missing or ambiguous')
@@ -33,6 +35,9 @@ def instrument_source(source, retained_lr=False):
     if retained_lr:
         from retained_lr_prefix import splice_completed_lr
         source = splice_completed_lr(source)
+    if retained_shape:
+        from retained_shape_prefix import splice_completed_shape
+        source = splice_completed_shape(source)
     return source
 
 
@@ -55,10 +60,10 @@ def evaluated_step_line(fn):
 def require_complete(report, checkpoint_dir):
     import numpy as np
 
-    retained = report.get('trajectory') == 'retained_lr'
+    retained = report.get('trajectory') in ('retained_lr', 'retained_shape')
     if retained and not report.get('retained_prefix_verified'):
         raise ValueError('unverified retained prefix')
-    expected = STAGES[2:] if retained else STAGES
+    expected = ('texture',) if report.get('trajectory') == 'retained_shape' else STAGES[2:] if retained else STAGES
     if [x['stage'] for x in report['samplers']] != list(expected):
         raise ValueError('expected all four fresh sampler calls')
     for sampler in report['samplers']:
@@ -120,6 +125,7 @@ def main():
     p.add_argument('--image-sha256', required=True)
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--completed-lr-manifest', type=Path)
+    p.add_argument('--completed-shape-manifest', type=Path)
     p.add_argument('--retain-euler-steps', action='store_true',
                    help='Retain every guidance operand through the sampler capture hook, including fresh stages.')
     args = p.parse_args()
@@ -139,6 +145,8 @@ def main():
         temp.replace(report_path)
     write()
     try:
+        if args.completed_lr_manifest and args.completed_shape_manifest:
+            raise ValueError('choose exactly one retained prefix')
         root = args.source_root.resolve()
         revision = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
         if revision != args.expected_revision:
@@ -182,18 +190,25 @@ def main():
             report.update(trajectory='retained_lr', retained_prefix_verified=True,
                           retained_prefix=provenance, conditioning_backend='retained_native_mlx',
                           claim_limit='Recovered MLX trajectory from completed retained LR and exact RNG. HR and texture newly executed; no uninterrupted-run or mesh-quality claim.')
+        if args.completed_shape_manifest:
+            from retained_shape_prefix import load_completed_shape
+            retained, provenance = load_completed_shape(args.completed_shape_manifest, report)
+            report.update(trajectory='retained_shape', retained_prefix_verified=True,
+                          retained_prefix=provenance, conditioning_backend='retained_native_mlx',
+                          claim_limit='Recovered MLX shape prefix and HR terminal RNG. Decoder, extraction and texture newly executed; no uninterrupted-run or finished-mesh quality claim.')
         report['effective']['sampler_observation'] = (
             'full_euler_capture' if retained or args.retain_euler_steps else 'evaluated_sample_trace')
         cp = out / 'checkpoints'
         cp.mkdir()
         if retained:
             import shutil
-            for stage in ('conditioning', 'sparse_coords'):
+            inherited = ('conditioning', 'sparse_coords', 'shape_slat') if args.completed_shape_manifest else ('conditioning', 'sparse_coords')
+            for stage in inherited:
                 for suffix in ('.npz', '.json'):
                     path = Path(retained['checkpoint_dir']) / (stage + suffix)
                     if path.exists():
                         shutil.copyfile(path, cp / path.name)
-            report['stage_outputs'].extend(['conditioning', 'sparse_coords'])
+            report['stage_outputs'].extend(inherited)
         samples = out / 'samplers'
         samples.mkdir()
         original_sampler = samplers.flow_euler_sample
@@ -207,7 +222,7 @@ def main():
             np.savez_compressed(path, **payload)
         def sampled(*pos, **kw):
             index = len(report['samplers'])
-            stages = STAGES[2:] if retained else STAGES
+            stages = ('texture',) if report.get('trajectory') == 'retained_shape' else STAGES[2:] if retained else STAGES
             if index >= len(stages):
                 raise ValueError('unexpected additional sampler call')
             stage = stages[index]
@@ -270,6 +285,8 @@ def main():
             finally:
                 sys.settrace(previous)
         def saved(directory, stage, **arrays):
+            report['phase'] = stage + '_checkpoint_write'
+            write()
             original_checkpoint(directory, stage, **arrays)
             report['stage_outputs'].append(stage)
             report['last_trustworthy_evidence'] = str(cp / (stage + '.npz'))
@@ -280,8 +297,8 @@ def main():
         checkpoint.save_checkpoint = saved
         namespace = {'__name__': '_fresh_assay_generator', '__file__': str(generator)}
         if retained:
-            namespace['_retained_lr'] = retained
-        exec(compile(instrument_source(generator.read_text(), bool(retained)), str(generator), 'exec'), namespace)
+            namespace['_retained_shape' if args.completed_shape_manifest else '_retained_lr'] = retained
+        exec(compile(instrument_source(generator.read_text(), bool(args.completed_lr_manifest), bool(args.completed_shape_manifest)), str(generator), 'exec'), namespace)
         def native_features(path, resolution=512):
             from trellmlx.models.dinov3 import extract_features
             report['phase'] = 'native_mlx_conditioning'
