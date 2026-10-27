@@ -428,6 +428,8 @@ class SLatFlowModel(nn.Module):
             x = self._run_blocks(x, mod[0], cond, rope_phases)
         else:
             for i, block in enumerate(self.blocks):
+                from ..greenroom_pause import pause_boundary
+                pause_boundary("shape_flow_block", i - 1)
                 block_kv = cross_kv_cache[i] if cross_kv_cache is not None else None
                 block_injection = None
                 if shape_block_injection is not None:

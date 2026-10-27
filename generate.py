@@ -1620,7 +1620,27 @@ def main():
     parser.add_argument("--vs3d-rasi-k", type=int, default=0,
                         help="RASI inner optimization steps (default: 0 = RASI disabled). "
                              "Set >0 to enable RASI source anchoring.")
+    parser.add_argument("--greenroom-queue-dir", metavar="DIR",
+                        default=os.environ.get("TRELLIS2MLX_GREENROOM_QUEUE_DIR"),
+                        help="Honor Greenroom Pause/Play during sampling and between stages; retains model RAM and worker lock")
+    parser.add_argument("--greenroom-pause-report", metavar="PATH",
+                        default=os.environ.get("TRELLIS2MLX_GREENROOM_PAUSE_REPORT"),
+                        help="Fresh pause report path; requires a Greenroom queue; default is unique beside output")
     args = parser.parse_args()
+    if args.greenroom_pause_report and not args.greenroom_queue_dir:
+        parser.error("--greenroom-pause-report requires --greenroom-queue-dir")
+    from trellmlx.greenroom_pause import pause_session
+    import uuid
+    report_path = args.greenroom_pause_report or (
+        Path(args.output).parent / "_control" /
+        f"{Path(args.output).stem}.{uuid.uuid4().hex}.pause.json"
+    )
+    with pause_session(args.greenroom_queue_dir, report_path) as pause_control:
+        return _generate(args, parser, pause_control)
+
+
+def _generate(args, parser, pause_control):
+    from trellmlx.greenroom_pause import pause_boundary
     if args.no_hole_fill and args.reference_cleanup:
         parser.error("--no-hole-fill changes --reference-cleanup; use the local cleanup route")
     os.environ["TRELLIS2MLX_QK_NORM_BACKEND"] = args.qk_norm_backend
@@ -1924,6 +1944,7 @@ def main():
             t_total = time.perf_counter()
 
             # Re-run cleanup + simplification with current settings
+            pause_boundary("mesh_cleanup")
             vertices, faces = _cleanup_and_simplify_mesh(
                 vertices, faces,
                 target_faces=args.target_faces,
@@ -1972,6 +1993,7 @@ def main():
             from trellmlx.texture_bake import bake_texture
             unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
             t0 = time.perf_counter()
+            pause_boundary("uv_unwrap")
             uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
@@ -1990,6 +2012,7 @@ def main():
                     output_path=args.output,
                 )
 
+            pause_boundary("resume_texture_bake")
             base_color, metallic_roughness, alpha_mode = bake_texture(
                 uv_verts, uv_faces, uvs, vmapping,
                 tex_coords_spatial, tex_np, mesh_grid_size,
@@ -2073,6 +2096,7 @@ def main():
     from trellmlx.cleanup import cleanup_model, cleanup
 
     if args.shape_slat_sample:
+        pause_boundary("shape_decode_replay")
         print("=== Shape SLat replay: Decode Shape ===", flush=True)
         shape_slat_sample_npz = np.load(args.shape_slat_sample)
         missing = {"feats", "coords"} - set(shape_slat_sample_npz.files)
@@ -2152,6 +2176,7 @@ def main():
     if args.quantize:
         from trellmlx.quantize import quantize_model
 
+    pause_boundary("conditioning")
     # === Image conditioning ===
     if args.conditioning_sample:
         conditioning_sample_npz = np.load(args.conditioning_sample)
@@ -2308,6 +2333,7 @@ def main():
             cond_tgt_hr, neg_cond_hr = _extract_high_resolution_conditioning([tgt_image_path])
         print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
 
+    pause_boundary("sparse_flow")
     # === Stage 1: Sparse Structure ===
     print("=== Stage 1: Sparse Structure ===", flush=True)
     from trellmlx.models.sparse_structure_flow import SparseStructureFlowModel
@@ -2961,6 +2987,7 @@ def main():
         print("  Stop after stage: sparse_flow_steps", flush=True)
         return
 
+    pause_boundary("sparse_decode")
     logits = ss_dec(z_s.astype(mx.float32))
     mx.eval(logits)
     decoded = np.array(logits[0, 0] > 0)
@@ -3031,6 +3058,7 @@ def main():
             flush=True,
         )
 
+    pause_boundary("lr_shape")
     # === Stage 2a: LR Shape Latent ===
     print("\n=== Stage 2a: LR Shape Latent ===", flush=True)
     attention_route_baseline = _capture_attention_route_env()
@@ -3532,6 +3560,7 @@ def main():
         print(f"  No-cascade: using LR SLat directly ({num_tokens:,} tokens, "
               f"grid_size={hr_resolution})", flush=True)
     else:
+        pause_boundary("shape_upsample")
         # === Stage 2b: Upsample to get HR coordinates ===
         print("\n=== Stage 2b: Upsample → HR coordinates ===", flush=True)
 
@@ -3563,6 +3592,7 @@ def main():
         del decoder
         gc.collect()
 
+        pause_boundary("hr_shape")
         # === Stage 2c: HR Shape Latent (second SLat pass) ===
         print("\n=== Stage 2c: HR Shape Latent ===", flush=True)
 
@@ -3620,6 +3650,7 @@ def main():
             print("  Stop after stage: shape_slat", flush=True)
             return
 
+    pause_boundary("shape_decode")
     # === Stage 3: Shape Decode ===
     print("\n=== Stage 3: Decode Shape ===", flush=True)
 
@@ -3638,6 +3669,7 @@ def main():
     del shape_decoder
     gc.collect()
 
+    pause_boundary("mesh_extract")
     # === Mesh Extraction ===
     print("\n=== Mesh Extraction ===", flush=True)
     from trellmlx.mesh_extract import decoder_output_to_mesh
@@ -3698,6 +3730,7 @@ def main():
             print("  Stop after stage: mesh_raw", flush=True)
             return
 
+    pause_boundary("mesh_cleanup")
     vertices, faces = _cleanup_and_simplify_mesh(
         vertices,
         faces,
@@ -3746,6 +3779,7 @@ def main():
             print("  Stop after stage: mesh_clean", flush=True)
             return
 
+    pause_boundary("texture_flow")
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
 
@@ -3787,6 +3821,7 @@ def main():
     del tex_flow
     gc.collect()
 
+    pause_boundary("texture_decode")
     # === Stage 5: Texture Decode ===
     print("\n=== Stage 5: Texture Decode ===", flush=True)
 
@@ -3826,6 +3861,7 @@ def main():
             next_stage="texture_bake",
             output_path=args.output,
         )
+    pause_boundary("uv_unwrap")
     # === Stage 6: Texture Baking ===
     print("\n=== Stage 6: Texture Baking ===", flush=True)
     from trellmlx.texture_bake import uv_unwrap, uv_unwrap_cube, bake_texture
@@ -3835,6 +3871,7 @@ def main():
     # UV unwrap
     unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
     t0 = time.perf_counter()
+    pause_boundary("uv_unwrap")
     uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
@@ -3856,6 +3893,7 @@ def main():
             print("  Stop after stage: mesh_uv", flush=True)
             return
 
+    pause_boundary("texture_bake")
     # Bake PBR textures
     base_color, metallic_roughness, alpha_mode = bake_texture(
         uv_verts, uv_faces, uvs, vmapping,
@@ -3864,6 +3902,7 @@ def main():
         backend=args.texture_backend,
     )
 
+    pause_boundary("export")
     # === Export ===
     import trimesh
     from trimesh.visual.material import PBRMaterial
