@@ -2240,8 +2240,11 @@ def main():
     # The source cascade uses 512px image features for sparse/LR sampling,
     # and 1024px features for HR shape and texture (also for the 768 cascade).
     cond_hr, neg_cond_hr = cond, neg_cond
-    hr_conditioning_route = {"route": "shared", "reason": "512-resolution"}
-    if args.resolution > 512:
+    hr_conditioning_route = {
+        "route": "shared",
+        "reason": "512-model-no-cascade" if args.no_cascade else "512-resolution",
+    }
+    if args.resolution > 512 and not args.no_cascade:
         if args.conditioning_sample:
             cond_hr, neg_cond_hr, separate_hr = _high_resolution_conditioning_from_sample(
                 conditioning_sample_npz, cond, neg_cond,
@@ -2301,7 +2304,7 @@ def main():
         cond_src = cond          # source image conditioning
         cond_tgt = _extract_image_features(tgt_image_path)
         cond_tgt_hr = cond_tgt
-        if args.resolution > 512:
+        if args.resolution > 512 and not args.no_cascade:
             cond_tgt_hr, neg_cond_hr = _extract_high_resolution_conditioning([tgt_image_path])
         print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
 

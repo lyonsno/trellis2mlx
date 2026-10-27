@@ -155,19 +155,21 @@ def test_image_ingress_persists_both_stage_pairs(tmp_path, monkeypatch):
             return mx.ones((1, 2 if resolution == 512 else 7, 4))
 
         monkeypatch.setattr(generate, "_extract_image_features", extract)
-        for resolution in (512, 768, 1024):
+        for resolution, no_cascade in ((512, False), (768, False), (1024, False), (1024, True)):
             calls.clear()
-            output = tmp_path / str(resolution)
+            output = tmp_path / f"{resolution}-{no_cascade}"
             args = types.SimpleNamespace(conditioning_sample=None, image=[str(image)],
-                no_rembg=True, resolution=resolution, save_checkpoints=str(output),
+                no_rembg=True, resolution=resolution, no_cascade=no_cascade,
+                shape_slat_support_mesh_grid_size=None, save_checkpoints=str(output),
                 stop_after_stage="conditioning")
             namespace = dict(vars(generate), args=args)
             exec(compile(module, str(image), "exec"), namespace)
             namespace["conditioning_block"]()
-            assert calls == ([512] if resolution == 512 else [512, 1024])
+            expected_high = resolution > 512 and not no_cascade
+            assert calls == ([512, 1024] if expected_high else [512])
             with np.load(output / "conditioning.npz", allow_pickle=False) as archive:
                 assert archive["cond"].shape == (1, 2, 4)
-                assert archive["cond_hr"].shape == (1, 2 if resolution == 512 else 7, 4)
+                assert archive["cond_hr"].shape == (1, 7 if expected_high else 2, 4)
                 np.testing.assert_array_equal(archive["neg_cond_hr"], 0)
     finally:
         mx.set_default_device(previous)
