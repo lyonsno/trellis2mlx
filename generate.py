@@ -2237,10 +2237,35 @@ def main():
             "route": "random",
             "seed": args.seed,
         }
+    # The source cascade uses 512px image features for sparse/LR sampling,
+    # and 1024px features for HR shape and texture (also for the 768 cascade).
+    cond_hr, neg_cond_hr = cond, neg_cond
+    hr_conditioning_route = {"route": "shared", "reason": "512-resolution"}
+    if args.resolution > 512:
+        if args.conditioning_sample:
+            cond_hr, neg_cond_hr, separate_hr = _high_resolution_conditioning_from_sample(
+                conditioning_sample_npz, cond, neg_cond,
+            )
+            hr_conditioning_route = {
+                "route": "checkpoint-sample" if separate_hr else "legacy-shared-sample",
+            }
+            if not separate_hr:
+                print("  Diagnostic conditioning sample has no HR pair; sharing its "
+                      "explicit tensors across stages (not source-resolution parity)", flush=True)
+        elif args.image:
+            cond_hr, neg_cond_hr = _extract_high_resolution_conditioning(image_paths)
+            hr_conditioning_route = {"route": "image", "image_resolution": 1024}
+        else:
+            hr_conditioning_route = {"route": "shared", "reason": "random-conditioning"}
     cond_np = np.array(cond)
     neg_cond_np = np.array(neg_cond)
+    cond_hr_np = np.array(cond_hr)
+    neg_cond_hr_np = np.array(neg_cond_hr)
     conditioning_route["cond"] = _array_identity(cond_np)
     conditioning_route["neg_cond"] = _array_identity(neg_cond_np)
+    hr_conditioning_route["cond"] = _array_identity(cond_hr_np)
+    hr_conditioning_route["neg_cond"] = _array_identity(neg_cond_hr_np)
+    conditioning_route["high_resolution"] = hr_conditioning_route
     if args.save_checkpoints:
         from trellmlx.checkpoint import save_checkpoint
         save_checkpoint(
@@ -2248,6 +2273,8 @@ def main():
             "conditioning",
             cond=cond_np,
             neg_cond=neg_cond_np,
+            cond_hr=cond_hr_np,
+            neg_cond_hr=neg_cond_hr_np,
             conditioning_route_json=json.dumps(
                 conditioning_route,
                 sort_keys=True,
@@ -2273,6 +2300,9 @@ def main():
             tgt_image_path = args.edit_target
         cond_src = cond          # source image conditioning
         cond_tgt = _extract_image_features(tgt_image_path)
+        cond_tgt_hr = cond_tgt
+        if args.resolution > 512:
+            cond_tgt_hr, neg_cond_hr = _extract_high_resolution_conditioning([tgt_image_path])
         print(f"  VS3D: cond_src {cond_src.shape}, cond_tgt {cond_tgt.shape}", flush=True)
 
     # === Stage 1: Sparse Structure ===
@@ -3544,7 +3574,7 @@ def main():
 
         t0 = time.perf_counter()
         hr_slat = flow_euler_sample(
-            hr_slat_flow, hr_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+            hr_slat_flow, hr_noise, cond_tgt_hr if vs3d_mode else cond_hr, neg_cond_hr,
             verbose=False,
             coords=mx.array(hr_coords_3d),
             **SHAPE_SAMPLER,
@@ -3733,7 +3763,7 @@ def main():
     tex_noise = mx.random.normal((num_tokens, 32))
     t0 = time.perf_counter()
     tex_slat = flow_euler_sample(
-        tex_flow, tex_noise, cond_tgt if vs3d_mode else cond, neg_cond,
+        tex_flow, tex_noise, cond_tgt_hr if vs3d_mode else cond_hr, neg_cond_hr,
         verbose=False,
         coords=mx.array(hr_coords_3d),
         concat_cond=shape_cond,
@@ -3933,6 +3963,36 @@ def main():
     from trellmlx.modules.sparse_conv import clear_neighbor_map_cache
     clear_neighbor_map_cache()
     cleanup()
+
+
+def _extract_high_resolution_conditioning(image_paths):
+    """Encode the source HR views without changing the sampling random draw."""
+    sampling_state = [mx.array(np.array(value)) for value in mx.random.state]
+    try:
+        features = [_extract_image_features(path, resolution=1024) for path in image_paths]
+        cond = mx.concatenate(features, axis=1)
+        mx.eval(cond)
+        return cond, mx.zeros_like(cond)
+    finally:
+        # MLX 0.32 exposes a read-only state container whose arrays are mutable.
+        for current, saved in zip(mx.random.state, sampling_state):
+            current[...] = saved
+        mx.eval(*mx.random.state)
+
+
+def _high_resolution_conditioning_from_sample(archive, cond, neg_cond):
+    """Keep legacy explicit shared fixtures; preserve a supplied HR pair."""
+    present = {"cond_hr", "neg_cond_hr"}.intersection(archive.files)
+    if not present:
+        return cond, neg_cond, False
+    if present != {"cond_hr", "neg_cond_hr"}:
+        raise ValueError("conditioning sample requires both cond_hr and neg_cond_hr")
+    positive, negative = mx.array(archive["cond_hr"]), mx.array(archive["neg_cond_hr"])
+    if (positive.ndim != 3 or positive.shape != negative.shape or
+            positive.shape[0] != cond.shape[0] or positive.shape[-1] != cond.shape[-1] or
+            positive.shape[1] == 0):
+        raise ValueError("conditioning sample has incompatible HR conditioning shapes")
+    return positive, negative, True
 
 
 def _extract_image_features(image_path, resolution=512):
