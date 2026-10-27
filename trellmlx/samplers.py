@@ -68,6 +68,7 @@ def flow_euler_sample(
     capture_steps: list[dict] | None = None,
     stop_after_first_step: bool = False,
     start_step_index: int = 0,
+    on_step_boundary=None,
     sparse_block_injection=None,
     shape_block_injection=None,
     **model_kwargs,
@@ -109,6 +110,11 @@ def flow_euler_sample(
                 "sparse-token sampling currently requires one conditioning batch; "
                 f"got cond={cond_batches}, neg_cond={neg_cond_batches}"
             )
+
+    if on_step_boundary is None:
+        from .greenroom_pause import pause_boundary
+        on_step_boundary = lambda index: pause_boundary("sampling", index)
+    on_step_boundary(start_step_index - 1)
 
     # Build cross-attention KV caches if the model supports it.
     # The image conditioning doesn't change between steps, so KV projections
@@ -266,6 +272,7 @@ def flow_euler_sample(
                 mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
         mx.eval(sample)
+        on_step_boundary(step_idx)
 
         if verbose:
             print(f" done", flush=True)

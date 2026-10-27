@@ -362,6 +362,8 @@ class SLatDecoder(nn.Module):
         upsample_count = 0
         subs = [] if return_subs else None
         for level_idx, level_blocks in enumerate(self.blocks):
+            from ..greenroom_pause import pause_boundary
+            pause_boundary("shape_decode_level", level_idx - 1)
             if stop_after is not None and upsample_count >= stop_after:
                 if return_subs:
                     return feats, coords, subs
@@ -371,7 +373,8 @@ class SLatDecoder(nn.Module):
 
             nmap = build_neighbor_map(coords)
 
-            for block in level_blocks:
+            for block_idx, block in enumerate(level_blocks):
+                pause_boundary(f"shape_decode_level_{level_idx}_block", block_idx - 1)
                 if isinstance(block, SparseConvNeXtBlock3d):
                     feats = block(feats, nmap)
                     mx.eval(feats)
