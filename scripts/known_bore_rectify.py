@@ -132,9 +132,9 @@ def main():
                 if part.get('ellipse'):
                     lines=trimesh.intersections.mesh_plane(mesh,[1,0,0],[feature['sectionX'],0,0])[:,:,1:3]
                     ellipse=fit_bore_ellipse(selected_contour(lines,np.array(before['selected']['bounds'])),authored['selected']['radius'])
-                anchors.append(dict(x=feature['sectionX'],center=before['selected']['centerYZ'],
+                anchors.append(dict(dict(x=feature['sectionX'],center=before['selected']['centerYZ'],
                     radius=before['selected']['radius'],targetCenter=authored['selected']['centerYZ'],
-                    targetRadius=authored['selected']['radius'],**ellipse))
+                    targetRadius=authored['selected']['radius']),**ellipse))
             result['phase']='export:'+part['name']
             exported=export_deformation(part['input'],part['output'],part['position'],
                 lambda p:warp_with_jacobian(p,anchors,part['fadeRadius']),
