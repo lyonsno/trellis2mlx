@@ -248,6 +248,13 @@ def fit_profile(mesh, authored):
 
 def export_warp(input_path, output_path, position, generated, authored):
     """Bake a nonlinear warp into GLB positions/normals; retain UV/images/indices."""
+    return export_deformation(input_path, output_path, position,
+        lambda points: warp_with_jacobian(points, generated, authored),
+        'knownAxialRectification', dict(generated=generated, authored=authored))
+
+
+def export_deformation(input_path, output_path, position, warp, provenance_key, provenance):
+    """Bake a caller's validated deformation on the retained single-mesh route."""
     raw = Path(input_path).read_bytes()
     jn, jt = struct.unpack_from('<II', raw, 12)
     doc = json.loads(raw[20:20+jn])
@@ -271,7 +278,7 @@ def export_warp(input_path, output_path, position, generated, authored):
 
     pos = array(primitive['attributes']['POSITION'])
     world = np.array(pos, dtype=float) + position + np.asarray(node.get('translation', [0, 0, 0]))
-    corrected, jac = warp_with_jacobian(world, generated, authored)
+    corrected, jac = warp(world)
     determinants = np.linalg.det(jac)
     if not np.isfinite(corrected).all() or not np.all(determinants > 0):
         raise ValueError('Nonfinite or orientation-reversing warp')
@@ -293,7 +300,7 @@ def export_warp(input_path, output_path, position, generated, authored):
             raise ValueError('Warp modified an index/UV/image buffer')
         preserved.append(hashlib.sha256(original[start:end]).hexdigest())
     node.pop('translation', None)
-    doc.setdefault('extras', {})['knownAxialRectification'] = dict(generated=generated, authored=authored,
+    doc.setdefault('extras', {})[provenance_key] = dict(provenance,
         sourceSha256=hashlib.sha256(raw).hexdigest(), preservedBufferSha256=preserved)
     jb = json.dumps(doc, separators=(',', ':')).encode(); jb += b' '*((-len(jb)) % 4)
     binary.extend(b'\0'*((-len(binary)) % 4))
