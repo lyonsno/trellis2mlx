@@ -46,6 +46,14 @@ class KnownBoreCorrectionTests(unittest.TestCase):
         result,jac=warp_with_jacobian(points,[anchor],.44)
         np.testing.assert_allclose(np.linalg.norm(result[:,1:]-[1.25,0],axis=1),.21,atol=1e-10)
         self.assertTrue(np.all(np.linalg.det(jac)>0))
+        p=np.array([[0.,1.59,.08]])
+        _,j=warp_with_jacobian(p,[anchor],.44)
+        for i in range(3):
+            h=np.zeros_like(p);h[:,i]=1e-6
+            numeric=(warp_with_jacobian(p+h,[anchor],.44)[0]-warp_with_jacobian(p-h,[anchor],.44)[0])/2e-6
+            np.testing.assert_allclose(j[:,:,i],numeric,atol=1e-7)
+        with self.assertRaises(ValueError):
+            fit_bore_ellipse(np.array([[[0.,0.],[1.,0.]]]*4),.2)
 
 
 if __name__ == '__main__':
