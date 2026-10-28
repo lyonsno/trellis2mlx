@@ -2,6 +2,27 @@
 import numpy as np
 
 
+def fit_bore_ellipse(lines, target_radius):
+    lines=np.asarray(lines,dtype=float);p=lines.reshape(-1,2)
+    w=np.repeat(np.linalg.norm(lines[:,1]-lines[:,0],axis=1),2)
+    if len(p)<5 or not w.sum()>0 or target_radius<=0:
+        raise ValueError('Ellipse requires observed contour lengths and a positive target')
+    origin=np.average(p,axis=0,weights=w);q=p-origin
+    design=np.column_stack([q[:,0]**2,2*q[:,0]*q[:,1],q[:,1]**2,q])
+    params,_,rank,_=np.linalg.lstsq(design*np.sqrt(w[:,None]),np.sqrt(w),rcond=None)
+    if rank<5:raise ValueError('Bore ellipse is underconstrained')
+    quadratic=np.array([[params[0],params[1]],[params[1],params[2]]])
+    eig=np.linalg.eigvalsh(quadratic)
+    if not np.all(eig>0):raise ValueError('Observed bore is not an ellipse')
+    center=-.5*np.linalg.solve(quadratic,params[3:])
+    metric=quadratic/(1+center@quadratic@center)
+    eigenvalues,vectors=np.linalg.eigh(metric)
+    linear=target_radius*(vectors*np.sqrt(eigenvalues))@vectors.T
+    return dict(center=(origin+center).tolist(),radius=float(1/np.sqrt(eigenvalues.min())),
+                linear=linear.tolist(),ellipseAxes=(1/np.sqrt(eigenvalues)).tolist(),
+                ellipseResidualRMS=float(np.sqrt(np.average((np.sqrt(np.einsum('ni,ij,nj->n',q-center,metric,q-center))-1)**2,weights=w))))
+
+
 def warp_with_jacobian(points, anchors, fade_radius):
     points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all() or not anchors:
@@ -33,16 +54,41 @@ def warp_with_jacobian(points, anchors, fade_radius):
     dudx = (drdx-1.25*drg*(1-u))/(fade_radius-band)
     dwdx = np.where((u>0)&(u<1),dwdu*dudx,0)
     scale = ra/rg
-    ds = dra/rg-ra*drg/(rg*rg)
-    delta = target-c+(scale-1)[:,None]*d
+    matrices=np.array([a.get('linear',np.eye(2)*(a['targetRadius']/a['radius'])) for a in anchors])
+    if matrices.shape!=(len(anchors),2,2) or not np.isfinite(matrices).all() or not np.all(np.linalg.det(matrices)>0):
+        raise ValueError('Bore linear correction must preserve orientation')
+    flat=matrices.reshape(len(anchors),4)
+    linear=np.column_stack([np.interp(x,data[:,0],flat[:,i]) for i in range(4)]).reshape(-1,2,2)
+    dl=np.zeros_like(linear)
+    if len(data)>1:
+        dl=np.diff(matrices,axis=0)[segment]/np.diff(data[:,0])[segment,None,None]
+        dl[(x<data[0,0])|(x>=data[-1,0])]=0
+    delta = target-c+np.einsum('nij,nj->ni',linear-np.eye(2),d)
     out = points.copy(); out[:,1:] += w[:,None]*delta
     jac = np.broadcast_to(np.eye(3),(len(points),3,3)).copy()
-    jac[:,1:,1:] += (w*(scale-1))[:,None,None]*np.eye(2)
+    jac[:,1:,1:] += w[:,None,None]*(linear-np.eye(2))
     jac[:,1:,1:] += delta[:,:,None]*(dwdr[:,None]*unit)[:,None,:]
-    jac[:,1:,0] = (dwdx[:,None]*delta + w[:,None]*(dt-scale[:,None]*dc+ds[:,None]*d))
+    jac[:,1:,0] = (dwdx[:,None]*delta + w[:,None]*(dt-np.einsum('nij,nj->ni',linear,dc)+np.einsum('nij,nj->ni',dl,d)))
     if not np.all(np.linalg.det(jac)>0):
         raise ValueError('Requested bore correction reverses or collapses the surface neighborhood')
     return out,jac
+
+
+def selected_contour(lines,bounds):
+    """Recover the exact connected contour already identified by the diagnostic."""
+    _,ids=np.unique(np.rint(lines.reshape(-1,2)/5e-6).astype(np.int64),axis=0,return_inverse=True)
+    parent=list(range(int(ids.max())+1))
+    def find(i):
+        while parent[i]!=i:parent[i]=parent[parent[i]];i=parent[i]
+        return i
+    for i,j in ids.reshape(-1,2):parent[find(int(i))]=find(int(j))
+    labels=np.array([find(int(i)) for i in ids[::2]])
+    matches=[]
+    for label in np.unique(labels):
+        g=lines[labels==label];p=g.reshape(-1,2)
+        if np.max(abs(np.array([p.min(0),p.max(0)])-bounds))<1e-8:matches.append(g)
+    if len(matches)!=1:raise ValueError('Identified bore contour is ambiguous or unavailable')
+    return matches[0]
 
 
 def main():
@@ -82,9 +128,13 @@ def main():
                 evidence.append(dict(before=before,authored=authored))
                 if not before['observed'] or not authored['observed']:
                     raise ValueError('Known bore correspondence unresolved: '+feature['feature'])
+                ellipse={}
+                if part.get('ellipse'):
+                    lines=trimesh.intersections.mesh_plane(mesh,[1,0,0],[feature['sectionX'],0,0])[:,:,1:3]
+                    ellipse=fit_bore_ellipse(selected_contour(lines,np.array(before['selected']['bounds'])),authored['selected']['radius'])
                 anchors.append(dict(x=feature['sectionX'],center=before['selected']['centerYZ'],
                     radius=before['selected']['radius'],targetCenter=authored['selected']['centerYZ'],
-                    targetRadius=authored['selected']['radius']))
+                    targetRadius=authored['selected']['radius'],**ellipse))
             result['phase']='export:'+part['name']
             exported=export_deformation(part['input'],part['output'],part['position'],
                 lambda p:warp_with_jacobian(p,anchors,part['fadeRadius']),

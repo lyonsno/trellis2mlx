@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from scripts.known_bore_rectify import warp_with_jacobian
+from scripts.known_bore_rectify import warp_with_jacobian, fit_bore_ellipse
 
 
 class KnownBoreCorrectionTests(unittest.TestCase):
@@ -35,6 +35,17 @@ class KnownBoreCorrectionTests(unittest.TestCase):
                   [dict(x=0.,center=[1.25,0],radius=.24,targetCenter=[1.25,0],targetRadius=.2)]*2]:
             with self.assertRaises(ValueError):
                 warp_with_jacobian(p,a,.4)
+
+    def test_oval_bore_corrects_both_axes(self):
+        theta=np.linspace(0,2*np.pi,256,endpoint=False)
+        p=np.column_stack([.24*np.cos(theta)+1.27,.18*np.sin(theta)-.03])
+        lines=np.stack([p,np.roll(p,-1,axis=0)],axis=1)
+        observed=fit_bore_ellipse(lines,.21)
+        anchor=dict(x=0.,**observed,targetCenter=[1.25,0.],targetRadius=.21)
+        points=np.column_stack([np.zeros(len(p)),p])
+        result,jac=warp_with_jacobian(points,[anchor],.44)
+        np.testing.assert_allclose(np.linalg.norm(result[:,1:]-[1.25,0],axis=1),.21,atol=1e-10)
+        self.assertTrue(np.all(np.linalg.det(jac)>0))
 
 
 if __name__ == '__main__':
