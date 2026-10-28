@@ -27,7 +27,22 @@ def center(profile, x):
             (np.asarray(x)[..., None] - profile.get('centerOrigin', 0.)) * profile['slope'])
 
 
+def validate_profile(profile):
+    """Each named section must dominate its own interval's midpoint."""
+    k, w = np.asarray(profile['knots']), np.asarray(profile['widths'])
+    if not (np.all(np.diff(k) > 0) and np.all(w > 0)):
+        raise ValueError('Ordered, distinct axial stations are required')
+    mid = (k[:-1] + k[1:]) / 2
+    u = expit((mid[:, None]-k[1:3])/w)
+    basis = np.column_stack([1-u[:, 0], u[:, 0]-u[:, 1], u[:, 1]])
+    if not np.all(np.diag(basis) > .5):
+        raise ValueError('Three sections are not separately observed: transition dominance failed')
+    return basis.tolist()
+
+
 def warp_with_jacobian(points, generated, authored):
+    validate_profile(generated)
+    validate_profile(authored)
     points = np.asarray(points, dtype=float)
     x = points[:, 0]
     gk, ak = np.asarray(generated['knots']), np.asarray(authored['knots'])
@@ -63,56 +78,114 @@ def warp_points(points, generated, authored):
     return warp_with_jacobian(points, generated, authored)[0]
 
 
-def fit_profile(mesh, authored):
-    """Recover the ordered radii/transitions using every triangle's area.
+def outer_sections(mesh, spacing):
+    """Intersect the complete mesh, retaining connected contours and rejections.
 
-    Axial cap normals have zero cylindrical-wall weight. Angular detail and
-    bevels retain intermediate weight. Correspondence starts from the authored
-    order and coarse registration, rather than recognizing an arbitrary part.
+    A circular contour must surround its own center. The largest such contour
+    supplies the exterior radius; nested bore contours remain in the evidence.
+    The axial quadrature spacing is caller-visible, not a triangle/sample cap.
     """
-    pts = np.asarray(mesh.triangles_center)
-    area = np.asarray(mesh.area_faces)
-    wall_weight = (1 - np.asarray(mesh.face_normals)[:, 0] ** 2) ** 2
-    weights = area * wall_weight
-    if not np.any(weights > 0):
-        raise ValueError('No cylindrical-wall evidence')
-    sw = np.sqrt(weights / weights.mean())
+    import trimesh
     lo, hi = mesh.bounds[:, 0]
-    span, mid = hi - lo, (hi + lo) / 2
-    if not span > 0:
-        raise ValueError('No axial extent')
+    xs = np.linspace(lo, hi, int(np.ceil((hi-lo)/spacing))+2)[1:-1]
+    rows = []
+    for x in xs:
+        lines = trimesh.intersections.mesh_plane(mesh, [1, 0, 0], [x, 0, 0])
+        points = lines[:, :, 1:3].reshape(-1, 2)
+        row = dict(x=float(x), segmentCount=len(lines), candidates=[], selected=None)
+        rows.append(row)
+        if not len(lines):
+            continue
+        _, ids = np.unique(np.rint(points/5e-6).astype(np.int64), axis=0, return_inverse=True)
+        parent = list(range(int(ids.max())+1))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]; i = parent[i]
+            return i
+
+        for i, j in ids.reshape(-1, 2):
+            parent[find(int(i))] = find(int(j))
+        labels = np.array([find(int(i)) for i in ids[::2]])
+        for label in np.unique(labels):
+            segments = lines[labels == label, :, 1:3]
+            p = segments.reshape(-1, 2)
+            w = np.repeat(np.linalg.norm(segments[:, 1]-segments[:, 0], axis=1), 2)
+            candidate = dict(segmentCount=len(segments), valid=False)
+            row['candidates'].append(candidate)
+            if len(p) < 3 or np.linalg.matrix_rank(p-p.mean(0)) < 2 or not w.sum() > 0:
+                candidate['reason'] = 'Underconstrained profile'; continue
+            mean = np.average(p, axis=0, weights=w)
+            q = p-mean
+            design = np.column_stack([2*q, np.ones(len(q))])
+            solution = np.linalg.lstsq(design*np.sqrt(w[:, None]),
+                                       np.sum(q*q, axis=1)*np.sqrt(w), rcond=None)[0]
+            c = mean+solution[:2]
+            rsq = solution[2]+np.sum(solution[:2]**2)
+            if not rsq > 0:
+                candidate['reason'] = 'Nonpositive radius'; continue
+            r = np.sqrt(rsq)
+            angles = np.sort(np.mod(np.arctan2(p[:, 1]-c[1], p[:, 0]-c[0]), 2*np.pi))
+            gap = np.diff(np.r_[angles, angles[0]+2*np.pi]).max()
+            candidate.update(center=c.tolist(), radius=float(r),
+                             radialRMS=float(np.sqrt(np.average((np.linalg.norm(p-c, axis=1)-r)**2, weights=w))),
+                             angularCoverage=float(2*np.pi-gap), valid=bool(gap < np.pi))
+            if not candidate['valid']:
+                candidate['reason'] = 'Contour does not surround fitted center'
+        valid = [i for i, c in enumerate(row['candidates']) if c['valid']]
+        if valid:
+            row['selected'] = max(valid, key=lambda i: row['candidates'][i]['radius'])
+    return rows
+
+
+def fit_profile(mesh, authored):
+    """Fit the known ordered exterior features, distinct from nested bores."""
+    lo, hi = mesh.bounds[:, 0]
+    span, mid = hi-lo, (hi+lo)/2
     ak = np.asarray(authored['knots'])
-    fraction = (ak - ak[0]) / (ak[-1] - ak[0])
-    f1, f2 = fraction[1], (fraction[2] - fraction[1]) / (1 - fraction[1])
-    initial_center = center(authored, np.array([mid]))[0]
-    initial = np.r_[initial_center, authored['slope'], np.log(authored['radii']),
-                    logit([f1, f2]), np.log(np.asarray(authored['widths']) * span / (ak[-1] - ak[0]))]
+    spacing = float(np.min(np.diff(ak))/8)
+    sections = outer_sections(mesh, spacing)
+    observed = [s for s in sections if s['selected'] is not None]
+    if len(observed) < 3:
+        raise ValueError('Insufficient separately observed exterior sections')
+    x = np.array([s['x'] for s in observed])
+    candidates = [s['candidates'][s['selected']] for s in observed]
+    radii = np.array([c['radius'] for c in candidates])
+    centers = np.array([c['center'] for c in candidates])
+    line = np.linalg.lstsq(np.column_stack([np.ones(len(x)), x-mid]), centers, rcond=None)[0]
+    # Globally initialize the two change points on the complete sampled
+    # exterior profile, rather than depending on tiny transition gradients.
+    prefix = np.r_[0., np.cumsum(radii)]
+    square = np.r_[0., np.cumsum(radii*radii)]
+
+    def cost(i, j):
+        return square[j]-square[i]-(prefix[j]-prefix[i])**2/(j-i)
+
+    best = min((cost(0, i)+cost(i, j)+cost(j, len(x)), i, j)
+               for i in range(1, len(x)-1) for j in range(i+1, len(x)))
+    _, i, j = best
+    b1, b2 = (x[i-1]+x[i])/2, (x[j-1]+x[j])/2
+    levels = [radii[:i].mean(), radii[i:j].mean(), radii[j:].mean()]
+    f1, f2 = (b1-lo)/span, (b2-b1)/(hi-b1)
+    initial = np.r_[np.log(levels), logit([f1, f2]), np.log([spacing, spacing])]
 
     def decode(p):
-        b1 = lo + span * expit(p[7])
-        b2 = b1 + (hi - b1) * expit(p[8])
+        b1 = lo+span*expit(p[3]); b2 = b1+(hi-b1)*expit(p[4])
         return dict(knots=[float(lo), float(b1), float(b2), float(hi)],
-                    radii=np.exp(p[4:7]).tolist(), widths=np.exp(p[9:11]).tolist(),
-                    center=p[:2].tolist(), slope=p[2:4].tolist(), centerOrigin=float(mid))
+                    radii=np.exp(p[:3]).tolist(), widths=np.exp(p[5:7]).tolist(),
+                    center=line[0].tolist(), slope=line[1].tolist(), centerOrigin=float(mid))
 
-    def residual(p):
-        profile = decode(p)
-        radial = np.linalg.norm(pts[:, 1:3] - center(profile, pts[:, 0]), axis=1)
-        # Weak log-parameter prior stabilizes a feature with little wall area;
-        # the returned surface error and per-feature evidence remain visible.
-        return np.r_[(radial - radius(profile, pts[:, 0])) * sw,
-                     .001 * (p - initial)]
-
-    fitted = least_squares(residual, initial, loss='soft_l1', f_scale=.005, x_scale='jac')
+    fitted = least_squares(lambda p: np.r_[radii-radius(decode(p), x), .0001*(p-initial)],
+                           initial, loss='soft_l1', f_scale=.005, x_scale='jac')
     profile = decode(fitted.x)
-    r = np.linalg.norm(pts[:, 1:3] - center(profile, pts[:, 0]), axis=1) - radius(profile, pts[:, 0])
     if not fitted.success or not np.isfinite(fitted.x).all():
-        raise ValueError('Profile solve failed: ' + fitted.message)
-    return profile, dict(success=bool(fitted.success), message=fitted.message,
-                         nfev=int(fitted.nfev), triangleCount=len(pts),
-                         weightedWallRMS=float(np.sqrt(np.average(r*r, weights=weights))),
-                         wallWeightSum=float(weights.sum()), allTriangleArea=float(area.sum()),
-                         method='ordered-three-section-axisymmetric-wall-fit; source-axis/frame prior')
+        raise ValueError('Profile solve failed: '+fitted.message)
+    dominance = validate_profile(profile)
+    return profile, dict(success=True, message=fitted.message, nfev=int(fitted.nfev),
+                         triangleCount=len(mesh.faces), sectionSpacing=spacing,
+                         profileRMS=float(np.sqrt(np.mean((radii-radius(profile, x))**2))),
+                         midpointFeatureBasis=dominance, sections=sections,
+                         method='ordered-three-section-exterior-contour-fit; source-axis/frame prior')
 
 
 def export_warp(input_path, output_path, position, generated, authored):

@@ -5,6 +5,32 @@ from scripts.known_axial_profile_rectify import warp_points, warp_with_jacobian,
 
 
 class LocalProfileCorrection(unittest.TestCase):
+    def test_nested_bores_do_not_replace_the_exterior_profile(self):
+        import trimesh
+        knots = [-1., -.78, .72, 1.1]; radii = [.27, .20, .26]
+        parts = []
+        for start, end, r in zip(knots[:-1], knots[1:], radii):
+            m = trimesh.creation.annulus(r_min=.08, r_max=r, height=end-start, sections=48)
+            m.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [0, 1, 0]))
+            m.apply_translation([(start+end)/2, 0., 0.]); parts.append(m)
+        authored = dict(knots=[-.92, -.84, .84, 1.], radii=[.225, .19, .35],
+                        widths=[.005, .005], center=[0., 0.], slope=[0., 0.])
+        fitted, report = fit_profile(trimesh.util.concatenate(parts), authored)
+        np.testing.assert_allclose(fitted['radii'], radii, atol=.001)
+        np.testing.assert_allclose(fitted['knots'][1:3], knots[1:3], atol=.02)
+        self.assertTrue(any(len(s['candidates']) >= 2 for s in report['sections']))
+
+    def test_unresolved_three_section_fit_cannot_be_exported(self):
+        # Observed first real-pin failure: numerical convergence hid the middle
+        # feature under transitions wider than the complete part.
+        bad = dict(knots=[2.2558, 2.3363, 3.9648, 4.1933],
+                   radii=[.3625, .1896, .0229], widths=[215.1, 218.1],
+                   center=[1.25, 0.], slope=[0., 0.])
+        authored = dict(knots=[2.28, 2.36, 4.04, 4.2], radii=[.225, .19, .35],
+                        widths=[.005, .005], center=[1.25, 0.], slope=[0., 0.])
+        with self.assertRaisesRegex(ValueError, 'separately observed'):
+            warp_points(np.array([[3.2, 1.44, 0.]]), bad, authored)
+
     def test_jacobian_and_order(self):
         g = dict(knots=[-1., -.7, .7, 1.], radii=[.27, .20, .26],
                  widths=[.03, .03], center=[.02, -.03], slope=[.01, -.005])
