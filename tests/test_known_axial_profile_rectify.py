@@ -1,10 +1,36 @@
 """Known local deformations must recover dimensions a whole-body scale cannot."""
 import unittest
 import numpy as np
-from scripts.known_axial_profile_rectify import warp_points, warp_with_jacobian, fit_profile, radius, center
+from scripts.known_axial_profile_rectify import warp_points, warp_with_jacobian, fit_profile, radius, center, outer_sections
 
 
 class LocalProfileCorrection(unittest.TestCase):
+    def test_fragmented_exterior_does_not_promote_an_inner_loop(self):
+        import trimesh
+        inner = trimesh.creation.cylinder(radius=.08, height=2., sections=48)
+        inner.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [0, 1, 0]))
+        theta = np.linspace(-.4, .4, 16)
+        vertices = [[x, .3*np.cos(t), .3*np.sin(t)] for x in [-1., 1.] for t in theta]
+        faces = []
+        for j in range(15): faces += [[j, j+1, j+17], [j, j+17, j+16]]
+        fragment = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        sections = outer_sections(trimesh.util.concatenate([inner, fragment]), .2)
+        self.assertTrue(sections)
+        self.assertTrue(all(s['selected'] is None for s in sections),
+                        'An intact inner loop must not replace rejected exterior evidence')
+
+    def test_missing_collar_is_not_an_observed_third_feature(self):
+        import trimesh
+        parts = []
+        for lo, hi, r in [(-1., .7, .2), (.7, 1.1, .26)]:
+            m = trimesh.creation.cylinder(radius=r, height=hi-lo, sections=32)
+            m.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [0, 1, 0]))
+            m.apply_translation([(lo+hi)/2, 0, 0]); parts.append(m)
+        authored = dict(knots=[-.92, -.84, .84, 1.], radii=[.225, .19, .35],
+                        widths=[.005, .005], center=[0., 0.], slope=[0., 0.])
+        with self.assertRaisesRegex(ValueError, 'unresolved|separat|observed'):
+            fit_profile(trimesh.util.concatenate(parts), authored)
+
     def test_nested_bores_do_not_replace_the_exterior_profile(self):
         import trimesh
         knots = [-1., -.78, .72, 1.1]; radii = [.27, .20, .26]

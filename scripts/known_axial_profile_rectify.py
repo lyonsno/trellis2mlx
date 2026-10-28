@@ -14,6 +14,12 @@ from scipy.optimize import least_squares
 from scipy.special import expit, logit
 
 
+class ProfileCorrespondenceError(ValueError):
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = evidence
+
+
 def radius(profile, x):
     r = np.asarray(profile['radii'])
     knots = np.asarray(profile['knots'])
@@ -78,7 +84,7 @@ def warp_points(points, generated, authored):
     return warp_with_jacobian(points, generated, authored)[0]
 
 
-def outer_sections(mesh, spacing):
+def outer_sections(mesh, spacing, axis_profile=None):
     """Intersect the complete mesh, retaining connected contours and rejections.
 
     A circular contour must surround its own center. The largest such contour
@@ -107,11 +113,14 @@ def outer_sections(mesh, spacing):
         for i, j in ids.reshape(-1, 2):
             parent[find(int(i))] = find(int(j))
         labels = np.array([find(int(i)) for i in ids[::2]])
+        axis_center = (center(axis_profile, np.array([x]))[0] if axis_profile is not None
+                       else mesh.bounds.mean(0)[1:3])
         for label in np.unique(labels):
             segments = lines[labels == label, :, 1:3]
             p = segments.reshape(-1, 2)
             w = np.repeat(np.linalg.norm(segments[:, 1]-segments[:, 0], axis=1), 2)
-            candidate = dict(segmentCount=len(segments), valid=False)
+            candidate = dict(segmentCount=len(segments), valid=False,
+                             radialExtent=float(np.linalg.norm(p-axis_center, axis=1).max()))
             row['candidates'].append(candidate)
             if len(p) < 3 or np.linalg.matrix_rank(p-p.mean(0)) < 2 or not w.sum() > 0:
                 candidate['reason'] = 'Underconstrained profile'; continue
@@ -132,9 +141,14 @@ def outer_sections(mesh, spacing):
                              angularCoverage=float(2*np.pi-gap), valid=bool(gap < np.pi))
             if not candidate['valid']:
                 candidate['reason'] = 'Contour does not surround fitted center'
-        valid = [i for i, c in enumerate(row['candidates']) if c['valid']]
-        if valid:
-            row['selected'] = max(valid, key=lambda i: row['candidates'][i]['radius'])
+        if row['candidates']:
+            exterior = max(range(len(row['candidates'])),
+                           key=lambda i: row['candidates'][i]['radialExtent'])
+            row['exteriorCandidate'] = exterior
+            if row['candidates'][exterior]['valid']:
+                row['selected'] = exterior
+            else:
+                row['reason'] = 'Exterior contour unresolved; an inner contour cannot replace it'
     return rows
 
 
@@ -144,10 +158,11 @@ def fit_profile(mesh, authored):
     span, mid = hi-lo, (hi+lo)/2
     ak = np.asarray(authored['knots'])
     spacing = float(np.min(np.diff(ak))/8)
-    sections = outer_sections(mesh, spacing)
+    sections = outer_sections(mesh, spacing, authored)
+    evidence = dict(triangleCount=len(mesh.faces), sectionSpacing=spacing, sections=sections)
     observed = [s for s in sections if s['selected'] is not None]
     if len(observed) < 3:
-        raise ValueError('Insufficient separately observed exterior sections')
+        raise ProfileCorrespondenceError('Insufficient separately observed exterior sections', evidence)
     x = np.array([s['x'] for s in observed])
     candidates = [s['candidates'][s['selected']] for s in observed]
     radii = np.array([c['radius'] for c in candidates])
@@ -161,30 +176,73 @@ def fit_profile(mesh, authored):
     def cost(i, j):
         return square[j]-square[i]-(prefix[j]-prefix[i])**2/(j-i)
 
-    best = min((cost(0, i)+cost(i, j)+cost(j, len(x)), i, j)
-               for i in range(1, len(x)-1) for j in range(i+1, len(x)))
+    source_signs = np.sign(np.log(np.asarray(authored['radii'])[[0, 2]]/authored['radii'][1]))
+    if np.any(source_signs == 0):
+        raise ProfileCorrespondenceError('Source family has no separately observed diameter change', evidence)
+    choices = []
+    for i in range(1, len(x)-1):
+        for j in range(i+1, len(x)):
+            levels = np.array([(prefix[i]-prefix[0])/i, (prefix[j]-prefix[i])/(j-i),
+                               (prefix[-1]-prefix[j])/(len(x)-j)])
+            if np.all(np.sign(np.log(levels[[0, 2]]/levels[1])) == source_signs):
+                choices.append((cost(0, i)+cost(i, j)+cost(j, len(x)), i, j))
+    if not choices:
+        raise ProfileCorrespondenceError('Source-ordered diameter changes are unresolved', evidence)
+    best = min(choices)
     _, i, j = best
     b1, b2 = (x[i-1]+x[i])/2, (x[j-1]+x[j])/2
     levels = [radii[:i].mean(), radii[i:j].mean(), radii[j:].mean()]
     f1, f2 = (b1-lo)/span, (b2-b1)/(hi-b1)
-    initial = np.r_[np.log(levels), logit([f1, f2]), np.log([spacing, spacing])]
+    contrasts = np.abs(np.log(np.asarray(levels)[[0, 2]]/levels[1]))
+    initial = np.r_[np.log(levels[1]), np.log(np.expm1(contrasts)),
+                    logit([f1, f2]), np.log([spacing, spacing])]
 
     def decode(p):
         b1 = lo+span*expit(p[3]); b2 = b1+(hi-b1)*expit(p[4])
+        base = np.exp(p[0]); ratios = np.exp(source_signs*np.logaddexp(0, p[1:3]))
         return dict(knots=[float(lo), float(b1), float(b2), float(hi)],
-                    radii=np.exp(p[:3]).tolist(), widths=np.exp(p[5:7]).tolist(),
+                    radii=[float(base*ratios[0]), float(base), float(base*ratios[1])],
+                    widths=np.exp(p[5:7]).tolist(),
                     center=line[0].tolist(), slope=line[1].tolist(), centerOrigin=float(mid))
 
     fitted = least_squares(lambda p: np.r_[radii-radius(decode(p), x), .0001*(p-initial)],
                            initial, loss='soft_l1', f_scale=.005, x_scale='jac')
     profile = decode(fitted.x)
+    evidence.update(candidateProfile=profile, profileRMS=float(np.sqrt(np.mean((radii-radius(profile, x))**2))))
     if not fitted.success or not np.isfinite(fitted.x).all():
         raise ValueError('Profile solve failed: '+fitted.message)
-    dominance = validate_profile(profile)
+    try:
+        dominance = validate_profile(profile)
+    except ValueError as exc:
+        raise ProfileCorrespondenceError(str(exc), evidence) from exc
+    u = expit((x[:, None]-np.asarray(profile['knots'])[1:3])/profile['widths'])
+    basis = np.column_stack([1-u[:, 0], u[:, 0]-u[:, 1], u[:, 1]])
+    observed_features = []
+    for feature in range(3):
+        mask = basis[:, feature] > .5
+        values = radii[mask]
+        if len(values) < 2:
+            raise ProfileCorrespondenceError('Feature has fewer than two observed axial stations', evidence)
+        observed_features.append(dict(count=len(values),
+                                      quartiles=np.quantile(values, [.25, .5, .75]).tolist(),
+                                      circleResidual=float(np.median([c['radialRMS'] for c, keep in zip(candidates, mask) if keep]))))
+    precision = float(np.finfo(np.float32).eps*max(np.abs(mesh.bounds).max(), 1.))
+    separations = []
+    for left in range(2):
+        ql, qr = observed_features[left]['quartiles'], observed_features[left+1]['quartiles']
+        increasing = authored['radii'][left+1] > authored['radii'][left]
+        gap = qr[0]-ql[2] if increasing else ql[0]-qr[2]
+        uncertainty = precision+observed_features[left]['circleResidual']+observed_features[left+1]['circleResidual']
+        separations.append(dict(gap=float(gap), coordinatePrecision=precision,
+                                contourResidualAllowance=float(uncertainty)))
+    evidence.update(observedFeatures=observed_features, adjacentSeparations=separations)
+    if any(s['gap'] <= s['contourResidualAllowance'] for s in separations):
+        raise ProfileCorrespondenceError('Adjacent exterior features are unresolved in the observed radii', evidence)
     return profile, dict(success=True, message=fitted.message, nfev=int(fitted.nfev),
                          triangleCount=len(mesh.faces), sectionSpacing=spacing,
                          profileRMS=float(np.sqrt(np.mean((radii-radius(profile, x))**2))),
                          midpointFeatureBasis=dominance, sections=sections,
+                         observedFeatures=observed_features, adjacentSeparations=separations,
                          method='ordered-three-section-exterior-contour-fit; source-axis/frame prior')
 
 
@@ -279,6 +337,8 @@ def main():
         result.update(ok=True, phase='complete')
     except BaseException as exc:
         result.update(error=str(exc), traceback=traceback.format_exc())
+        if hasattr(exc, 'evidence'):
+            result['correspondenceEvidence'] = exc.evidence
         raise
     finally:
         args.report.write_text(json.dumps(result, indent=2)+'\n')
