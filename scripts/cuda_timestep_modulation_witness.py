@@ -23,6 +23,20 @@ PROJECTION_BATCH_MODES = (
 )
 EXPECTED_STEP_INDICES = tuple(range(8))
 SCHEDULE_TIMESTEP_FLOAT32_BITS = {
+    "texture-slat-12-rescale-3": (
+        0x447A0000,
+        0x4472A5A6,
+        0x446A6000,
+        0x44610000,
+        0x44564925,
+        0x4449EC4F,
+        0x443B8000,
+        0x442A745D,
+        0x44160000,
+        0x43FA0000,
+        0x43BB8000,
+        0x43564925,
+    ),
     "shape-slat-rescale-3": (
         0x447A0000,
         0x446EA2E9,
@@ -114,10 +128,12 @@ def _safe_failure_report_path(
     return candidate
 
 
-def validate_route(*, torch_version: str, cuda_device: str) -> None:
-    if torch_version != EXPECTED_TORCH:
+def validate_route(
+    *, torch_version: str, cuda_device: str, expected_torch: str = EXPECTED_TORCH
+) -> None:
+    if torch_version != expected_torch:
         raise ValueError(
-            f"Torch route must be {EXPECTED_TORCH}, got {torch_version}"
+            f"Torch route must be {expected_torch}, got {torch_version}"
         )
     if cuda_device != EXPECTED_DEVICE:
         raise ValueError(
@@ -133,18 +149,19 @@ def validate_schedule(
 ) -> dict[str, Any]:
     step_indices = np.asarray(step_indices)
     timesteps = np.asarray(timesteps)
-    expected_steps = np.asarray(EXPECTED_STEP_INDICES, dtype=np.int32)
     if schedule_profile not in SCHEDULE_TIMESTEP_FLOAT32_BITS:
         raise ValueError(f"unsupported schedule profile {schedule_profile!r}")
     expected_timestep_bits = SCHEDULE_TIMESTEP_FLOAT32_BITS[schedule_profile]
     expected_bits = np.asarray(expected_timestep_bits, dtype=np.uint32)
+    expected_steps = np.arange(len(expected_bits), dtype=np.int32)
+    count_name = "eight" if len(expected_bits) == 8 else "twelve"
     if (
         step_indices.dtype != np.int32
         or step_indices.shape != expected_steps.shape
         or not np.array_equal(step_indices, expected_steps)
     ):
         raise ValueError(
-            "candidate must use the canonical eight-step schedule indices"
+            f"candidate must use the canonical {count_name}-step schedule indices"
         )
     if (
         timesteps.dtype != np.float32
@@ -152,12 +169,12 @@ def validate_schedule(
         or not np.array_equal(timesteps.view(np.uint32), expected_bits)
     ):
         raise ValueError(
-            "candidate must use the canonical eight-step schedule timesteps"
+            f"candidate must use the canonical {count_name}-step schedule timesteps"
         )
     return {
         "profile_expected": schedule_profile,
         "profile_effective": schedule_profile,
-        "step_indices_expected": list(EXPECTED_STEP_INDICES),
+        "step_indices_expected": expected_steps.tolist(),
         "step_indices_effective": step_indices.tolist(),
         "timestep_float32_bits_expected": [
             f"0x{bits:08x}" for bits in expected_timestep_bits
@@ -546,6 +563,9 @@ def _compute_source_cuda(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id")
+    parser.add_argument("--expected-torch", default=EXPECTED_TORCH,
+                        choices=(EXPECTED_TORCH, "2.11.0+cu128"))
     parser.add_argument("--weights", required=True, type=Path)
     parser.add_argument("--expected-weights-sha256", required=True)
     parser.add_argument("--expected-source-checkpoint-sha256", required=True)
@@ -593,6 +613,7 @@ def main() -> int:
     last_trustworthy_phase = "request_received"
     report: dict[str, Any] = {
         "schema": SCHEMA,
+        "run_id": args.run_id,
         "status": "failed",
         "failure_phase": phase,
         "last_trustworthy_phase": last_trustworthy_phase,
@@ -609,7 +630,7 @@ def main() -> int:
         "output_json_effective": str(output_json),
         "output_npz": str(args.output_npz),
         "requested_route": {
-            "torch": EXPECTED_TORCH,
+            "torch": args.expected_torch,
             "cuda_device": EXPECTED_DEVICE,
             "projection_batch_mode": args.projection_batch_mode,
             "schedule_profile": args.schedule_profile,
@@ -706,6 +727,7 @@ def main() -> int:
         validate_route(
             torch_version=torch.__version__,
             cuda_device=cuda_device,
+            expected_torch=args.expected_torch,
         )
         report["effective_route"] = {
             "torch": torch.__version__,

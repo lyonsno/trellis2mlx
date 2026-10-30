@@ -533,3 +533,42 @@ def test_modulation_main_rejects_substituted_input_and_removes_stale_primary(
     assert report["primary_output_status"] == "missing"
     assert "weights sha256 mismatch" in report["error"]
     assert not output_npz.exists()
+
+
+def test_texture_twelve_step_schedule_matches_source_sampler_and_rejects_shape():
+    from scripts.cuda_timestep_modulation_witness import validate_schedule
+
+    # Source FlowEulerSampler.sample: linspace, rescale_t=3, then model time *1000.
+    schedule = np.linspace(1, 0, 13)
+    schedule = 3 * schedule / (1 + 2 * schedule)
+    timesteps = np.asarray(1000 * schedule[:-1], dtype=np.float32)
+    indices = np.arange(12, dtype=np.int32)
+    identity = validate_schedule(
+        step_indices=indices, timesteps=timesteps,
+        schedule_profile="texture-slat-12-rescale-3",
+    )
+    assert identity["step_indices_effective"] == list(range(12))
+    with pytest.raises(ValueError, match="canonical twelve-step schedule"):
+        validate_schedule(
+            step_indices=indices[:8], timesteps=timesteps[:8],
+            schedule_profile="texture-slat-12-rescale-3",
+        )
+    wrong = timesteps.copy()
+    wrong[7] = np.nextafter(wrong[7], np.float32(np.inf))
+    with pytest.raises(ValueError, match="canonical twelve-step schedule"):
+        validate_schedule(
+            step_indices=indices, timesteps=wrong,
+            schedule_profile="texture-slat-12-rescale-3",
+        )
+
+
+def test_explicit_current_torch_route_does_not_relax_historical_default():
+    from scripts.cuda_timestep_modulation_witness import validate_route
+
+    validate_route(torch_version="2.11.0+cu128", cuda_device="Tesla T4",
+                   expected_torch="2.11.0+cu128")
+    with pytest.raises(ValueError, match="Torch route"):
+        validate_route(torch_version="2.11.0+cu128", cuda_device="Tesla T4")
+    with pytest.raises(ValueError, match="Torch route"):
+        validate_route(torch_version="2.10.0+cu128", cuda_device="Tesla T4",
+                       expected_torch="2.11.0+cu128")
