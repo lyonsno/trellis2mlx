@@ -1,0 +1,15 @@
+{
+  "command": [
+    "kaggle",
+    "datasets",
+    "status",
+    "noahboo/t2mlx-kiln-texture-latent-1030-r1",
+    "--format",
+    "json"
+  ],
+  "returncode": 0,
+  "stdout": "Warning: Looks like you're using an outdated `kaggle` version (installed: 2.2.3), please consider upgrading to the latest version (2.2.5)\n{\"status\": \"ready\", \"current_version_number\": 1}",
+  "stderr": "",
+  "observed_at": "2026-10-30T14:57:38.544796+00:00",
+  "route": "installed Kaggle CLI 2.2.3, authenticated dataset version 1"
+}

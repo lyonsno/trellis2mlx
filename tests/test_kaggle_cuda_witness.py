@@ -1697,6 +1697,51 @@ def test_run_command_treats_invalid_dataset_source_as_failed(tmp_path):
     assert report["exit_code"] == 0
 
 
+@pytest.mark.parametrize("mutation", [None, "unknown_notice", "trailing_payload"])
+def test_dataset_publication_accepts_observed_cli_version_notice(tmp_path, mutation):
+    from trellmlx.kaggle_cuda_witness import (
+        KaggleCudaWitnessPacket, prepare_packet, wait_for_published_dataset_manifest,
+    )
+
+    observed = json.loads((Path(__file__).parent / "fixtures" /
+                           "kaggle_dataset_status_2_2_3.json").read_text())
+    if mutation == "unknown_notice":
+        observed["stdout"] = "Unknown status wrapper\n" + observed["stdout"]
+    elif mutation == "trailing_payload":
+        observed["stdout"] += '\n{"status": "creating"}'
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "probe.py").write_text("print('probe')\n")
+    packet = prepare_packet(KaggleCudaWitnessPacket(
+        capsule_dir=capsule, output_dir=tmp_path / "packet",
+        dataset_id="operator/version-notice-inputs",
+        kernel_id="operator/version-notice-cuda", title="Version Notice CUDA",
+        entrypoint="probe.py", inputs=("probe.py",),
+    ))
+    manifest = (packet.dataset_dir / "witness-manifest.json").read_bytes()
+
+    def runner(cmd, **kwargs):
+        if cmd[:3] == ["kaggle", "datasets", "status"]:
+            return subprocess.CompletedProcess(cmd, observed["returncode"],
+                stdout=observed["stdout"], stderr=observed["stderr"])
+        assert cmd[:3] == ["kaggle", "datasets", "download"]
+        destination = Path(cmd[cmd.index("-p") + 1])
+        (destination / "witness-manifest.json").write_bytes(manifest)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = wait_for_published_dataset_manifest(packet,
+        report_path=tmp_path / "publication.json", runner=runner,
+        sleeper=lambda _: None, scratch_root=tmp_path, max_attempts=1)
+    if mutation:
+        assert report["status"] == "failed"
+        assert report["failure_phase"] == "dataset_status"
+        assert report["last_observation"]["status_stdout"] == observed["stdout"]
+        return
+    assert report["status"] == "done"
+    assert report["remote_manifest_sha256"] == report["expected_manifest_sha256"]
+    assert report["dataset_status"]["status"] == "ready"
+
+
 def test_wait_for_published_dataset_manifest_rejects_stale_ready_version(
     tmp_path,
 ):

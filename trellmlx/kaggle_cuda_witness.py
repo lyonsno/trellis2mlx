@@ -357,7 +357,18 @@ def wait_for_published_dataset_manifest(
         failure_phase = "dataset_status"
         if status_completed.returncode == 0:
             try:
-                decoded_status = json.loads(status_completed.stdout)
+                # Kaggle CLI 2.2.3 prints this version notice to stdout even
+                # with --format json. Strip only that observed notice; keep
+                # JSON parsing strict and retain the raw stdout in receipts.
+                status_text = re.sub(
+                    r"\AWarning: Looks like you're using an outdated `kaggle` "
+                    r"version \(installed: [^\r\n)]+\), please consider upgrading "
+                    r"to the latest version \([^\r\n)]+\)\r?\n",
+                    "",
+                    status_completed.stdout,
+                    count=1,
+                )
+                decoded_status = json.loads(status_text)
                 if isinstance(decoded_status, dict):
                     dataset_status = decoded_status
                 else:
