@@ -59,8 +59,10 @@ def parser():
     p.add_argument('--run-id', required=True)
     p.add_argument('--manifest', type=Path, required=True)
     p.add_argument('--manifest-sha256', required=True)
-    p.add_argument('--report', type=Path, default=Path('cuda_image_features_report.json'))
-    p.add_argument('--output', type=Path, default=Path('cuda_image_features.npz'))
+    p.add_argument('--output-json', '--report', dest='report', type=Path,
+                   default=Path('cuda_image_features_report.json'))
+    p.add_argument('--output-npz', '--output', dest='output', type=Path,
+                   default=Path('cuda_image_features.npz'))
     return p
 
 
