@@ -31,7 +31,8 @@ def test_actual_texture_stage_loads_pipeline_model(
     # inference. A correct unused selector cannot satisfy this witness.
     source = Path(__file__).resolve().parents[1] / "generate.py"
     tree = ast.parse(source.read_text())
-    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    # The CLI owns Pause/Play; _generate contains the executed stages.
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_generate")
     start = next(i for i, n in enumerate(main.body)
                  if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                  and any(isinstance(a, ast.Constant) and isinstance(a.value, str)

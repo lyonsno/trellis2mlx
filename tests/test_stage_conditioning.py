@@ -134,7 +134,7 @@ def test_image_ingress_persists_both_stage_pairs(tmp_path, monkeypatch):
         import generate
 
         tree = ast.parse(Path(generate.__file__).read_text())
-        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_generate")
         start = next(i for i, n in enumerate(main.body) if isinstance(n, ast.If)
                      and isinstance(n.test, ast.Attribute) and n.test.attr == "conditioning_sample")
         stop = next(i for i in range(start + 1, len(main.body))
