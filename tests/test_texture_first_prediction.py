@@ -92,3 +92,29 @@ def test_native_effective_precision_and_qk_match_requested_profile(profile,dtype
     with pytest.raises(ValueError,match='precision'):mod.validate_route(wrong,'mlx',native_profile=profile)
     wrong=dict(route,qk_norm='mlx-sum' if qk!='mlx-sum' else 'source-cuda-warp32')
     with pytest.raises(ValueError,match='MLX route'):mod.validate_route(wrong,'mlx',native_profile=profile)
+
+
+@pytest.mark.parametrize('profile,qk,modulation', [
+    ('bf16-f32-modulation','source-cuda-warp32','float32'),
+    ('bf16-mlx-sum','mlx-sum','bfloat16'),
+])
+def test_isolated_native_profile_keeps_bf16_and_reports_intervention(profile,qk,modulation,tmp_path,monkeypatch):
+    import json
+    mod=module();inp=tmp_path/'input.npz';coords=np.array([[0,1,2,3]],np.int32)
+    np.savez(inp,noise=np.zeros((1,32),np.float32),shape_cond=np.ones((1,32),np.float32),coords=coords,cond=np.ones((1,4101,1024),np.float32),t=np.array([1000],np.float32))
+    observed=[]
+    def backend(args,*unused):
+        observed.append(args.native_profile)
+        return np.ones((1,32),np.float32),coords
+    monkeypatch.setattr(mod,'run_mlx',backend)
+    report=tmp_path/'report.json'
+    result=mod.main(['--backend','mlx','--native-profile',profile,'--run-id','unit-isolated','--inputs',str(inp),'--inputs-sha256',mod.digest(inp),'--output-json',str(report),'--output-npz',str(tmp_path/'out.npz')])
+    r=json.loads(report.read_text())
+    assert result==0 and observed==[profile] and r['native_profile_requested']==profile
+    assert r['claim_ceiling']==mod.BF16_CONTROL_CLAIM
+    route=dict(mlx='0.32.4',device='gpu',attention='fast',query_chunk=2048,qk_norm=qk,torso_dtype='bfloat16',learned_modulation_dtype=modulation)
+    assert mod.validate_route(route,'mlx',native_profile=profile) is None
+    with pytest.raises(ValueError):mod.validate_route(dict(route,learned_modulation_dtype='bfloat16' if modulation=='float32' else 'float32'),'mlx',native_profile=profile)
+    with pytest.raises(ValueError):mod.validate_route(dict(route,qk_norm='mlx-sum' if qk!='mlx-sum' else 'source-cuda-warp32'),'mlx',native_profile=profile)
+    with pytest.raises(ValueError):mod.validate_route(dict(route,torso_dtype='float16'),'mlx',native_profile=profile)
+    with pytest.raises(ValueError):mod.validate_route(route,'cuda',native_profile=profile)

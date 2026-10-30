@@ -25,6 +25,13 @@ MODEL_HASHES = {
 }
 CLAIM = 'Provisional same-input FP16 prediction; no production BF16, recurrence or visual parity claim.'
 BF16_CLAIM = 'Native production BF16 first prediction; comparison with FP16 does not establish original CUDA BF16, recurrence or visual parity.'
+BF16_CONTROL_CLAIM = 'Provisional isolated native BF16 profile; no original CUDA BF16, recurrence or visual parity claim.'
+NATIVE_PROFILES = {
+    'fp16-control': ('float16', 'mlx-sum', 'float32'),
+    'production-bf16': ('bfloat16', 'source-cuda-warp32', 'bfloat16'),
+    'bf16-f32-modulation': ('bfloat16', 'source-cuda-warp32', 'float32'),
+    'bf16-mlx-sum': ('bfloat16', 'mlx-sum', 'bfloat16'),
+}
 
 
 def digest(path):
@@ -59,11 +66,11 @@ def validate_inputs(arrays):
 
 
 def validate_route(route, backend, *, native_profile='fp16-control'):
-    if native_profile not in {'fp16-control','production-bf16'}:
+    if native_profile not in NATIVE_PROFILES:
         raise ValueError('unknown native profile')
-    native_bf16 = native_profile == 'production-bf16'
+    dtype,qk,modulation = NATIVE_PROFILES[native_profile]
     if backend=='cuda':
-        if native_bf16: raise ValueError('native profile requires MLX')
+        if native_profile!='fp16-control': raise ValueError('native profile requires MLX')
         if (route.get('cuda_available') is not True or route.get('attention')!='xformers'
                 or route.get('sparse_container')!='none' or route.get('trellis')!=TRELLIS_REVISION
                 or route.get('torch')!='2.11.0+cu128' or route.get('xformers')!='0.0.35'):
@@ -71,10 +78,13 @@ def validate_route(route, backend, *, native_profile='fp16-control'):
     elif backend=='mlx':
         if (route.get('mlx')!='0.32.4' or route.get('device')!='gpu'
                 or route.get('attention')!='fast' or route.get('query_chunk')!=2048
-                or route.get('qk_norm')!=('source-cuda-warp32' if native_bf16 else 'mlx-sum')):
+                or route.get('qk_norm')!=qk):
             raise ValueError('effective MLX route differs')
+        # Earlier baseline reports preserve the full dtype map without this field.
+        if (native_profile in {'bf16-f32-modulation','bf16-mlx-sum'} or 'learned_modulation_dtype' in route) and route.get('learned_modulation_dtype')!=modulation:
+            raise ValueError('learned modulation precision differs')
     else: raise ValueError('unknown backend')
-    if route.get('torso_dtype')!=('bfloat16' if native_bf16 else 'float16'):
+    if route.get('torso_dtype')!=dtype:
         raise ValueError('wrong comparison precision')
 
 
@@ -136,7 +146,8 @@ def run_cuda(args, arrays, report, save):
 
 
 def run_mlx(args, arrays, report, save):
-    native_bf16 = args.native_profile == 'production-bf16'
+    dtype,qk,modulation = NATIVE_PROFILES[args.native_profile]
+    native_bf16 = dtype == 'bfloat16'
     root=args.source_root.resolve()
     if not args.native_revision or subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()!=args.native_revision:
         raise ValueError('native revision differs')
@@ -144,7 +155,7 @@ def run_mlx(args, arrays, report, save):
     subprocess.run(['git','-C',str(root),'diff','--exit-code','HEAD'],check=True,capture_output=True)
     sys.path.insert(0,str(root))
     os.environ.pop('TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE',None)
-    os.environ.update(TRELLIS2MLX_ATTENTION_BACKEND='fast',TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE='2048',TRELLIS2MLX_QK_NORM_BACKEND='source-cuda-warp32' if native_bf16 else 'mlx-sum')
+    os.environ.update(TRELLIS2MLX_ATTENTION_BACKEND='fast',TRELLIS2MLX_FAST_ATTENTION_QUERY_CHUNK_SIZE='2048',TRELLIS2MLX_QK_NORM_BACKEND=qk)
     import mlx.core as mx
     import mlx.utils
     import generate
@@ -158,9 +169,14 @@ def run_mlx(args, arrays, report, save):
         attention=actual['shape_flow_attention_backend_effective'],query_chunk=actual['shape_flow_fast_attention_query_chunk_size_effective'],
         qk_norm=generate.get_qk_norm_backend(),torso_dtype='bfloat16' if native_bf16 else 'float16',native_revision=args.native_revision,
         source_path=inspect.getfile(SLatFlowModel),model_revision=MODEL_REVISION,
-        native_profile=args.native_profile,
-        precision_change='none: unmodified for_texture constructor and production weight loader' if native_bf16 else 'block linears float16, source-equivalent float32 learned modulation; outer layers stay float32',
-        qk_norm_limit='production source-cuda-warp32; original CUDA BF16 not observed in this comparison' if native_bf16 else 'production source-cuda-warp32 refuses FP16; this provisional control uses supported mlx-sum, so differences are not attributed to production BF16')
+        native_profile=args.native_profile,learned_modulation_dtype=modulation,
+        precision_change={
+            'production-bf16':'none: unmodified for_texture constructor and production weight loader',
+            'fp16-control':'block linears float16, source-equivalent float32 learned modulation; outer layers stay float32',
+            'bf16-f32-modulation':'only learned block modulation held float32 before loading; production BF16 linears and QK retained',
+            'bf16-mlx-sum':'none: production parameter dtypes; only QK normalization selects mlx-sum',
+        }[args.native_profile],
+        qk_norm_limit='original CUDA BF16 not observed in this comparison; effective normalization route recorded explicitly')
     validate_route(route,'mlx',native_profile=args.native_profile)
     if Path(route['source_path']).resolve()!=root/'trellmlx/models/slat_flow.py': raise ValueError('wrong native source import')
     if digest(args.checkpoint)!=MODEL_HASHES[STEM+'.safetensors']: raise ValueError('native checkpoint differs')
@@ -170,6 +186,9 @@ def run_mlx(args, arrays, report, save):
         if not native_bf16:
             for block in model.blocks:
                 _cast_block_linears(block,mx.float16);block.modulation=block.modulation.astype(mx.float32)
+        elif modulation=='float32':
+            for block in model.blocks:
+                block.modulation=block.modulation.astype(mx.float32)
         params=dict(mlx.utils.tree_flatten(model.parameters()))
         with safe_open(str(args.checkpoint),framework='numpy') as sf:
             keys={_remap_key(k) for k in sf.keys()}
@@ -177,7 +196,7 @@ def run_mlx(args, arrays, report, save):
         if load_weights(model,str(args.checkpoint),verbose=False): raise ValueError('unloaded native weights')
         mx.eval(model.parameters())
         linear_dtype=mx.bfloat16 if native_bf16 else mx.float16
-        modulation_dtype=mx.bfloat16 if native_bf16 else mx.float32
+        modulation_dtype=mx.bfloat16 if modulation=='bfloat16' else mx.float32
         if (model.input_layer.weight.dtype!=mx.float32 or model.out_layer.weight.dtype!=mx.float32
                 or any(b.modulation.dtype!=modulation_dtype or b.self_attn.to_qkv.weight.dtype!=linear_dtype for b in model.blocks)):
             raise ValueError('native mixed precision contract differs')
@@ -193,7 +212,7 @@ def run_mlx(args, arrays, report, save):
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--backend',choices=['cuda','mlx'],required=True)
-    p.add_argument('--native-profile',choices=['fp16-control','production-bf16'],default='fp16-control')
+    p.add_argument('--native-profile',choices=list(NATIVE_PROFILES),default='fp16-control')
     p.add_argument('--run-id',required=True)
     p.add_argument('--inputs',type=Path,required=True);p.add_argument('--inputs-sha256',required=True)
     p.add_argument('--output-json',type=Path,required=True);p.add_argument('--output-npz',type=Path,required=True)
@@ -204,7 +223,7 @@ def main(argv=None):
     if args.output_json.exists(): raise ValueError('fresh report path required')
     report=dict(schema='trellis2mlx.texture_first_prediction.v1',status='running',phase='input_admission',
         run_id=args.run_id,backend_requested=args.backend,inputs_sha256=args.inputs_sha256,
-        native_profile_requested=args.native_profile,claim_ceiling=BF16_CLAIM if args.native_profile=='production-bf16' else CLAIM,
+        native_profile_requested=args.native_profile,claim_ceiling=CLAIM if args.native_profile=='fp16-control' else BF16_CLAIM if args.native_profile=='production-bf16' else BF16_CONTROL_CLAIM,
         last_trustworthy_phase='arguments_parsed')
     save=lambda:write_json(args.output_json,report)
     save()
