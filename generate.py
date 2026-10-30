@@ -3749,9 +3749,14 @@ def main():
     # === Stage 4: Texture SLat ===
     print("\n=== Stage 4: Texture SLat ===", flush=True)
 
-    # Load texture flow model (same architecture, in_channels=64)
+    # Match the executed shape model family, not the requested grid or atlas.
+    # A cascade uses the 1024 model even at an intermediate grid (e.g. 768).
+    # --no-cascade executes the 512 model despite the default --resolution 1024.
+    tex_model_resolution = 512 if args.no_cascade else 1024
+    tex_checkpoint = f"slat_flow_imgshape2tex_dit_1_3B_{tex_model_resolution}_bf16.safetensors"
+    print(f"  Texture model: {tex_checkpoint}", flush=True)
     tex_flow = SLatFlowModel.for_texture()
-    load_weights(tex_flow, HF_4B + "slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", verbose=False)
+    load_weights(tex_flow, HF_4B + tex_checkpoint, verbose=False)
     if args.quantize:
         quantize_model(tex_flow, bits=args.quantize)
     if args.compile:
