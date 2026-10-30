@@ -55,3 +55,40 @@ def test_partial_backend_result_is_retained_but_never_completed(tmp_path,monkeyp
     result=mod.main(['--backend','cuda','--run-id','unit-partial','--inputs',str(inp),'--inputs-sha256',mod.digest(inp),'--output-json',str(report),'--output-npz',str(output)])
     r=json.loads(report.read_text());assert result==1 and r['status']=='failed' and r['failure_phase']=='output_capture'
     assert output.is_file() and r['output']['sha256']==mod.digest(output)
+
+
+def test_native_production_profile_is_explicit_and_reported(tmp_path, monkeypatch):
+    import json
+    mod=module();inp=tmp_path/'input.npz';coords=np.array([[0,1,2,3]],np.int32)
+    np.savez(inp,noise=np.zeros((1,32),np.float32),shape_cond=np.ones((1,32),np.float32),coords=coords,cond=np.ones((1,4101,1024),np.float32),t=np.array([1000],np.float32))
+    observed=[]
+    def backend(args,*unused):
+        observed.append(args.native_profile)
+        return np.ones((1,32),np.float32),coords
+    monkeypatch.setattr(mod,'run_mlx',backend)
+    report=tmp_path/'report.json'
+    result=mod.main(['--backend','mlx','--native-profile','production-bf16','--run-id','unit-production','--inputs',str(inp),'--inputs-sha256',mod.digest(inp),'--output-json',str(report),'--output-npz',str(tmp_path/'out.npz')])
+    r=json.loads(report.read_text())
+    assert result==0 and observed==['production-bf16']
+    assert r['native_profile_requested']=='production-bf16'
+    assert 'Native production BF16 first prediction' in r['claim_ceiling']
+
+
+def test_native_profile_cannot_change_cuda_route(tmp_path, monkeypatch):
+    import json
+    mod=module();report=tmp_path/'report.json'
+    monkeypatch.setattr(mod,'run_cuda',lambda *args:pytest.fail('CUDA must not run with native profile'))
+    result=mod.main(['--backend','cuda','--native-profile','production-bf16','--run-id','unit-misroute','--inputs',str(tmp_path/'missing.npz'),'--inputs-sha256','0'*64,'--output-json',str(report),'--output-npz',str(tmp_path/'out.npz')])
+    r=json.loads(report.read_text())
+    assert result==1 and r['failure_phase']=='profile_admission'
+    assert 'native profile requires MLX' in r['error']
+
+
+@pytest.mark.parametrize('profile,dtype,qk', [('fp16-control','float16','mlx-sum'),('production-bf16','bfloat16','source-cuda-warp32')])
+def test_native_effective_precision_and_qk_match_requested_profile(profile,dtype,qk):
+    mod=module();route=dict(mlx='0.32.4',device='gpu',attention='fast',query_chunk=2048,qk_norm=qk,torso_dtype=dtype)
+    assert mod.validate_route(route,'mlx',native_profile=profile) is None
+    wrong=dict(route,torso_dtype='float16' if dtype=='bfloat16' else 'bfloat16')
+    with pytest.raises(ValueError,match='precision'):mod.validate_route(wrong,'mlx',native_profile=profile)
+    wrong=dict(route,qk_norm='mlx-sum' if qk!='mlx-sum' else 'source-cuda-warp32')
+    with pytest.raises(ValueError,match='MLX route'):mod.validate_route(wrong,'mlx',native_profile=profile)
