@@ -43,7 +43,7 @@ def main():
         packet = KaggleCudaWitnessPacket(capsule_dir=capsule, output_dir=root/'packet',
             dataset_id=plan['dataset_id'], kernel_id=plan['kernel_id'], title=plan['title'],
             entrypoint=source.name, inputs=(source.name,'latent.npz','guides.npz','reference.npz','decode-manifest.json'),
-            entrypoint_args=('--manifest','decode-manifest.json','--manifest-sha256',digest(capsule/'decode-manifest.json')),
+            entrypoint_args=('--run-id',plan['run_id'],'--manifest','decode-manifest.json','--manifest-sha256',digest(capsule/'decode-manifest.json')),
             run_id=plan['run_id'], enable_internet=True,
             output_json='cuda_texture_report.json', output_npz='cuda_texture_state.npz')
         if packet.output_dir.exists(): raise ValueError('packet directory already exists')

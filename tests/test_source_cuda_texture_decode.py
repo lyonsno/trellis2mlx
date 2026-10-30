@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -79,3 +80,37 @@ def test_cpu_fallback_and_wrong_sparse_backend_refused():
     for available, backend in [(False, 'flex_gemm'), (True, 'none'), (True, 'spconv')]:
         with pytest.raises(ValueError, match='native CUDA'):
             mod.validate_route(available, backend)
+
+
+def test_preparation_preserves_run_identity_through_child_cli(tmp_path, monkeypatch):
+    """Exercise the real packet builder, then parse its actual child arguments."""
+    mod = module()
+    inputs = {}
+    for role in ['latent', 'decoder', 'reference']:
+        path = tmp_path / (role + '.npz')
+        np.savez(path, fixture=np.zeros(1, np.float32))
+        inputs[role] = {'path': str(path), 'sha256': mod.digest(path)}
+    run_id = 'a9dd9640-9ae1-46c6-a79a-c0b519488dc8'
+    root = tmp_path / 'prepared'
+    plan = tmp_path / 'plan.json'
+    plan.write_text(json.dumps(dict(output_dir=str(root), inputs=inputs,
+        dataset_id='fixture/retained-texture-inputs', kernel_id='fixture/retained-texture-decode',
+        title='Retained Texture Decode', run_id=run_id, script_sha256=mod.digest(SCRIPT))))
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    spec = importlib.util.spec_from_file_location('texture_prepare', SCRIPT.with_name('prepare_retained_texture_cuda.py'))
+    prepare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prepare)
+    monkeypatch.setattr(sys, 'argv', ['prepare', '--plan', str(plan)])
+    assert prepare.main() == 0, (root / 'prepare-report.json').read_text()
+    dataset = root / 'packet/dataset'
+    manifest = json.loads((dataset / 'witness-manifest.json').read_text())
+    assert manifest['run_id'] == run_id
+    assert manifest['entrypoint_args'].count('--run-id') == 1
+    assert manifest['entrypoint_args'][manifest['entrypoint_args'].index('--run-id') + 1] == run_id
+    monkeypatch.chdir(dataset)
+    # Runtime is deliberately excluded: this test establishes only CLI/packet identity.
+    monkeypatch.setattr(mod, 'run_decode', lambda *args: None)
+    report = tmp_path / 'child-report.json'
+    assert mod.main(manifest['entrypoint_args'] + ['--output-json', str(report),
+                    '--output-npz', str(tmp_path / 'child.npz')]) == 0
+    assert json.loads(report.read_text())['run_id'] == run_id

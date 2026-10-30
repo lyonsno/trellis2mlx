@@ -200,13 +200,14 @@ def run_decode(args, manifest, report, save):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--run-id')
     p.add_argument('--manifest', type=Path, required=True)
     p.add_argument('--manifest-sha256', required=True)
     p.add_argument('--output-json', type=Path, required=True)
     p.add_argument('--output-npz', type=Path, required=True)
     p.add_argument('--work-dir', type=Path, default=Path('/kaggle/temp/texture-decoder-runtime'))
     args = p.parse_args(argv)
-    report = dict(schema='trellis2mlx.retained_texture_cuda_decode.v1', status='running',
+    report = dict(schema='trellis2mlx.retained_texture_cuda_decode.v1', run_id=args.run_id, status='running',
                   phase='input_admission', last_trustworthy_phase='arguments_parsed')
     save = lambda: write_json(args.output_json, report)
     save()
