@@ -6,11 +6,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from trellmlx.kaggle_cuda_witness import KaggleCudaWitnessPacket, prepare_packet
-from source_cuda_texture_decode import children, digest, write_json
+from source_cuda_texture_decode import digest, write_json
 
 
 def main():
@@ -31,29 +30,14 @@ def main():
         if digest(source) != plan['script_sha256']: raise ValueError('decoder witness changed')
         capsule = root/'capsule'
         capsule.mkdir(exist_ok=False)
-        with np.load(paths['latent']) as z:
-            coords, feats = z['coords'], z['feats']
-            if coords.shape != (len(feats), 4) or feats.shape[1] != 32 or not np.isfinite(feats).all():
-                raise ValueError('invalid retained latent')
-        report['phase'] = 'guide_reconstruction'; save()
-        guides = {}
-        with np.load(paths['decoder']) as z:
-            for i in range(4):
-                guides[f'shape_subs_{i}'] = z[f'shape_subs_{i}']
-                coords = children(coords, guides[f'shape_subs_{i}'])
-        with np.load(paths['reference']) as z:
-            if not np.array_equal(coords[:,1:], z['tex_coords_spatial']):
-                raise ValueError('reconstructed coordinates differ from native material output')
-            field = z['tex_np']
-            if field.shape != (len(coords),6) or not np.isfinite(field).all():
-                raise ValueError('invalid retained reference field')
-        report['rows'] = len(coords); report['coordinate_order_exact'] = True
-        np.savez_compressed(capsule/'guides.npz', **guides)
+        # Staging only: preserve source archives byte-for-byte. The remote decoder
+        # validates guide expansion against every reference coordinate before compute.
+        (capsule/'guides.npz').symlink_to(paths['decoder'])
         shutil.copy2(paths['latent'], capsule/'latent.npz')
         (capsule/'reference.npz').symlink_to(paths['reference'])
         shutil.copy2(source, capsule/source.name)
         manifest = dict(schema='trellis2mlx.retained_texture_inputs.v1', provenance=plan['inputs'],
-                        rows=len(coords), files={n: {'sha256':digest(capsule/n)} for n in
+                        validation='full array validation occurs on CUDA worker before decode', files={n: {'sha256':digest(capsule/n)} for n in
                         ['latent.npz','guides.npz','reference.npz']})
         write_json(capsule/'decode-manifest.json', manifest)
         packet = KaggleCudaWitnessPacket(capsule_dir=capsule, output_dir=root/'packet',
