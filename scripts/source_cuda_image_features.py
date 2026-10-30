@@ -89,8 +89,10 @@ def run(args):
         report.update(inputs=files, manifest_sha256=args.manifest_sha256,
                       last_trustworthy_phase='authenticated_inputs', phase='runtime_setup')
         save(args.report, report)
+        # The original extractor uses the 4.56 model.layer API. The retained
+        # weights name 4.56.0.dev0; 4.56.2 passes the original-extractor witness.
         installed = subprocess.run([sys.executable, '-m', 'pip', 'install',
-                                    'transformers==5.9.0'], capture_output=True, text=True)
+                                    'transformers==4.56.2'], capture_output=True, text=True)
         report['installation'] = {'returncode': installed.returncode,
                                   'stdout': installed.stdout, 'stderr': installed.stderr}
         save(args.report, report)

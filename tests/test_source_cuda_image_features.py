@@ -101,3 +101,32 @@ def test_generated_wrapper_arguments_reach_child_parser(tmp_path):
     assert args.run_id == run_id
     assert args.manifest == Path('plan.json')
     assert args.manifest_sha256 == 'a' * 64
+
+
+def test_original_extractor_against_installed_transformers(tmp_path):
+    """Opt-in real dependency conformance; tiny CPU model, no downloaded weights."""
+    import os
+    source = os.environ.get('TRELLIS_SOURCE_IMAGE_EXTRACTOR')
+    if not source:
+        pytest.skip('Set TRELLIS_SOURCE_IMAGE_EXTRACTOR to the authenticated source file')
+    assert load().digest(source) == load().SOURCE_SHA
+    import torch
+    import transformers
+    from transformers import DINOv3ViTConfig, DINOv3ViTModel
+
+    spec = importlib.util.spec_from_file_location('original_image_extractor', source)
+    original = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(original)
+    torch.manual_seed(0)
+    config = DINOv3ViTConfig(hidden_size=32, intermediate_size=64,
+                           num_hidden_layers=1, num_attention_heads=4,
+                           image_size=32, patch_size=16, num_register_tokens=4)
+    DINOv3ViTModel(config).save_pretrained(tmp_path)
+    encoder = original.DinoV3FeatureExtractor(str(tmp_path), image_size=32)
+    with torch.no_grad():
+        result = encoder.extract_features(torch.zeros(1, 3, 32, 32))
+    assert result.shape == (1, 9, 32)
+    assert result.dtype == torch.float32
+    assert torch.isfinite(result).all()
+    print(f'Original extractor CPU conformance: transformers={transformers.__version__}, '
+          f'torch={torch.__version__}, shape={tuple(result.shape)}')
