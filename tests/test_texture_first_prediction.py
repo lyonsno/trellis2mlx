@@ -164,3 +164,42 @@ def test_trace_records_every_prediction_and_final_sample(tmp_path):
     with np.load(tmp_path/'steps/step-001.npz') as z:
         assert set(z.files)=={'sample_in','prediction','coords','prediction_coords','t'}
         assert np.array_equal(z['sample_in'],np.full_like(noise,-.25))
+
+
+@pytest.mark.parametrize('defect', ['overflow', 'wrong_support', 'wrong_dtype', 'incomplete'])
+def test_adapter_retains_rejected_final_before_return(tmp_path, monkeypatch, defect):
+    import json
+    mod=module();inp=tmp_path/'input.npz';coords=np.array([[0,1,2,3]],np.int32)
+    noise=np.full((1,32),1e38,np.float32)
+    np.savez(inp,noise=noise,shape_cond=np.ones_like(noise),coords=coords,
+        cond=np.ones((1,4101,1024),np.float32),t=np.array([1000],np.float32))
+    returned={}
+    def adapter(args, arrays, report, save):
+        trace=mod.TrajectoryTrace(tmp_path/'steps',coords,noise,1,3,report,save)
+        trace.begin(noise,arrays['t'],coords)
+        prediction=np.full_like(noise,-3e38)
+        if defect!='incomplete': trace.end(prediction,coords)
+        with np.errstate(over='ignore'): final=noise-prediction
+        got=coords.copy()
+        if defect!='overflow': final=np.zeros_like(noise)
+        if defect=='wrong_support': got[0,1]=9
+        if defect=='wrong_dtype': final=final.astype(np.float16)
+        returned.update(sample=final,coords=got)
+        # Match the real adapters: finish can reject before main gets the arrays.
+        trace.finish(final,got)
+        pytest.fail('invalid final sample must not return as complete')
+    monkeypatch.setattr(mod,'run_mlx',adapter)
+    rp=tmp_path/'report.json';out=tmp_path/'sample.npz'
+    rc=mod.main(['--backend','mlx','--mode','texture-trajectory','--steps','1','--rescale-t','3',
+        '--run-id','rejected-final','--inputs',str(inp),'--inputs-sha256',mod.digest(inp),
+        '--output-json',str(rp),'--output-npz',str(out)])
+    report=json.loads(rp.read_text())
+    assert rc==1 and report['status']=='failed'
+    assert out.exists(), 'adapter rejected final sample before retaining it'
+    with np.load(out,allow_pickle=False) as z:
+        assert np.array_equal(z['sample'],returned['sample'])
+        assert z['sample'].dtype==returned['sample'].dtype
+        assert np.array_equal(z['coords'],returned['coords'])
+    assert report['output']['sha256']==mod.digest(out)
+    assert report['failure_phase']=='trajectory_final_validation'
+    assert report['trajectory']['final_sample_validated'] is False

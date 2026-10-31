@@ -80,7 +80,16 @@ class TrajectoryTrace:
         self.report['last_trustworthy_phase']=f'trajectory_prediction_{self.index-1}'
         self.save()
 
-    def finish(self, sample, coords):
+    def finish(self, sample, coords, output_path=None):
+        self.report['phase']='trajectory_final_capture'
+        self.report['trajectory']['final_sample_validated']=False;self.save()
+        path=Path(output_path) if output_path is not None else self.root.parent/'sample.npz'
+        path.parent.mkdir(parents=True,exist_ok=True)
+        temporary=path.with_suffix(path.suffix+'.tmp')
+        with temporary.open('wb') as f: np.savez(f,sample=sample,coords=coords)
+        temporary.replace(path)
+        self.report['output']=dict(path=str(path),sha256=digest(path),bytes=path.stat().st_size)
+        self.report['phase']='trajectory_final_validation';self.save()
         if self.pending is not None or self.index!=self.steps: raise ValueError('incomplete trajectory')
         validate_output(sample,coords,self.coords)
         self.report['trajectory']['final_sample_validated']=True;self.save()
@@ -103,7 +112,7 @@ def trajectory_cuda(model, x, shape, cond, args, arrays, report, save):
             observed_model,x,cond,torch.zeros_like(cond),steps=args.steps,rescale_t=args.rescale_t,
             guidance_strength=1.0,guidance_rescale=0.0,guidance_interval=(0.6,0.9),concat_cond=shape)
     sample=result.samples.feats.cpu().numpy();coords=result.samples.coords.cpu().numpy()
-    trace.finish(sample,coords)
+    trace.finish(sample,coords,args.output_npz)
     return sample,coords
 
 
@@ -140,7 +149,7 @@ def trajectory_mlx(model,args,arrays,report,save):
     mx.eval(out);sample=np.array(out)
     report['trajectory']['cache_builds']=observed.builds;report['trajectory']['cache_uses']=observed.uses
     if observed.builds!=1 or observed.uses!=args.steps: raise ValueError('trajectory cache coverage differs')
-    trace.finish(sample,arrays['coords'])
+    trace.finish(sample,arrays['coords'],args.output_npz)
     return sample,arrays['coords']
 
 
