@@ -118,3 +118,49 @@ def test_isolated_native_profile_keeps_bf16_and_reports_intervention(profile,qk,
     with pytest.raises(ValueError):mod.validate_route(dict(route,qk_norm='mlx-sum' if qk!='mlx-sum' else 'source-cuda-warp32'),'mlx',native_profile=profile)
     with pytest.raises(ValueError):mod.validate_route(dict(route,torso_dtype='float16'),'mlx',native_profile=profile)
     with pytest.raises(ValueError):mod.validate_route(route,'cuda',native_profile=profile)
+
+
+def test_trajectory_requires_complete_trace_before_success(tmp_path, monkeypatch):
+    import json
+    mod=module();inp=tmp_path/'input.npz';coords=np.array([[0,1,2,3]],np.int32)
+    np.savez(inp,noise=np.zeros((1,32),np.float32),shape_cond=np.ones((1,32),np.float32),coords=coords,cond=np.ones((1,4101,1024),np.float32),t=np.array([1000],np.float32))
+    # A complete final sample cannot stand in for the requested intermediate trace.
+    monkeypatch.setattr(mod,'run_mlx',lambda *a:(np.ones((1,32),np.float32),coords))
+    report=tmp_path/'report.json';output=tmp_path/'out.npz'
+    result=mod.main(['--backend','mlx','--mode','texture-trajectory','--steps','2','--rescale-t','3','--run-id','missing-trace','--inputs',str(inp),'--inputs-sha256',mod.digest(inp),'--output-json',str(report),'--output-npz',str(output)])
+    r=json.loads(report.read_text())
+    assert result==1 and r['status']=='failed' and 'trajectory' in r['error']
+    assert output.exists()
+
+
+def test_trace_retains_raw_corruption_and_refuses_completion(tmp_path):
+    mod=module();coords=np.array([[0,1,2,3]],np.int32);report={}
+    trace=mod.TrajectoryTrace(tmp_path/'steps',coords,np.zeros((1,32),np.float32),2,3,report,lambda:None)
+    trace.begin(np.zeros((1,32),np.float32),np.array([1000],np.float32),coords)
+    bad=np.ones((1,32),np.float32);bad[0,0]=np.nan
+    with pytest.raises(ValueError,match='nonfinite'):trace.end(bad,coords)
+    with np.load(tmp_path/'steps/step-000.npz') as z: assert np.isnan(z['prediction'][0,0])
+    assert report['trajectory']['completed_steps']==0
+
+
+def test_trace_rejects_wrong_schedule_and_partial_or_stale_capture(tmp_path):
+    mod=module();coords=np.array([[0,1,2,3]],np.int32);noise=np.zeros((1,32),np.float32)
+    trace=mod.TrajectoryTrace(tmp_path/'steps',coords,noise,2,3,{},lambda:None)
+    with pytest.raises(ValueError,match='timestep'):trace.begin(noise,np.array([900],np.float32),coords)
+    with pytest.raises(ValueError,match='fresh'):mod.TrajectoryTrace(tmp_path/'steps',coords,noise,2,3,{},lambda:None)
+    with pytest.raises(ValueError,match='incomplete'):trace.finish(noise,coords)
+
+
+def test_trace_records_every_prediction_and_final_sample(tmp_path):
+    mod=module();coords=np.array([[0,1,2,3]],np.int32);noise=np.zeros((1,32),np.float32);report={}
+    trace=mod.TrajectoryTrace(tmp_path/'steps',coords,noise,2,3,report,lambda:None)
+    trace.begin(noise,np.array([1000],np.float32),coords);trace.end(np.ones_like(noise),coords)
+    trace.begin(np.full_like(noise,-.25),np.array([750],np.float32),coords);trace.end(np.ones_like(noise),coords)
+    trace.finish(np.full_like(noise,-1),coords)
+    assert report['trajectory']['completed_steps']==2
+    assert len(report['trajectory']['records'])==2
+    for row in report['trajectory']['records']:
+        assert row['sha256']==mod.digest(row['path'])
+    with np.load(tmp_path/'steps/step-001.npz') as z:
+        assert set(z.files)=={'sample_in','prediction','coords','prediction_coords','t'}
+        assert np.array_equal(z['sample_in'],np.full_like(noise,-.25))

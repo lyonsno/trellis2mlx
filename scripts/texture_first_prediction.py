@@ -32,6 +32,116 @@ NATIVE_PROFILES = {
     'bf16-f32-modulation': ('bfloat16', 'source-cuda-warp32', 'float32'),
     'bf16-mlx-sum': ('bfloat16', 'mlx-sum', 'bfloat16'),
 }
+TRAJECTORY_CLAIM = 'Same-input texture sampling trace; no original CUDA BF16 or visible material-quality parity claim.'
+
+
+class TrajectoryTrace:
+    """Keep each actual model input/output, including the last input on failure."""
+    def __init__(self, root, coords, noise, steps, rescale_t, report, save):
+        self.root=Path(root)
+        if self.root.exists(): raise ValueError('fresh trajectory directory required')
+        self.root.mkdir(parents=True)
+        self.coords=coords;self.noise=noise;self.steps=steps;self.report=report;self.save=save
+        t=np.linspace(1,0,steps+1);self.schedule=rescale_t*t/(1+(rescale_t-1)*t)
+        self.index=0;self.pending=None
+        report['trajectory']=dict(steps=steps,rescale_t=rescale_t,sigma_min=1e-5,
+            guidance_strength=1.0,guidance_rescale=0.0,guidance_interval=[0.6,0.9],
+            schedule=self.schedule.tolist(),completed_steps=0,records=[])
+        save()
+
+    def _write(self):
+        path=self.root/f'step-{self.index:03d}.npz'
+        temporary=path.with_suffix('.tmp')
+        with temporary.open('wb') as f: np.savez(f,**self.pending)
+        temporary.replace(path)
+        self.report['trajectory']['active_record']=dict(path=str(path),sha256=digest(path))
+        self.save()
+        return path
+
+    def begin(self, sample, t, coords):
+        if self.pending is not None or self.index>=self.steps: raise ValueError('extra trajectory forward')
+        self.report['phase']=f'trajectory_step_{self.index}_input'
+        self.pending=dict(sample_in=sample,t=t,coords=coords)
+        self._write()  # Preserve raw input before rejecting it.
+        validate_output(sample,coords,self.coords)
+        expected=np.array([1000*self.schedule[self.index]],np.float32)
+        if t.dtype!=np.float32 or not np.array_equal(t,expected): raise ValueError('trajectory timestep differs')
+        if self.index==0 and not np.array_equal(sample,self.noise): raise ValueError('trajectory initial noise differs')
+        self.report['phase']=f'trajectory_step_{self.index}_forward';self.save()
+
+    def end(self, prediction, coords):
+        if self.pending is None: raise ValueError('trajectory output without input')
+        self.pending.update(prediction=prediction,prediction_coords=coords)
+        path=self._write()
+        validate_output(prediction,coords,self.coords)
+        self.report['trajectory']['records'].append(dict(index=self.index,path=str(path),sha256=digest(path)))
+        self.index+=1;self.pending=None
+        self.report['trajectory']['completed_steps']=self.index
+        self.report['last_trustworthy_phase']=f'trajectory_prediction_{self.index-1}'
+        self.save()
+
+    def finish(self, sample, coords):
+        if self.pending is not None or self.index!=self.steps: raise ValueError('incomplete trajectory')
+        validate_output(sample,coords,self.coords)
+        self.report['trajectory']['final_sample_validated']=True;self.save()
+
+
+def trajectory_cuda(model, x, shape, cond, args, arrays, report, save):
+    import torch
+    from trellis2.pipelines.samplers.flow_euler import FlowEulerGuidanceIntervalSampler
+    trace=TrajectoryTrace(args.output_json.parent/'steps',arrays['coords'],arrays['noise'],args.steps,args.rescale_t,report,save)
+    report['trajectory']['sampler_source']=inspect.getfile(FlowEulerGuidanceIntervalSampler)
+    report['trajectory']['sampler_sha256']=digest(report['trajectory']['sampler_source'])
+    report['trajectory']['cross_kv_cache']='original model has no sampler cache'
+    def observed_model(sample,t,conditioning,**kw):
+        trace.begin(sample.feats.cpu().numpy(),t.cpu().numpy(),sample.coords.cpu().numpy())
+        out=model(sample,t,conditioning,**kw)
+        trace.end(out.feats.cpu().numpy(),out.coords.cpu().numpy())
+        return out
+    with torch.inference_mode():
+        result=FlowEulerGuidanceIntervalSampler(sigma_min=1e-5).sample(
+            observed_model,x,cond,torch.zeros_like(cond),steps=args.steps,rescale_t=args.rescale_t,
+            guidance_strength=1.0,guidance_rescale=0.0,guidance_interval=(0.6,0.9),concat_cond=shape)
+    sample=result.samples.feats.cpu().numpy();coords=result.samples.coords.cpu().numpy()
+    trace.finish(sample,coords)
+    return sample,coords
+
+
+def trajectory_mlx(model,args,arrays,report,save):
+    import mlx.core as mx
+    from trellmlx.samplers import flow_euler_sample
+    trace=TrajectoryTrace(args.output_json.parent/'steps',arrays['coords'],arrays['noise'],args.steps,args.rescale_t,report,save)
+    report['trajectory']['sampler_source']=inspect.getfile(flow_euler_sample)
+    report['trajectory']['sampler_sha256']=digest(report['trajectory']['sampler_source'])
+    report['trajectory']['cross_kv_cache']='production sampler builds once; every forward must consume that cache'
+    class ObservedModel:
+        def __init__(self): self.cache=None;self.builds=0;self.uses=0
+        def build_cross_kv_cache(self, cond):
+            self.builds+=1
+            if self.builds!=1: raise ValueError('trajectory cache rebuilt')
+            self.cache=model.build_cross_kv_cache(cond)
+            if len(self.cache)!=len(model.blocks): raise ValueError('incomplete trajectory cache')
+            return self.cache
+        def __call__(self,sample,t,cond,**kw):
+            cache=kw.get('cross_kv_cache')
+            if cache is None or cache is not self.cache: raise ValueError('trajectory cache not consumed')
+            self.uses+=1
+            coords=np.column_stack([np.zeros(len(sample),np.int32),np.array(kw['coords'])])
+            trace.begin(np.array(sample),np.array(t),coords)
+            out=model(sample,t,cond,**kw);mx.eval(out)
+            trace.end(np.array(out),coords)
+            return out
+    observed=ObservedModel()
+    cond=mx.array(arrays['cond'])
+    out=flow_euler_sample(observed,mx.array(arrays['noise']),cond,mx.zeros_like(cond),
+        steps=args.steps,rescale_t=args.rescale_t,guidance_strength=1.0,guidance_rescale=0.0,
+        guidance_interval=(0.6,0.9),sigma_min=1e-5,coords=mx.array(arrays['coords'][:,1:]),
+        concat_cond=mx.array(arrays['shape_cond']))
+    mx.eval(out);sample=np.array(out)
+    report['trajectory']['cache_builds']=observed.builds;report['trajectory']['cache_uses']=observed.uses
+    if observed.builds!=1 or observed.uses!=args.steps: raise ValueError('trajectory cache coverage differs')
+    trace.finish(sample,arrays['coords'])
+    return sample,arrays['coords']
 
 
 def digest(path):
@@ -139,8 +249,11 @@ def run_cuda(args, arrays, report, save):
     x=sp.SparseTensor(feats=torch.from_numpy(arrays['noise']).cuda(),coords=coords)
     shape=sp.SparseTensor(feats=torch.from_numpy(arrays['shape_cond']).cuda(),coords=coords)
     with torch.inference_mode():
-        out=model(x,torch.from_numpy(arrays['t']).cuda(),torch.from_numpy(arrays['cond']).cuda(),concat_cond=shape)
-        prediction=out.feats.cpu().numpy();got_coords=out.coords.cpu().numpy()
+        if args.mode=='texture-trajectory':
+            prediction,got_coords=trajectory_cuda(model,x,shape,torch.from_numpy(arrays['cond']).cuda(),args,arrays,report,save)
+        else:
+            out=model(x,torch.from_numpy(arrays['t']).cuda(),torch.from_numpy(arrays['cond']).cuda(),concat_cond=shape)
+            prediction=out.feats.cpu().numpy();got_coords=out.coords.cpu().numpy()
     report['peak_allocated_bytes']=torch.cuda.max_memory_allocated()
     return prediction,got_coords
 
@@ -202,9 +315,12 @@ def run_mlx(args, arrays, report, save):
             raise ValueError('native mixed precision contract differs')
         report['parameter_dtypes']={k:str(v.dtype) for k,v in mlx.utils.tree_flatten(model.parameters())}
         report['last_trustworthy_phase']='model_loaded';report['phase']='prediction';save()
-        prediction=model(mx.array(arrays['noise']),mx.array(arrays['t']),mx.array(arrays['cond']),coords=mx.array(arrays['coords'][:,1:]),concat_cond=mx.array(arrays['shape_cond']))
-        mx.eval(prediction)
-        prediction=np.array(prediction)
+        if args.mode=='texture-trajectory':
+            prediction,_=trajectory_mlx(model,args,arrays,report,save)
+        else:
+            prediction=model(mx.array(arrays['noise']),mx.array(arrays['t']),mx.array(arrays['cond']),coords=mx.array(arrays['coords'][:,1:]),concat_cond=mx.array(arrays['shape_cond']))
+            mx.eval(prediction)
+            prediction=np.array(prediction)
         report['peak_allocated_bytes']=mx.get_peak_memory()
     return prediction,arrays['coords']
 
@@ -212,6 +328,9 @@ def run_mlx(args, arrays, report, save):
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--backend',choices=['cuda','mlx'],required=True)
+    p.add_argument('--mode',choices=['first-prediction','texture-trajectory'],default='first-prediction')
+    p.add_argument('--steps',type=int)
+    p.add_argument('--rescale-t',type=float)
     p.add_argument('--native-profile',choices=list(NATIVE_PROFILES),default='fp16-control')
     p.add_argument('--run-id',required=True)
     p.add_argument('--inputs',type=Path,required=True);p.add_argument('--inputs-sha256',required=True)
@@ -221,13 +340,20 @@ def main(argv=None):
     p.add_argument('--queue-dir',type=Path,default=Path.home()/'.local/state/gpu-greenroom')
     args=p.parse_args(argv)
     if args.output_json.exists(): raise ValueError('fresh report path required')
-    report=dict(schema='trellis2mlx.texture_first_prediction.v1',status='running',phase='input_admission',
+    report=dict(schema='trellis2mlx.texture_first_prediction.v1' if args.mode=='first-prediction' else 'trellis2mlx.texture_trajectory.v1',status='running',phase='input_admission',
         run_id=args.run_id,backend_requested=args.backend,inputs_sha256=args.inputs_sha256,
+        mode_requested=args.mode,
         native_profile_requested=args.native_profile,claim_ceiling=CLAIM if args.native_profile=='fp16-control' else BF16_CLAIM if args.native_profile=='production-bf16' else BF16_CONTROL_CLAIM,
         last_trustworthy_phase='arguments_parsed')
     save=lambda:write_json(args.output_json,report)
     save()
     try:
+        if args.mode=='texture-trajectory':
+            report['claim_ceiling']=TRAJECTORY_CLAIM
+            if args.steps is None or args.steps<1 or args.rescale_t is None or not np.isfinite(args.rescale_t) or args.rescale_t<=0:
+                raise ValueError('trajectory requires explicit positive steps and rescale-t')
+        elif args.steps is not None or args.rescale_t is not None:
+            raise ValueError('sampler settings require trajectory mode')
         if args.native_profile!='fp16-control' and args.backend!='mlx':
             report['phase']='profile_admission'
             raise ValueError('native profile requires MLX')
@@ -239,10 +365,23 @@ def main(argv=None):
         prediction,coords=(run_cuda if args.backend=='cuda' else run_mlx)(args,arrays,report,save)
         report['phase']='output_capture';save()
         # Retain raw data even if validation exposes corruption.
-        np.savez(args.output_npz,prediction=prediction,coords=coords,t=arrays['t'])
+        if args.mode=='texture-trajectory':
+            np.savez(args.output_npz,sample=prediction,coords=coords)
+        else:
+            np.savez(args.output_npz,prediction=prediction,coords=coords,t=arrays['t'])
         report['output']=dict(path=str(args.output_npz),sha256=digest(args.output_npz),bytes=args.output_npz.stat().st_size)
         validate_output(prediction,coords,arrays['coords'])
-        report.update(status='completed',phase='complete_prediction',last_trustworthy_phase='complete_prediction');save();return 0
+        phase='complete_prediction'
+        if args.mode=='texture-trajectory':
+            trace=report.get('trajectory',{})
+            if (trace.get('completed_steps')!=args.steps or trace.get('steps')!=args.steps
+                    or trace.get('rescale_t')!=args.rescale_t or trace.get('final_sample_validated') is not True
+                    or len(trace.get('records',[]))!=args.steps):
+                raise ValueError('incomplete trajectory cannot be reported as success')
+            for i,row in enumerate(trace['records']):
+                if row['index']!=i or digest(row['path'])!=row['sha256']: raise ValueError('trajectory record differs')
+            phase='complete_trajectory'
+        report.update(status='completed',phase=phase,last_trustworthy_phase=phase);save();return 0
     except BaseException as exc:
         report.update(status='failed',failure_phase=report['phase'],error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc());save();return 1
 
