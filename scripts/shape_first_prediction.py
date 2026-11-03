@@ -10,8 +10,10 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from typing import Any
@@ -33,6 +35,7 @@ NATIVE_PROFILES = (
     "bf16-mlx-sum",
 )
 ACCEPTED_TORCH_CUDA_VERSIONS = ("2.11.0+cu128", "2.11.0+cu130")
+HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 SAMPLER_PARAMS = {
     "steps": 12,
     "guidance_strength": 7.5,
@@ -99,12 +102,153 @@ def digest(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def report_tmp_path(path: str | Path) -> Path:
+    p = Path(path)
+    return p.with_suffix(p.suffix + ".tmp")
+
+
 def write_json(path: str | Path, value: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = report_tmp_path(p)
     tmp.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n")
     tmp.replace(p)
+
+
+def choose_safe_refusal_report_path(
+    requested_path: str | Path,
+    protected_paths: set[Path],
+) -> Path:
+    req = Path(requested_path)
+    parent = req.parent
+    try:
+        use_parent = not (parent.exists() and not parent.is_dir())
+    except OSError:
+        use_parent = False
+    if use_parent:
+        req_tmp = report_tmp_path(req)
+        req_pair = {req.resolve(), req_tmp.resolve()}
+        if not (req_pair & protected_paths) and not (
+            req.exists()
+            or req.is_symlink()
+            or req_tmp.exists()
+            or req_tmp.is_symlink()
+        ):
+            return req
+    base_dir = parent if use_parent else Path(tempfile.gettempdir())
+    base_name = req.name or "report.json"
+    for idx in range(1, 10000):
+        candidate = base_dir / f"{base_name}.refusal-{idx}.json"
+        candidate_tmp = report_tmp_path(candidate)
+        resolved_pair = {candidate.resolve(), candidate_tmp.resolve()}
+        if resolved_pair & protected_paths:
+            continue
+        if (
+            candidate.exists()
+            or candidate.is_symlink()
+            or candidate_tmp.exists()
+            or candidate_tmp.is_symlink()
+        ):
+            continue
+        return candidate
+    raise RuntimeError("unable to allocate safe refusal report path")
+
+
+def admit_witness_output_paths(
+    output_json: Path,
+    output_npz: Path,
+    protected_inputs: list[Path],
+) -> dict[str, Path]:
+    report_p = output_json.resolve()
+    report_tmp = report_tmp_path(report_p).resolve()
+    npz_p = output_npz.resolve()
+    npz_tmp = npz_p.with_name(f"{npz_p.stem}.tmp{npz_p.suffix}").resolve()
+    pause_p = (report_p.parent / "pause.json").resolve()
+    pause_tmp = report_tmp_path(pause_p).resolve()
+
+    mutation_paths = {
+        "output_json": report_p,
+        "output_json_tmp": report_tmp,
+        "output_npz": npz_p,
+        "output_npz_tmp": npz_tmp,
+        "pause_json": pause_p,
+        "pause_json_tmp": pause_tmp,
+    }
+    if len(set(mutation_paths.values())) != len(mutation_paths):
+        raise ValueError("output and temporary mutation paths must be pairwise distinct")
+
+    protected_resolved = {p.resolve() for p in protected_inputs}
+    for label, mp in mutation_paths.items():
+        if mp in protected_resolved:
+            raise ValueError(f"{label} must not alias protected input path: {mp}")
+        if mp.exists() or mp.is_symlink():
+            raise ValueError(f"refusing to overwrite preexisting path for {label}: {mp}")
+    return mutation_paths
+
+
+def xformers_pip_install_argv(
+    torch_version: str,
+    python_executable: str = sys.executable,
+) -> list[str]:
+    match = re.search(r"\+(cu\d+)$", torch_version or "")
+    if match is None:
+        raise ValueError(
+            f"torch version must carry an explicit +cuXYZ CUDA tag, got {torch_version!r}"
+        )
+    cu_tag = match.group(1)
+    return [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--index-url",
+        f"https://download.pytorch.org/whl/{cu_tag}",
+        "xformers==0.0.35",
+    ]
+
+
+def verify_native_source(
+    source_root: Path,
+    requested_revision: str | None,
+) -> dict[str, Any]:
+    root = source_root.resolve()
+    info: dict[str, Any] = {
+        "source_root": str(root),
+        "requested_revision": requested_revision,
+        "observed_revision": None,
+        "tree_clean": None,
+    }
+    if not requested_revision or not HEX40_RE.match(requested_revision):
+        raise ValueError(
+            "--native-revision must be a 40-character lowercase hex commit SHA for mlx backend"
+        )
+    if not root.is_dir():
+        raise ValueError(f"native source_root does not exist: {root}")
+    observed = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    info["observed_revision"] = observed
+    diff_proc = subprocess.run(
+        ["git", "-C", str(root), "diff", "--exit-code", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    status_proc = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    clean = diff_proc.returncode == 0 and status_proc.stdout.strip() == ""
+    info["tree_clean"] = clean
+    if observed != requested_revision:
+        raise ValueError(
+            f"native revision differs: {observed} != {requested_revision}"
+        )
+    if not clean:
+        raise ValueError("native tracked source tree is dirty")
+    return info
 
 
 def claim_ceiling_for(backend: str, native_profile: str) -> str:
@@ -226,6 +370,137 @@ def compute_step1_euler(
     }
 
 
+def compute_cuda_step1_euler(
+    x_t: Any,
+    out_pos: Any,
+    out_neg: Any,
+    coords: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Execute upstream TRELLIS.2 ClassifierFreeGuidanceSamplerMixin + FlowEulerSampler step 1 on SparseTensor."""
+    g = float(SAMPLER_PARAMS["guidance_strength"])
+    r = float(SAMPLER_PARAMS["guidance_rescale"])
+    sigma_min = float(SAMPLER_PARAMS["sigma_min"])
+    t = 1.0
+    t_prev = 33.0 / 34.0
+    coeff = sigma_min + (1.0 - sigma_min) * t
+
+    pred_cfg = g * out_pos + (1.0 - g) * out_neg
+    x0_pos = (1.0 - sigma_min) * x_t - coeff * out_pos
+    x0_cfg = (1.0 - sigma_min) * x_t - coeff * pred_cfg
+    std_pos_t = x0_pos.std(dim=list(range(1, x0_pos.ndim)), keepdim=True)
+    std_cfg_t = x0_cfg.std(dim=list(range(1, x0_cfg.ndim)), keepdim=True)
+    ratio_t = std_pos_t / std_cfg_t
+    x0_rescaled = x0_cfg * ratio_t
+    x0_after_rescale = r * x0_rescaled + (1.0 - r) * x0_cfg
+    pred_final = ((1.0 - sigma_min) * x_t - x0_after_rescale) / coeff
+    sample_next = x_t - (t - t_prev) * pred_final
+
+    def _feats_np(st: Any) -> np.ndarray:
+        return np.ascontiguousarray(st.feats.detach().float().cpu().numpy(), dtype=np.float32)
+
+    def _scalar_np(val: Any) -> np.ndarray:
+        return np.asarray(val.detach().float().cpu().numpy(), dtype=np.float32).reshape(())
+
+    ratio_np = _scalar_np(ratio_t)
+    return {
+        "coords": np.ascontiguousarray(coords, dtype=np.int32),
+        "sample_in": _feats_np(x_t),
+        "pred_pos": _feats_np(out_pos),
+        "pred_neg": _feats_np(out_neg),
+        "pred_cfg": _feats_np(pred_cfg),
+        "x0_pos": _feats_np(x0_pos),
+        "x0_cfg": _feats_np(x0_cfg),
+        "std_pos": _scalar_np(std_pos_t),
+        "std_cfg": _scalar_np(std_cfg_t),
+        "ratio_raw": ratio_np,
+        "std_ratio": ratio_np,
+        "ratio_effective": ratio_np,
+        "x0_rescaled": _feats_np(x0_rescaled),
+        "x0_after_rescale": _feats_np(x0_after_rescale),
+        "pred_final": _feats_np(pred_final),
+        "sample_next": _feats_np(sample_next),
+        "t": STEP1_T.reshape(()),
+        "t_prev": STEP1_T_PREV.reshape(()),
+    }
+
+
+def compute_mlx_step1_euler(
+    x_mx: Any,
+    out_pos_mx: Any,
+    out_neg_mx: Any,
+    coords: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Execute native trellmlx.samplers step-1 CFG + rescale + Euler update on Metal."""
+    import mlx.core as mx
+    from trellmlx.samplers import _cfg_rescale_std, _pred_to_xstart, _xstart_to_pred
+
+    guidance_strength = float(SAMPLER_PARAMS["guidance_strength"])
+    guidance_rescale = float(SAMPLER_PARAMS["guidance_rescale"])
+    sigma_min = float(SAMPLER_PARAMS["sigma_min"])
+    t = 1.0
+    t_prev = 33.0 / 34.0
+
+    pred_cfg = guidance_strength * out_pos_mx + (1.0 - guidance_strength) * out_neg_mx
+    x0_pos = _pred_to_xstart(x_mx, t, out_pos_mx, sigma_min)
+    x0_cfg = _pred_to_xstart(x_mx, t, pred_cfg, sigma_min)
+    std_pos = _cfg_rescale_std(x0_pos, sparse_tokens=True)
+    std_cfg = _cfg_rescale_std(x0_cfg, sparse_tokens=True)
+    safe_std_cfg = mx.where(std_cfg > 0, std_cfg, mx.ones_like(std_cfg))
+    ratio_raw = std_pos / safe_std_cfg
+    ratio_raw = mx.where(std_cfg > 0, ratio_raw, mx.ones_like(ratio_raw))
+    std_ratio = ratio_raw
+    x0_rescaled = x0_cfg * std_ratio
+    x0_after_rescale = (
+        guidance_rescale * x0_rescaled + (1.0 - guidance_rescale) * x0_cfg
+    )
+    pred_final = _xstart_to_pred(x_mx, t, x0_after_rescale, sigma_min)
+    euler_dt = np.float32(t - t_prev).item()
+    euler_delta = euler_dt * pred_final
+    mx.eval(euler_delta)
+    sample_next = x_mx - euler_delta
+    mx.eval(
+        pred_cfg,
+        x0_pos,
+        x0_cfg,
+        std_pos,
+        std_cfg,
+        ratio_raw,
+        std_ratio,
+        x0_rescaled,
+        x0_after_rescale,
+        pred_final,
+        sample_next,
+    )
+
+    def _mat_np(arr: Any) -> np.ndarray:
+        return np.array(arr.astype(mx.float32), dtype=np.float32, copy=True)
+
+    def _sca_np(arr: Any) -> np.ndarray:
+        return np.array(arr.astype(mx.float32), dtype=np.float32, copy=True).reshape(())
+
+    ratio_np = _sca_np(std_ratio)
+    return {
+        "coords": np.ascontiguousarray(coords, dtype=np.int32),
+        "sample_in": _mat_np(x_mx),
+        "pred_pos": _mat_np(out_pos_mx),
+        "pred_neg": _mat_np(out_neg_mx),
+        "pred_cfg": _mat_np(pred_cfg),
+        "x0_pos": _mat_np(x0_pos),
+        "x0_cfg": _mat_np(x0_cfg),
+        "std_pos": _sca_np(std_pos),
+        "std_cfg": _sca_np(std_cfg),
+        "ratio_raw": _sca_np(ratio_raw),
+        "std_ratio": ratio_np,
+        "ratio_effective": ratio_np,
+        "x0_rescaled": _mat_np(x0_rescaled),
+        "x0_after_rescale": _mat_np(x0_after_rescale),
+        "pred_final": _mat_np(pred_final),
+        "sample_next": _mat_np(sample_next),
+        "t": STEP1_T.reshape(()),
+        "t_prev": STEP1_T_PREV.reshape(()),
+    }
+
+
 def validate_step1_bundle(
     bundle: dict[str, np.ndarray],
     expected_coords: np.ndarray,
@@ -267,6 +542,8 @@ def validate_route(
             sparse_container="none",
             trellis=TRELLIS_REVISION,
             xformers="0.0.35",
+            xformers_built_with_cuda=True,
+            xformers_fp16_block_diagonal_smoke=True,
             torso_dtype="float16",
             hr_resolution=64,
         )
@@ -299,6 +576,18 @@ def validate_route(
             raise ValueError(
                 f"MLX modulation precision does not match {native_profile}: {route}"
             )
+        rev = route.get("native_revision")
+        rev_req = route.get("native_revision_requested")
+        rev_obs = route.get("native_revision_observed")
+        if (
+            not isinstance(rev, str)
+            or not HEX40_RE.match(rev)
+            or rev_req != rev
+            or rev_obs != rev
+        ):
+            raise ValueError(f"invalid or unverified MLX native revision: {route}")
+        if route.get("native_tree_clean") is not True:
+            raise ValueError(f"MLX native source tree is not clean: {route}")
         expected_mlx = dict(
             mlx="0.32.4",
             device="gpu",
@@ -391,7 +680,7 @@ def run_cuda(
         ATTN_BACKEND="xformers",
         PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
     )
-    command([sys.executable, "-m", "pip", "install", "--no-deps", "xformers==0.0.35"])
+    command(xformers_pip_install_argv(torch.__version__, sys.executable))
     command(
         [
             sys.executable,
@@ -405,6 +694,24 @@ def run_cuda(
             "safetensors",
         ]
     )
+    import xformers._cpp_lib as xformers_cpp_lib
+    import xformers.ops as xops
+
+    xf_built_with_cuda = bool(getattr(xformers_cpp_lib, "_built_with_cuda", False))
+    xf_build_meta = getattr(xformers_cpp_lib, "_build_metadata", None)
+    xf_load_exc = getattr(xformers_cpp_lib, "_cpp_library_load_exception", None)
+    smoke_ok = False
+    if xf_built_with_cuda:
+        with torch.inference_mode():
+            q_smoke = torch.zeros((1, 16, 12, 128), device="cuda", dtype=torch.float16)
+            mask_smoke = xops.fmha.BlockDiagonalMask.from_seqlens([16], [16])
+            out_smoke = xops.memory_efficient_attention(
+                q_smoke, q_smoke, q_smoke, attn_bias=mask_smoke
+            )
+            torch.cuda.synchronize()
+            smoke_ok = tuple(out_smoke.shape) == (1, 16, 12, 128)
+            del q_smoke, mask_smoke, out_smoke
+
     source = args.work_dir / "TRELLIS.2"
     if source.exists():
         raise ValueError("fresh CUDA source directory required")
@@ -452,6 +759,16 @@ def run_cuda(
         capability=list(torch.cuda.get_device_capability(0)),
         torch=torch.__version__,
         xformers=importlib.metadata.version("xformers"),
+        xformers_built_with_cuda=xf_built_with_cuda,
+        xformers_build_cuda=(
+            getattr(xf_build_meta, "cuda_version", None)
+            if xf_build_meta is not None
+            else None
+        ),
+        xformers_cpp_lib_exception=(
+            str(xf_load_exc) if xf_load_exc is not None else None
+        ),
+        xformers_fp16_block_diagonal_smoke=smoke_ok,
         attention=config.ATTN,
         sparse_container=config.CONV,
         torso_dtype="float16",
@@ -509,18 +826,28 @@ def run_cuda(
         torch.cuda.synchronize()
         pred_s = time.perf_counter() - t1
 
-    pos_coords = out_pos.coords.cpu().numpy().astype(np.int32)
-    neg_coords = out_neg.coords.cpu().numpy().astype(np.int32)
-    if not np.array_equal(pos_coords, neg_coords):
-        raise ValueError("CUDA pos and neg branch output coordinates differ")
-    pred_pos = out_pos.feats.float().cpu().numpy()
-    pred_neg = out_neg.feats.float().cpu().numpy()
+        pos_coords = out_pos.coords.cpu().numpy().astype(np.int32)
+        neg_coords = out_neg.coords.cpu().numpy().astype(np.int32)
+        if not np.array_equal(pos_coords, neg_coords):
+            raise ValueError("CUDA pos and neg branch output coordinates differ")
+        backend_bundle = compute_cuda_step1_euler(x, out_pos, out_neg, pos_coords)
+
+    cpu_bundle = compute_step1_euler(
+        arrays["noise"],
+        backend_bundle["pred_pos"],
+        backend_bundle["pred_neg"],
+        pos_coords,
+    )
+    report["step1_update_source"] = "cuda-sparse-tensor-sampler"
+    report["standardized_cpu_step1_parity"] = compare_bundles(
+        backend_bundle, cpu_bundle
+    )
     report["timing_seconds"] = {
         "model_load": load_s,
         "prediction_both_branches": pred_s,
     }
     report["peak_allocated_bytes"] = int(torch.cuda.max_memory_allocated())
-    return compute_step1_euler(arrays["noise"], pred_pos, pred_neg, pos_coords)
+    return backend_bundle
 
 
 def run_mlx(
@@ -546,17 +873,40 @@ def run_mlx(
     )
     native_bf16 = dtype == "bfloat16"
     root = (args.source_root or Path(__file__).resolve().parents[1]).resolve()
-    if args.native_revision:
-        actual_rev = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-        ).strip()
-        if actual_rev != args.native_revision:
-            raise ValueError(f"native revision differs: {actual_rev} != {args.native_revision}")
-        subprocess.run(
-            ["git", "-C", str(root), "diff", "--exit-code", "HEAD"],
-            check=True,
-            capture_output=True,
-        )
+    report["phase"] = "native_source_admission"
+    native_source_info = {
+        "source_root": str(root),
+        "requested_revision": args.native_revision,
+        "observed_revision": None,
+        "tree_clean": None,
+    }
+    report["native_source"] = native_source_info
+    _save()
+    try:
+        verified_source = verify_native_source(root, args.native_revision)
+        native_source_info.update(verified_source)
+    except BaseException:
+        if root.is_dir():
+            try:
+                native_source_info["observed_revision"] = subprocess.check_output(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+                ).strip()
+                diff_rc = subprocess.run(
+                    ["git", "-C", str(root), "diff", "--exit-code", "HEAD"],
+                    capture_output=True,
+                ).returncode
+                status_out = subprocess.check_output(
+                    ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+                    text=True,
+                ).strip()
+                native_source_info["tree_clean"] = diff_rc == 0 and status_out == ""
+            except BaseException:
+                pass
+        _save()
+        raise
+    report["last_trustworthy_phase"] = "native_source_admission"
+    _save()
+
     sys.path.insert(0, str(root))
     os.environ.update(
         TRELLIS2MLX_ATTENTION_BACKEND="fast",
@@ -574,13 +924,10 @@ def run_mlx(
     from trellmlx.greenroom_pause import pause_session
     from trellmlx.models.slat_flow import SLatFlowModel
     from trellmlx.models.sparse_structure_flow import _cast_block_linears
-    import trellmlx.modules.attention as attention_mod
     from trellmlx.shape_flow_layernorm import get_shape_flow_layernorm_backend
     from trellmlx.weight_loader import _remap_key, load_weights
 
-    sfa.configure_sparse_flow_attention_from_env()
-    sfa.set_hr_shape_attention_active(True)
-    attention_mod._qk_norm_backend = None
+    sfa.configure_sparse_flow_attention_backend("inherit")
     try:
         ckpt_path = args.checkpoint
         json_path = None
@@ -612,13 +959,18 @@ def run_mlx(
             device="gpu" if mx.default_device() == mx.gpu else str(mx.default_device()),
             attention=actual["shape_flow_attention_backend_effective"],
             query_chunk=actual["shape_flow_fast_attention_query_chunk_size_effective"],
-            hr_attention_active=sfa.get_hr_shape_attention_active(),
+            hr_attention_active=(
+                os.environ.get("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE") == "1"
+            ),
             shape_flow_layernorm=get_shape_flow_layernorm_backend(),
             qk_norm=generate.get_qk_norm_backend(),
             torso_dtype=dtype,
             learned_modulation_dtype=modulation,
             native_profile=args.native_profile,
-            native_revision=args.native_revision,
+            native_revision=native_source_info["observed_revision"],
+            native_revision_requested=native_source_info["requested_revision"],
+            native_revision_observed=native_source_info["observed_revision"],
+            native_tree_clean=native_source_info["tree_clean"],
             source_path=inspect.getfile(SLatFlowModel),
             model_revision=MODEL_REVISION,
             weights={
@@ -688,19 +1040,28 @@ def run_mlx(
             out_neg = model(x_mx, t_mx, neg_cond_mx, coords=coords3_mx)
             mx.eval(out_pos, out_neg)
             pred_s = time.perf_counter() - t1
+            backend_bundle = compute_mlx_step1_euler(
+                x_mx, out_pos, out_neg, arrays["coords"].copy()
+            )
             report["peak_allocated_bytes"] = int(mx.get_peak_memory())
 
-        pred_pos = np.array(out_pos.astype(mx.float32), dtype=np.float32, copy=True)
-        pred_neg = np.array(out_neg.astype(mx.float32), dtype=np.float32, copy=True)
+        cpu_bundle = compute_step1_euler(
+            arrays["noise"],
+            backend_bundle["pred_pos"],
+            backend_bundle["pred_neg"],
+            arrays["coords"].copy(),
+        )
+        report["step1_update_source"] = "mlx-trellmlx-sampler"
+        report["standardized_cpu_step1_parity"] = compare_bundles(
+            backend_bundle, cpu_bundle
+        )
         report["timing_seconds"] = {
             "model_load": load_s,
             "prediction_both_branches": pred_s,
         }
-        return compute_step1_euler(
-            arrays["noise"], pred_pos, pred_neg, arrays["coords"].copy()
-        )
+        return backend_bundle
     finally:
-        sfa.set_hr_shape_attention_active(False)
+        os.environ.pop("TRELLIS2MLX_HR_SHAPE_ATTENTION_ACTIVE", None)
 
 
 def compare_bundles(
@@ -766,6 +1127,13 @@ def main(argv: list[str] | None = None) -> int:
 
     phase = "argument_parsing"
     last_trustworthy_phase: str | None = None
+    admitted_paths: dict[str, Path] | None = None
+    protected_inputs: list[Path] = [args.inputs]
+    if args.checkpoint is not None:
+        protected_inputs.append(args.checkpoint)
+    if args.source_root is not None:
+        protected_inputs.append(args.source_root)
+
     report: dict[str, Any] = {
         "schema": "trellis2mlx.shape_first_prediction_witness.v1",
         "run_id": args.run_id,
@@ -780,7 +1148,9 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     def save() -> None:
-        write_json(args.output_json, report)
+        if admitted_paths is None:
+            raise RuntimeError("cannot write to output_json before output_path_admission")
+        write_json(admitted_paths["output_json"], report)
 
     try:
         phase = "profile_admission"
@@ -789,18 +1159,15 @@ def main(argv: list[str] | None = None) -> int:
         last_trustworthy_phase = phase
 
         phase = "output_path_admission"
-        if args.output_npz.exists():
-            raise ValueError(
-                f"refusing to overwrite preexisting output NPZ: {args.output_npz}"
-            )
-        if args.output_json.resolve() == args.output_npz.resolve():
-            raise ValueError("output JSON and output NPZ paths must not alias")
-        if args.inputs.exists() and (
-            args.output_json.resolve() == args.inputs.resolve()
-            or args.output_npz.resolve() == args.inputs.resolve()
-        ):
-            raise ValueError("output paths must not alias input archive")
+        admitted_paths = admit_witness_output_paths(
+            args.output_json,
+            args.output_npz,
+            protected_inputs,
+        )
         last_trustworthy_phase = phase
+        report["phase"] = phase
+        report["last_trustworthy_phase"] = last_trustworthy_phase
+        save()
 
         phase = "input_admission"
         if not args.inputs.is_file() or args.inputs.stat().st_size <= 0:
@@ -812,6 +1179,8 @@ def main(argv: list[str] | None = None) -> int:
         arrays = load_inputs(args.inputs)
         report["inputs"]["rows"] = int(arrays["coords"].shape[0])
         last_trustworthy_phase = phase
+        report["last_trustworthy_phase"] = last_trustworthy_phase
+        save()
 
         phase = "backend_execution"
         runner = run_cuda if args.backend == "cuda" else run_mlx
@@ -819,12 +1188,16 @@ def main(argv: list[str] | None = None) -> int:
         last_trustworthy_phase = phase
 
         phase = "output_capture"
-        args.output_npz.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(args.output_npz, **bundle)
+        npz_path = admitted_paths["output_npz"]
+        npz_tmp = admitted_paths["output_npz_tmp"]
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        with npz_tmp.open("wb") as f:
+            np.savez(f, **bundle)
+        npz_tmp.replace(npz_path)
         report["output"] = {
             "path": str(args.output_npz),
-            "sha256": digest(args.output_npz),
-            "bytes": args.output_npz.stat().st_size,
+            "sha256": digest(npz_path),
+            "bytes": npz_path.stat().st_size,
         }
         validate_step1_bundle(bundle, arrays["coords"], arrays["noise"])
         report["output"].update(
@@ -858,7 +1231,26 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc(),
         )
-        save()
+        if admitted_paths is not None:
+            save()
+        else:
+            pause_p = (args.output_json.resolve().parent / "pause.json").resolve()
+            protected_set = {
+                *(p.resolve() for p in protected_inputs),
+                args.output_npz.resolve(),
+                args.output_npz.with_name(
+                    f"{args.output_npz.stem}.tmp{args.output_npz.suffix}"
+                ).resolve(),
+                pause_p,
+                report_tmp_path(pause_p).resolve(),
+            }
+            safe_refusal = choose_safe_refusal_report_path(
+                args.output_json, protected_set
+            )
+            report["requested_output_json"] = str(args.output_json)
+            report["refusal_report_path"] = str(safe_refusal)
+            write_json(safe_refusal, report)
+            print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
         return 1
 
 

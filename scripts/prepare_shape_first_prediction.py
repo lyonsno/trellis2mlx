@@ -18,8 +18,11 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.shape_first_prediction import (  # noqa: E402
     FP16_CONTROL_CLAIM,
+    choose_safe_refusal_report_path,
     digest,
     load_inputs,
+    report_tmp_path,
+    write_json,
 )
 from trellmlx.kaggle_cuda_witness import (  # noqa: E402
     KaggleCudaWitnessPacket,
@@ -46,14 +49,35 @@ INPUTS = {
 }
 DEFAULT_STAGE_ROOT = Path(
     "/Users/noahlyons/.local/state/trellis-metal-remesh-20261011/"
-    "kiln-corrected-shape-cuda-decode-1102-r1/shape-first-prediction-1103-r3"
+    "kiln-corrected-shape-cuda-decode-1102-r1/shape-first-prediction-1103-r4"
 )
 DEFAULT_RUN_ID = "c841529a-1103-4f7c-8a91-20a236098f7d"
 
 
-def write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+def admit_preparer_output_dir(
+    root: Path,
+    protected_inputs: list[Path],
+) -> dict[str, Path]:
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"output_dir is not a directory: {root}")
+    report_p = (root / "prepare-report.json").resolve()
+    report_tmp = report_tmp_path(report_p).resolve()
+    capsule_p = (root / "capsule").resolve()
+    packet_p = (root / "packet").resolve()
+
+    mutation_paths = {
+        "prepare_report": report_p,
+        "prepare_report_tmp": report_tmp,
+        "capsule": capsule_p,
+        "packet": packet_p,
+    }
+    protected_resolved = {p.resolve() for p in protected_inputs}
+    for label, mp in mutation_paths.items():
+        if mp in protected_resolved:
+            raise ValueError(f"{label} must not alias protected input path: {mp}")
+        if mp.exists() or mp.is_symlink():
+            raise ValueError(f"refusing to overwrite preexisting path for {label}: {mp}")
+    return mutation_paths
 
 
 def verify_retained_inputs(inputs_spec: dict = INPUTS) -> dict[str, np.ndarray]:
@@ -133,11 +157,18 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     root = Path(args.output_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    witness = Path(__file__).with_name("shape_first_prediction.py")
+    protected_inputs = [
+        *(Path(item["path"]) for item in INPUTS.values()),
+        witness,
+        Path(__file__),
+    ]
+    admitted_paths: dict[str, Path] | None = None
     report: dict[str, object] = {
         "schema": "trellis2mlx.prepare_shape_first_prediction.v1",
         "status": "running",
-        "phase": "input_admission",
+        "phase": "output_path_admission",
+        "last_trustworthy_phase": None,
         "run_id": args.run_id,
         "output_dir": str(root),
         "inputs": INPUTS,
@@ -145,18 +176,25 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     def save() -> None:
-        write_json(root / "prepare-report.json", report)
+        if admitted_paths is None:
+            raise RuntimeError("cannot write prepare-report.json before output_path_admission")
+        write_json(admitted_paths["prepare_report"], report)
 
-    save()
     try:
+        admitted_paths = admit_preparer_output_dir(root, protected_inputs)
+        root.mkdir(parents=True, exist_ok=True)
+        report["last_trustworthy_phase"] = "output_path_admission"
+        report["phase"] = "input_admission"
+        save()
+
         arrays = verify_retained_inputs(INPUTS)
-        witness = Path(__file__).with_name("shape_first_prediction.py")
         report["witness_sha256"] = digest(witness)
         report["prepare_sha256"] = digest(__file__)
+        report["last_trustworthy_phase"] = "input_admission"
         report["phase"] = "packet_prepare"
         save()
 
-        capsule = root / "capsule"
+        capsule = admitted_paths["capsule"]
         capsule.mkdir(exist_ok=False)
         inputs_npz = capsule / "inputs.npz"
         np.savez(inputs_npz, **arrays)
@@ -176,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         inputs_sha = digest(inputs_npz)
         packet = KaggleCudaWitnessPacket(
             capsule_dir=capsule,
-            output_dir=root / "packet",
+            output_dir=admitted_paths["packet"],
             dataset_id=args.dataset_id,
             kernel_id=args.kernel_id,
             title=args.title,
@@ -201,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         report.update(
             status="completed",
             phase="packet_prepared",
+            last_trustworthy_phase="packet_prepared",
             packet_manifest_sha256=digest(packet.dataset_dir / "witness-manifest.json"),
             input_archive_sha256=inputs_sha,
         )
@@ -213,7 +252,24 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc(),
         )
-        save()
+        if admitted_paths is not None:
+            save()
+        else:
+            requested_rep = root / "prepare-report.json"
+            protected_set = {
+                *(p.resolve() for p in protected_inputs),
+                requested_rep.resolve(),
+                report_tmp_path(requested_rep).resolve(),
+                (root / "capsule").resolve(),
+                (root / "packet").resolve(),
+            }
+            safe_refusal = choose_safe_refusal_report_path(
+                requested_rep, protected_set
+            )
+            report["requested_output_json"] = str(requested_rep)
+            report["refusal_report_path"] = str(safe_refusal)
+            write_json(safe_refusal, report)
+            print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
         return 1
 
 
