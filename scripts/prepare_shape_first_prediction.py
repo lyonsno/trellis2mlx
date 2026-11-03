@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.shape_first_prediction import (  # noqa: E402
     FP16_CONTROL_CLAIM,
+    SHAPE_TRAJECTORY_CLAIM,
     choose_safe_refusal_report_path,
     digest,
     load_inputs,
@@ -142,6 +143,13 @@ def verify_retained_inputs(inputs_spec: dict = INPUTS) -> dict[str, np.ndarray]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--mode",
+        choices=["first-prediction", "shape-trajectory"],
+        default="first-prediction",
+    )
+    ap.add_argument("--steps", type=int, default=12)
+    ap.add_argument("--rescale-t", type=float, default=3.0)
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_STAGE_ROOT)
     ap.add_argument("--run-id", default=DEFAULT_RUN_ID)
     ap.add_argument(
@@ -166,15 +174,21 @@ def main(argv: list[str] | None = None) -> int:
         Path(__file__),
     ]
     admitted_paths: dict[str, Path] | None = None
+    claim_ceiling = (
+        SHAPE_TRAJECTORY_CLAIM
+        if args.mode == "shape-trajectory"
+        else FP16_CONTROL_CLAIM
+    )
     report: dict[str, object] = {
         "schema": "trellis2mlx.prepare_shape_first_prediction.v1",
         "status": "running",
         "phase": "output_path_admission",
         "last_trustworthy_phase": None,
         "run_id": args.run_id,
+        "mode": args.mode,
         "output_dir": str(root),
         "inputs": INPUTS,
-        "claim_ceiling": FP16_CONTROL_CLAIM,
+        "claim_ceiling": claim_ceiling,
     }
 
     def save() -> None:
@@ -183,6 +197,12 @@ def main(argv: list[str] | None = None) -> int:
         write_json(admitted_paths["prepare_report"], report)
 
     try:
+        if (
+            args.steps < 1
+            or not np.isfinite(args.rescale_t)
+            or args.rescale_t <= 0
+        ):
+            raise ValueError("steps and rescale_t must be positive")
         admitted_paths = admit_preparer_output_dir(root, protected_inputs)
         root.mkdir(parents=True, exist_ok=True)
         report["last_trustworthy_phase"] = "output_path_admission"
@@ -214,6 +234,42 @@ def main(argv: list[str] | None = None) -> int:
         write_json(capsule / "provenance.json", report)
 
         inputs_sha = digest(inputs_npz)
+        if args.mode == "shape-trajectory":
+            entrypoint_args = (
+                "--backend",
+                "cuda",
+                "--mode",
+                "shape-trajectory",
+                "--steps",
+                str(args.steps),
+                "--rescale-t",
+                str(args.rescale_t),
+                "--run-id",
+                args.run_id,
+                "--inputs",
+                "inputs.npz",
+                "--inputs-sha256",
+                inputs_sha,
+            )
+            output_json = "cuda_trajectory_report.json"
+            output_npz = "cuda_sample.npz"
+            expected_outputs = tuple(
+                f"steps/step-{idx:03d}.npz" for idx in range(args.steps)
+            )
+        else:
+            entrypoint_args = (
+                "--backend",
+                "cuda",
+                "--run-id",
+                args.run_id,
+                "--inputs",
+                "inputs.npz",
+                "--inputs-sha256",
+                inputs_sha,
+            )
+            output_json = "cuda_prediction_report.json"
+            output_npz = "cuda_prediction.npz"
+            expected_outputs = ()
         packet = KaggleCudaWitnessPacket(
             capsule_dir=capsule,
             output_dir=admitted_paths["packet"],
@@ -224,18 +280,10 @@ def main(argv: list[str] | None = None) -> int:
             inputs=(witness.name, "inputs.npz", "provenance.json"),
             run_id=args.run_id,
             enable_internet=True,
-            entrypoint_args=(
-                "--backend",
-                "cuda",
-                "--run-id",
-                args.run_id,
-                "--inputs",
-                "inputs.npz",
-                "--inputs-sha256",
-                inputs_sha,
-            ),
-            output_json="cuda_prediction_report.json",
-            output_npz="cuda_prediction.npz",
+            entrypoint_args=entrypoint_args,
+            output_json=output_json,
+            output_npz=output_npz,
+            expected_outputs=expected_outputs,
         )
         prepare_packet(packet)
         report.update(

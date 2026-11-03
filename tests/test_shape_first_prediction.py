@@ -860,3 +860,346 @@ def test_occupied_file_ancestor_rejected_with_durable_refusal_report(tmp_path: P
     assert rep_p["status"] == "failed"
     assert rep_p["failure_phase"] == "output_path_admission"
     assert rep_p["last_trustworthy_phase"] is None
+
+
+def test_trajectory_requires_complete_trace_before_success(
+    tmp_path: Path, monkeypatch
+):
+    mod = load_module()
+    inp, coords, noise = make_valid_inputs(tmp_path)
+    rev = "e89df2a0965938605418375850d5ced650442663"
+    monkeypatch.setattr(
+        mod,
+        "run_mlx",
+        lambda *a: {"sample": noise.copy(), "coords": coords.copy()},
+    )
+    report = tmp_path / "report.json"
+    output = tmp_path / "sample.npz"
+    rc = mod.main(
+        [
+            "--backend",
+            "mlx",
+            "--mode",
+            "shape-trajectory",
+            "--steps",
+            "2",
+            "--rescale-t",
+            "1.0",
+            "--native-revision",
+            rev,
+            "--run-id",
+            "missing-trace",
+            "--inputs",
+            str(inp),
+            "--inputs-sha256",
+            mod.digest(inp),
+            "--output-json",
+            str(report),
+            "--output-npz",
+            str(output),
+        ]
+    )
+    r = json.loads(report.read_text())
+    assert rc == 1 and r["status"] == "failed" and "trajectory" in r["error"]
+    assert output.is_file()
+
+
+def test_shape_trace_records_guided_and_unguided_steps_and_final_sample(
+    tmp_path: Path,
+):
+    mod = load_module()
+    coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
+    noise = np.linspace(-0.5, 0.5, 64, dtype=np.float32).reshape(2, 32)
+    pos0 = np.full((2, 32), 0.25, dtype=np.float32)
+    neg0 = np.full((2, 32), -0.125, dtype=np.float32)
+    pos1 = np.full((2, 32), 0.1, dtype=np.float32)
+    report: dict = {}
+    trace = mod.ShapeTrajectoryTrace(
+        tmp_path / "steps", coords, noise, 2, 1.0, report, lambda: None
+    )
+    # Step 0: t=1.0 in [0.6, 1.0] -> guided (requires pos and neg)
+    trace.begin(noise, np.array([1000.0], dtype=np.float32), coords, branch="pos")
+    trace.end(pos0, coords)
+    trace.begin(noise, np.array([1000.0], dtype=np.float32), coords, branch="neg")
+    trace.end(neg0, coords)
+    step0_expected = mod.compute_euler_step(
+        noise, pos0, neg0, coords, t=1.0, t_prev=0.5, guided=True
+    )
+
+    # Step 1: t=0.5 < 0.6 -> unguided (requires pos only)
+    sample1_in = step0_expected["sample_next"]
+    trace.begin(
+        sample1_in, np.array([500.0], dtype=np.float32), coords, branch="pos"
+    )
+    trace.end(pos1, coords)
+    step1_expected = mod.compute_euler_step(
+        sample1_in, pos1, pos1, coords, t=0.5, t_prev=0.0, guided=False
+    )
+
+    sample_out = tmp_path / "sample.npz"
+    trace.finish(step1_expected["sample_next"], coords, sample_out)
+    assert report["trajectory"]["completed_steps"] == 2
+    assert len(report["trajectory"]["records"]) == 2
+    assert report["trajectory"]["records"][0]["guided"] is True
+    assert report["trajectory"]["records"][0]["sampler_transition_exact"] is True
+    assert report["trajectory"]["records"][1]["guided"] is False
+    assert report["trajectory"]["final_sample_validated"] is True
+    assert report["trajectory"]["final_sample_matches_last_step_exact"] is True
+
+    with np.load(tmp_path / "steps/step-000.npz", allow_pickle=False) as z0:
+        for k in mod.STEP1_MATRIX_KEYS:
+            assert np.array_equal(z0[k], step0_expected[k])
+    with np.load(tmp_path / "steps/step-001.npz", allow_pickle=False) as z1:
+        for k in mod.STEP1_MATRIX_KEYS:
+            assert np.array_equal(z1[k], step1_expected[k])
+        assert float(z1["std_ratio"]) == 1.0
+    with np.load(sample_out, allow_pickle=False) as zs:
+        assert np.array_equal(zs["sample"], step1_expected["sample_next"])
+        assert np.array_equal(
+            zs["feats"], mod.denormalize_shape_slat(step1_expected["sample_next"])
+        )
+        assert np.array_equal(zs["coords"], coords)
+        assert np.array_equal(zs["coords_3d"], coords[:, 1:])
+
+
+def test_shape_trace_retains_raw_corruption_and_refuses_completion(tmp_path: Path):
+    mod = load_module()
+    coords = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    noise = np.zeros((1, 32), dtype=np.float32)
+    report: dict = {}
+    trace = mod.ShapeTrajectoryTrace(
+        tmp_path / "steps", coords, noise, 2, 1.0, report, lambda: None
+    )
+    trace.begin(noise, np.array([1000.0], dtype=np.float32), coords, branch="pos")
+    trace.end(np.ones((1, 32), dtype=np.float32), coords)
+    trace.begin(noise, np.array([1000.0], dtype=np.float32), coords, branch="neg")
+    bad_neg = np.ones((1, 32), dtype=np.float32)
+    bad_neg[0, 0] = np.nan
+    with pytest.raises(ValueError, match="nonfinite"):
+        trace.end(bad_neg, coords)
+    with np.load(tmp_path / "steps/step-000.npz", allow_pickle=False) as z:
+        assert np.isnan(z["pred_neg"][0, 0])
+    assert report["trajectory"]["completed_steps"] == 0
+
+
+def test_shape_trace_rejects_wrong_schedule_missing_neg_branch_and_occupied_steps_dir(
+    tmp_path: Path, monkeypatch
+):
+    mod = load_module()
+    coords = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    noise = np.zeros((1, 32), dtype=np.float32)
+    trace = mod.ShapeTrajectoryTrace(
+        tmp_path / "steps", coords, noise, 2, 1.0, {}, lambda: None
+    )
+    with pytest.raises(ValueError, match="timestep"):
+        trace.begin(noise, np.array([900.0], dtype=np.float32), coords, branch="pos")
+    with pytest.raises(ValueError, match="fresh"):
+        mod.ShapeTrajectoryTrace(
+            tmp_path / "steps", coords, noise, 2, 1.0, {}, lambda: None
+        )
+
+    # Guided step with only pos completed must reject finish() as incomplete
+    trace2 = mod.ShapeTrajectoryTrace(
+        tmp_path / "steps2", coords, noise, 1, 1.0, {}, lambda: None
+    )
+    trace2.begin(noise, np.array([1000.0], dtype=np.float32), coords, branch="pos")
+    trace2.end(np.ones((1, 32), dtype=np.float32), coords)
+    with pytest.raises(ValueError, match="incomplete"):
+        trace2.finish(noise, coords, tmp_path / "sample2.npz")
+
+    # Preexisting steps directory in output_json.parent must be rejected at output_path_admission
+    case_dir = tmp_path / "occupied_steps_case"
+    inp, _, _ = make_valid_inputs(case_dir / "in")
+    (case_dir / "out/steps").mkdir(parents=True)
+    ((case_dir / "out/steps") / "step-000.npz").write_bytes(b"preexisting-step")
+    monkeypatch.setattr(
+        mod, "run_cuda", lambda *a: pytest.fail("backend must not run")
+    )
+    rc = mod.main(
+        [
+            "--backend",
+            "cuda",
+            "--mode",
+            "shape-trajectory",
+            "--steps",
+            "12",
+            "--rescale-t",
+            "3.0",
+            "--run-id",
+            "occupied-steps",
+            "--inputs",
+            str(inp),
+            "--inputs-sha256",
+            mod.digest(inp),
+            "--output-json",
+            str(case_dir / "out/report.json"),
+            "--output-npz",
+            str(case_dir / "out/sample.npz"),
+        ]
+    )
+    rep = json.loads((case_dir / "out/report.json").read_text())
+    assert rc == 1 and rep["failure_phase"] == "output_path_admission"
+    assert (
+        ((case_dir / "out/steps") / "step-000.npz").read_bytes()
+        == b"preexisting-step"
+    )
+
+
+@pytest.mark.parametrize(
+    "defect", ["overflow", "wrong_support", "wrong_dtype", "incomplete"]
+)
+def test_shape_adapter_retains_rejected_final_before_return(
+    tmp_path: Path, monkeypatch, defect: str
+):
+    mod = load_module()
+    inp, coords, noise = make_valid_inputs(tmp_path, rows=1)
+    rev = "e89df2a0965938605418375850d5ced650442663"
+    returned: dict = {}
+
+    def adapter(args, arrays, report, save):
+        trace = mod.ShapeTrajectoryTrace(
+            args.output_json.parent / "steps",
+            coords,
+            arrays["noise"],
+            1,
+            1.0,
+            report,
+            save,
+        )
+        trace.begin(
+            arrays["noise"],
+            np.array([1000.0], dtype=np.float32),
+            coords,
+            branch="pos",
+        )
+        trace.end(np.ones_like(arrays["noise"]), coords)
+        trace.begin(
+            arrays["noise"],
+            np.array([1000.0], dtype=np.float32),
+            coords,
+            branch="neg",
+        )
+        if defect != "incomplete":
+            trace.end(np.zeros_like(arrays["noise"]), coords)
+        final = np.zeros_like(arrays["noise"])
+        if defect == "overflow":
+            final[0, 0] = np.inf
+        got = coords.copy()
+        if defect == "wrong_support":
+            got[0, 1] = 99
+        if defect == "wrong_dtype":
+            final = final.astype(np.float16)
+        returned.update(sample=final, coords=got)
+        trace.finish(final, got, args.output_npz)
+        pytest.fail("invalid final sample must not return as complete")
+
+    monkeypatch.setattr(mod, "run_mlx", adapter)
+    rp = tmp_path / "report.json"
+    out = tmp_path / "sample.npz"
+    rc = mod.main(
+        [
+            "--backend",
+            "mlx",
+            "--mode",
+            "shape-trajectory",
+            "--steps",
+            "1",
+            "--rescale-t",
+            "1.0",
+            "--native-revision",
+            rev,
+            "--run-id",
+            "rejected-final",
+            "--inputs",
+            str(inp),
+            "--inputs-sha256",
+            mod.digest(inp),
+            "--output-json",
+            str(rp),
+            "--output-npz",
+            str(out),
+        ]
+    )
+    report = json.loads(rp.read_text())
+    assert rc == 1 and report["status"] == "failed"
+    assert out.is_file(), "adapter rejected final sample before retaining it"
+    with np.load(out, allow_pickle=False) as z:
+        assert np.array_equal(
+            z["sample"], returned["sample"], equal_nan=True
+        )
+        assert z["sample"].dtype == returned["sample"].dtype
+        assert np.array_equal(z["coords"], returned["coords"])
+    assert report["output"]["sha256"] == mod.digest(out)
+    assert report["failure_phase"] == "trajectory_final_validation"
+    assert report["trajectory"]["final_sample_validated"] is False
+
+
+def test_prepare_shape_trajectory_stages_expected_step_outputs_and_verifies_retained_12step_reference(
+    tmp_path: Path,
+):
+    prep = load_module(PREPARE_SCRIPT, "prepare_shape_first_prediction")
+    mod = load_module()
+    stage_dir = tmp_path / "traj_stage"
+    rc = prep.main(
+        [
+            "--mode",
+            "shape-trajectory",
+            "--steps",
+            "12",
+            "--rescale-t",
+            "3.0",
+            "--output-dir",
+            str(stage_dir),
+            "--dataset-id",
+            "noahboo/t2mlx-shape-traj-inputs-1103-r1",
+            "--kernel-id",
+            "noahboo/t2mlx-shape-traj-cuda-1103-r1",
+            "--title",
+            "T2mlx Shape Traj Cuda 1103 R1",
+        ]
+    )
+    assert rc == 0
+    manifest = json.loads(
+        (stage_dir / "packet/dataset/witness-manifest.json").read_text()
+    )
+    assert manifest["output_roles"]["json"] == "cuda_trajectory_report.json"
+    assert manifest["output_roles"]["npz"] == "cuda_sample.npz"
+    assert manifest["output_roles"]["expected"] == [
+        f"steps/step-{i:03d}.npz" for i in range(12)
+    ]
+    assert "--mode" in manifest["entrypoint_args"]
+    assert "shape-trajectory" in manifest["entrypoint_args"]
+
+    # Also verify that compute_euler_step + denormalize_shape_slat reproduce all 12 retained BF16 steps & shape_slat
+    retained_root = Path(
+        "/Users/noahlyons/.local/state/trellis-metal-remesh-20261011/kiln-hr-conditioning-shape12-1027-r1"
+    )
+    t_raw = np.linspace(1.0, 0.0, 13)
+    sched = (3.0 * t_raw / (1.0 + 2.0 * t_raw)).tolist()
+    with np.load(prep.INPUTS["noise"]["path"], allow_pickle=False) as nz:
+        coords4 = np.pad(nz["coords"].astype(np.int32), ((0, 0), (1, 0)))
+    for idx in range(12):
+        with np.load(
+            retained_root / f"samplers/hr_shape_euler_{idx + 1:02d}.npz",
+            allow_pickle=False,
+        ) as ez:
+            guided = 0.6 <= sched[idx] <= 1.0
+            recomputed = mod.compute_euler_step(
+                ez["sample_in"],
+                ez["pred_pos"],
+                ez["pred_neg"],
+                coords4,
+                t=sched[idx],
+                t_prev=sched[idx + 1],
+                guided=guided,
+            )
+            assert np.array_equal(recomputed["pred_final"], ez["pred_final"])
+            assert np.array_equal(recomputed["sample_next"], ez["sample_next"])
+            if idx == 11:
+                last_sample_next = recomputed["sample_next"]
+    with np.load(
+        retained_root / "checkpoints/shape_slat.npz", allow_pickle=False
+    ) as slat:
+        assert np.array_equal(
+            mod.denormalize_shape_slat(last_sample_next), slat["feats"]
+        )
