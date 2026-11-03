@@ -22,6 +22,7 @@ from scripts.shape_first_prediction import (  # noqa: E402
     digest,
     load_inputs,
     report_tmp_path,
+    validate_creatable_parent,
     write_json,
 )
 from trellmlx.kaggle_cuda_witness import (  # noqa: E402
@@ -77,6 +78,7 @@ def admit_preparer_output_dir(
             raise ValueError(f"{label} must not alias protected input path: {mp}")
         if mp.exists() or mp.is_symlink():
             raise ValueError(f"refusing to overwrite preexisting path for {label}: {mp}")
+        validate_creatable_parent(mp, label)
     return mutation_paths
 
 
@@ -253,23 +255,26 @@ def main(argv: list[str] | None = None) -> int:
             traceback=traceback.format_exc(),
         )
         if admitted_paths is not None:
-            save()
-        else:
-            requested_rep = root / "prepare-report.json"
-            protected_set = {
-                *(p.resolve() for p in protected_inputs),
-                requested_rep.resolve(),
-                report_tmp_path(requested_rep).resolve(),
-                (root / "capsule").resolve(),
-                (root / "packet").resolve(),
-            }
-            safe_refusal = choose_safe_refusal_report_path(
-                requested_rep, protected_set
-            )
-            report["requested_output_json"] = str(requested_rep)
-            report["refusal_report_path"] = str(safe_refusal)
-            write_json(safe_refusal, report)
-            print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
+            try:
+                save()
+                return 1
+            except OSError:
+                pass
+        requested_rep = root / "prepare-report.json"
+        protected_set = {
+            *(p.resolve() for p in protected_inputs),
+            requested_rep.resolve(),
+            report_tmp_path(requested_rep).resolve(),
+            (root / "capsule").resolve(),
+            (root / "packet").resolve(),
+        }
+        safe_refusal = choose_safe_refusal_report_path(
+            requested_rep, protected_set
+        )
+        report["requested_output_json"] = str(requested_rep)
+        report["refusal_report_path"] = str(safe_refusal)
+        write_json(safe_refusal, report)
+        print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
         return 1
 
 

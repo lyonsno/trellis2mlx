@@ -790,3 +790,73 @@ def test_compute_cuda_step1_euler_matches_standardized_step1_euler():
     cmp = mod.compare_bundles(cuda_bundle, std_bundle)
     assert all(m["exact"] for m in cmp["matrices"].values())
     assert all(s["exact"] for s in cmp["scalars"].values())
+
+
+def test_occupied_file_ancestor_rejected_with_durable_refusal_report(tmp_path: Path):
+    import subprocess
+    import sys
+
+    mod = load_module()
+    inp, _, _ = make_valid_inputs(tmp_path / "inputs")
+    inp_sha = mod.digest(inp)
+
+    # 1. Witness CLI: immediate parent and nested ancestor occupied by a regular file
+    w_dir = tmp_path / "parent-file"
+    w_dir.mkdir(parents=True)
+    occupied_w = w_dir / "occupied"
+    occupied_w.write_bytes(b"occupied-witness-ancestor")
+
+    for idx, rel_report in enumerate(("occupied/report.json", "occupied/nested/report.json"), start=1):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--backend",
+                "cuda",
+                "--run-id",
+                f"ancestor-file-{idx}",
+                "--inputs",
+                str(inp),
+                "--inputs-sha256",
+                inp_sha,
+                "--output-json",
+                str(w_dir / rel_report),
+                "--output-npz",
+                str(w_dir / f"output-{idx}.npz"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 1
+        assert occupied_w.is_file() and occupied_w.read_bytes() == b"occupied-witness-ancestor"
+        refusal = w_dir / f"report.json.refusal-{idx}.json"
+        assert refusal.is_file(), f"missing refusal report {refusal}; stderr={proc.stderr}"
+        rep = json.loads(refusal.read_text())
+        assert rep["status"] == "failed"
+        assert rep["failure_phase"] == "output_path_admission"
+        assert rep["last_trustworthy_phase"] == "profile_admission"
+        assert rep.get("commands", []) == []
+
+    # 2. Preparer CLI: ancestor of --output-dir occupied by a regular file
+    p_dir = tmp_path / "preparer-parent-file"
+    p_dir.mkdir(parents=True)
+    occupied_p = p_dir / "occupied"
+    occupied_p.write_bytes(b"occupied-preparer-ancestor")
+    proc_p = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_SCRIPT),
+            "--output-dir",
+            str(occupied_p / "new-stage"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc_p.returncode == 1
+    assert occupied_p.is_file() and occupied_p.read_bytes() == b"occupied-preparer-ancestor"
+    refusal_p = p_dir / "prepare-report.json.refusal-1.json"
+    assert refusal_p.is_file(), f"missing preparer refusal {refusal_p}; stderr={proc_p.stderr}"
+    rep_p = json.loads(refusal_p.read_text())
+    assert rep_p["status"] == "failed"
+    assert rep_p["failure_phase"] == "output_path_admission"
+    assert rep_p["last_trustworthy_phase"] is None

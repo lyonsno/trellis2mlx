@@ -115,16 +115,32 @@ def write_json(path: str | Path, value: dict[str, Any]) -> None:
     tmp.replace(p)
 
 
+def validate_creatable_parent(path: Path, label: str) -> None:
+    for anc in (path.parent, *path.parent.parents):
+        if anc.exists() or anc.is_symlink():
+            if not anc.is_dir():
+                raise ValueError(f"ancestor of {label} is not a directory: {anc}")
+
+
+def _resolve_refusal_base_dir(parent: Path) -> tuple[bool, Path]:
+    try:
+        for anc in (parent, *parent.parents):
+            if (anc.exists() or anc.is_symlink()) and not anc.is_dir():
+                for candidate_dir in anc.parents:
+                    if candidate_dir.exists() and candidate_dir.is_dir():
+                        return False, candidate_dir
+                return False, Path(tempfile.gettempdir())
+        return True, parent
+    except OSError:
+        return False, Path(tempfile.gettempdir())
+
+
 def choose_safe_refusal_report_path(
     requested_path: str | Path,
     protected_paths: set[Path],
 ) -> Path:
     req = Path(requested_path)
-    parent = req.parent
-    try:
-        use_parent = not (parent.exists() and not parent.is_dir())
-    except OSError:
-        use_parent = False
+    use_parent, base_dir = _resolve_refusal_base_dir(req.parent)
     if use_parent:
         req_tmp = report_tmp_path(req)
         req_pair = {req.resolve(), req_tmp.resolve()}
@@ -135,7 +151,6 @@ def choose_safe_refusal_report_path(
             or req_tmp.is_symlink()
         ):
             return req
-    base_dir = parent if use_parent else Path(tempfile.gettempdir())
     base_name = req.name or "report.json"
     for idx in range(1, 10000):
         candidate = base_dir / f"{base_name}.refusal-{idx}.json"
@@ -183,6 +198,7 @@ def admit_witness_output_paths(
             raise ValueError(f"{label} must not alias protected input path: {mp}")
         if mp.exists() or mp.is_symlink():
             raise ValueError(f"refusing to overwrite preexisting path for {label}: {mp}")
+        validate_creatable_parent(mp, label)
     return mutation_paths
 
 
@@ -1232,25 +1248,28 @@ def main(argv: list[str] | None = None) -> int:
             traceback=traceback.format_exc(),
         )
         if admitted_paths is not None:
-            save()
-        else:
-            pause_p = (args.output_json.resolve().parent / "pause.json").resolve()
-            protected_set = {
-                *(p.resolve() for p in protected_inputs),
-                args.output_npz.resolve(),
-                args.output_npz.with_name(
-                    f"{args.output_npz.stem}.tmp{args.output_npz.suffix}"
-                ).resolve(),
-                pause_p,
-                report_tmp_path(pause_p).resolve(),
-            }
-            safe_refusal = choose_safe_refusal_report_path(
-                args.output_json, protected_set
-            )
-            report["requested_output_json"] = str(args.output_json)
-            report["refusal_report_path"] = str(safe_refusal)
-            write_json(safe_refusal, report)
-            print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
+            try:
+                save()
+                return 1
+            except OSError:
+                pass
+        pause_p = (args.output_json.resolve().parent / "pause.json").resolve()
+        protected_set = {
+            *(p.resolve() for p in protected_inputs),
+            args.output_npz.resolve(),
+            args.output_npz.with_name(
+                f"{args.output_npz.stem}.tmp{args.output_npz.suffix}"
+            ).resolve(),
+            pause_p,
+            report_tmp_path(pause_p).resolve(),
+        }
+        safe_refusal = choose_safe_refusal_report_path(
+            args.output_json, protected_set
+        )
+        report["requested_output_json"] = str(args.output_json)
+        report["refusal_report_path"] = str(safe_refusal)
+        write_json(safe_refusal, report)
+        print(f"refusal_report_path={safe_refusal}", file=sys.stderr)
         return 1
 
 
