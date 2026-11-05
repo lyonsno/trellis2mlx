@@ -40,7 +40,7 @@ def test_failure_before_primary_output_has_durable_phase_report(tmp_path):
     path = inputs(tmp_path)
     report = tmp_path / 'report.json'
     with pytest.raises(ValueError, match='digest mismatch'):
-        runner.main(['--inputs', str(path), '--inputs-sha256', '0'*64,
+        runner.main(['--run-id', 'test-failure', '--inputs', str(path), '--inputs-sha256', '0'*64,
                      '--source-tar', 'absent', '--source-sha256', '0'*64,
                      '--assets', 'absent', '--assets-sha256', '0'*64,
                      '--output-json', str(report), '--output-npz', str(tmp_path/'out.npz')])

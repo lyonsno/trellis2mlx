@@ -39,6 +39,7 @@ def load_inputs(path, expected_digest):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--run-id', required=True)
     parser.add_argument('--inputs', type=Path, required=True)
     parser.add_argument('--inputs-sha256', required=True)
     parser.add_argument('--source-tar', type=Path, required=True)
@@ -49,7 +50,7 @@ def main(argv=None):
     parser.add_argument('--output-npz', type=Path, required=True)
     args = parser.parse_args(argv)
     started = time.monotonic()
-    report = dict(schema='trellis2mlx.matched_sparse_cuda.v1', status='failed',
+    report = dict(schema='trellis2mlx.matched_sparse_cuda.v1', status='failed', run_id=args.run_id,
                   phase='input_admission', last_trustworthy_phase=None,
                   claim_ceiling='paired Stage 1 only; no full-pipeline or visual parity claim')
 
