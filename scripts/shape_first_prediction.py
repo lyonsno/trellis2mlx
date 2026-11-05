@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the first 1024 HR shape-flow prediction and step-1 Euler update on identical retained inputs."""
+"""Compare retained shape-flow predictions and trajectories on MLX or upstream CUDA."""
 
 from __future__ import annotations
 
@@ -28,6 +28,23 @@ WEIGHT_HASHES = {
     ".json": "7ebd6d367393f52fee9e92c2b3d727a9026a338549c6a6fa84c7ea122140ffdd",
     ".safetensors": "07cd0596f634c5adc1890023d16023afc5eed02fb84b22bb23aff5bf0030fbbd",
 }
+
+
+def model_spec(stage: str = "hr1024") -> dict[str, Any]:
+    if stage == "hr1024":
+        return dict(stem=STEM, weights=WEIGHT_HASHES, resolution=64, conditioning_tokens=4101)
+    if stage == "lr512":
+        return dict(
+            stem="ckpts/slat_flow_img2shape_dit_1_3B_512_bf16",
+            weights={
+                ".json": "ddbd7a1d34ce9a8e7af2f6ef9ae686d9ab49f69e62dacb98d8409b511cdbd5e2",
+                ".safetensors": "ec5e0917ef9b7e25ad51dffc7d19687a42019871f94239f2fa7f86264c55b70f",
+            },
+            resolution=32, conditioning_tokens=1029,
+        )
+    raise ValueError(f"unknown model stage: {stage}")
+
+
 NATIVE_PROFILES = (
     "fp16-control",
     "production-bf16",
@@ -352,8 +369,18 @@ def verify_native_source(
 
 
 def claim_ceiling_for(
-    backend: str, native_profile: str, *, mode: str = "first-prediction"
+    backend: str, native_profile: str, *, mode: str = "first-prediction",
+    model_stage: str = "hr1024",
 ) -> str:
+    model_spec(model_stage)
+    if model_stage == "lr512":
+        return (
+            "LR512 same-input shape-flow diagnostic on the supplied ordered support, "
+            "saved shape noise and 1029-token conditioning. Clean upstream CUDA "
+            "uses FP16 block linears because T4 refuses BF16 sparse xFormers. "
+            "Native BF16 versus CUDA FP16 can compare shape behavior but cannot "
+            "isolate an implementation defect; no finished-mesh or hosted-draw parity claim."
+        )
     if mode == "shape-trajectory":
         return SHAPE_TRAJECTORY_CLAIM
     if backend == "mlx" and native_profile == "production-bf16":
@@ -979,8 +1006,10 @@ def validate_step1_bundle(
 
 
 def validate_route(
-    route: dict[str, Any], backend: str, native_profile: str = "fp16-control"
+    route: dict[str, Any], backend: str, native_profile: str = "fp16-control",
+    *, model_stage: str = "hr1024",
 ) -> None:
+    spec = model_spec(model_stage)
     if backend == "cuda":
         if native_profile != "fp16-control":
             raise ValueError("native profile requires MLX backend")
@@ -993,13 +1022,15 @@ def validate_route(
             xformers_built_with_cuda=True,
             xformers_fp16_block_diagonal_smoke=True,
             torso_dtype="float16",
-            hr_resolution=64,
+            hr_resolution=spec["resolution"],
         )
         if not all(route.get(k) == v for k, v in expected.items()):
             raise ValueError(f"invalid CUDA route: {route}")
         if route.get("torch") not in ACCEPTED_TORCH_CUDA_VERSIONS:
             raise ValueError(f"unsupported CUDA torch runtime: {route.get('torch')!r}")
     elif backend == "mlx":
+        if model_stage != "hr1024":
+            raise ValueError("LR512 native uses generate.py; this MLX witness is HR-only")
         if native_profile not in NATIVE_PROFILES:
             raise ValueError(f"unknown native profile: {native_profile}")
         expected_dtype = "float16" if native_profile == "fp16-control" else "bfloat16"
@@ -1052,7 +1083,8 @@ def validate_route(
         raise ValueError(f"unknown backend: {backend}")
 
 
-def load_inputs(path: str | Path) -> dict[str, np.ndarray]:
+def load_inputs(path: str | Path, *, model_stage: str = "hr1024") -> dict[str, np.ndarray]:
+    spec = model_spec(model_stage)
     with np.load(path, allow_pickle=False) as z:
         arrays = {k: z[k] for k in z.files}
     expected_keys = {"noise", "cond", "neg_cond", "coords", "t", "t_prev"}
@@ -1073,8 +1105,8 @@ def load_inputs(path: str | Path) -> dict[str, np.ndarray]:
     rows = coords.shape[0]
     for k, shape in [
         ("noise", (rows, 32)),
-        ("cond", (1, 4101, 1024)),
-        ("neg_cond", (1, 4101, 1024)),
+        ("cond", (1, spec["conditioning_tokens"], 1024)),
+        ("neg_cond", (1, spec["conditioning_tokens"], 1024)),
         ("t", (1,)),
         ("t_prev", (1,)),
     ]:
@@ -1382,9 +1414,11 @@ def run_cuda(
     from trellis2.modules import sparse as sp
     from trellis2.modules.sparse import config
 
+    stage = getattr(args, "model_stage", "hr1024")
+    spec = model_spec(stage)
     files = {}
-    for ext, expected in WEIGHT_HASHES.items():
-        name = f"{STEM}{ext}"
+    for ext, expected in spec["weights"].items():
+        name = f"{spec['stem']}{ext}"
         path = Path(
             hf_hub_download(
                 MODEL_REPO,
@@ -1420,6 +1454,8 @@ def run_cuda(
         attention=config.ATTN,
         sparse_container=config.CONV,
         torso_dtype="float16",
+        shape_stage=stage,
+        model_stem=spec["stem"],
         hr_resolution=int(kwargs.get("resolution", -1)),
         trellis=command(["git", "rev-parse", "HEAD"], source),
         model_revision=MODEL_REVISION,
@@ -1427,7 +1463,7 @@ def run_cuda(
         precision_change="original dtype argument bfloat16 replaced by float16; original convert_to retained",
         weights={k: digest(v) for k, v in files.items()},
     )
-    validate_route(route, "cuda")
+    validate_route(route, "cuda", model_stage=stage)
     if not Path(route["source_path"]).is_relative_to(source):
         raise ValueError("wrong source import")
     command(["git", "diff", "--exit-code", "HEAD"], source)
@@ -1774,6 +1810,7 @@ def compare_bundles(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", choices=["cuda", "mlx"], required=True)
+    ap.add_argument("--model-stage", choices=["hr1024", "lr512"], default="hr1024")
     ap.add_argument(
         "--mode",
         choices=["first-prediction", "shape-trajectory"],
@@ -1823,10 +1860,11 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": args.run_id,
         "backend_requested": args.backend,
         "mode_requested": args.mode,
+        "model_stage_requested": args.model_stage,
         "native_profile_requested": args.native_profile,
         "status": "running",
         "claim_ceiling": claim_ceiling_for(
-            args.backend, args.native_profile, mode=args.mode
+            args.backend, args.native_profile, mode=args.mode, model_stage=args.model_stage
         ),
         "inputs": {
             "path": str(args.inputs),
@@ -1842,6 +1880,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         phase = "profile_admission"
         report["phase"] = phase
+        if args.model_stage == "lr512" and args.backend != "cuda":
+            raise ValueError("LR512 native uses generate.py; this MLX witness is HR-only")
         if args.backend != "mlx" and args.native_profile != "fp16-control":
             raise ValueError("native profile requires MLX backend")
         if args.mode == "shape-trajectory":
@@ -1880,7 +1920,7 @@ def main(argv: list[str] | None = None) -> int:
         report["inputs"]["observed_sha256"] = got
         if got != args.inputs_sha256:
             raise ValueError(f"input digest mismatch: {got} != {args.inputs_sha256}")
-        arrays = load_inputs(args.inputs)
+        arrays = load_inputs(args.inputs, model_stage=args.model_stage)
         report["inputs"]["rows"] = int(arrays["coords"].shape[0])
         last_trustworthy_phase = phase
         report["last_trustworthy_phase"] = last_trustworthy_phase
