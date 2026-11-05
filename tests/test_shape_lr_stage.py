@@ -80,3 +80,19 @@ def test_lr_cli_failure_keeps_actual_stage_and_phase(tmp_path, monkeypatch):
     assert 'LR512' in r['claim_ceiling']
     assert '24578' not in r['claim_ceiling']
     assert r['failure_phase'] == 'model_load'
+
+
+def test_pacing_request_must_match_effective_native_route():
+    m = module()
+    rev = 'a' * 40
+    route = dict(mlx='0.32.4', device='gpu', attention='fast', query_chunk=1024,
+                 hr_attention_active=True, shape_flow_layernorm='mlx-two-pass',
+                 qk_norm='source-cuda-warp32', torso_dtype='bfloat16',
+                 learned_modulation_dtype='bfloat16', native_revision=rev,
+                 native_revision_requested=rev, native_revision_observed=rev,
+                 native_tree_clean=True, shape_block_sync=1)
+    m.validate_route(route, 'mlx', native_profile='production-bf16', sync_every_block=True)
+    with pytest.raises(ValueError, match='MLX route'):
+        m.validate_route(dict(route, shape_block_sync=6), 'mlx', native_profile='production-bf16', sync_every_block=True)
+    with pytest.raises(ValueError, match='MLX route'):
+        m.validate_route(route, 'mlx', native_profile='production-bf16', sync_every_block=False)

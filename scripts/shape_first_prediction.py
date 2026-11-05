@@ -141,28 +141,28 @@ SHAPE_SLAT_STD = np.array(
 
 FP16_CONTROL_CLAIM = (
     "First-step 1024 HR shape-flow prediction diagnostic only: same retained "
-    "24578-row support/noise, same 4101x1024 conditioning and zero negative "
+    "ordered support/noise, same 4101x1024 conditioning and zero negative "
     "conditioning, same t=1000, and explicit float16 block computation because "
     "Tesla T4 refuses BF16 xFormers BlockDiagonalMask. Not native BF16 production "
     "parity, not full 12-step trajectory evidence, and not hosted SourceCUDA "
     "random-draw reproduction."
 )
 SHAPE_TRAJECTORY_CLAIM = (
-    "Same-input 12-step 1024 HR shape-flow Euler trajectory trace on retained "
-    "24578-row support/noise and 4101x1024 conditioning: explicit float16 block "
+    "1024 HR shape-flow Euler trajectory diagnostic on the supplied retained "
+    "ordered support/noise and 4101x1024 conditioning: explicit float16 block "
     "computation on T4 CUDA / MLX fp16-control, or native BF16 on MLX profiles. "
     "Not T4 CUDA BF16 equivalence and not hosted SourceCUDA random-draw reproduction."
 )
 PRODUCTION_BF16_CLAIM = (
     "Native production BF16 first-step 1024 HR shape-flow prediction control on "
-    "the identical retained 24578-row support/noise and 4101x1024 conditioning at "
+    "the supplied retained ordered support/noise and 4101x1024 conditioning at "
     "t=1000. Useful for quantifying the MLX BF16 vs FP16 delta and verifying exact "
     "equivalence to retained hr_shape_euler_01.npz; not a T4 CUDA BF16 equivalence "
     "claim."
 )
 BF16_CONTROL_CLAIM = (
     "Native BF16 first-step 1024 HR shape-flow prediction isolation control on the "
-    "identical retained 24578-row support/noise and 4101x1024 conditioning at "
+    "supplied retained ordered support/noise and 4101x1024 conditioning at "
     "t=1000: block Linear weights remain bfloat16 while only the named "
     "sub-operation is varied. Diagnostic attribution only; not a production "
     "default change or T4 CUDA BF16 equivalence claim."
@@ -1008,6 +1008,7 @@ def validate_step1_bundle(
 def validate_route(
     route: dict[str, Any], backend: str, native_profile: str = "fp16-control",
     *, model_stage: str = "hr1024",
+    sync_every_block: bool = False,
 ) -> None:
     spec = model_spec(model_stage)
     if backend == "cuda":
@@ -1077,6 +1078,8 @@ def validate_route(
             qk_norm=expected_qk,
             torso_dtype=expected_dtype,
         )
+        if sync_every_block or "shape_block_sync" in route:
+            expected_mlx["shape_block_sync"] = 1 if sync_every_block else 6
         if not all(route.get(k) == v for k, v in expected_mlx.items()):
             raise ValueError(f"invalid MLX route: {route}")
     else:
@@ -1661,6 +1664,7 @@ def run_mlx(
             ),
             shape_flow_layernorm=get_shape_flow_layernorm_backend(),
             qk_norm=generate.get_qk_norm_backend(),
+            shape_block_sync=1 if getattr(args, "sync_every_block", False) else 6,
             torso_dtype=dtype,
             learned_modulation_dtype=modulation,
             native_profile=args.native_profile,
@@ -1681,7 +1685,8 @@ def run_mlx(
                 "bf16-mlx-sum": "none: production parameter dtypes; only QK normalization selects mlx-sum",
             }[args.native_profile],
         )
-        validate_route(route, "mlx", native_profile=args.native_profile)
+        validate_route(route, "mlx", native_profile=args.native_profile,
+                       sync_every_block=getattr(args, "sync_every_block", False))
         if Path(route["source_path"]).resolve() != root / "trellmlx/models/slat_flow.py":
             raise ValueError("wrong native source import")
         report["effective_route"] = route
@@ -1690,7 +1695,11 @@ def run_mlx(
 
         with pause_session(args.queue_dir, args.output_json.parent / "pause.json"):
             t0 = time.perf_counter()
-            model = SLatFlowModel.for_shape()
+            model = SLatFlowModel.for_shape(
+                lr_sync_every_block=getattr(args, "sync_every_block", False)
+            )
+            if model.lr_sync_every_block != getattr(args, "sync_every_block", False):
+                raise ValueError("effective per-block synchronization differs")
             if not native_bf16:
                 for block in model.blocks:
                     _cast_block_linears(block, mx.float16)
@@ -1811,6 +1820,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", choices=["cuda", "mlx"], required=True)
     ap.add_argument("--model-stage", choices=["hr1024", "lr512"], default="hr1024")
+    ap.add_argument("--sync-every-block", action="store_true",
+                    help="MLX shape diagnostic: evaluate every block using the existing opt-in pacing route")
     ap.add_argument(
         "--mode",
         choices=["first-prediction", "shape-trajectory"],
@@ -1861,6 +1872,7 @@ def main(argv: list[str] | None = None) -> int:
         "backend_requested": args.backend,
         "mode_requested": args.mode,
         "model_stage_requested": args.model_stage,
+        "sync_every_block_requested": args.sync_every_block,
         "native_profile_requested": args.native_profile,
         "status": "running",
         "claim_ceiling": claim_ceiling_for(
@@ -1880,6 +1892,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         phase = "profile_admission"
         report["phase"] = phase
+        if args.sync_every_block and args.backend != "mlx":
+            raise ValueError("--sync-every-block requires MLX backend")
         if args.model_stage == "lr512" and args.backend != "cuda":
             raise ValueError("LR512 native uses generate.py; this MLX witness is HR-only")
         if args.backend != "mlx" and args.native_profile != "fp16-control":
