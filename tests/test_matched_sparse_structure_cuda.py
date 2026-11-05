@@ -85,3 +85,31 @@ def test_decoder_output_cannot_close_on_corrupted_logits(tmp_path, bad):
         runner.write_complete_output(output, _source_sparse_flow_steps_payload(steps=12),
                                      support, broken, logits, support, write_source_sparse_flow_steps_npz)
     assert not output.exists()
+
+
+def test_complete_output_preserves_steps_and_both_decoder_controls(tmp_path):
+    from test_source_cuda_postcond_full_decode_timing import _source_sparse_flow_steps_payload
+    from scripts.source_cuda_postcond_full_decode_timing import write_source_sparse_flow_steps_npz
+    logits = np.zeros((1, 1, 64, 64, 64), dtype=np.float32)
+    support = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    output = tmp_path/'out.npz'
+    artifact = runner.write_complete_output(output, _source_sparse_flow_steps_payload(steps=12),
+                                            support, logits, logits, support, write_source_sparse_flow_steps_npz)
+    assert artifact['sha256'] == runner.digest(output)
+    with np.load(output) as z:
+        assert z['sample_next'].shape[0] == 12
+        np.testing.assert_array_equal(z['native_decoded_coords'], support)
+        np.testing.assert_array_equal(z['decoded_logits'], logits)
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_export_failure_does_not_publish_partial_primary(tmp_path):
+    def broken_writer(path, payload, support):
+        Path(path).write_bytes(b'partial')
+        raise OSError('simulated disk failure')
+    from pathlib import Path
+    logits = np.zeros((1, 1, 64, 64, 64), dtype=np.float32)
+    support = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    with pytest.raises(OSError, match='disk failure'):
+        runner.write_complete_output(tmp_path/'out.npz', {}, support, logits, logits, support, broken_writer)
+    assert not list(tmp_path.iterdir())
