@@ -3397,20 +3397,21 @@ def _source_sparse_flow_steps_payload(*, steps=8, break_recurrence=False):
     }
 
 
-def test_write_source_sparse_flow_steps_npz_binds_recurrence_and_support(tmp_path):
+@pytest.mark.parametrize("steps", [8, 12])
+def test_write_source_sparse_flow_steps_npz_binds_recurrence_and_support(tmp_path, steps):
     from scripts.source_cuda_postcond_full_decode_timing import (
         write_source_sparse_flow_steps_npz,
     )
 
     output = tmp_path / "source_cuda_sparse_flow_steps.npz"
-    payload = _source_sparse_flow_steps_payload()
+    payload = _source_sparse_flow_steps_payload(steps=steps)
     coords = np.array([[0, 1, 2, 3], [0, 4, 5, 6]], dtype=np.int32)
 
     artifact = write_source_sparse_flow_steps_npz(output, payload, coords)
 
     assert artifact["artifact_scope"] == "source_cuda_sparse_flow_steps"
     assert artifact["format"] == "sparse_flow_steps_npz"
-    assert artifact["step_count"] == 8
+    assert artifact["step_count"] == steps
     assert artifact["support_count"] == 2
     assert artifact["official_sampler_fields"] == [
         "sample_in",
@@ -3442,7 +3443,7 @@ def test_write_source_sparse_flow_steps_npz_binds_recurrence_and_support(tmp_pat
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("step_count", "exactly 8 steps"),
+        ("step_count", "positive"),
         ("recurrence", "recurrence"),
         ("nonfinite", "non-finite"),
     ],
@@ -3457,9 +3458,11 @@ def test_write_source_sparse_flow_steps_npz_rejects_false_closure(
     )
 
     payload = _source_sparse_flow_steps_payload(
-        steps=7 if mutation == "step_count" else 8,
+        steps=8,
         break_recurrence=mutation == "recurrence",
     )
+    if mutation == "step_count":
+        payload["steps"] = np.asarray(0, dtype=np.int32)
     if mutation == "nonfinite":
         payload["pred_final"] = payload["pred_final"].copy()
         payload["pred_final"][0, 0, 0, 0, 0, 0] = np.nan

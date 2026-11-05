@@ -598,11 +598,6 @@ def main(argv: list[str] | None = None) -> int:
                     "--stop-after-sparse-structure requires exact sparse-flow noise "
                     "and its expected SHA256"
                 )
-            if args.steps != 8:
-                raise ValueError(
-                    "the source-CUDA sparse-flow recurrence witness requires "
-                    "--steps 8"
-                )
             if args.pipeline_type != "512":
                 raise ValueError(
                     "the source-CUDA sparse-flow recurrence witness requires "
@@ -4239,8 +4234,8 @@ def write_source_sparse_flow_steps_npz(
 
     arrays = {name: np.asarray(payload[name]) for name in sorted(required)}
     steps = int(arrays["steps"].item())
-    if steps != 8:
-        raise ValueError(f"source sparse-flow witness requires exactly 8 steps, got {steps}")
+    if steps <= 0:
+        raise ValueError(f"source sparse-flow witness requires positive steps, got {steps}")
     noise = arrays["noise"]
     if noise.dtype != np.float32 or noise.ndim != 5:
         raise ValueError(
