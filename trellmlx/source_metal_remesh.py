@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from .source_metal_checkpoint import DistanceQueryCheckpoint, FinisherCheckpointBoundary
+
 
 def load_backend():
     """Require the Metal route; never substitute CPU/CUDA fallback exporters."""
@@ -125,25 +127,37 @@ def verify_deep_bvh_traversal(backend, receipt=None):
 
 
 def rebuild_surface(vertices, faces, *, backend, grid_size, target_faces,
-                    band=1., project_back=.9, capture=None, phase=None, verbose=False):
+                    band=1., project_back=.9, capture=None, phase=None, verbose=False,
+                    checkpoint=None):
     """Prefill→original BVH→DC/project→direct reduction; no cleanup loop."""
     if grid_size <= 0 or target_faces <= 0 or band <= 0:
         raise ValueError("grid, target and band must be positive")
     if not math.isfinite(band) or not math.isfinite(project_back) or not 0 <= project_back <= 1:
         raise ValueError("invalid band or project-back factor")
     mesh = backend.mesh()
+    if checkpoint is not None and hasattr(checkpoint, 'track_resource'):
+        checkpoint.track_resource(mesh)
     notify = phase or (lambda value: None)
     notify("mesh_init")
     mesh.init(vertices, faces)
     if capture:
         capture("raw", dict(zip(("vertices", "faces"), mesh.read())))
     notify("prefill")
-    mesh.fill_holes(max_hole_perimeter=.03)
-    original_v, original_f = mesh.read()
+    original = checkpoint.original() if checkpoint is not None else None
+    if original is None:
+        mesh.fill_holes(max_hole_perimeter=.03)
+        original_v, original_f = mesh.read()
+        if checkpoint is not None:
+            checkpoint.freeze_original(original_v, original_f)
+    else:
+        original_v, original_f = original
+        mesh.init(original_v, original_f)
     if capture:
         capture("filled_original", {"vertices": original_v, "faces": original_f})
     notify("bvh")
     bvh = backend.bvh(original_v, original_f)
+    if checkpoint is not None:
+        bvh = checkpoint.wrap_bvh(bvh)
     notify("bvh_self_distance")
     verify_bvh_source_surface(original_v, original_f, bvh)
     # AABB is the model's fixed [-.5,.5]^3 domain, not the mesh's bounding box.
@@ -172,7 +186,7 @@ def original_surface_positions(positions, vertices, faces, bvh):
 
 def to_glb(vertices, faces, attrs, coords, *, backend, grid_size,
            target_faces=1000000, texture_size=4096, band=1., project_back=.9,
-           capture=None, phase=None, verbose=False):
+           capture=None, phase=None, verbose=False, checkpoint=None):
     """Complete original remesh treatment from saved mesh and appearance."""
     import cv2
     from PIL import Image
@@ -191,7 +205,7 @@ def to_glb(vertices, faces, attrs, coords, *, backend, grid_size,
     mesh, original_v, original_f, bvh = rebuild_surface(
         vertices, faces, backend=backend, grid_size=grid_size,
         target_faces=target_faces, band=band, project_back=project_back,
-        capture=capture, phase=notify, verbose=verbose)
+        capture=capture, phase=notify, verbose=verbose, checkpoint=checkpoint)
     notify("uv")
     out_v, out_f, uv, vmaps = mesh.uv_unwrap(
         compute_charts_kwargs={"threshold_cone_half_angle_rad": np.radians(90.),

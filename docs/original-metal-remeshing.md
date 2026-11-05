@@ -81,3 +81,49 @@ Algorithm source: Microsoft TRELLIS.2 `5565d240c4a494caaf9ece7a554542b76ffa36d3`
 `o-voxel/o_voxel/postprocess.py` (MIT). Metal primitives: Pedro Augusto's
 mtlmesh and trellis2-apple. The source's 100,000-face raster chunks consume
 every face; this is memory tiling, not a face-count cap.
+
+## Cooperative distance-query checkpoints
+
+The optional `--cooperative-checkpoint` mode lets a managed Greenroom job save
+its progress, exit, and resume after queued Quick work or an operator pause.
+Use a command-v2 Greenroom request with `cooperative_checkpoint: true`, make
+Greenroom's Python SDK available to the same interpreter, and add:
+
+```text
+--cooperative-checkpoint
+--checkpoint-root /durable/run/query-state
+--query-chunk-rows 32768
+--continuation-registration /durable/run/register-successor.json
+```
+
+The state directory must be separate from the finishing output. The registration
+file contains `{"argv": ["command", "...{job_id}..."]}`. The runner replaces
+`{job_id}` literally with the future Greenroom job ID and runs the argv without a
+shell. That command must register completion delivery for that exact successor;
+a nonzero return prevents its publication. Owner, source root, executable,
+route, arguments, backend manifest, and registration identity stay bound through
+the continuation. Existing unmanaged runs keep their original behavior.
+
+The adapter partitions the original BVH's independent distance queries and
+retains every result, including triangle IDs and requested barycentrics. It
+freezes the original filled surface and verifies exact query identity before
+reusing a complete or partial saved prefix. No query, face, or detail is
+dropped. Saved buffers are protected from the remesher's in-place arithmetic.
+
+Handoffs currently occur in the original-surface self-distance check and narrow
+band remeshing queries. Opaque native operations, including BVH construction,
+simplification, and UV work, still finish their current call. The checkpoint
+interval therefore depends on those operations as well as query chunk size and
+state-save time; the option does not impose a wall-clock deadline. Resuming
+rebuilds the original BVH and replays the outer prefix using saved query results.
+That adds restart overhead but preserves the remeshing implementation and its
+completed expensive queries. Different replay inputs or corrupted state stop
+the command rather than silently recomputing an incompatible result.
+
+Before a handoff, native resources unwind out of the finisher and their Python
+owners must be released. Greenroom then saves the descriptor, confirms the
+producer's quiescence, registers the successor, and verifies process-group exit
+before another job starts. A checkpointed report explicitly says that no final
+output has completed. CPU tests cover the state and caller contracts; real
+Metal/query agreement and actual queue passage require the corresponding live
+witness. A directory of saved meshes alone does not establish pause support.

@@ -105,7 +105,7 @@ def validate_composition(path, revision, backend_manifest):
     return {"report": str(path), "sha256": digest(path), "output_sha256": output["sha256"]}
 
 
-def run(args, *, backend_loader=load_backend, finalizer=to_glb):
+def run(args, *, backend_loader=load_backend, finalizer=to_glb, checkpoint=None):
     started = time.perf_counter()
     report = {"schema": "trellis2mlx.original-metal-remesh.v1", "status": "failed",
               "failure_phase": None, "last_trustworthy_phase": "request",
@@ -120,9 +120,15 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
         # producer (including its atomic ownership marker) remains protected.
         args.output_dir.mkdir(parents=True, exist_ok=True)
         if any(args.output_dir.iterdir()):
-            raise FileExistsError(f"finishing output contains previous state: {args.output_dir}")
-        with (args.output_dir / ".finishing-owner.json").open("x") as ownership:
-            ownership.write(json.dumps(report["requested"], sort_keys=True) + "\n")
+            owner_path = args.output_dir / '.finishing-owner.json'
+            if (checkpoint is None or not checkpoint.has_original() or not owner_path.is_file()
+                    or json.loads(owner_path.read_text()) != report['requested']):
+                raise FileExistsError(f"finishing output contains previous state: {args.output_dir}")
+            previous = json.loads(report_path.read_text())
+            report['stages'] = previous['stages']
+        else:
+            with (args.output_dir / ".finishing-owner.json").open("x") as ownership:
+                ownership.write(json.dumps(report["requested"], sort_keys=True) + "\n")
         owns_output = True
         write_report(report_path, report)
         phase = "source_identity"
@@ -148,15 +154,17 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
                                      "project_back": args.project_back, "alpha_mode": "OPAQUE",
                                      "double_sided": False})
         report["backend_manifest_sha256"] = digest(args.backend_manifest)
-        with np.load(args.checkpoints / "texture.npz", allow_pickle=False) as checkpoint:
+        with np.load(args.checkpoints / "texture.npz", allow_pickle=False) as texture_checkpoint:
             report["effective"]["grid_identity_source"] = (
-                "embedded mesh_grid_size" if "mesh_grid_size" in checkpoint else "caller declaration; historical checkpoint")
+                "embedded mesh_grid_size" if "mesh_grid_size" in texture_checkpoint else "caller declaration; historical checkpoint")
         report["last_trustworthy_phase"] = phase
         write_report(report_path, report)
 
         def set_phase(value):
             nonlocal phase
             phase = value
+            if checkpoint is not None:
+                checkpoint.set_phase(value)
             report["active_phase"] = value
             report["failure_phase"] = value
             write_report(report_path, report)
@@ -164,8 +172,17 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
 
         def capture(name, tensors):
             set_phase(name)
-            path = args.output_dir / f"{len(report['stages']):02d}-{name}.npz"
             payload = {k: v.detach().cpu().numpy() for k, v in tensors.items()}
+            prior = next((row for row in report['stages'] if row['name'] == name), None)
+            if prior is not None:
+                path = Path(prior['path'])
+                if digest(path) != prior['sha256']:
+                    raise ValueError('saved stage bytes changed')
+                with np.load(path, allow_pickle=False) as saved:
+                    if set(saved.files) != set(payload) or any(not np.array_equal(saved[k], v) for k, v in payload.items()):
+                        raise ValueError('replayed stage differs from saved original')
+                return
+            path = args.output_dir / f"{len(report['stages']):02d}-{name}.npz"
             np.savez_compressed(path, **payload)
             record = {"name": name, "path": str(path), "sha256": digest(path),
                       "shapes": {k: list(v.shape) for k, v in payload.items()},
@@ -182,11 +199,12 @@ def run(args, *, backend_loader=load_backend, finalizer=to_glb):
         write_report(report_path, report)
         vertices, faces, attrs, coords = [backend.torch.from_numpy(v) for v in arrays]
         with backend.torch.no_grad():
+            optional = {'checkpoint': checkpoint} if checkpoint is not None else {}
             mesh = finalizer(vertices, faces, attrs, coords, backend=backend,
                              grid_size=args.grid_size, target_faces=args.target_faces,
                              texture_size=args.texture_size, band=args.band,
                              project_back=args.project_back, capture=capture,
-                             phase=set_phase, verbose=True)
+                             phase=set_phase, verbose=True, **optional)
         set_phase("export")
         output = args.output_dir / "output.glb"
         mesh.export(output)
@@ -234,7 +252,29 @@ def main():
     parser.add_argument("--texture-size", type=int, default=4096)
     parser.add_argument("--band", type=float, default=1.)
     parser.add_argument("--project-back", type=float, default=.9)
+    parser.add_argument('--cooperative-checkpoint', action='store_true',
+                        help='Save and exit at distance-query boundaries for Greenroom Quick/pause requests')
+    parser.add_argument('--checkpoint-root', type=Path,
+                        help='Persistent query-state directory, separate from final output')
+    parser.add_argument('--query-chunk-rows', type=int, default=32768,
+                        help='Work partition only; every query is processed and retained')
+    parser.add_argument('--continuation-registration', type=Path,
+                        help='JSON argv template for registering each successor before publication; {job_id} is replaced literally')
     args = parser.parse_args()
+    if args.cooperative_checkpoint:
+        try:
+            from trellmlx.source_metal_greenroom import run_cooperative
+            return run_cooperative(args, run)
+        except Exception as error:
+            # Initialization/registration can fail before run() owns an output.
+            # Preserve earlier state and always leave a separate failure report.
+            path = args.output_dir.parent / f'{args.output_dir.name}-checkpoint-failure-{uuid.uuid4().hex}.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_report(path, {'status': 'failed', 'failure_phase': 'checkpoint_admission_or_handoff',
+                                'error': f'{type(error).__name__}: {error}',
+                                'traceback': traceback.format_exc(), 'final_output_complete': False})
+            print(json.dumps({'status': 'failed', 'report': str(path)}), flush=True)
+            return 1
     return 0 if run(args)["status"] == "complete" else 1
 
 
