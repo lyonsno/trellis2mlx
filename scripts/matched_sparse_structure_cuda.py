@@ -123,7 +123,7 @@ def main(argv=None):
                 model, load_file(str(paths[name + '_weights'])), name)
             loaded[name] = model.eval()
         flow, decoder = loaded['flow'], loaded['decoder']
-        report['effective_route']['flow_dtype'] = str(flow.blocks[0].attn.to_qkv.weight.dtype)
+        report['effective_route']['flow_dtype'] = str(flow.blocks[0].self_attn.to_qkv.weight.dtype)
         report['model_configs'] = {name: json.loads(paths[name + '_config'].read_text()) for name in loaded}
         report['model_assets'] = assets
         sampler = samplers.FlowEulerGuidanceIntervalSampler(sigma_min=params['sigma_min'])
