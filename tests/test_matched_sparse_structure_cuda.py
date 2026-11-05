@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from scripts import matched_sparse_structure_cuda as runner
+from types import SimpleNamespace
 
 
 def inputs(tmp_path):
@@ -49,3 +50,20 @@ def test_failure_before_primary_output_has_durable_phase_report(tmp_path):
     assert actual['failure_phase'] == 'input_admission'
     assert actual['last_trustworthy_phase'] is None
     assert not (tmp_path/'out.npz').exists()
+
+
+def test_load_matches_official_regenerated_rope_buffer_behavior():
+    class Model:
+        def load_state_dict(self, state, strict):
+            assert strict is False
+            return SimpleNamespace(missing_keys=['rope_phases'], unexpected_keys=[])
+    assert runner.load_official_weights(Model(), {}, 'flow')['missing_keys'] == ['rope_phases']
+
+
+@pytest.mark.parametrize('missing,unexpected', [(['blocks.0.weight'], []), ([], ['other.weight'])])
+def test_loader_rejects_missing_parameters_or_unknown_checkpoint_entries(missing, unexpected):
+    class Model:
+        def load_state_dict(self, state, strict):
+            return SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
+    with pytest.raises(ValueError, match='checkpoint mismatch'):
+        runner.load_official_weights(Model(), {}, 'flow')

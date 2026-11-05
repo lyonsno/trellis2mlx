@@ -37,6 +37,16 @@ def load_inputs(path, expected_digest):
     return arrays, params
 
 
+def load_official_weights(model, state, role):
+    # Official from_pretrained uses strict=False: flow RoPE phases are a
+    # constructor-generated buffer, absent from the published checkpoint.
+    result = model.load_state_dict(state, strict=False)
+    allowed = {'rope_phases'} if role == 'flow' else set()
+    if set(result.missing_keys) - allowed or result.unexpected_keys:
+        raise ValueError(f'checkpoint mismatch for {role}: {result}')
+    return dict(missing_keys=list(result.missing_keys), unexpected_keys=list(result.unexpected_keys))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-id', required=True)
@@ -105,12 +115,15 @@ def main(argv=None):
                 raise ValueError(f'model asset digest mismatch: {role}')
             paths[role] = path
         loaded = {}
+        report['state_dict_loads'] = {}
         for name in ('flow', 'decoder'):
             cfg = json.loads(paths[name + '_config'].read_text())
             model = getattr(models, cfg['name'])(**cfg['args'])
-            model.load_state_dict(load_file(str(paths[name + '_weights'])), strict=True)
+            report['state_dict_loads'][name] = load_official_weights(
+                model, load_file(str(paths[name + '_weights'])), name)
             loaded[name] = model.eval()
         flow, decoder = loaded['flow'], loaded['decoder']
+        report['effective_route']['flow_dtype'] = str(flow.blocks[0].attn.to_qkv.weight.dtype)
         report['model_configs'] = {name: json.loads(paths[name + '_config'].read_text()) for name in loaded}
         report['model_assets'] = assets
         sampler = samplers.FlowEulerGuidanceIntervalSampler(sigma_min=params['sigma_min'])
