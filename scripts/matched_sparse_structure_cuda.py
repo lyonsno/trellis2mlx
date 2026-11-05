@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -45,6 +46,32 @@ def load_official_weights(model, state, role):
     if set(result.missing_keys) - allowed or result.unexpected_keys:
         raise ValueError(f'checkpoint mismatch for {role}: {result}')
     return dict(missing_keys=list(result.missing_keys), unexpected_keys=list(result.unexpected_keys))
+
+
+def write_complete_output(path, payload, support, logits, native_logits, native_support, writer):
+    for value in (logits, native_logits):
+        if value.shape != (1, 1, 64, 64, 64) or value.dtype != np.float32 or not np.isfinite(value).all():
+            raise ValueError('invalid decoder logits: expected finite float32 [1,1,64,64,64]')
+    if native_support.dtype != np.int32 or native_support.ndim != 2 or native_support.shape[1] != 4:
+        raise ValueError('invalid native decoded support')
+    path = Path(path)
+    if path.exists():
+        raise ValueError('refusing to overwrite preexisting primary output')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.npz', delete=False) as f:
+        temp = Path(f.name)
+    try:
+        artifact = writer(temp, payload, support)
+        with np.load(temp) as z:
+            output = {key: z[key] for key in z.files}
+        output.update(decoded_logits=logits, native_decoded_logits=native_logits,
+                      native_decoded_coords=native_support)
+        np.savez(temp, **output)
+        os.replace(temp, path)
+        artifact.update(path=str(path), sha256=digest(path), size_bytes=path.stat().st_size)
+        return artifact
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def main(argv=None):
@@ -104,7 +131,7 @@ def main(argv=None):
             raise RuntimeError('effective attention backend differs')
         report['effective_route'] = dict(device='cuda', device_name=torch.cuda.get_device_name(0),
             capability=list(torch.cuda.get_device_capability(0)), torch=torch.__version__,
-            attention=attention_config.BACKEND, flow_dtype='bfloat16',
+            attention=attention_config.BACKEND, flow_dtype=None,
             sampler='official FlowEulerGuidanceIntervalSampler.sample', source_revision=assets['source_revision'])
         report['phase'] = 'model_load'
         save()
@@ -124,6 +151,12 @@ def main(argv=None):
             loaded[name] = model.eval()
         flow, decoder = loaded['flow'], loaded['decoder']
         report['effective_route']['flow_dtype'] = str(flow.blocks[0].self_attn.to_qkv.weight.dtype)
+        report['effective_route']['decoder_dtype'] = str(decoder.dtype)
+        report['effective_route']['autocast_enabled'] = torch.is_autocast_enabled()
+        if (flow.dtype != torch.bfloat16 or
+                flow.blocks[0].self_attn.to_qkv.weight.dtype != torch.bfloat16 or
+                torch.is_autocast_enabled()):
+            raise ValueError('effective flow precision differs from stock BF16')
         report['model_configs'] = {name: json.loads(paths[name + '_config'].read_text()) for name in loaded}
         report['model_assets'] = assets
         sampler = samplers.FlowEulerGuidanceIntervalSampler(sigma_min=params['sigma_min'])
@@ -158,14 +191,9 @@ def main(argv=None):
         report['last_trustworthy_phase'] = 'decoder'
         report['phase'] = 'export'
         save()
-        report['artifact'] = write_source_sparse_flow_steps_npz(args.output_npz, payload, support)
-        # Keep the entire signal, including the same-decoder native-latent control.
-        with np.load(args.output_npz) as z:
-            output = {key: z[key] for key in z.files}
-        output.update(decoded_logits=logits_np, native_decoded_logits=native_logits_np,
-                      native_decoded_coords=native_support)
-        np.savez(args.output_npz, **output)
-        report['artifact'].update(sha256=digest(args.output_npz), size_bytes=args.output_npz.stat().st_size)
+        report['artifact'] = write_complete_output(
+            args.output_npz, payload, support, logits_np, native_logits_np, native_support,
+            write_source_sparse_flow_steps_npz)
         report.update(status='done', phase='complete', last_trustworthy_phase='export',
                       elapsed_seconds=time.monotonic()-started)
         save()

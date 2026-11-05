@@ -67,3 +67,21 @@ def test_loader_rejects_missing_parameters_or_unknown_checkpoint_entries(missing
             return SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
     with pytest.raises(ValueError, match='checkpoint mismatch'):
         runner.load_official_weights(Model(), {}, 'flow')
+
+
+@pytest.mark.parametrize('bad', ['nan', 'shape'])
+def test_decoder_output_cannot_close_on_corrupted_logits(tmp_path, bad):
+    from test_source_cuda_postcond_full_decode_timing import _source_sparse_flow_steps_payload
+    from scripts.source_cuda_postcond_full_decode_timing import write_source_sparse_flow_steps_npz
+    logits = np.zeros((1, 1, 64, 64, 64), dtype=np.float32)
+    broken = logits.copy()
+    if bad == 'nan':
+        broken.flat[0] = np.nan
+    else:
+        broken = broken[:, :, :-1]
+    support = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    output = tmp_path/'out.npz'
+    with pytest.raises(ValueError, match='decoder logits'):
+        runner.write_complete_output(output, _source_sparse_flow_steps_payload(steps=12),
+                                     support, broken, logits, support, write_source_sparse_flow_steps_npz)
+    assert not output.exists()
