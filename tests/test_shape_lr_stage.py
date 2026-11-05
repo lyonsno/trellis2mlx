@@ -80,4 +80,3 @@ def test_lr_cli_failure_keeps_actual_stage_and_phase(tmp_path, monkeypatch):
     assert 'LR512' in r['claim_ceiling']
     assert '24578' not in r['claim_ceiling']
     assert r['failure_phase'] == 'model_load'
-
