@@ -259,7 +259,7 @@ class ManagedCheckpoint:
 
     def _release_scratch(self):
         args = self.identity["arguments"]
-        if (self.request.output_class != "final" or args.get("save_checkpoints")
+        if (self.request.output_class not in (None, "final") or args.get("save_checkpoints")
                 or args.get("stop_after_stage") or self.published is None):
             return
         removed, retained = [], []

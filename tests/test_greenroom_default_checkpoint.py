@@ -475,7 +475,7 @@ def test_foreground_cancel_follows_a_parent_that_already_handed_off(tmp_path, mo
     assert cancelled == ["fixture-successor"], "foreground exit left its resumed job queued"
 
 
-@pytest.mark.parametrize('preserve', ['none', 'research', 'witness', 'failure', 'stale-output', 'changed-scratch'])
+@pytest.mark.parametrize('preserve', ['none', 'unclassified', 'research', 'witness', 'failure', 'stale-output', 'changed-scratch'])
 def test_only_completed_final_export_releases_owned_replay_scratch(managed, tmp_path, preserve):
     from trellmlx.greenroom_checkpoint import ManagedCheckpoint, checkpointed
 
@@ -486,6 +486,8 @@ def test_only_completed_final_export_releases_owned_replay_scratch(managed, tmp_
         arguments['save_checkpoints'] = str(tmp_path / 'research')
     control = ManagedCheckpoint(tmp_path / 'scratch-report.json', arguments=arguments)
     control.request.output_class = 'witness' if preserve == 'witness' else 'final'
+    if preserve == 'unclassified':
+        control.request.output_class = None
     unknown = control.directory / 'caller-note.txt'
     unknown.write_text('retain unknown content')
 
@@ -509,9 +511,9 @@ def test_only_completed_final_export_releases_owned_replay_scratch(managed, tmp_
     else:
         control.run(generation)
     tensors = list(control.directory.glob('*.safetensors'))
-    assert bool(tensors) is (preserve != 'none')
+    assert bool(tensors) is (preserve not in ('none', 'unclassified'))
     assert unknown.read_text() == 'retain unknown content'
     assert output.read_bytes() == (b'old asset' if preserve in ('failure', 'stale-output') else b'new final asset')
     report = json.loads((tmp_path / 'scratch-report.json').read_text())
-    if preserve == 'none':
+    if preserve in ('none', 'unclassified'):
         assert report['scratch_cleanup']['removed_files'] == 1

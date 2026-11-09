@@ -38,6 +38,8 @@ research snapshots remain retained without automatic expiry. After an ordinary
 final export succeeds, only this controller's recorded, unchanged tensor scratch
 files are removed. Unknown files, changed files and final assets are preserved;
 no scheduled cleaner or retention timer is installed.
+The same rule covers ordinary submissions with no output class; an explicit
+witness or intermediate class keeps its scratch.
 
 Opaque extraction, cleanup, unwrap and bake calls currently yield after the
 call returns. Model block boundaries are interruptible, with unfinished work
@@ -46,6 +48,9 @@ step boundary. This does not promise a maximum pause latency for opaque calls.
 The separate original-order Metal finisher has its own checkpoint integration.
 An outer controller launching child CLIs must own the continuation; the CLI
 rejects a mismatched admitted entrypoint instead of silently duplicating it.
+Existing outer harnesses that spawn the CLI therefore need a continuation
+adapter before using this managed route. The ordinary typed generation routes
+invoke `generate.py` directly and inherit its source declaration.
 
 The source-owned `.gpu-greenroom-producer.json` declares `generate.py` to
 Greenroom versions supporting producer checkpoint declarations. Normal typed
