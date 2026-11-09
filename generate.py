@@ -23,6 +23,7 @@ import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
 from trellmlx.greenroom_checkpoint import checkpointed, checkpoint_call
+from trellmlx.greenroom_entry import run_unmanaged
 from trellmlx.decoder_turing_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND as DECODER_CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_DECODER_LAYERNORM_BACKEND,
@@ -1629,6 +1630,9 @@ def main():
                         default=os.environ.get("TRELLIS2MLX_GREENROOM_PAUSE_REPORT"),
                         help="Fresh pause report path; requires a Greenroom queue; default is unique beside output")
     args = parser.parse_args()
+    admitted = run_unmanaged(args)
+    if admitted is not None:
+        return admitted
     if args.greenroom_pause_report and not args.greenroom_queue_dir:
         parser.error("--greenroom-pause-report requires --greenroom-queue-dir")
     from trellmlx.greenroom_pause import pause_session
@@ -4011,4 +4015,4 @@ def _extract_image_features(image_path, resolution=512):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

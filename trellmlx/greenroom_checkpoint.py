@@ -153,7 +153,7 @@ class ManagedCheckpoint:
         # Args supply actual inputs, not cwd-based guesses; output/control paths
         # are intentionally excluded because generation writes them.
         inputs = {}
-        excluded = {"output", "resume", "save_checkpoints", "greenroom_pause_report",
+        excluded = {"output", "save_checkpoints", "greenroom_pause_report",
                     "greenroom_queue_dir", "checkpoint_stop_file"}
         for key, value in arguments.items():
             if key in excluded:
@@ -162,10 +162,20 @@ class ManagedCheckpoint:
                 if isinstance(item, str) and Path(item).is_file():
                     path = str(Path(item).resolve())
                     inputs[path] = _hash(path)
+                    if Path(item).suffix == ".npz":
+                        sidecar = Path(item).resolve().with_suffix(".json")
+                        inputs[str(sidecar)] = _hash(sidecar) if sidecar.is_file() else None
+        if arguments.get("resume"):
+            resume = Path(arguments["resume"]).resolve()
+            for name in ("mesh_raw.npz", "texture.npz", "mesh_raw.json", "texture.json"):
+                path = resume / name
+                inputs[str(path)] = _hash(path) if path.is_file() else None
         self.identity = {"schema": "trellis2mlx.managed-replay.v1", "arguments": arguments,
                          "source_root": str(self.root),
                          "sources": {str(p.relative_to(self.root)): _hash(p) for p in sources},
-                         "inputs": inputs, "mlx_version": mx.__version__}
+                         "inputs": inputs, "mlx_version": mx.__version__,
+                         "environment": {k: v for k, v in os.environ.items()
+                                         if k.startswith("TRELLIS2MLX_") and not k.startswith("TRELLIS2MLX_GREENROOM_")}}
         self.identity = json.loads(json.dumps(self.identity))
         saved = self.sdk.load_checkpoint()
         self.records, self.weights, self.partial = [], {}, None
@@ -318,6 +328,15 @@ class ManagedCheckpoint:
             raise _CheckpointRequested()
 
     def run(self, operation):
+        try:
+            return self._run(operation)
+        except BaseException as error:
+            if not (isinstance(error, SystemExit) and error.code == 0 and self.state.get("status") == "checkpointed"):
+                self._write(status="cancelled" if isinstance(error, SystemExit) and error.code == 130 else "failed",
+                            error_type=type(error).__name__, error=str(error))
+            raise
+
+    def _run(self, operation):
         from .cleanup import _clear_mlx_cache
         cancellation = importlib.import_module("gpu_queue.cancellation").cancellation
         with cancellation() as self.stop:

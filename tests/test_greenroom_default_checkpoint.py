@@ -1,7 +1,7 @@
 """Ordinary CLI callers inherit the observed Greenroom managed-job contract.
 
-The context envelope matches canonical command.v2 job 8ac362a06592 (installed
-Greenroom 598c7da). Temporary process identities are supplied by the real SDK.
+The context envelope matches observed command.v2 output from Greenroom 598c7da.
+Temporary process identities are supplied by the real SDK.
 All tensor checks in this module run on CPU.
 """
 
@@ -191,7 +191,7 @@ def test_partial_euler_resumes_next_step_and_preserves_captures(managed, tmp_pat
     import numpy as np
 
     queue, job, _ = managed
-    calls, captures = [], []
+    calls, captures, first = [], [], {}
     pause = None
     control = ManagedCheckpoint(tmp_path / "flow-first.json", arguments={"steps": 4})
 
@@ -207,9 +207,10 @@ def test_partial_euler_resumes_next_step_and_preserves_captures(managed, tmp_pat
 
     def generation():
         captures.clear()
+        first.clear()
         return flow_euler_sample(
             model, mx.zeros((1, 2)), mx.zeros((1, 1, 2)), mx.zeros((1, 1, 2)),
-            steps=4, guidance_strength=1, verbose=False, capture_steps=captures,
+            steps=4, guidance_strength=1, verbose=False, capture_steps=captures, capture_first_step=first,
             on_step_boundary=boundary,
         )
 
@@ -228,6 +229,7 @@ def test_partial_euler_resumes_next_step_and_preserves_captures(managed, tmp_pat
         _active_control.reset(token)
     assert len(calls) == 4, "completed Euler steps were recomputed"
     assert len(captures) == 4, "diagnostic captures were dropped at restart"
+    assert first["t"].item() == 1.0, "resumed step overwrote the first-step diagnostic capture"
     expected = flow_euler_sample(model, mx.zeros((1, 2)), mx.zeros((1, 1, 2)), mx.zeros((1, 1, 2)),
                                  steps=4, guidance_strength=1, verbose=False)
     np.testing.assert_array_equal(np.array(actual), np.array(expected))
@@ -298,3 +300,174 @@ def test_cancellation_does_not_publish_a_continuation(managed, tmp_path):
     assert not (job / "checkpoint-handoff.json").exists()
     assert not list((queue.queue_dir / "pending").iterdir())
     assert json.loads((tmp_path / "cancel.json").read_text())["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("changed", ["sidecar", "new-sidecar", "resume-input", "attention-env"])
+def test_implicit_inputs_and_effective_backend_are_bound(managed, tmp_path, monkeypatch, changed):
+    from trellmlx.greenroom_checkpoint import ManagedCheckpoint, checkpointed
+
+    queue, job, _ = managed
+    sample = tmp_path / "sample.npz"
+    sample.write_bytes(b"fixture")
+    if changed == "sidecar":
+        sample.with_suffix(".json").write_text('{"mesh_grid_size":512}')
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    (resume / "mesh_raw.npz").write_bytes(b"mesh")
+    (resume / "texture.npz").write_bytes(b"texture")
+    arguments = {"conditioning_sample": str(sample), "resume": str(resume)}
+
+    @checkpointed
+    def stage():
+        queue.pause(owner="test", epoch="implicit-input")
+        return mx.ones((2,))
+
+    first = ManagedCheckpoint(tmp_path / "before.json", arguments=arguments)
+    with pytest.raises(SystemExit):
+        first.run(stage)
+    continue_job(queue, job, monkeypatch)
+    if changed in ("sidecar", "new-sidecar"):
+        sample.with_suffix(".json").write_text('{"mesh_grid_size":1024}')
+    elif changed == "resume-input":
+        (resume / "texture.npz").write_bytes(b"different texture")
+    else:
+        monkeypatch.setenv("TRELLIS2MLX_ATTENTION_CHUNK_SIZE", "17")
+    with pytest.raises(ValueError, match="source/input/config identity"):
+        ManagedCheckpoint(tmp_path / "after.json", arguments=arguments)
+
+
+def test_ordinary_direct_cli_automatically_queues_without_pause_or_identity_flags(tmp_path, monkeypatch):
+    import generate
+    import gpu_queue.queue
+    from types import SimpleNamespace
+
+    submitted = []
+
+    class Queue:
+        def __init__(self, path):
+            self.queue_dir = Path(path)
+
+        def submit(self, request):
+            submitted.append(request)
+            path = self.queue_dir / "done" / request.job_id
+            path.mkdir(parents=True)
+            (path / "request.json").write_text(request.to_json())
+            return path
+
+        def get_job(self, job):
+            return SimpleNamespace(status=SimpleNamespace(value="done"), exit_code=0)
+
+    monkeypatch.setattr(gpu_queue.queue, "GPUQueue", Queue)
+    for key in ("GPU_GREENROOM_CONTEXT", "GPU_GREENROOM_JOB_ID", "GREENROOM_JOB_ID", "TRELLIS2MLX_GREENROOM_QUEUE_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GPU_GREENROOM_QUEUE_DIR", str(tmp_path / "queue"))
+    monkeypatch.setattr(sys, "argv", [str(Path(generate.__file__)), "--output", str(tmp_path / "mesh.glb")])
+    monkeypatch.setattr(generate, "_generate", lambda *args: pytest.fail("direct unadmitted CLI reached model execution"))
+    assert generate.main() == 0
+    assert len(submitted) == 1
+    assert submitted[0].cooperative_checkpoint is True
+    assert submitted[0].agent_id is None
+    assert "--cooperative-checkpoint" not in submitted[0].command_argv
+
+
+def test_foreground_cli_follows_real_sdk_successor_and_accepts_its_incoming_edge(tmp_path, monkeypatch):
+    import threading
+    import time
+    from types import SimpleNamespace
+    from gpu_queue.queue import GPUQueue
+    from trellmlx import greenroom_entry
+
+    root = tmp_path / "producer"
+    root.mkdir()
+    (root / ".gpu-greenroom-producer.json").write_text(json.dumps({
+        "schema": "gpu-greenroom.producer-checkpoints.v1", "entrypoints": ["generate.py"]}))
+    (root / "generate.py").write_text('''import json,pathlib,time,uuid
+from dataclasses import replace
+from gpu_queue.cooperative import _context,load_checkpoint,yield_if_requested
+q,job,r,s=_context()
+state=load_checkpoint() or {'step':0}
+if state['step']==0:
+ q.pause(owner='isolated-entry-fixture')
+ yield_if_requested(save_checkpoint=lambda p:{'step':1},quiesce=lambda:True,
+  continuation=lambda p:replace(r,job_id=uuid.uuid4().hex[:12],submitted_at=time.time()))
+pathlib.Path(r.output_dir,'fixture-result.json').write_text(json.dumps(state))
+''')
+    monkeypatch.setattr(greenroom_entry, "__file__", str(root / "trellmlx" / "greenroom_entry.py"))
+    queue = GPUQueue(tmp_path / "queue")
+    for key in ("GPU_GREENROOM_CONTEXT", "GPU_GREENROOM_JOB_ID", "GREENROOM_JOB_ID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GPU_GREENROOM_QUEUE_DIR", str(queue.queue_dir))
+    monkeypatch.setattr(sys, "argv", [str(root / "generate.py"), "--output", str(tmp_path / "mesh.glb")])
+    stop = threading.Event()
+    errors = []
+
+    def service():
+        try:
+            while not stop.is_set():
+                pending = list((queue.queue_dir / "pending").iterdir())
+                if queue.is_paused() and pending and list((queue.queue_dir / "done").iterdir()):
+                    queue.resume(owner="isolated-entry-fixture")
+                if not queue.run_one({}):
+                    stop.wait(.01)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=service)
+    worker.start()
+    try:
+        assert greenroom_entry.run_unmanaged(SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / "mesh.glb"))) == 0
+    finally:
+        stop.set()
+        worker.join()
+    assert errors == []
+    assert json.loads((tmp_path / "fixture-result.json").read_text()) == {"step": 1}
+    receipts = list((tmp_path / "_control").glob("*.admission.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["status"] == "done" and len(receipt["chain"]) == 1
+    assert len(list((queue.queue_dir / "done").iterdir())) == 2
+
+
+def test_foreground_cancel_follows_a_parent_that_already_handed_off(tmp_path, monkeypatch):
+    import gpu_queue.queue
+    from trellmlx import greenroom_entry
+    from types import SimpleNamespace
+    from dataclasses import replace
+
+    cancelled = []
+
+    class Queue:
+        def __init__(self, path):
+            self.queue_dir = Path(path)
+            self.first_read = True
+
+        def submit(self, request):
+            self.parent = request.job_id
+            self.child = "fixture-successor"
+            parent = self.queue_dir / "done" / self.parent
+            child = self.queue_dir / "pending" / self.child
+            parent.mkdir(parents=True); child.mkdir(parents=True)
+            (parent / "request.json").write_text(request.to_json())
+            (parent / "checkpoint-handoff.json").write_text(json.dumps({
+                "status": "committed", "job_id": self.parent, "next_job_id": self.child}))
+            successor = replace(request, job_id=self.child, params={**request.params, "continuation_of": self.parent})
+            (child / "request.json").write_text(successor.to_json())
+            return parent
+
+        def get_job(self, job):
+            if self.first_read:
+                self.first_read = False
+                raise KeyboardInterrupt()
+            return SimpleNamespace(status=SimpleNamespace(value="done" if job == self.parent else "pending"), exit_code=0)
+
+        def cancel(self, job):
+            cancelled.append(job)
+
+    monkeypatch.setattr(gpu_queue.queue, "GPUQueue", Queue)
+    for key in ("GPU_GREENROOM_CONTEXT", "GPU_GREENROOM_JOB_ID", "GREENROOM_JOB_ID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GPU_GREENROOM_QUEUE_DIR", str(tmp_path / "queue"))
+    monkeypatch.setattr(sys, "argv", [str(Path(greenroom_entry.__file__).resolve().parents[1] / "generate.py")])
+    code = greenroom_entry.run_unmanaged(SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / "mesh.glb")))
+    assert code == 130
+    assert cancelled == ["fixture-successor"], "foreground exit left its resumed job queued"

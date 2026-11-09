@@ -1,5 +1,15 @@
 # Pause and continue a Trellis run
 
+On a machine with Greenroom installed, an ordinary `python generate.py ...`
+automatically submits the exact CLI command to the shared queue and waits for
+its terminal continuation. No queue, pause, identity or checkpoint flags are
+required. The foreground client relays model logs and writes a unique
+`_control/*.admission.json` beside the requested output. Ctrl-C requests
+cancellation of its current job, following a completed handoff when necessary.
+On a machine without Greenroom, standalone generation remains available.
+An old managed route that did not admit checkpoint support fails before loading
+models; it cannot silently occupy the worker without pause support.
+
 An admitted Greenroom checkpoint job running `generate.py` uses managed
 checkpoint/exit/continuation automatically. No Trellis queue, pause-report or
 checkpoint-save flags are needed. The context comes from the actual scheduler
@@ -17,7 +27,9 @@ saved completed results. Queue-wide pause, per-job holds and Quick passage
 use the scheduler's existing controls; cancellation does not create a successor.
 
 The saved state binds the source files, arguments, input files, weight files
-and MLX version. Changed identity or tensor bytes fail visibly. These internal
+and MLX version. It includes optional NPZ sidecar presence/content, resumed raw
+mesh and texture inputs, and numerical `TRELLIS2MLX_*` environment settings.
+Changed identity or tensor bytes fail visibly. These internal
 snapshots use exact safetensors/NumPy arrays without pickle. They are distinct
 from `--save-checkpoints` research outputs. Keep them through a pending pause
 or an open failure investigation; there is no automatic expiry or deletion.
@@ -33,9 +45,13 @@ rejects a mismatched admitted entrypoint instead of silently duplicating it.
 The source-owned `.gpu-greenroom-producer.json` declares `generate.py` to
 Greenroom versions supporting producer checkpoint declarations. Normal typed
 `submit` and structured `submit-command` then admit the capability without a
-caller flag. Older Greenroom versions require the existing explicit
-checkpoint-capable command admission. A plain resident queue flag below does
-not establish managed admission. The declaration applies to this exact
+caller flag. Callers without `--agent-id` retain an unrecorded caller identity;
+Greenroom assigns checkpoint custody to the job, preserving caller attribution.
+Prepared jobs preserve input validation and rerun their original CPU
+preflight for a successor. These paths require the corresponding worker/SDK
+capabilities. Older Greenroom installations must be updated before shared CLI
+generation; unsupported managed execution fails visibly. A plain resident
+queue flag below does not establish managed admission. The declaration applies to this exact
 entrypoint; it does not claim arbitrary custom controllers or standalone
 finisher scripts are checkpoint-capable.
 

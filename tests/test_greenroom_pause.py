@@ -197,6 +197,7 @@ def test_legacy_pause_and_sampling_resume_are_numerically_identical(tmp_path, mo
 
 def test_generate_cli_scopes_control_and_closes_status(tmp_path, monkeypatch):
     import generate
+    monkeypatch.setattr(generate, "run_unmanaged", lambda args: None)
 
     root = queue_root(tmp_path)
     report = tmp_path / "pause.json"
@@ -316,6 +317,7 @@ def test_real_decoder_checks_pause_inside_levels_without_numerical_change(tmp_pa
 
 def test_generate_consumes_queue_and_report_from_environment(tmp_path, monkeypatch):
     import generate
+    monkeypatch.setattr(generate, "run_unmanaged", lambda args: None)
     root = queue_root(tmp_path)
     report = tmp_path / 'pause.json'
     monkeypatch.setenv('TRELLIS2MLX_GREENROOM_QUEUE_DIR', str(root))
@@ -330,6 +332,7 @@ def test_generate_consumes_queue_and_report_from_environment(tmp_path, monkeypat
 
 def test_default_report_is_fresh_for_repeated_same_output(tmp_path, monkeypatch):
     import generate
+    monkeypatch.setattr(generate, "run_unmanaged", lambda args: None)
     root = queue_root(tmp_path)
     output = tmp_path / 'same.glb'
     monkeypatch.delenv('TRELLIS2MLX_GREENROOM_PAUSE_REPORT', raising=False)

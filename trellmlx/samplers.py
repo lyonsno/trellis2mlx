@@ -161,7 +161,7 @@ def flow_euler_sample(
             and guidance_interval[0] <= t <= guidance_interval[1]
         )
         capture_this_step = (
-            (capture_first_step is not None and step_idx == start_step_index)
+            (capture_first_step is not None and resumed is None and step_idx == start_step_index)
             or capture_steps is not None
         )
 
@@ -278,7 +278,7 @@ def flow_euler_sample(
                 "t": mx.array(t, dtype=mx.float32),
                 "t_prev": mx.array(t_prev, dtype=mx.float32),
             }
-            if capture_first_step is not None and step_idx == start_step_index:
+            if capture_first_step is not None and resumed is None and step_idx == start_step_index:
                 capture_first_step.update(step_payload)
                 mx.eval(*[value for value in capture_first_step.values() if value is not None])
             if capture_steps is not None:
