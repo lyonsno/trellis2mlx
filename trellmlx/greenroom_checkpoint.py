@@ -98,6 +98,13 @@ def checkpoint_call(label, function, *args, **kwargs):
     return control.call(function, args, kwargs, label=label)
 
 
+def output_published(path):
+    """Called only after the final asset export succeeds in this invocation."""
+    control = _current.get()
+    if control is not None:
+        control.output_published(path)
+
+
 def sampler_resume():
     control = _current.get()
     return control.partial if control is not None and control.in_sampler else None
@@ -179,10 +186,12 @@ class ManagedCheckpoint:
         self.identity = json.loads(json.dumps(self.identity))
         saved = self.sdk.load_checkpoint()
         self.records, self.weights, self.partial = [], {}, None
+        self.artifacts, self.published = {}, None
         if saved is not None:
             if saved.get("identity") != self.identity:
                 raise ValueError("Trellis checkpoint source/input/config identity changed")
             self.records, self.weights = saved["records"], saved["weights"]
+            self.artifacts = saved.get("artifacts", {})
             self.partial = self._load(saved["partial"]) if saved.get("partial") else None
             self.directory = Path(saved["directory"])
             for path, digest in self.weights.items():
@@ -239,7 +248,45 @@ class ManagedCheckpoint:
             path = self.directory / f"{name}.npz"
             np.savez(path, **numpy_arrays)
             files["numpy"] = {"path": str(path), "sha256": _hash(path)}
+        self.artifacts.update({item["path"]: item["sha256"] for item in files.values()})
         return {"tree": tree, "files": files}
+
+    def output_published(self, path):
+        path = Path(path).resolve()
+        expected = self.identity["arguments"].get("output")
+        if expected and path == Path(expected).resolve() and path.is_file() and path.stat().st_size:
+            self.published = (path, _hash(path))
+
+    def _release_scratch(self):
+        args = self.identity["arguments"]
+        if (self.request.output_class != "final" or args.get("save_checkpoints")
+                or args.get("stop_after_stage") or self.published is None):
+            return
+        removed, retained = [], []
+        try:
+            output, digest = self.published
+            if _hash(output) != digest or self.directory.is_symlink() or self.directory.resolve() != self.directory:
+                return
+            for name, expected in self.artifacts.items():
+                path = Path(name)
+                if (path.parent != self.directory or path.is_symlink()
+                        or path.suffix not in {".npz", ".safetensors"}):
+                    retained.append(name)
+                    continue
+                if not path.exists():
+                    continue
+                if _hash(path) != expected:
+                    retained.append(name)
+                    continue
+                path.unlink()
+                removed.append(name)
+            if not any(self.directory.iterdir()):
+                self.directory.rmdir()
+        except OSError as error:
+            self._write(scratch_cleanup={"removed_files": len(removed), "retained": retained,
+                                         "error": str(error)})
+        else:
+            self._write(scratch_cleanup={"removed_files": len(removed), "retained": retained})
 
     def _load(self, record):
         sources = {}
@@ -354,6 +401,7 @@ class ManagedCheckpoint:
                     raise
                 else:
                     self._write(status="finished", completed_calls=len(self.records))
+                    self._release_scratch()
                     return result
                 finally:
                     _current.reset(token)
@@ -366,7 +414,7 @@ class ManagedCheckpoint:
                 self._write(status="handoff-pending", completed_calls=len(self.records),
                             submitted_work_drained=True)
                 payload = {"identity": self.identity, "records": self.records, "weights": self.weights,
-                           "directory": str(self.directory), "partial": partial}
+                           "directory": str(self.directory), "partial": partial, "artifacts": self.artifacts}
                 self.sdk.yield_if_requested(
                     save_checkpoint=lambda directory: payload,
                     quiesce=lambda: True,

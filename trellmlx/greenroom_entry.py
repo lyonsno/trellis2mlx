@@ -75,14 +75,16 @@ def run_unmanaged(args):
     queue_root = args.greenroom_queue_dir or os.environ.get("GPU_GREENROOM_QUEUE_DIR") or str(Path.home() / ".local/state/gpu-greenroom")
     queue = queue_type(Path(queue_root).expanduser().resolve())
     output = Path(args.output).resolve()
-    receipt = output.parent / "_control" / f"{output.stem}.{uuid.uuid4().hex}.admission.json"
+    run_id = f"{output.stem}.{uuid.uuid4().hex}"
+    receipt = output.parent / "_control" / f"{run_id}.admission.json"
+    job_output = output.parent / "_control" / f"{run_id}.job"
     env = {k:v for k,v in os.environ.items() if k.startswith("TRELLIS2MLX_") or k in
            {"PATH", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HUB_OFFLINE"}}
     env["PYTHONPATH"] = str(root) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
     request = admission.command_request(admission.normalize_manifest({
         "schema": "gpu-greenroom.command.v1", "repo_root": str(root), "cwd": os.getcwd(),
         "argv": [sys.executable, "-u", str(root / "generate.py"), *sys.argv[1:]],
-        "output_dir": str(output.parent), "output_class": "final",
+        "output_dir": str(job_output), "output_class": "final",
         "route_identity": "trellis2mlx/ordinary-cli/automatic-checkpoint", "env": env,
     }))
     state = {"schema": "trellis2mlx.automatic-admission.v1", "status": "submitting",
@@ -90,6 +92,7 @@ def run_unmanaged(args):
              "argv": request.command_argv, "caller_agent_id": None,
              "claim_ceiling": "queued-command terminality; inspect produced artifacts separately",
              "chain": [], "receipt": str(receipt)}
+    state.update(job_output_dir=str(job_output), requested_output=str(output))
     _write(receipt, state)
     current = None
     previous_term = None

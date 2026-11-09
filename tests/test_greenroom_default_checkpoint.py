@@ -368,6 +368,8 @@ def test_ordinary_direct_cli_automatically_queues_without_pause_or_identity_flag
     assert submitted[0].cooperative_checkpoint is True
     assert submitted[0].agent_id is None
     assert "--cooperative-checkpoint" not in submitted[0].command_argv
+    assert Path(submitted[0].output_dir).parent == tmp_path / "_control"
+    assert Path(submitted[0].output_dir) != tmp_path, "caller directory became job-owned storage"
 
 
 def test_foreground_cli_follows_real_sdk_successor_and_accepts_its_incoming_edge(tmp_path, monkeypatch):
@@ -420,10 +422,10 @@ pathlib.Path(r.output_dir,'fixture-result.json').write_text(json.dumps(state))
         stop.set()
         worker.join()
     assert errors == []
-    assert json.loads((tmp_path / "fixture-result.json").read_text()) == {"step": 1}
     receipts = list((tmp_path / "_control").glob("*.admission.json"))
     assert len(receipts) == 1
     receipt = json.loads(receipts[0].read_text())
+    assert json.loads((Path(receipt["job_output_dir"]) / "fixture-result.json").read_text()) == {"step": 1}
     assert receipt["status"] == "done" and len(receipt["chain"]) == 1
     assert len(list((queue.queue_dir / "done").iterdir())) == 2
 
@@ -471,3 +473,45 @@ def test_foreground_cancel_follows_a_parent_that_already_handed_off(tmp_path, mo
     code = greenroom_entry.run_unmanaged(SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / "mesh.glb")))
     assert code == 130
     assert cancelled == ["fixture-successor"], "foreground exit left its resumed job queued"
+
+
+@pytest.mark.parametrize('preserve', ['none', 'research', 'witness', 'failure', 'stale-output', 'changed-scratch'])
+def test_only_completed_final_export_releases_owned_replay_scratch(managed, tmp_path, preserve):
+    from trellmlx.greenroom_checkpoint import ManagedCheckpoint, checkpointed
+
+    output = tmp_path / 'mesh.glb'
+    output.write_bytes(b'old asset')
+    arguments = {'output': str(output)}
+    if preserve == 'research':
+        arguments['save_checkpoints'] = str(tmp_path / 'research')
+    control = ManagedCheckpoint(tmp_path / 'scratch-report.json', arguments=arguments)
+    control.request.output_class = 'witness' if preserve == 'witness' else 'final'
+    unknown = control.directory / 'caller-note.txt'
+    unknown.write_text('retain unknown content')
+
+    @checkpointed
+    def stage():
+        return mx.ones((2,))
+
+    def generation():
+        stage()
+        if preserve == 'failure':
+            raise RuntimeError('export failed')
+        if preserve != 'stale-output':
+            output.write_bytes(b'new final asset')
+            control.output_published(output)
+        if preserve == 'changed-scratch':
+            next(control.directory.glob('*.safetensors')).write_bytes(b'external change')
+
+    if preserve == 'failure':
+        with pytest.raises(RuntimeError, match='export failed'):
+            control.run(generation)
+    else:
+        control.run(generation)
+    tensors = list(control.directory.glob('*.safetensors'))
+    assert bool(tensors) is (preserve != 'none')
+    assert unknown.read_text() == 'retain unknown content'
+    assert output.read_bytes() == (b'old asset' if preserve in ('failure', 'stale-output') else b'new final asset')
+    report = json.loads((tmp_path / 'scratch-report.json').read_text())
+    if preserve == 'none':
+        assert report['scratch_cleanup']['removed_files'] == 1

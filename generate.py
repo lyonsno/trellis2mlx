@@ -2054,6 +2054,8 @@ def _generate(args, parser, pause_control):
                     visual=trimesh.visual.TextureVisuals(uv=export_uvs, material=material),
                 )
                 textured_mesh.export(args.output)
+                from trellmlx.greenroom_checkpoint import output_published
+                output_published(args.output)
                 print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
                 if args.save_checkpoints:
                     _assert_resume_source_unchanged(
@@ -3909,6 +3911,8 @@ def _generate(args, parser, pause_control):
             visual=trimesh.visual.TextureVisuals(uv=export_uvs, material=material),
         )
         textured_mesh.export(args.output)
+        from trellmlx.greenroom_checkpoint import output_published
+        output_published(args.output)
         print(f"\n  Saved: {args.output} ({os.path.getsize(args.output)/1e6:.1f}MB)", flush=True)
         if args.save_checkpoints:
             _save_final_glb_checkpoint(

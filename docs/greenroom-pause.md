@@ -9,6 +9,8 @@ cancellation of its current job, following a completed handoff when necessary.
 On a machine without Greenroom, standalone generation remains available.
 An old managed route that did not admit checkpoint support fails before loading
 models; it cannot silently occupy the worker without pause support.
+Each automatic submission registers a unique `_control/*.job` output directory;
+the caller's containing directory never becomes job-owned storage.
 
 An admitted Greenroom checkpoint job running `generate.py` uses managed
 checkpoint/exit/continuation automatically. No Trellis queue, pause-report or
@@ -31,8 +33,11 @@ and MLX version. It includes optional NPZ sidecar presence/content, resumed raw
 mesh and texture inputs, and numerical `TRELLIS2MLX_*` environment settings.
 Changed identity or tensor bytes fail visibly. These internal
 snapshots use exact safetensors/NumPy arrays without pickle. They are distinct
-from `--save-checkpoints` research outputs. Keep them through a pending pause
-or an open failure investigation; there is no automatic expiry or deletion.
+from `--save-checkpoints` research outputs. Pending, failed, witness and explicit
+research snapshots remain retained without automatic expiry. After an ordinary
+final export succeeds, only this controller's recorded, unchanged tensor scratch
+files are removed. Unknown files, changed files and final assets are preserved;
+no scheduled cleaner or retention timer is installed.
 
 Opaque extraction, cleanup, unwrap and bake calls currently yield after the
 call returns. Model block boundaries are interruptible, with unfinished work
