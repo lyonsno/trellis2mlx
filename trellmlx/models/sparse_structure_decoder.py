@@ -100,6 +100,9 @@ class UpsampleBlock3d(nn.Module):
         return pixel_shuffle_3d(self.conv(x), 2)
 
 
+from ..greenroom_checkpoint import checkpointed
+
+
 class SparseStructureDecoder(nn.Module):
     """Decode the flow model's 8-channel latent into a 1-channel occupancy logit.
 
@@ -137,6 +140,7 @@ class SparseStructureDecoder(nn.Module):
         self.out_layer_0 = ChannelLayerNorm32(channels[-1])
         self.out_layer_2 = Conv3d(channels[-1], out_channels)
 
+    @checkpointed
     def __call__(self, x: mx.array) -> mx.array:
         """
         Args:

@@ -73,6 +73,8 @@ def load_weights(model: nn.Module, checkpoint_path: str, verbose: bool = True):
     Returns:
         List of checkpoint keys that were not loaded (missing in model).
     """
+    from .greenroom_checkpoint import bind_weight_file
+    bind_weight_file(checkpoint_path)
     # Get the model's parameter tree
     model_params = dict(mlx.utils.tree_flatten(model.parameters()))
     model_keys = set(model_params)

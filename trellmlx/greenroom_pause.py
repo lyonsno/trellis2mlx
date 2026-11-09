@@ -112,7 +112,19 @@ class GreenroomPause:
 
 
 @contextmanager
-def pause_session(queue_dir, report_path):
+def pause_session(queue_dir, report_path, *, arguments=None):
+    from .greenroom_checkpoint import managed_checkpoint
+    if arguments is not None:
+        managed = managed_checkpoint(report_path, arguments)
+        if managed is not None:
+            if queue_dir is not None and Path(queue_dir).resolve() != managed.queue.queue_dir.resolve():
+                raise ValueError("explicit pause queue differs from the managed job queue")
+            token = _active_control.set(managed)
+            try:
+                yield managed
+            finally:
+                _active_control.reset(token)
+            return
     if queue_dir is None:
         yield None
         return

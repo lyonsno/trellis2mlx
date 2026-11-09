@@ -1,4 +1,45 @@
-# Pause and continue a resident Trellis run
+# Pause and continue a Trellis run
+
+An admitted Greenroom checkpoint job running `generate.py` uses managed
+checkpoint/exit/continuation automatically. No Trellis queue, pause-report or
+checkpoint-save flags are needed. The context comes from the actual scheduler
+request; a stale or wrong request fails before inference. Private virtual
+environments discover the SDK through the installed `gpu-greenroom` command.
+
+Completed conditioning, sampling, decode, extraction, cleanup, unwrap and bake
+calls are saved under a unique `_control/replay-*` folder beside the output.
+Euler sampling also retains the last completed step, including diagnostic
+captures and the actual MLX random key. A pause during an unfinished model
+block resumes from that step. The producer unwinds model frames and drains MLX
+before staging the successor. Greenroom waits for the whole process group to
+exit before admitting other work. Resume reloads model weights but reuses the
+saved completed results. Queue-wide pause, per-job holds and Quick passage
+use the scheduler's existing controls; cancellation does not create a successor.
+
+The saved state binds the source files, arguments, input files, weight files
+and MLX version. Changed identity or tensor bytes fail visibly. These internal
+snapshots use exact safetensors/NumPy arrays without pickle. They are distinct
+from `--save-checkpoints` research outputs. Keep them through a pending pause
+or an open failure investigation; there is no automatic expiry or deletion.
+
+Opaque extraction, cleanup, unwrap and bake calls currently yield after the
+call returns. Model block boundaries are interruptible, with unfinished work
+replayed from the saved prefix. Compiled model calls retain their surrounding
+step boundary. This does not promise a maximum pause latency for opaque calls.
+The separate original-order Metal finisher has its own checkpoint integration.
+An outer controller launching child CLIs must own the continuation; the CLI
+rejects a mismatched admitted entrypoint instead of silently duplicating it.
+
+The source-owned `.gpu-greenroom-producer.json` declares `generate.py` to
+Greenroom versions supporting producer checkpoint declarations. Normal typed
+`submit` and structured `submit-command` then admit the capability without a
+caller flag. Older Greenroom versions require the existing explicit
+checkpoint-capable command admission. A plain resident queue flag below does
+not establish managed admission. The declaration applies to this exact
+entrypoint; it does not claim arbitrary custom controllers or standalone
+finisher scripts are checkpoint-capable.
+
+## Legacy resident Pause/Play
 
 Opt in when submitting a new `generate.py` command to Greenroom:
 

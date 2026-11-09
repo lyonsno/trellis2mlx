@@ -8,6 +8,7 @@ Implements the FlowEulerGuidanceIntervalSampler from the reference:
 
 import mlx.core as mx
 import numpy as np
+from .greenroom_checkpoint import checkpointed, sampler_resume, sampler_progress, restore_rng
 
 
 _source_sparse_cfg_row_stats_kernel = None
@@ -51,6 +52,7 @@ def dense_cfg_rescale_std_backend_identity(
     }
 
 
+@checkpointed
 def flow_euler_sample(
     model,
     noise: mx.array,
@@ -92,6 +94,18 @@ def flow_euler_sample(
         Final denoised sample, same shape as noise.
     """
     sample = noise
+    resumed = sampler_resume()
+    if resumed is not None:
+        start_step_index = resumed["next_step"]
+        sample = resumed["sample"]
+        restore_rng(resumed["rng"])
+        targets = {"capture_first_step": capture_first_step, "capture_steps": capture_steps}
+        for key, value in resumed["captures"].items():
+            target = targets[key]
+            target.clear()
+            target.update(value) if isinstance(target, dict) else target.extend(value)
+        if start_step_index == steps or stop_after_first_step:
+            return sample
 
     if concat_cond is not None:
         model_kwargs['concat_cond'] = concat_cond
@@ -272,6 +286,10 @@ def flow_euler_sample(
                 mx.eval(*[value for value in step_payload.values() if value is not None])
         sample = sample_next
         mx.eval(sample)
+        sampler_progress(step_idx, sample, {
+            k: v for k, v in (("capture_first_step", capture_first_step), ("capture_steps", capture_steps))
+            if v is not None
+        })
         on_step_boundary(step_idx)
 
         if verbose:

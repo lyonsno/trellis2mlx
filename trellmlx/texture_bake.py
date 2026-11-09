@@ -1043,6 +1043,10 @@ def inpaint_texture(image, mask, radius=3):
         return result
 
 
+from .greenroom_checkpoint import checkpointed
+
+
+@checkpointed
 def bake_texture(vertices, faces, uvs, vmapping,
                  voxel_coords, voxel_attrs, grid_size,
                  texture_size=1024, backend="gpu"):

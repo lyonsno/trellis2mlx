@@ -31,6 +31,10 @@ _QUAD_SPLIT_2 = np.array([0, 1, 3, 3, 1, 2], dtype=np.int64)
 _SOURCE_CUDA_SIGMOID_KERNEL = None
 
 
+from .greenroom_checkpoint import checkpointed
+
+
+@checkpointed
 def decoder_output_to_mesh(
     feats: np.ndarray,       # [N, 7] decoder output
     coords: np.ndarray,      # [N, 4] as (batch, z, y, x) int

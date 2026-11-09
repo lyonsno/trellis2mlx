@@ -277,6 +277,9 @@ class SparseResBlockC2S3d(nn.Module):
         return new_feats, new_coords, subdiv_logits
 
 
+from ..greenroom_checkpoint import checkpointed
+
+
 class SLatDecoder(nn.Module):
     """Decode structured latents via sparse UNet.
 
@@ -393,6 +396,7 @@ class SLatDecoder(nn.Module):
             return feats, coords, subs
         return feats, coords
 
+    @checkpointed
     def upsample(self, feats: mx.array, coords: mx.array,
                  upsample_times: int = 4) -> mx.array:
         """Run the decoder to get upsampled coordinates (structure only).
@@ -416,6 +420,7 @@ class SLatDecoder(nn.Module):
                                             stop_after=upsample_times)
         return hr_coords
 
+    @checkpointed
     def __call__(self, feats: mx.array, coords: mx.array,
                  guide_subs: list = None, return_subs: bool = False) -> tuple:
         """

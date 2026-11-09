@@ -22,6 +22,7 @@ import mlx.core as mx
 import numpy as np
 
 from trellmlx.checkpoint_yield import maybe_checkpoint_yield
+from trellmlx.greenroom_checkpoint import checkpointed, checkpoint_call
 from trellmlx.decoder_turing_layernorm import (
     CUDA_WELFORD_TURING_T4_BACKEND as DECODER_CUDA_WELFORD_TURING_T4_BACKEND,
     DEFAULT_BACKEND as DEFAULT_DECODER_LAYERNORM_BACKEND,
@@ -606,6 +607,7 @@ def _save_final_glb_checkpoint(
     save_checkpoint(checkpoint_dir, "final_glb", **arrays)
 
 
+@checkpointed
 def _cleanup_and_simplify_mesh(
     vertices,
     faces,
@@ -1635,7 +1637,9 @@ def main():
         Path(args.output).parent / "_control" /
         f"{Path(args.output).stem}.{uuid.uuid4().hex}.pause.json"
     )
-    with pause_session(args.greenroom_queue_dir, report_path) as pause_control:
+    with pause_session(args.greenroom_queue_dir, report_path, arguments=vars(args)) as pause_control:
+        if hasattr(pause_control, "run"):
+            return pause_control.run(lambda: _generate(args, parser, pause_control))
         return _generate(args, parser, pause_control)
 
 
@@ -1994,7 +1998,7 @@ def _generate(args, parser, pause_control):
             unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
             t0 = time.perf_counter()
             pause_boundary("uv_unwrap")
-            uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
+            uv_verts, uv_faces, uvs, vmapping = checkpoint_call("uv_unwrap", unwrap_fn, vertices, faces)
             print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
                   f"({time.perf_counter()-t0:.1f}s)", flush=True)
             if args.save_checkpoints:
@@ -3834,7 +3838,7 @@ def _generate(args, parser, pause_control):
     unwrap_fn, method_name = _select_uv_method(args.uv_method, vertices, faces)
     t0 = time.perf_counter()
     pause_boundary("uv_unwrap")
-    uv_verts, uv_faces, uvs, vmapping = unwrap_fn(vertices, faces)
+    uv_verts, uv_faces, uvs, vmapping = checkpoint_call("uv_unwrap", unwrap_fn, vertices, faces)
     print(f"  UV unwrap ({method_name}): {len(uv_verts):,}V {len(uv_faces):,}F "
           f"({time.perf_counter()-t0:.1f}s)", flush=True)
     if args.save_checkpoints:
@@ -3974,6 +3978,7 @@ def _generate(args, parser, pause_control):
     cleanup()
 
 
+@checkpointed
 def _extract_image_features(image_path, resolution=512):
     """Extract DINOv3 image features, preferring native MLX path."""
     try:

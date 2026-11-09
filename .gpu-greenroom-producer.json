@@ -1,0 +1,4 @@
+{
+  "schema": "gpu-greenroom.producer-checkpoints.v1",
+  "entrypoints": ["generate.py"]
+}
