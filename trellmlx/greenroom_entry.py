@@ -22,12 +22,25 @@ from .greenroom_checkpoint import _sdk, _write, _hash
 def _successor(queue, expected, current, observed, seen):
     if observed is None or observed.status.value != "done":
         return None
-    path = queue.queue_dir / "done" / current
-    edge_path = path / "checkpoint-handoff.json"
-    if not edge_path.exists():
-        return None
-    edge = json.loads(edge_path.read_text())
-    raw = json.loads((path / "request.json").read_text())
+    # Terminal status is written before the worker moves the directory. The
+    # committed edge already exists at that point; follow its actual record.
+    for bucket in ("running", "done", "failed", "cancelled"):
+        path = queue.queue_dir / bucket / current
+        try:
+            raw = json.loads((path / "request.json").read_text())
+        except FileNotFoundError:
+            continue
+        try:
+            edge = json.loads((path / "checkpoint-handoff.json").read_text())
+        except FileNotFoundError:
+            if path.is_dir():
+                return None
+            continue  # The record moved during the read; try its next bucket.
+        break
+    else:
+        raise RuntimeError(f"cannot locate TRELLIS terminal record: {current}")
+    if raw.get("job_id") != current:
+        raise ValueError("TRELLIS parent record identity changed")
     if edge.get("status") != "committed":
         raise ValueError("incomplete TRELLIS checkpoint handoff")
     if edge.get("job_id") != current:
@@ -52,6 +65,11 @@ def _successor(queue, expected, current, observed, seen):
     return successor
 
 
+def _terminal_published(queue, current, observed):
+    # The worker writes its terminal receipt before this directory transition.
+    return (queue.queue_dir / observed.status.value / current).is_dir()
+
+
 def _cancel_current(queue, expected, current, state):
     """Reconcile transitions until cancellation is accepted or work ended."""
     while True:
@@ -66,6 +84,9 @@ def _cancel_current(queue, expected, current, state):
             continue
         status = observed.status.value
         if status in ("done", "failed", "cancelled"):
+            if not _terminal_published(queue, current, observed):
+                time.sleep(.25)
+                continue
             return current, {"status": status, "action": "already-terminal"}
         if status in ("pending", "deferred"):
             if queue.cancel(current):
@@ -157,6 +178,9 @@ def run_unmanaged(args):
                         destination.write(data.decode("utf-8", errors="replace"))
                         destination.flush()
             if observed.status.value not in ("done", "failed", "cancelled"):
+                time.sleep(.25)
+                continue
+            if not _terminal_published(queue, current, observed):
                 time.sleep(.25)
                 continue
             path = queue.queue_dir / observed.status.value / current

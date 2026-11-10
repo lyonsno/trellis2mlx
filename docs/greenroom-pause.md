@@ -10,6 +10,10 @@ If a worker claims or completes the job during cancellation, the client refreshe
 that state and follows any committed successor. Its receipt distinguishes accepted
 running cancellation, cancellation before start, already terminal work and failure
 to cancel; client exit alone does not establish process quiescence.
+Status-file terminality, committed handoff and terminal directory publication are
+separate milestones. Cancellation reads a committed edge from the parent's actual
+record even before its directory moves. Normal completion waits for terminal
+directory publication; a terminal status field alone cannot finish the client.
 On a machine without Greenroom, standalone generation remains available.
 An old managed route that did not admit checkpoint support fails before loading
 models; it cannot silently occupy the worker without pause support.

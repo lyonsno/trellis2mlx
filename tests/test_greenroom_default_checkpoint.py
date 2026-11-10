@@ -661,3 +661,115 @@ def test_foreground_cancel_pending_claim_uses_actual_sdk_disposition(tmp_path, m
         for thread in threads:
             thread.join()
     assert errors == []
+
+
+def test_cancel_follows_handoff_before_actual_worker_terminal_move(tmp_path):
+    import threading
+    import time
+    from gpu_queue.models import JobRequest
+    from gpu_queue.queue import GPUQueue
+    from trellmlx.greenroom_entry import _cancel_current
+
+    root = tmp_path / 'producer'
+    root.mkdir()
+    (root / '.gpu-greenroom-producer.json').write_text(json.dumps({
+        'schema': 'gpu-greenroom.producer-checkpoints.v1', 'entrypoints': ['generate.py']}))
+    (root / 'generate.py').write_text('''import time,uuid
+from dataclasses import replace
+from gpu_queue.cooperative import _context,yield_if_requested
+q,job,r,s=_context()
+q.pause(owner='publication-fixture')
+yield_if_requested(save_checkpoint=lambda p:{'step':1},quiesce=lambda:True,
+ continuation=lambda p:replace(r,job_id=uuid.uuid4().hex[:12],submitted_at=time.time()))
+''')
+    visible, release = threading.Event(), threading.Event()
+    errors = []
+
+    class Queue(GPUQueue):
+        intercepted = False
+        def _write_text_atomic(self, path, text):
+            super()._write_text_atomic(path, text)
+            if (not self.intercepted and path.name == 'status.json' and path.parent.name == self.target
+                    and path.parent.parent.name == 'running' and json.loads(text).get('status') == 'done'):
+                self.intercepted = True
+                visible.set()
+                release.wait()
+
+    queue = Queue(tmp_path / 'queue')
+    import gpu_queue
+    request = JobRequest(job_type='command', input_path='', repo_root=str(root), command_cwd=str(root),
+                         command_argv=[sys.executable, str(root / 'generate.py')],
+                         command_env={'PYTHONPATH': str(Path(gpu_queue.__file__).resolve().parents[1])})
+    queue.target = request.job_id
+    queue.submit(request)
+
+    def service():
+        try:
+            queue.run_one({})
+        except BaseException as error:
+            errors.append(repr(error))
+
+    worker = threading.Thread(target=service)
+    try:
+        worker.start()
+        while not visible.is_set() and worker.is_alive():
+            visible.wait(.01)
+        assert visible.is_set(), errors
+        assert queue.get_job(request.job_id).status.value == 'done'
+        assert (queue.queue_dir / 'running' / request.job_id).exists()
+        assert not (queue.queue_dir / 'done' / request.job_id).exists()
+        child = next((queue.queue_dir / 'pending').iterdir()).name
+        state = {'chain': [], 'job_id': request.job_id}
+        current, result = _cancel_current(queue, request, request.job_id, state)
+        assert current == child, 'terminal status hid a published successor before directory move'
+        assert result['status'] == 'cancelled'
+        assert queue.get_job(child).status.value == 'cancelled'
+        assert state['chain'] == [request.job_id]
+    finally:
+        release.set()
+        worker.join()
+    assert errors == []
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_foreground_waits_for_terminal_directory_publication(tmp_path, monkeypatch, cancel):
+    import gpu_queue.queue
+    from trellmlx import greenroom_entry
+    from types import SimpleNamespace
+
+    queues, waited = [], []
+
+    class Queue:
+        first = True
+        def __init__(self, path):
+            self.queue_dir = Path(path)
+            queues.append(self)
+        def submit(self, request):
+            self.job = request.job_id
+            path = self.queue_dir / 'running' / self.job
+            path.mkdir(parents=True)
+            (path / 'request.json').write_text(request.to_json())
+            return path
+        def get_job(self, job):
+            if cancel and self.first:
+                self.first = False
+                raise KeyboardInterrupt()
+            return SimpleNamespace(status=SimpleNamespace(value='done'), exit_code=0)
+
+    def finish_publication(_):
+        waited.append(True)
+        queue = queues[0]
+        source = queue.queue_dir / 'running' / queue.job
+        target = queue.queue_dir / 'done' / queue.job
+        target.parent.mkdir()
+        source.rename(target)
+
+    monkeypatch.setattr(gpu_queue.queue, 'GPUQueue', Queue)
+    monkeypatch.setattr(greenroom_entry.time, 'sleep', finish_publication)
+    for key in ('GPU_GREENROOM_CONTEXT', 'GPU_GREENROOM_JOB_ID', 'GREENROOM_JOB_ID'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('GPU_GREENROOM_QUEUE_DIR', str(tmp_path / 'queue'))
+    monkeypatch.setattr(sys, 'argv', [str(Path(greenroom_entry.__file__).resolve().parents[1] / 'generate.py')])
+    code = greenroom_entry.run_unmanaged(SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / 'mesh.glb')))
+    assert code == (130 if cancel else 0)
+    assert waited, 'terminal status was mistaken for completed record publication'
