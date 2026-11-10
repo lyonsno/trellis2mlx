@@ -6,6 +6,10 @@ its terminal continuation. No queue, pause, identity or checkpoint flags are
 required. The foreground client relays model logs and writes a unique
 `_control/*.admission.json` beside the requested output. Ctrl-C requests
 cancellation of its current job, following a completed handoff when necessary.
+If a worker claims or completes the job during cancellation, the client refreshes
+that state and follows any committed successor. Its receipt distinguishes accepted
+running cancellation, cancellation before start, already terminal work and failure
+to cancel; client exit alone does not establish process quiescence.
 On a machine without Greenroom, standalone generation remains available.
 An old managed route that did not admit checkpoint support fails before loading
 models; it cannot silently occupy the worker without pause support.

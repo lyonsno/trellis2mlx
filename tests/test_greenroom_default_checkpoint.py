@@ -464,6 +464,7 @@ def test_foreground_cancel_follows_a_parent_that_already_handed_off(tmp_path, mo
 
         def cancel(self, job):
             cancelled.append(job)
+            return True
 
     monkeypatch.setattr(gpu_queue.queue, "GPUQueue", Queue)
     for key in ("GPU_GREENROOM_CONTEXT", "GPU_GREENROOM_JOB_ID", "GREENROOM_JOB_ID"):
@@ -517,3 +518,146 @@ def test_only_completed_final_export_releases_owned_replay_scratch(managed, tmp_
     report = json.loads((tmp_path / 'scratch-report.json').read_text())
     if preserve in ('none', 'unclassified'):
         assert report['scratch_cleanup']['removed_files'] == 1
+
+
+@pytest.mark.parametrize('transition', ['running', 'done', 'handoff', 'running-done', 'submit', 'rejected'])
+def test_foreground_cancel_reconciles_a_pending_transition(tmp_path, monkeypatch, transition):
+    import gpu_queue.queue
+    from trellmlx import greenroom_entry
+    from types import SimpleNamespace
+    from dataclasses import replace
+
+    accepted = []
+
+    class Queue:
+        def __init__(self, path):
+            self.queue_dir = Path(path)
+            self.first = True
+            self.status = 'pending'
+        def submit(self, request):
+            self.request = request
+            self.current = request.job_id
+            path = self.queue_dir / 'pending' / self.current
+            path.mkdir(parents=True)
+            (path / 'request.json').write_text(request.to_json())
+            if transition == 'submit':
+                self.first = False
+                raise KeyboardInterrupt()
+            return path
+        def get_job(self, job):
+            if self.first:
+                self.first = False
+                raise KeyboardInterrupt()
+            return SimpleNamespace(status=SimpleNamespace(value=self.status if job == self.current else 'pending'),
+                                   started_at=42 if self.status == 'running' else None, exit_code=0)
+        def cancel(self, job):
+            if job != self.current:
+                accepted.append(job)
+                return True
+            self.status = 'running' if transition in ('running', 'running-done', 'submit', 'rejected') else 'done'
+            before = self.queue_dir / 'pending' / job
+            after = self.queue_dir / self.status / job
+            after.parent.mkdir(exist_ok=True)
+            before.rename(after)
+            if transition == 'handoff':
+                child = replace(self.request, job_id='successor', params={**self.request.params, 'continuation_of': job})
+                path = self.queue_dir / 'pending' / child.job_id
+                path.mkdir()
+                (path / 'request.json').write_text(child.to_json())
+                (after / 'checkpoint-handoff.json').write_text(json.dumps({
+                    'status': 'committed', 'job_id': job, 'next_job_id': child.job_id}))
+            return False
+        def request_cancel(self, **kwargs):
+            assert kwargs['expected_status'] == 'running' and kwargs['expected_started_at'] == 42
+            if transition == 'rejected':
+                raise ValueError('running worker does not support confirmed cancellation')
+            if transition == 'running-done':
+                self.status = 'done'
+                before = self.queue_dir / 'running' / self.current
+                after = self.queue_dir / 'done' / self.current
+                after.parent.mkdir(exist_ok=True)
+                before.rename(after)
+                raise ValueError('job changed; refresh before cancelling')
+            accepted.append(kwargs['job_id'])
+            return {'status': 'cancelling', 'job_id': kwargs['job_id'], 'receipt_path': 'actual-sdk-receipt'}
+
+    monkeypatch.setattr(gpu_queue.queue, 'GPUQueue', Queue)
+    for key in ('GPU_GREENROOM_CONTEXT', 'GPU_GREENROOM_JOB_ID', 'GREENROOM_JOB_ID'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('GPU_GREENROOM_QUEUE_DIR', str(tmp_path / 'queue'))
+    monkeypatch.setattr(sys, 'argv', [str(Path(greenroom_entry.__file__).resolve().parents[1] / 'generate.py')])
+    args = SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / 'mesh.glb'))
+    if transition == 'rejected':
+        with pytest.raises(ValueError, match='does not support'):
+            greenroom_entry.run_unmanaged(args)
+    else:
+        assert greenroom_entry.run_unmanaged(args) == 130
+    receipt = json.loads(next((tmp_path / '_control').glob('*.admission.json')).read_text())
+    if transition == 'rejected':
+        assert accepted == []
+        assert receipt['status'] == 'cancellation-failed'
+    elif transition in ('done', 'running-done'):
+        assert accepted == []
+        assert receipt['status'] == 'done', 'already completed work was labelled cancellation-requested'
+    else:
+        assert len(accepted) == 1, 'cancellation was lost at the pending transition'
+        assert receipt['job_id'] == accepted[0]
+
+
+def test_foreground_cancel_pending_claim_uses_actual_sdk_disposition(tmp_path, monkeypatch):
+    import threading
+    import time
+    import gpu_queue.queue
+    from gpu_queue.queue import GPUQueue
+    from trellmlx import greenroom_entry
+    from types import SimpleNamespace
+
+    root = tmp_path / 'producer'
+    root.mkdir()
+    started, release = tmp_path / 'started', tmp_path / 'release'
+    (root / '.gpu-greenroom-producer.json').write_text(json.dumps({
+        'schema': 'gpu-greenroom.producer-checkpoints.v1', 'entrypoints': ['generate.py']}))
+    (root / 'generate.py').write_text(
+        f"import pathlib,time\npathlib.Path({str(started)!r}).touch()\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(.01)\n")
+    threads, errors = [], []
+
+    class Queue(GPUQueue):
+        first = True
+        def get_job(self, job):
+            if self.first:
+                self.first = False
+                raise KeyboardInterrupt()
+            return super().get_job(job)
+        def cancel(self, job):
+            def service():
+                try:
+                    self.run_one({})
+                except BaseException as error:
+                    errors.append(repr(error))
+            thread = threading.Thread(target=service)
+            threads.append(thread)
+            thread.start()
+            while not started.exists() and thread.is_alive():
+                time.sleep(.01)
+            return super().cancel(job)
+
+    monkeypatch.setattr(gpu_queue.queue, 'GPUQueue', Queue)
+    monkeypatch.setattr(greenroom_entry, '__file__', str(root / 'trellmlx/greenroom_entry.py'))
+    for key in ('GPU_GREENROOM_CONTEXT', 'GPU_GREENROOM_JOB_ID', 'GREENROOM_JOB_ID'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('GPU_GREENROOM_QUEUE_DIR', str(tmp_path / 'queue'))
+    monkeypatch.setattr(sys, 'argv', [str(root / 'generate.py')])
+    try:
+        assert greenroom_entry.run_unmanaged(SimpleNamespace(greenroom_queue_dir=None, output=str(tmp_path / 'mesh.glb'))) == 130
+        receipt = json.loads(next((tmp_path / '_control').glob('*.admission.json')).read_text())
+        assert receipt['cancellation']['status'] == 'cancelling'
+        accepted = json.loads(Path(receipt['cancellation']['receipt_path']).read_text())
+        assert accepted['phase'] == 'completed'
+        assert accepted['request']['job_id'] == receipt['job_id']
+        assert accepted['request']['expected_status'] == 'running'
+    finally:
+        release.touch()
+        for thread in threads:
+            thread.join()
+    assert errors == []

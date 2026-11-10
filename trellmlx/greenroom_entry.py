@@ -52,6 +52,40 @@ def _successor(queue, expected, current, observed, seen):
     return successor
 
 
+def _cancel_current(queue, expected, current, state):
+    """Reconcile transitions until cancellation is accepted or work ended."""
+    while True:
+        observed = queue.get_job(current)
+        if observed is None:
+            raise RuntimeError(f"cannot locate TRELLIS job for cancellation: {current}")
+        successor = _successor(queue, expected, current, observed, state["chain"])
+        if successor is not None:
+            state["chain"].append(current)
+            current = successor
+            state["job_id"] = current
+            continue
+        status = observed.status.value
+        if status in ("done", "failed", "cancelled"):
+            return current, {"status": status, "action": "already-terminal"}
+        if status in ("pending", "deferred"):
+            if queue.cancel(current):
+                return current, {"status": "cancelled", "action": "cancelled-before-start"}
+            continue  # Worker/control moved it; the old observation is spent.
+        if status != "running":
+            raise RuntimeError(f"unsupported TRELLIS cancellation state: {status}")
+        path = queue.queue_dir / "running" / current
+        try:
+            result = queue.request_cancel(job_id=current, request_digest=_hash(path / "request.json"),
+                expected_status="running", expected_started_at=observed.started_at,
+                request_id=uuid.uuid4().hex, requested_by="ordinary TRELLIS foreground client", force=False)
+        except (ValueError, FileNotFoundError):
+            refreshed = queue.get_job(current)
+            if refreshed is None or (refreshed.status.value, refreshed.started_at) == (status, observed.started_at):
+                raise
+            continue  # Completion/handoff won; reconcile its actual disposition.
+        return current, result
+
+
 def run_unmanaged(args):
     if os.environ.get("GPU_GREENROOM_CONTEXT"):
         return None
@@ -97,8 +131,8 @@ def run_unmanaged(args):
     current = None
     previous_term = None
     try:
-        path = queue.submit(request)
         current = request.job_id
+        path = queue.submit(request)
         state.update(status="waiting", job_id=current, request_path=str(path / "request.json"))
         _write(receipt, state)
         print(f"Greenroom job {current}; automatic checkpoint support. Admission: {receipt}", flush=True)
@@ -138,23 +172,15 @@ def run_unmanaged(args):
             _write(receipt, state)
             return code
     except KeyboardInterrupt:
-        if current is not None:
-            observed = queue.get_job(current)
-            while observed is not None:
-                successor = _successor(queue, request, current, observed, state["chain"])
-                if successor is None:
-                    break
-                state["chain"].append(current)
-                current = successor
-                observed = queue.get_job(current)
-            if observed is not None and observed.status.value == "pending":
-                queue.cancel(current)
-            elif observed is not None and observed.status.value == "running":
-                path = queue.queue_dir / "running" / current
-                queue.request_cancel(job_id=current, request_digest=_hash(path / "request.json"),
-                    expected_status="running", expected_started_at=observed.started_at,
-                    request_id=uuid.uuid4().hex, requested_by="ordinary TRELLIS foreground client", force=False)
-        state.update(status="cancellation-requested", job_id=current)
+        try:
+            current, result = _cancel_current(queue, request, current, state)
+        except BaseException as error:
+            state.update(status="cancellation-failed", job_id=state.get("job_id", current),
+                         error_type=type(error).__name__, error=str(error))
+            _write(receipt, state)
+            raise
+        state.update(status="cancellation-requested" if result["status"] == "cancelling" else result["status"],
+                     job_id=current, cancellation=result)
         _write(receipt, state)
         return 130
     except BaseException as error:
