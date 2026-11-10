@@ -11,11 +11,17 @@ import os
 from pathlib import Path
 import sys
 import weakref
+from contextlib import nullcontext
 
 import mlx.core as mx
 import pytest
 
 pytest.importorskip("gpu_queue", reason="managed checkpoint conformance uses the installed Greenroom SDK")
+
+
+class _QueueView:
+    def _coordination_lock(self):
+        return nullcontext()
 
 
 @pytest.fixture(autouse=True)
@@ -343,7 +349,7 @@ def test_ordinary_direct_cli_automatically_queues_without_pause_or_identity_flag
 
     submitted = []
 
-    class Queue:
+    class Queue(_QueueView):
         def __init__(self, path):
             self.queue_dir = Path(path)
 
@@ -438,7 +444,7 @@ def test_foreground_cancel_follows_a_parent_that_already_handed_off(tmp_path, mo
 
     cancelled = []
 
-    class Queue:
+    class Queue(_QueueView):
         def __init__(self, path):
             self.queue_dir = Path(path)
             self.first_read = True
@@ -529,7 +535,7 @@ def test_foreground_cancel_reconciles_a_pending_transition(tmp_path, monkeypatch
 
     accepted = []
 
-    class Queue:
+    class Queue(_QueueView):
         def __init__(self, path):
             self.queue_dir = Path(path)
             self.first = True
@@ -739,7 +745,7 @@ def test_foreground_waits_for_terminal_directory_publication(tmp_path, monkeypat
 
     queues, waited = [], []
 
-    class Queue:
+    class Queue(_QueueView):
         first = True
         def __init__(self, path):
             self.queue_dir = Path(path)

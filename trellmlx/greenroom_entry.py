@@ -22,6 +22,13 @@ from .greenroom_checkpoint import _sdk, _write, _hash
 def _successor(queue, expected, current, observed, seen):
     if observed is None or observed.status.value != "done":
         return None
+    # Claims, terminal moves and checkpoint publication use this same short
+    # lock. Read the parent edge and child identity in one transition view.
+    with queue._coordination_lock():
+        return _successor_record(queue, expected, current, seen)
+
+
+def _successor_record(queue, expected, current, seen):
     # Terminal status is written before the worker moves the directory. The
     # committed edge already exists at that point; follow its actual record.
     for bucket in ("running", "done", "failed", "cancelled"):
