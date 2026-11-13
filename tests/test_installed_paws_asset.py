@@ -140,3 +140,25 @@ def test_missing_plan_still_writes_failure_report(tmp_path):
                              "--report", str(report)], capture_output=True)
     assert result.returncode != 0
     assert json.loads(report.read_text())["failure_phase"] == "read-plan"
+
+
+def test_pinned_queue_functions_load_without_executing_model_imports(monkeypatch):
+    raw = b'''raise RuntimeError("model module must not execute in CPU observer")
+import missing_model_runtime
+def _successor(queue, expected, current, observed, seen):
+    return _successor_record(queue, expected, current, seen)
+def _successor_record(queue, expected, current, seen):
+    return {"same": current, "hash": _hash, "path": Path, "json": json}
+'''
+    calls = []
+    monkeypatch.setattr(m.subprocess, "check_output", lambda argv, **kw: calls.append((argv, kw)) or raw)
+    entry, identity = m.lineage_helpers("/product", "pinned-sha")
+    assert entry._successor(None, None, "child", None, [])["same"] == "child"
+    assert calls == [(["git", "show", "pinned-sha:trellmlx/greenroom_entry.py"], {"cwd": "/product"})]
+    assert identity["sha256"] == m.hashlib.sha256(raw).hexdigest()
+
+
+def test_missing_production_function_fails_before_model_import(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "check_output", lambda *a, **k: b'def _successor(): return None')
+    with pytest.raises(ValueError, match="missing from pinned source"):
+        m.lineage_helpers("/product", "pinned-sha")

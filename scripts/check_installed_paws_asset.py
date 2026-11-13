@@ -4,6 +4,7 @@ The model child admits itself through Greenroom; this observer owns no GPU
 lease. Its report is lifecycle evidence, never numerical or visual parity.
 """
 import argparse
+import ast
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ import struct
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import uuid
 
 
@@ -42,6 +44,28 @@ def source(root, expected):
     if sha != expected or dirty:
         raise ValueError(f"source mismatch or dirty checkout: {root}")
     return {"root": str(root), "commit": sha, "dirty": False}
+
+
+def lineage_helpers(root, sha):
+    """Load the immutable queue-only functions without model-library imports.
+
+    Importing greenroom_entry normally imports its checkpoint module and MLX.
+    These two functions need only Path/json/hash and the existing queue API.
+    Source identity is retained so this is production code, not a second edge
+    implementation or a synthetic replacement for the continuation contract.
+    """
+    path = "trellmlx/greenroom_entry.py"
+    raw = subprocess.check_output(["git", "show", sha + ":" + path], cwd=root)
+    names = {"_successor", "_successor_record"}
+    nodes = [node for node in ast.parse(raw).body
+             if isinstance(node, ast.FunctionDef) and node.name in names]
+    if {node.name for node in nodes} != names:
+        raise ValueError("production lineage helpers missing from pinned source")
+    namespace = {"Path": Path, "json": json, "_hash": digest}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(Path(root) / path), "exec"), namespace)
+    return SimpleNamespace(_successor=namespace["_successor"]), {
+        "path": path, "revision": sha, "sha256": hashlib.sha256(raw).hexdigest(),
+        "functions": sorted(names), "mode": "immutable production function projection; no module imports"}
 
 
 def validate_request(request, plan):
@@ -207,8 +231,8 @@ def run(plan, report_path):
         report["sdk"] = source(plan["sdk_root"], plan["sdk_sha"])
         if digest(plan["input"]) != plan["input_sha256"]:
             raise ValueError("source image changed")
-        sys.path[:0] = [plan["producer_root"], plan["sdk_root"]]
-        from trellmlx import greenroom_entry as entry
+        entry, report["lineage_helper_source"] = lineage_helpers(plan["producer_root"], plan["producer_sha"])
+        sys.path.insert(0, plan["sdk_root"])
         from gpu_queue.queue import GPUQueue
         from gpu_queue.models import JobRequest
         from gpu_queue import job_controls as controls
