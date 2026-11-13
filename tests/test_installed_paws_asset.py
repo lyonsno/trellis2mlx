@@ -5,6 +5,9 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+from types import SimpleNamespace
+from contextlib import nullcontext
+import types
 
 import pytest
 
@@ -149,6 +152,10 @@ def _successor(queue, expected, current, observed, seen):
     return _successor_record(queue, expected, current, seen)
 def _successor_record(queue, expected, current, seen):
     return {"same": current, "hash": _hash, "path": Path, "json": json}
+def _terminal_published(queue, current, observed):
+    return True
+def _cancel_current(queue, expected, current, state):
+    return current, {"status": "cancelled"}
 '''
     calls = []
     monkeypatch.setattr(m.subprocess, "check_output", lambda argv, **kw: calls.append((argv, kw)) or raw)
@@ -162,3 +169,150 @@ def test_missing_production_function_fails_before_model_import(monkeypatch):
     monkeypatch.setattr(m.subprocess, "check_output", lambda *a, **k: b'def _successor(): return None')
     with pytest.raises(ValueError, match="missing from pinned source"):
         m.lineage_helpers("/product", "pinned-sha")
+
+
+def test_ordinary_image_prefix_selects_lr_shape_stage_three():
+    # Pinned 1d8a721 ordinary --image call prefix: image_features, SS flow,
+    # SS decoder, LR shape flow. ManagedCheckpoint.call increments its cursor
+    # for each top-level call. The saved-conditioning replay skipped call 0.
+    p = {"pause_stage": "sampler_3"}
+    assert m.pause_due({"stage": "sampler_3", "completed_step": 0}, p)
+    assert not m.pause_due({"stage": "sampler_2", "completed_step": 0}, p)
+    assert not m.pause_due({"stage": "sampler_3", "completed_step": -1}, p)
+
+
+@pytest.mark.parametrize("parent_moved", [False, True])
+def test_failure_releases_actual_inherited_hold_before_cancel_and_cancels_probe(parent_moved):
+    calls = []
+    requests = {n: SimpleNamespace(job_id=n, agent_id=None, command_argv=[n], repo_root="/producer",
+                                  command_cwd="/cwd", output_dir="/out/" + n, route_identity="test")
+                for n in ("parent", "child", "probe")}
+    snapshots = {
+        "parent": {"bucket": "done" if parent_moved else "running", "state": {"status": "done" if parent_moved else "running"}},
+        "child": {"bucket": "pending", "state": {"status": "pending"}},
+        "probe": {"bucket": "pending", "state": {"status": "pending"}},
+    }
+    for name, snapshot in snapshots.items():
+        snapshot["request"] = vars(requests[name])
+    class Caller:
+        def poll(self): return None
+        def terminate(self): calls.append(("terminate", "caller"))
+        def wait(self): return 130
+    class Entry:
+        def _successor(self, queue, expected, current, observed, seen):
+            return "child" if current == "parent" and parent_moved else None
+        def _cancel_current(self, queue, expected, current, state):
+            calls.append(("cancel", current)); return current, {"status": "cancelled"}
+    queue = SimpleNamespace(get_job=lambda job: SimpleNamespace(status=SimpleNamespace(value=snapshots[job]["state"]["status"])))
+    def action(job, verb):
+        calls.append((verb, job))
+        assert snapshots[job]["state"]["status"] in ("pending", "running")
+    m.cleanup_owned(queue, Entry(), requests["parent"], "parent", requests["probe"],
+                    Caller(), snapshots.__getitem__, action, {})
+    assert calls[0] == ("resume", "child" if parent_moved else "parent")
+    assert ("cancel", "probe") in calls, "observer left its independent probe queued"
+
+
+def test_run_orchestrates_image_stage_pause_passage_and_final_caller_without_model_import(tmp_path, monkeypatch):
+    # Full observer body with deterministic queue/model doubles. This tests
+    # orchestration, not the external Greenroom or Trellis model contract.
+    p = plan(tmp_path)
+    p.update(queue=str(tmp_path / "queue"), sdk_root=str(tmp_path / "sdk"), control_owner="test-owner",
+             pause_stage="sampler_3", input=str(tmp_path / "input.png"), input_sha256="input-digest")
+    qroot, output = Path(p["queue"]), Path(p["output"])
+    control = output.parent / "_control"
+    for bucket in m.BUCKETS:
+        (qroot / bucket).mkdir(parents=True)
+    caller_state = {"finished": False}
+    events = []
+
+    class Request:
+        def __init__(self, **kw): self.__dict__.update(kw); self.job_id = kw.get("job_id", "probe")
+        @classmethod
+        def from_json(cls, raw): return cls(**json.loads(raw))
+
+    def publish(bucket, job, request, done=False):
+        path = qroot / bucket / job; path.mkdir()
+        m.dump(path / "request.json", request)
+        m.dump(path / "status.json", {"job_id": job, "status": bucket, "exit_code": 0 if done else None,
+            "started_at": 3 if job == "probe" else 1, "finished_at": 4 if job == "probe" else 2,
+            "child_process_group": 123})
+        if done:
+            m.dump(path / "receipt.json", {"status": "done", "exit_code": 0, "effective_argv": p["argv"],
+                "effective_cwd": p["cwd"], "requested_route": m.ROUTE,
+                "worker": {"source_root": p["sdk_root"], "commit": p["sdk_sha"], "git_dirty": False}})
+        return path
+
+    class Queue:
+        def __init__(self, root): self.queue_dir = root
+        def _coordination_lock(self): return nullcontext()
+        def _process_group_alive(self, group): return False
+        def get_job(self, job):
+            for bucket in m.BUCKETS:
+                if (qroot / bucket / job).exists(): return SimpleNamespace(status=SimpleNamespace(value=bucket))
+        def submit(self, request):
+            events.append("probe-submitted")
+            publish("done", request.job_id, vars(request), done=True)
+            m.dump(tmp_path / "passage.json", {"at": 3})
+
+    def perform(queue, **kw):
+        job, verb = kw["job_id"], kw["action"]; events.append(verb + ":" + job)
+        if verb == "pause":
+            request = json.loads((qroot / "running/parent/request.json").read_text())
+            (qroot / "running/parent").rename(qroot / "running/old-parent")
+            parent = publish("done", "parent", request, done=True)
+            child = {**request, "job_id": "child", "params": {**request["params"], "continuation_of": "parent"}}
+            publish("pending", "child", child)
+            m.dump(parent / "checkpoint-handoff.json", {"status": "committed", "job_id": "parent", "next_job_id": "child"})
+        elif verb == "resume":
+            request = json.loads((qroot / "pending/child/request.json").read_text())
+            (qroot / "pending/child").rename(qroot / "pending/old-child")
+            publish("done", "child", request, done=True)
+            tiny_glb(output)
+            m.dump(control / "output.one.admission.json", {"job_id": "child", "terminal_job": "child"})
+            caller_state["finished"] = True
+        return {"status": "accepted"}
+
+    class Caller:
+        pid = 500; returncode = 0
+        def __init__(self, *args, **kw):
+            control.mkdir()
+            request = {"job_id": "parent", "repo_root": p["producer_root"], "command_argv": p["argv"],
+                       "command_cwd": p["cwd"], "output_dir": str(tmp_path / "job-output"), "agent_id": None,
+                       "route_identity": m.ROUTE, "cooperative_checkpoint": True,
+                       "params": {"_producer_checkpoint": {"source": "declared"}}}
+            publish("running", "parent", request)
+            m.dump(control / "output.one.admission.json", {"job_id": "parent"})
+            m.dump(control / "output.one.pause.json", {"stage": "sampler_3", "completed_step": 0,
+                "mode": "checkpoint-exit-continuation", "queue_dir": p["queue"], "job_id": "parent",
+                "source_root": p["producer_root"], "sdk": p["sdk_root"] + "/gpu_queue/cooperative.py"})
+        def poll(self): return 0 if caller_state["finished"] else None
+        def terminate(self): raise AssertionError("completed caller should not be terminated")
+        def wait(self): return 0
+
+    package = types.ModuleType("gpu_queue"); package.__file__ = p["sdk_root"] + "/gpu_queue/__init__.py"
+    qmodule = types.ModuleType("gpu_queue.queue"); qmodule.GPUQueue = Queue
+    models = types.ModuleType("gpu_queue.models"); models.JobRequest = Request
+    controls = types.ModuleType("gpu_queue.job_controls"); controls.perform = perform
+    package.job_controls = controls
+    for name, module in [("gpu_queue", package), ("gpu_queue.queue", qmodule), ("gpu_queue.models", models), ("gpu_queue.job_controls", controls)]:
+        monkeypatch.setitem(sys.modules, name, module)
+    entry = SimpleNamespace(_successor=lambda queue, expected, current, observed, seen: "child" if current == "parent" else None,
+                            _cancel_current=lambda queue, expected, current, state: (current, {"status": "already-terminal"}))
+    monkeypatch.setattr(m, "source", lambda root, expected: {"root": root, "commit": expected})
+    monkeypatch.setattr(m, "lineage_helpers", lambda *args: (entry, {"mode": "unit double"}))
+    real_digest = m.digest
+    monkeypatch.setattr(m, "digest", lambda path: "input-digest" if str(path) == p["input"] else real_digest(path))
+    monkeypatch.setattr(m.subprocess, "Popen", Caller)
+    def unexpected_wait(_): raise AssertionError("ordinary image stage never triggered expected pause")
+    monkeypatch.setattr(m.time, "sleep", unexpected_wait)
+    before_path = list(sys.path)
+    try:
+        m.run(p, tmp_path / "report.json")
+    finally:
+        sys.path[:] = before_path
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["status"] == "done" and report["terminal_job"] == "child"
+    assert report["glb"]["primitives"] == 1
+    assert events == ["pause:parent", "probe-submitted", "resume:child"]
+    assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)

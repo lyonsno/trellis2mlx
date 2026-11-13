@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 from pathlib import Path
 import struct
 import subprocess
@@ -56,14 +57,14 @@ def lineage_helpers(root, sha):
     """
     path = "trellmlx/greenroom_entry.py"
     raw = subprocess.check_output(["git", "show", sha + ":" + path], cwd=root)
-    names = {"_successor", "_successor_record"}
+    names = {"_successor", "_successor_record", "_terminal_published", "_cancel_current"}
     nodes = [node for node in ast.parse(raw).body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     if {node.name for node in nodes} != names:
         raise ValueError("production lineage helpers missing from pinned source")
-    namespace = {"Path": Path, "json": json, "_hash": digest}
+    namespace = {"Path": Path, "json": json, "_hash": digest, "time": time, "uuid": uuid}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(Path(root) / path), "exec"), namespace)
-    return SimpleNamespace(_successor=namespace["_successor"]), {
+    return SimpleNamespace(_successor=namespace["_successor"], _cancel_current=namespace["_cancel_current"]), {
         "path": path, "revision": sha, "sha256": hashlib.sha256(raw).hexdigest(),
         "functions": sorted(names), "mode": "immutable production function projection; no module imports"}
 
@@ -99,6 +100,51 @@ def validate_pause(producer, plan, job):
             or producer.get("source_root") != plan["producer_root"]
             or producer.get("sdk") != str(Path(plan["sdk_root"]) / "gpu_queue/cooperative.py")):
         raise ValueError("producer pause state has wrong route/source/job")
+
+
+def pause_due(producer, plan):
+    return producer.get("stage") == plan["pause_stage"] and producer.get("completed_step", -1) >= 0
+
+
+def cleanup_owned(queue, entry, expected, held, probe, caller, read, action, report):
+    # Release live own holds before cancellation makes resume inapplicable.
+    # A completed parent can already have transferred its hold to a successor.
+    if held is not None:
+        try:
+            current, seen = held, []
+            while True:
+                snapshot = read(current)
+                status = snapshot["state"]["status"]
+                if status in ("pending", "running") and snapshot["bucket"] == status:
+                    report.setdefault("hold_releases", []).append({"job": current, "result": action(current, "resume")})
+                successor = entry._successor(queue, expected, current, queue.get_job(current), seen)
+                if successor is None:
+                    break
+                seen.append(current)
+                current = successor
+        except Exception as error:
+            report["hold_release_error"] = str(error)
+    if caller is not None and caller.poll() is None:
+        try:
+            caller.terminate()
+            report["caller_cleanup_exit"] = caller.wait()
+        except Exception as error:
+            report["caller_cleanup_error"] = str(error)
+    # Reconcile exact model lineage even if the foreground caller had already
+    # died. The separate queued probe is also ours and needs cancellation.
+    for label, request in (("model", expected), ("probe", probe)):
+        if request is None:
+            continue
+        try:
+            snapshot = read(request.job_id)
+            for key in ("job_id", "agent_id", "command_argv", "repo_root", "command_cwd", "output_dir", "route_identity"):
+                if snapshot["request"].get(key) != getattr(request, key):
+                    raise ValueError("cleanup request custody changed: " + key)
+            current, result = entry._cancel_current(queue, request, request.job_id,
+                {"job_id": request.job_id, "chain": []})
+            report[label + "_cleanup"] = {"job": current, "result": result}
+        except Exception as error:
+            report[label + "_cleanup_error"] = str(error)
 
 
 def validate_glb(path):
@@ -182,6 +228,8 @@ def run(plan, report_path):
     held = None
     expected = None
     entry = None
+    probe = None
+    previous_term = None
 
     def write(**changes):
         report.update(changes, updated_at=time.time())
@@ -222,6 +270,10 @@ def run(plan, report_path):
 
     write()
     try:
+        previous_term = signal.getsignal(signal.SIGTERM)
+        def interrupted(*_):
+            raise KeyboardInterrupt("observer termination requested")
+        signal.signal(signal.SIGTERM, interrupted)
         root = Path(plan["run_root"])
         output = Path(plan["output"])
         if output.exists() or (output.parent / "_control").exists():
@@ -272,7 +324,7 @@ def run(plan, report_path):
                     raise ValueError("ambiguous producer pause state")
                 if states:
                     producer = json.loads(states[0].read_text())
-                    if producer.get("stage") == "sampler_2" and producer.get("completed_step", -1) >= 0:
+                    if pause_due(producer, plan):
                         validate_pause(producer, plan, parent)
                         report["pause_at"] = producer
                         report["pause_request"] = action(parent, "pause")
@@ -336,19 +388,11 @@ def run(plan, report_path):
         write(status="failed", failure_phase=report["phase"], error_type=type(error).__name__, error=str(error))
         raise
     finally:
-        if caller is not None and caller.poll() is None:
-            # Foreground SIGTERM invokes its source-owned exact-job cancellation.
-            caller.terminate()
-            report["caller_cleanup_exit"] = caller.wait()
-        if held is not None:
-            try:
-                snapshot = read(held)
-                if snapshot["bucket"] in ("pending", "running"):
-                    report["hold_release"] = action(held, "resume")
-                else:
-                    report["hold_terminal"] = snapshot["bucket"]
-            except Exception as error:
-                report["hold_release_error"] = str(error)
+        cleanup_owned(queue, entry, expected, held, probe, caller, read, action, report)
+        if previous_term is not None:
+            signal.signal(signal.SIGTERM, previous_term)
+        if report["status"] == "done" and any(key.endswith("_error") for key in report):
+            report.update(status="failed", failure_phase="cleanup")
         write()
 
 
